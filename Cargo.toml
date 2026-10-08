@@ -11,7 +11,7 @@ keywords = ["excel", "xlsx", "xlsm", "spreadsheet", "ooxml"]
 categories = ["encoding", "parser-implementations"]
 
 [dependencies]
-quick-xml = { version = "0.41", default-features = false }
+quick-xml = { version = "0.42", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
