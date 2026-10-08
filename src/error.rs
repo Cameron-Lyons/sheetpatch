@@ -9,6 +9,7 @@ pub enum Error {
     InvalidCellReference(String),
     InvalidValue(String),
     SheetNotFound(String),
+    SharedStringsUnavailable,
     Unsupported(String),
 }
 
@@ -23,6 +24,7 @@ impl fmt::Display for Error {
             Self::InvalidCellReference(e) => write!(f, "invalid cell reference: {e}"),
             Self::InvalidValue(e) => write!(f, "invalid cell value: {e}"),
             Self::SheetNotFound(e) => write!(f, "worksheet not found: {e}"),
+            Self::SharedStringsUnavailable => write!(f, "shared-string table is unavailable"),
             Self::Unsupported(e) => write!(f, "unsupported edit: {e}"),
         }
     }

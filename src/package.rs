@@ -1,12 +1,15 @@
-use crate::{CellRef, CellValue, Error, Result, archive::Archive, worksheet::patch_cell};
+use crate::{
+    CellContent, CellEdit, CellRef, CellValue, Error, Result,
+    archive::Archive,
+    worksheet::{patch_cells, read_cells, read_shared_strings},
+};
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    path::Path,
+    sync::OnceLock,
 };
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -52,6 +55,10 @@ pub struct Workbook {
     sheets: Vec<Sheet>,
     changes: BTreeMap<String, Vec<u8>>,
     signed: bool,
+    originals: Vec<OnceLock<Vec<u8>>>,
+    sheet_indexes: BTreeMap<String, usize>,
+    shared_strings_path: Option<String>,
+    shared_strings: OnceLock<Vec<String>>,
 }
 
 impl Workbook {
@@ -61,11 +68,7 @@ impl Workbook {
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::new(bytes)?;
-        if !archive
-            .entries()
-            .iter()
-            .any(|e| e.name == "[Content_Types].xml")
-        {
+        if !archive.contains("[Content_Types].xml") {
             return Err(Error::InvalidWorkbook("missing [Content_Types].xml".into()));
         }
         let roots = relationships(&archive.read("_rels/.rels")?)?;
@@ -92,6 +95,19 @@ impl Workbook {
             ));
         }
         let rels = relationships(&archive.read(&relationships_path(&workbook_path))?)?;
+        let shared: Vec<_> = rels
+            .iter()
+            .filter(|r| office_type(&r.kind, "sharedStrings"))
+            .collect();
+        if shared.len() > 1 || shared.first().is_some_and(|r| r.external) {
+            return Err(Error::InvalidWorkbook(
+                "expected at most one internal shared-string relationship".into(),
+            ));
+        }
+        let shared_strings_path = shared
+            .first()
+            .map(|r| resolve_target(&workbook_path, &r.target))
+            .transpose()?;
         let mut sheets = Vec::new();
         let mut names = BTreeSet::new();
         let mut paths = BTreeSet::new();
@@ -135,7 +151,7 @@ impl Workbook {
                 continue;
             }
             let path = resolve_target(&workbook_path, &relationship.target)?;
-            if !archive.entries().iter().any(|e| e.name == path) {
+            if !archive.contains(&path) {
                 return Err(Error::InvalidWorkbook(format!(
                     "missing worksheet part {path}"
                 )));
@@ -157,11 +173,21 @@ impl Workbook {
                 .entries()
                 .iter()
                 .any(|e| e.name.to_ascii_lowercase().starts_with("_xmlsignatures/"));
+        let originals = (0..sheets.len()).map(|_| OnceLock::new()).collect();
+        let sheet_indexes = sheets
+            .iter()
+            .enumerate()
+            .map(|(index, sheet)| (sheet.name.clone(), index))
+            .collect();
         Ok(Self {
             archive,
             sheets,
             changes: BTreeMap::new(),
             signed,
+            originals,
+            sheet_indexes,
+            shared_strings_path,
+            shared_strings: OnceLock::new(),
         })
     }
 
@@ -180,83 +206,166 @@ impl Workbook {
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        let cell: CellRef = address.parse()?;
-        let value = value.into();
-        value.validate()?;
-        let sheet = self
-            .sheets
-            .iter()
-            .find(|s| s.name == sheet)
-            .ok_or_else(|| Error::SheetNotFound(sheet.to_owned()))?;
+        self.apply_edits([CellEdit::new(sheet, address, value)?])
+    }
+
+    /// Apply edits to a worksheet in one parse and one XML patch.
+    /// Duplicate addresses use the last value; every input is validated.
+    /// The entire batch is committed only after every edit succeeds.
+    pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (S, V)>,
+        S: AsRef<str>,
+        V: Into<CellValue>,
+    {
+        let edits = cells
+            .into_iter()
+            .map(|(address, value)| CellEdit::new(sheet, address.as_ref(), value))
+            .collect::<Result<Vec<_>>>()?;
+        self.apply_edits(edits)
+    }
+
+    /// Apply a transaction across worksheets. On any error, all pending cell
+    /// values remain unchanged. Worksheets are decompressed lazily and cached.
+    pub fn apply_edits(&mut self, edits: impl IntoIterator<Item = CellEdit>) -> Result<()> {
+        let mut grouped: BTreeMap<usize, BTreeMap<CellRef, CellValue>> = BTreeMap::new();
+        for edit in edits {
+            let index = self.sheet_index(&edit.sheet)?;
+            grouped
+                .entry(index)
+                .or_default()
+                .insert(edit.cell, edit.value);
+        }
+        if grouped.is_empty() {
+            return Ok(());
+        }
         if self.signed {
             return Err(Error::Unsupported(
                 "editing a digitally signed OOXML package would invalidate its signature".into(),
             ));
         }
-        let original = self.archive.read(&sheet.path)?;
-        let current = self.changes.get(&sheet.path).unwrap_or(&original);
-        let patched = patch_cell(current, cell, &value)?;
-        if patched == original {
-            self.changes.remove(&sheet.path);
-        } else {
-            self.changes.insert(sheet.path.clone(), patched);
+        let mut staged = Vec::with_capacity(grouped.len());
+        for (index, cells) in grouped {
+            let sheet = &self.sheets[index];
+            let original = self.original_sheet(index)?;
+            let current = self
+                .changes
+                .get(&sheet.path)
+                .map(Vec::as_slice)
+                .unwrap_or(original);
+            let patched = patch_cells(current, &cells)?;
+            let changed = (patched != original).then_some(patched);
+            staged.push((sheet.path.clone(), changed));
+        }
+        for (path, changed) in staged {
+            if let Some(xml) = changed {
+                self.changes.insert(path, xml);
+            } else {
+                self.changes.remove(&path);
+            }
         }
         Ok(())
+    }
+
+    /// Read a cell's current value, cached formula result, and style index.
+    /// Missing cells return a blank value without modifying the workbook.
+    pub fn get_cell(&self, sheet: &str, address: &str) -> Result<CellContent> {
+        Ok(self.get_cells(sheet, [address])?.remove(0))
+    }
+
+    /// Read many cells with one worksheet parse, retaining input order.
+    pub fn get_cells<I, S>(&self, sheet: &str, addresses: I) -> Result<Vec<CellContent>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let index = self.sheet_index(sheet)?;
+        let cells = addresses
+            .into_iter()
+            .map(|address| address.as_ref().parse())
+            .collect::<Result<Vec<CellRef>>>()?;
+        if cells.is_empty() {
+            return Ok(Vec::new());
+        }
+        let xml = self
+            .changes
+            .get(&self.sheets[index].path)
+            .map(Vec::as_slice)
+            .map(Ok)
+            .unwrap_or_else(|| self.original_sheet(index))?;
+        match read_cells(xml, &cells, self.shared_strings.get().map(Vec::as_slice)) {
+            Err(Error::SharedStringsUnavailable) => {
+                let path = self
+                    .shared_strings_path
+                    .as_ref()
+                    .ok_or(Error::SharedStringsUnavailable)?;
+                let strings = read_shared_strings(&self.archive.read(path)?)?;
+                let _ = self.shared_strings.set(strings);
+                read_cells(xml, &cells, self.shared_strings.get().map(Vec::as_slice))
+            }
+            result => result,
+        }
+    }
+
+    /// Whether any package parts have pending edits.
+    pub fn has_changes(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// Discard every pending edit, restoring byte-identical original output.
+    pub fn reset_changes(&mut self) {
+        self.changes.clear();
+    }
+
+    fn sheet_index(&self, name: &str) -> Result<usize> {
+        self.sheet_indexes
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::SheetNotFound(name.to_owned()))
+    }
+
+    fn original_sheet(&self, index: usize) -> Result<&[u8]> {
+        let cache = &self.originals[index];
+        if cache.get().is_none() {
+            let xml = self.archive.read(&self.sheets[index].path)?;
+            let _ = cache.set(xml);
+        }
+        Ok(cache.get().expect("worksheet cache initialized").as_slice())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.archive.write(&self.changes)
     }
 
+    /// Serialize into a writer without allocating a second complete archive.
+    /// A failing writer may contain a partial archive; use `save` for atomic files.
+    pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
+        self.archive.write_to(&self.changes, &mut writer)
+    }
+
+    /// Remove obsolete ZIP records while retaining compressed bytes of untouched
+    /// entries. Central-directory offsets change. Opaque ZIP gaps are protected.
+    pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
+        self.archive.compact_to(&self.changes, &mut writer)
+    }
+
+    pub fn to_bytes_compact(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_compact_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Save through a temporary file in the destination directory, then rename.
     /// The original destination is retained if generation or writing fails.
     /// Using the input path as destination is supported.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let bytes = self.to_bytes()?;
-        let path = path.as_ref();
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let filename = path
-            .file_name()
-            .ok_or_else(|| Error::InvalidValue("destination must name a file".into()))?;
-        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let (temp_path, mut file) = loop {
-            let mut name = OsString::from(".");
-            name.push(filename);
-            name.push(format!(
-                ".sheetpatch-{}-{}.tmp",
-                std::process::id(),
-                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-            ));
-            let candidate = parent.join(name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => break (candidate, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let guard = TempFile(temp_path);
-        file.write_all(&bytes)?;
-        if let Ok(metadata) = fs::metadata(path) {
-            file.set_permissions(metadata.permissions())?;
-        }
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&guard.0, path)?;
-        Ok(())
+        crate::atomic::write(path.as_ref(), |writer| self.write_to(writer))
     }
-}
 
-struct TempFile(PathBuf);
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+    /// Atomically save a compact archive. Compaction is explicit because normal
+    /// saves preserve the entire original ZIP local-record area.
+    pub fn save_compact(&self, path: impl AsRef<Path>) -> Result<()> {
+        crate::atomic::write(path.as_ref(), |writer| self.write_compact_to(writer))
     }
 }
 
@@ -296,7 +405,7 @@ fn namespace(result: ResolveResult<'_>) -> Result<String> {
 fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
     let xml = std::str::from_utf8(bytes)
         .map_err(|_| Error::Unsupported("only UTF-8 workbook XML is supported".into()))?;
-    if !xml.chars().all(valid_xml_char) {
+    if !xml.chars().all(crate::xml::valid_char) {
         return Err(Error::Xml("invalid XML character".into()));
     }
     let mut reader = NsReader::from_str(xml);
@@ -335,7 +444,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                             reader.decoder(),
                         )?
                         .into_owned();
-                    if !value.chars().all(valid_xml_char) {
+                    if !value.chars().all(crate::xml::valid_char) {
                         return Err(Error::Xml("invalid XML attribute character".into()));
                     }
                     attributes.push(Attribute {
@@ -402,7 +511,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 let spelling = format!("&{reference};");
                 let value = quick_xml::escape::unescape(&spelling)
                     .map_err(|e| Error::Xml(e.to_string()))?;
-                if !value.chars().all(valid_xml_char) {
+                if !value.chars().all(crate::xml::valid_char) {
                     return Err(Error::Xml("invalid XML character reference".into()));
                 }
             }
@@ -414,10 +523,6 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
         return Err(Error::Xml("expected one complete XML root".into()));
     }
     Ok(nodes)
-}
-
-fn valid_xml_char(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
 struct Relationship {

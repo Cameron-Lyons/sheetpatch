@@ -61,7 +61,9 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - name: Unit, preservation, CLI, and documentation tests
-        run: cargo test --locked --all-features
+        run: cargo test --locked --all-targets --all-features
+      - name: Documentation examples
+        run: cargo test --locked --doc --all-features
 
   package:
     name: Package

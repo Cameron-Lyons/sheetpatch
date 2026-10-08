@@ -1,7 +1,7 @@
 # sheetpatch
 
 Lossless cell editing for **existing Excel workbooks**, written in Rust. Change
-text, numbers, booleans, or clear cells while preserving charts, pivot tables,
+text, numbers, booleans, errors, or clear cells while preserving charts, pivot tables,
 macros, formatting, relationships, and unfamiliar XML.
 
 The crate patches worksheet XML at byte offsets. It retains all untouched ZIP
@@ -18,7 +18,7 @@ sheetpatch = { path = "/path/to/sheetpatch" }
 ```
 
 ```rust,no_run
-use sheetpatch::{CellValue, Workbook};
+use sheetpatch::{CellEdit, CellValue, Workbook};
 
 fn main() -> sheetpatch::Result<()> {
     let mut book = Workbook::open("report.xlsm")?;
@@ -32,6 +32,18 @@ fn main() -> sheetpatch::Result<()> {
     book.set_cell("Summary", "D2", true)?;
     book.set_cell("Summary", "E2", CellValue::Blank)?;
 
+    // A batch parses each affected worksheet once.
+    book.set_cells("Summary", [("C3", 12.5), ("C4", 25.0)])?;
+
+    // A transaction across worksheets commits only after all edits succeed.
+    book.apply_edits([
+        CellEdit::new("Summary", "B3", "Reviewed")?,
+        CellEdit::new("Summary", "B4", "Approved")?,
+    ])?;
+
+    let cell = book.get_cell("Summary", "C3")?;
+    println!("{:?}", cell.value);
+
     book.save("report-edited.xlsm")?;
     Ok(())
 }
@@ -44,6 +56,23 @@ Numbers use `f64`; encode identifiers or integers requiring exact decimal digits
 as text. To edit dates, write the Excel numeric serial into a cell that already
 has the desired date format.
 
+Use `set_cells` for many edits on one sheet and `apply_edits` for transactions
+across sheets. Duplicate addresses use the last value; all inputs are validated.
+Failed transactions leave previous pending edits intact. `has_changes()` reports
+pending changes and `reset_changes()` restores the original archive.
+
+`get_cell` returns a `CellContent` with a scalar `value`, stored `formula` text,
+and `style_index`. `get_cells` reads multiple addresses with one worksheet parse,
+preserving input order. Shared strings and rich text are decoded without changing
+the workbook; formula values are cached results. Shared-formula follower cells
+may contain empty stored formula text. `CellRef::new(row, column)` supports typed,
+one-based addresses and `CellEdit::at` accepts them directly.
+
+`write_to` streams a workbook to any `std::io::Write` implementation. File saves
+use that same path, avoiding allocation of another complete ZIP. Worksheets are
+decompressed lazily and cached; shared strings are loaded only when a requested
+cell needs them.
+
 ## Use from the command line
 
 ```sh
@@ -53,7 +82,19 @@ cargo build --release --locked
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary C2 number 42.5
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary D2 bool true
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary E2 blank
+./target/release/sheetpatch get report.xlsm Summary B2
+./target/release/sheetpatch patch report.xlsm edited.xlsm edits.tsv
+./target/release/sheetpatch patch report.xlsm edited.xlsm - < edits.tsv
+./target/release/sheetpatch compact edited.xlsm compact.xlsm
 ```
+
+`get` prints the current scalar value, or an empty line for a blank cell. A patch
+file contains tab-separated `sheet`, `cell`, `type`, and `value` fields, one edit
+per line. Types are `text`, `number`, `bool`, `error`, and `blank`; `blank` may omit
+its value. Text keeps trailing whitespace and additional tabs. UTF-8 BOM and
+CRLF files are supported. Empty lines and tab-free lines beginning with `#` are
+ignored. Literal multiline values use the Rust API. Invalid rows report their
+line number and leave the destination unchanged.
 
 Each `set` invocation starts from its input workbook. To accumulate CLI edits,
 use the previous output as the next input, or use the same input and output path.
@@ -77,6 +118,13 @@ The ZIP writer retains the original local-record area and appends replacements
 for changed worksheets. Old worksheet bytes remain recoverable from unused ZIP
 records, and repeated saves can increase the file size. This API does not erase
 previous cell contents.
+
+Explicit `save_compact`, `to_bytes_compact`, and `write_compact_to` remove obsolete
+ZIP records. Untouched active local headers, compressed bytes, and descriptors
+remain unchanged; their central-directory offsets are adjusted. Compaction
+refuses opaque ZIP prefixes or gaps it cannot safely identify. It produces a
+smaller workbook while protecting unfamiliar archive data. It is not a secure
+erasure operation for copies or filesystem history.
 
 Charts, pivot tables, VBA projects, and other parts are preserved as opaque data.
 Formula results and chart/pivot caches are not calculated or refreshed. Recalculate
@@ -116,7 +164,7 @@ handled in the crate so untouched records can remain unchanged.
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo test --locked --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo build --locked --release
 cargo package --locked
@@ -128,6 +176,36 @@ the minimum supported Rust 1.88.0. Release builds and a clean package build must
 also pass. The aggregate `CI` check requires every job to succeed. Actions are
 pinned to full commit hashes, workflow permissions are read-only, and Dependabot
 checks Cargo dependencies and GitHub Actions weekly.
+
+## Performance
+
+Batch edits parse each affected worksheet once and apply all XML changes in one
+pass. Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
+scans. Streaming saves hold one replacement compressed part at a time, in
+addition to the input archive and pending worksheet XML.
+
+Run the dependency-free benchmark with:
+
+```sh
+SHEETPATCH_BENCH_SAMPLES=3 cargo bench --locked --bench editing
+```
+
+The harness independently checks expected worksheet XML and untouched compressed
+ZIP parts before measuring, and compares sequential edits, batching, streaming,
+and compaction. Initial measurements used one release-mode sample per synthetic
+workload on an Intel Core Ultra 5 325, Linux x86_64, Rust 1.99.0:
+
+| Worksheet cells / edits | Original sequential editor | Batch editor |
+| --- | ---: | ---: |
+| 10,000 / 100 | 1.335 s | 14.185 ms |
+| 50,000 / 500 | 43.954 s | 74.536 ms |
+
+The original editor was the initial public implementation at commit
+`532f27d6b3815b436b3ed1862f4a633001e595eb`, measured with the same generated fixtures.
+These timings describe those workloads, not a guarantee for every workbook.
+Five append saves of the 50,000-cell fixture grew it to 3,354,749 bytes; compaction
+kept it at 1,434,574 bytes. Streaming had comparable serialization time here and
+avoided allocating the output archive in memory.
 
 Preservation tests construct workbook archives and independently compare
 decompressed payloads, compressed streams, and central-directory metadata for

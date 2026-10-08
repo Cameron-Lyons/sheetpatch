@@ -1,9 +1,10 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 
-use crate::{CellRef, CellValue, Error, Result};
+use crate::xml::valid_char as valid_xml_char;
+use crate::{CellContent, CellRef, CellValue, Error, Result};
 
 const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
@@ -63,10 +64,6 @@ fn xml_error(message: impl Into<String>) -> Error {
 }
 fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
-}
-
-fn valid_xml_char(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
 fn decoded(input: &str) -> Result<String> {
@@ -308,12 +305,24 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
 
 fn edits_applied(xml: &[u8], mut edits: Vec<Edit>) -> Result<Vec<u8>> {
     edits.sort_by_key(|edit| (edit.start, edit.end));
-    let mut result = Vec::with_capacity(xml.len());
     let mut position = 0;
-    for edit in edits {
+    let mut length = 0usize;
+    for edit in &edits {
         if edit.start < position || edit.end < edit.start || edit.end > xml.len() {
             return Err(unsupported("overlapping XML edits"));
         }
+        length = length
+            .checked_add(edit.start - position)
+            .and_then(|length| length.checked_add(edit.bytes.len()))
+            .ok_or_else(|| unsupported("patched XML exceeds addressable memory"))?;
+        position = edit.end;
+    }
+    length = length
+        .checked_add(xml.len() - position)
+        .ok_or_else(|| unsupported("patched XML exceeds addressable memory"))?;
+    let mut result = Vec::with_capacity(length);
+    position = 0;
+    for edit in edits {
         result.extend_from_slice(&xml[position..edit.start]);
         result.extend_from_slice(&edit.bytes);
         position = edit.end;
@@ -400,6 +409,7 @@ fn value_type(value: &CellValue) -> Option<&'static str> {
     match value {
         CellValue::Text(_) => Some("inlineStr"),
         CellValue::Bool(_) => Some("b"),
+        CellValue::Error(_) => Some("e"),
         _ => None,
     }
 }
@@ -418,6 +428,7 @@ fn payload(prefix: &Element, value: &CellValue) -> Vec<u8> {
         }
         CellValue::Number(number) => format!("<{v}>{number}</{v}>").into_bytes(),
         CellValue::Bool(boolean) => format!("<{v}>{}</{v}>", u8::from(*boolean)).into_bytes(),
+        CellValue::Error(error) => format!("<{v}>{}</{v}>", text_escaped(error)).into_bytes(),
         CellValue::Blank => Vec::new(),
     }
 }
@@ -450,6 +461,39 @@ fn patched_cell(
     }
     if let Some(&child) = value_children.first() {
         validate_payload(elements, child, namespace)?;
+    }
+    let kind = cell
+        .attr("t")
+        .map_or("n", |attribute| attribute.value.as_str());
+    let unchanged = if let Some(&child) = value_children.first() {
+        let old = &elements[child];
+        match value {
+            CellValue::Number(number) if kind == "n" && old.is(namespace, "v") => {
+                element_text(xml, old)?.trim().parse::<f64>().ok() == Some(*number)
+            }
+            CellValue::Bool(boolean) if kind == "b" && old.is(namespace, "v") => {
+                match element_text(xml, old)?.trim() {
+                    "1" | "true" => *boolean,
+                    "0" | "false" => !*boolean,
+                    _ => false,
+                }
+            }
+            CellValue::Text(text) if kind == "inlineStr" && old.is(namespace, "is") => {
+                rich_text(xml, elements, child, namespace)? == *text
+            }
+            CellValue::Text(text) if kind == "str" && old.is(namespace, "v") => {
+                excel_text(&element_text(xml, old)?)? == *text
+            }
+            CellValue::Error(error) if kind == "e" && old.is(namespace, "v") => {
+                excel_text(&element_text(xml, old)?)? == *error
+            }
+            _ => false,
+        }
+    } else {
+        matches!(value, CellValue::Blank)
+    };
+    if unchanged {
+        return Ok(xml[cell.start..cell.end].to_vec());
     }
     let value_bytes = payload(cell, value);
     let kind = attribute_edit(cell, "t", value_type(value));
@@ -581,11 +625,312 @@ fn reference_range(reference: &str) -> Result<Range> {
     Ok(Range { first, last })
 }
 
-fn spans_edit(row: &Element, column: u16) -> Result<Option<Edit>> {
+// A worksheet's structure is indexed once. Byte spans remain relative to the
+// original document, so unrelated whitespace, prefixes and markup never move.
+struct WorksheetIndex {
+    elements: Vec<Element>,
+    namespace: String,
+    data_index: usize,
+    rows: Vec<RowCells>,
+    formula_cells: HashSet<CellRef>,
+    formula_ranges: Vec<Range>,
+    merged_ranges: Vec<Range>,
+    incomplete_formula_group: bool,
+}
+
+impl WorksheetIndex {
+    fn parse(xml: &[u8]) -> Result<Self> {
+        let elements = parse(xml)?;
+        let root = &elements[0];
+        let namespace = root
+            .namespace
+            .as_deref()
+            .ok_or_else(|| unsupported("worksheet has no OOXML namespace"))?;
+        if root.local_name() != "worksheet" || !matches!(namespace, TRANSITIONAL | STRICT) {
+            return Err(unsupported("expected an OOXML worksheet"));
+        }
+        let data: Vec<_> = root
+            .children
+            .iter()
+            .copied()
+            .filter(|&index| elements[index].is(namespace, "sheetData"))
+            .collect();
+        if data.len() != 1 {
+            return Err(unsupported(
+                "worksheet must contain exactly one sheetData element",
+            ));
+        }
+        let data_index = data[0];
+        let mut rows = Vec::new();
+        let mut previous_row = 0;
+        let mut shared: HashMap<String, bool> = HashMap::new();
+        let mut formula_cells = HashSet::new();
+        let mut formula_ranges = Vec::new();
+        let mut incomplete_formula_group = false;
+        for &index in &elements[data_index].children {
+            let row = &elements[index];
+            if !row.is(namespace, "row") {
+                continue;
+            }
+            let row_number = row
+                .attr("r")
+                .ok_or_else(|| unsupported("rows without explicit row numbers"))?
+                .value
+                .parse::<u32>()
+                .map_err(|_| unsupported("invalid row number"))?;
+            if row_number <= previous_row || row_number > 1_048_576 {
+                return Err(unsupported("duplicate, unsorted, or invalid row numbers"));
+            }
+            previous_row = row_number;
+            let mut cells = Vec::new();
+            let mut previous_column = 0;
+            for &index in &row.children {
+                let existing = &elements[index];
+                if !existing.is(namespace, "c") {
+                    continue;
+                }
+                let address: CellRef = existing
+                    .attr("r")
+                    .ok_or_else(|| unsupported("cells without explicit references"))?
+                    .value
+                    .parse()
+                    .map_err(|_| unsupported("invalid cell reference in worksheet"))?;
+                if address.row != row_number || address.column <= previous_column {
+                    return Err(unsupported(
+                        "duplicate, unsorted, or inconsistent cell references",
+                    ));
+                }
+                previous_column = address.column;
+                cells.push((address, index));
+                for &formula in &existing.children {
+                    let formula = &elements[formula];
+                    if !formula.is(namespace, "f") {
+                        continue;
+                    }
+                    formula_cells.insert(address);
+                    let range = formula
+                        .attr("ref")
+                        .map(|attribute| reference_range(&attribute.value))
+                        .transpose()?;
+                    if let Some(range) = range {
+                        formula_ranges.push(range);
+                    }
+                    match formula.attr("t").map(|attribute| attribute.value.as_str()) {
+                        Some("shared") => {
+                            let index = formula
+                                .attr("si")
+                                .ok_or_else(|| unsupported("shared formula without an index"))?
+                                .value
+                                .clone();
+                            let has_range = shared.entry(index).or_insert(false);
+                            *has_range |= range.is_some();
+                        }
+                        Some("array" | "dataTable") if range.is_none() => {
+                            incomplete_formula_group = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            rows.push((row_number, index, cells));
+        }
+        incomplete_formula_group |= shared.values().any(|has_range| !has_range);
+        let mut merged_ranges = Vec::new();
+        for &index in &root.children {
+            let merges = &elements[index];
+            if !merges.is(namespace, "mergeCells") {
+                continue;
+            }
+            for &index in &merges.children {
+                let merge = &elements[index];
+                if !merge.is(namespace, "mergeCell") {
+                    continue;
+                }
+                let reference = merge
+                    .attr("ref")
+                    .ok_or_else(|| unsupported("merged cells without a reference"))?;
+                merged_ranges.push(reference_range(&reference.value)?);
+            }
+        }
+        // Main-namespace rows/cells hidden in another container (such as
+        // AlternateContent) would make the visible cell addresses ambiguous.
+        for element in &elements {
+            if element.is(namespace, "row") && element.parent != Some(data_index) {
+                return Err(unsupported("row outside sheetData"));
+            }
+            if element.is(namespace, "c")
+                && !element.parent.is_some_and(|parent| {
+                    elements[parent].is(namespace, "row")
+                        && elements[parent].parent == Some(data_index)
+                })
+            {
+                return Err(unsupported("cell outside a worksheet row"));
+            }
+        }
+        let namespace = namespace.to_owned();
+        Ok(Self {
+            elements,
+            namespace,
+            data_index,
+            rows,
+            formula_cells,
+            formula_ranges,
+            merged_ranges,
+            incomplete_formula_group,
+        })
+    }
+
+    fn cell(&self, address: CellRef) -> Option<usize> {
+        let row = self
+            .rows
+            .binary_search_by_key(&address.row, |&(row, _, _)| row)
+            .ok()?;
+        let cells = &self.rows[row].2;
+        let cell = cells
+            .binary_search_by_key(&address.column, |&(cell, _)| cell.column)
+            .ok()?;
+        Some(cells[cell].1)
+    }
+
+    fn validate_edits(&self, cells: &BTreeMap<CellRef, CellValue>) -> Result<()> {
+        if self.incomplete_formula_group {
+            return Err(unsupported("formula group without a reference range"));
+        }
+        for &cell in cells.keys() {
+            if self.formula_cells.contains(&cell) {
+                return Err(unsupported(format!("{cell} contains a formula")));
+            }
+        }
+        validate_ranges(cells, &self.formula_ranges, false)?;
+        validate_ranges(cells, &self.merged_ranges, true)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GuardEvent {
+    row: u32,
+    first_column: u16,
+    last_column: u16,
+    delta: i32,
+}
+
+// Sorting integer row coordinates with a radix pass keeps large collections of
+// formula/merged ranges linear in the worksheet size. A small Fenwick tree then
+// tests each edited column against active ranges in at most 15 steps.
+fn sort_guard_events(events: &mut Vec<GuardEvent>) {
+    if events.len() < 2 {
+        return;
+    }
+    let mut scratch = events.clone();
+    for shift in [0, 8, 16] {
+        let mut counts = [0usize; 256];
+        for event in events.iter() {
+            counts[((event.row >> shift) & 255) as usize] += 1;
+        }
+        let mut total = 0;
+        for count in &mut counts {
+            let size = *count;
+            *count = total;
+            total += size;
+        }
+        for &event in events.iter() {
+            let bucket = ((event.row >> shift) & 255) as usize;
+            scratch[counts[bucket]] = event;
+            counts[bucket] += 1;
+        }
+        std::mem::swap(events, &mut scratch);
+    }
+}
+
+fn validate_ranges(
+    cells: &BTreeMap<CellRef, CellValue>,
+    ranges: &[Range],
+    merged: bool,
+) -> Result<()> {
+    let mut events = Vec::with_capacity(ranges.len() * if merged { 4 } else { 2 });
+    let mut add_range = |first_row, last_row, first_column, last_column| {
+        if first_row <= last_row && first_column <= last_column {
+            events.push(GuardEvent {
+                row: first_row,
+                first_column,
+                last_column,
+                delta: 1,
+            });
+            events.push(GuardEvent {
+                row: last_row + 1,
+                first_column,
+                last_column,
+                delta: -1,
+            });
+        }
+    };
+    for range in ranges {
+        if merged {
+            // The anchor remains editable; the rest of its rectangle does not.
+            add_range(
+                range.first.row,
+                range.first.row,
+                range.first.column + 1,
+                range.last.column,
+            );
+            add_range(
+                range.first.row + 1,
+                range.last.row,
+                range.first.column,
+                range.last.column,
+            );
+        } else {
+            add_range(
+                range.first.row,
+                range.last.row,
+                range.first.column,
+                range.last.column,
+            );
+        }
+    }
+    if events.is_empty() {
+        return Ok(());
+    }
+    sort_guard_events(&mut events);
+    let mut active = vec![0i32; 16_386];
+    let mut position = 0;
+    for &cell in cells.keys() {
+        while position < events.len() && events[position].row <= cell.row {
+            let event = events[position];
+            for (column, delta) in [
+                (event.first_column as usize, event.delta),
+                (event.last_column as usize + 1, -event.delta),
+            ] {
+                let mut index = column;
+                while index < active.len() {
+                    active[index] += delta;
+                    index += index & index.wrapping_neg();
+                }
+            }
+            position += 1;
+        }
+        let mut count = 0;
+        let mut index = cell.column as usize;
+        while index > 0 {
+            count += active[index];
+            index &= index - 1;
+        }
+        if count > 0 {
+            return Err(unsupported(if merged {
+                format!("{cell} is not the anchor of its merged range")
+            } else {
+                format!("{cell} belongs to a formula range")
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn spans_edit(row: &Element, columns: impl Iterator<Item = u16>) -> Result<Option<Edit>> {
     let Some(attribute) = row.attr("spans") else {
         return Ok(None);
     };
-    let mut spans: Vec<(u16, u16)> = Vec::new();
+    let mut spans = Vec::new();
     for span in attribute.value.split_whitespace() {
         let Some((first, last)) = span.split_once(':') else {
             return Err(unsupported("invalid row spans"));
@@ -604,267 +949,426 @@ fn spans_edit(row: &Element, column: u16) -> Result<Option<Edit>> {
     if spans.is_empty() {
         return Err(unsupported("empty row spans"));
     }
-    if spans
-        .iter()
-        .any(|&(first, last)| (first..=last).contains(&column))
-    {
+    let mut first = spans.iter().map(|span| span.0).min().unwrap();
+    let mut last = spans.iter().map(|span| span.1).max().unwrap();
+    let mut changed = false;
+    for column in columns {
+        changed |= !spans
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&column));
+        first = first.min(column);
+        last = last.max(column);
+    }
+    if !changed {
         return Ok(None);
     }
-    spans.push((column, column));
-    spans.sort_unstable();
-    // Row spans are hints; widen the closest span while retaining every old
-    // interval. The common single interval stays a single interval.
-    if spans.len() == 2 {
-        spans = vec![(spans[0].0, spans[1].1)];
-    }
-    let value = spans
-        .iter()
-        .map(|(first, last)| format!("{first}:{last}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(attribute_edit(row, "spans", Some(&value)))
+    // Spans are optional hints. Widen once for the whole batch, retaining every
+    // old interval and covering all new columns with a conservative bound.
+    Ok(attribute_edit(
+        row,
+        "spans",
+        Some(&format!("{first}:{last}")),
+    ))
 }
 
-pub(crate) fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
-    let elements = parse(xml)?;
-    let root = &elements[0];
-    let namespace = root
-        .namespace
-        .as_deref()
-        .ok_or_else(|| unsupported("worksheet has no OOXML namespace"))?;
-    if root.local_name() != "worksheet" || !matches!(namespace, TRANSITIONAL | STRICT) {
-        return Err(unsupported("expected an OOXML worksheet"));
-    }
-    let data: Vec<_> = root
-        .children
-        .iter()
-        .copied()
-        .filter(|&index| elements[index].is(namespace, "sheetData"))
-        .collect();
-    if data.len() != 1 {
-        return Err(unsupported(
-            "worksheet must contain exactly one sheetData element",
-        ));
-    }
-    let data_index = data[0];
-    let data = &elements[data_index];
-    let mut rows: Vec<RowCells> = Vec::new();
-    let mut previous_row = 0;
-    let mut shared: HashMap<String, bool> = HashMap::new();
-    let mut protected = Vec::new();
-    for &index in &data.children {
-        let row = &elements[index];
-        if !row.is(namespace, "row") {
-            continue;
-        }
-        let row_number = row
-            .attr("r")
-            .ok_or_else(|| unsupported("rows without explicit row numbers"))?
-            .value
-            .parse::<u32>()
-            .map_err(|_| unsupported("invalid row number"))?;
-        if row_number <= previous_row || row_number > 1_048_576 {
-            return Err(unsupported("duplicate, unsorted, or invalid row numbers"));
-        }
-        previous_row = row_number;
-        let mut cells = Vec::new();
-        let mut previous_column = 0;
-        for &index in &row.children {
-            let existing = &elements[index];
-            if !existing.is(namespace, "c") {
-                continue;
-            }
-            let address: CellRef = existing
-                .attr("r")
-                .ok_or_else(|| unsupported("cells without explicit references"))?
-                .value
-                .parse()
-                .map_err(|_| unsupported("invalid cell reference in worksheet"))?;
-            if address.row != row_number || address.column <= previous_column {
-                return Err(unsupported(
-                    "duplicate, unsorted, or inconsistent cell references",
-                ));
-            }
-            previous_column = address.column;
-            cells.push((address, index));
-            for &formula in &existing.children {
-                let formula = &elements[formula];
-                if !formula.is(namespace, "f") {
-                    continue;
-                }
-                if address == cell {
-                    return Err(unsupported(format!("{cell} contains a formula")));
-                }
-                let range = formula
-                    .attr("ref")
-                    .map(|attribute| reference_range(&attribute.value))
-                    .transpose()?;
-                if let Some(range) = range {
-                    protected.push(range);
-                }
-                match formula.attr("t").map(|attribute| attribute.value.as_str()) {
-                    Some("shared") => {
-                        let index = formula
-                            .attr("si")
-                            .ok_or_else(|| unsupported("shared formula without an index"))?
-                            .value
-                            .clone();
-                        let has_range = shared.entry(index).or_insert(false);
-                        *has_range |= range.is_some();
-                    }
-                    Some("array" | "dataTable") if range.is_none() => {
-                        return Err(unsupported("formula group without a reference range"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        rows.push((row_number, index, cells));
-    }
-    if shared.values().any(|has_range| !has_range) {
-        return Err(unsupported(
-            "shared formula group without a reference range",
-        ));
-    }
-    if protected.iter().any(|range| range.contains(cell)) {
-        return Err(unsupported(format!("{cell} belongs to a formula range")));
-    }
-    for &index in &root.children {
-        let merges = &elements[index];
-        if !merges.is(namespace, "mergeCells") {
-            continue;
-        }
-        for &index in &merges.children {
-            let merge = &elements[index];
-            if !merge.is(namespace, "mergeCell") {
-                continue;
-            }
-            let reference = merge
-                .attr("ref")
-                .ok_or_else(|| unsupported("merged cells without a reference"))?;
-            let range = reference_range(&reference.value)?;
-            if range.contains(cell) && cell != range.first {
-                return Err(unsupported(format!(
-                    "{cell} is not the anchor of its merged range"
-                )));
-            }
-        }
-    }
-    // A main-namespace row or cell hidden in another container is ambiguous
-    // (e.g. an AlternateContent layout); leave it for an OOXML-aware editor.
-    for element in &elements {
-        if element.is(namespace, "row") && element.parent != Some(data_index) {
-            return Err(unsupported("row outside sheetData"));
-        }
-        if element.is(namespace, "c")
-            && !element.parent.is_some_and(|parent| {
-                elements[parent].is(namespace, "row") && elements[parent].parent == Some(data_index)
-            })
-        {
-            return Err(unsupported("cell outside a worksheet row"));
-        }
-    }
-    let existing_row = rows.iter().find(|(number, _, _)| *number == cell.row);
-    let existing_cell =
-        existing_row.and_then(|(_, _, cells)| cells.iter().find(|(address, _)| *address == cell));
-    if existing_cell.is_none() && matches!(value, CellValue::Blank) {
+pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> Result<Vec<u8>> {
+    if cells.is_empty() {
         return Ok(xml.to_vec());
     }
+    for value in cells.values() {
+        value.validate()?;
+    }
+    let index = WorksheetIndex::parse(xml)?;
+    index.validate_edits(cells)?;
+    let elements = &index.elements;
+    let namespace = &index.namespace;
+    let data = &elements[index.data_index];
     let mut edits = Vec::new();
-    if let Some(&(_, index)) = existing_cell {
-        edits.push(Edit {
-            start: elements[index].start,
-            end: elements[index].end,
-            bytes: patched_cell(xml, &elements, index, namespace, value)?,
-        });
-    } else if let Some((_, row_index, cells)) = existing_row {
-        let row = &elements[*row_index];
-        let new_cell = new_cell(row, cell, value);
-        if row.empty {
-            let mut bytes = opening(xml, row, spans_edit(row, cell.column)?, true)?;
-            bytes.extend(new_cell);
-            bytes.extend_from_slice(format!("</{}>", row.name).as_bytes());
-            edits.push(Edit {
-                start: row.start,
-                end: row.end,
-                bytes,
-            });
-        } else {
-            let insertion = cells
+    let mut changed_cells = Vec::new();
+    let mut pending = cells.iter().peekable();
+    let mut row_position = 0;
+    let mut empty_data_rows = Vec::new();
+    while let Some(&(&address, _)) = pending.peek() {
+        let row_number = address.row;
+        while row_position < index.rows.len() && index.rows[row_position].0 < row_number {
+            row_position += 1;
+        }
+        let existing_row = index
+            .rows
+            .get(row_position)
+            .filter(|&&(number, _, _)| number == row_number);
+        let mut row_changes = Vec::new();
+        while pending
+            .peek()
+            .is_some_and(|(address, _)| address.row == row_number)
+        {
+            row_changes.push(pending.next().unwrap());
+        }
+        if let Some((_, row_index, existing_cells)) = existing_row {
+            let row = &elements[*row_index];
+            let mut cell_position = 0;
+            let mut changed_columns = Vec::new();
+            let mut empty_row_cells = Vec::new();
+            let fallback = row
+                .children
                 .iter()
-                .find(|(address, _)| address.column > cell.column)
-                .map(|(_, index)| elements[*index].start)
-                .unwrap_or_else(|| {
-                    row.children
-                        .iter()
-                        .map(|&index| &elements[index])
-                        .find(|child| child.is(namespace, "extLst"))
-                        .map_or(row.close_start, |child| child.start)
-                });
-            edits.push(Edit {
-                start: insertion,
-                end: insertion,
-                bytes: new_cell,
-            });
-            if let Some(edit) = spans_edit(row, cell.column)? {
+                .map(|&index| &elements[index])
+                .find(|child| child.is(namespace, "extLst"))
+                .map_or(row.close_start, |child| child.start);
+            for (&cell, value) in row_changes {
+                while cell_position < existing_cells.len()
+                    && existing_cells[cell_position].0.column < cell.column
+                {
+                    cell_position += 1;
+                }
+                let existing = existing_cells
+                    .get(cell_position)
+                    .filter(|&&(address, _)| address == cell);
+                if let Some(&(_, cell_index)) = existing {
+                    let bytes = patched_cell(xml, elements, cell_index, namespace, value)?;
+                    if bytes == xml[elements[cell_index].start..elements[cell_index].end] {
+                        continue;
+                    }
+                    edits.push(Edit {
+                        start: elements[cell_index].start,
+                        end: elements[cell_index].end,
+                        bytes,
+                    });
+                } else if matches!(value, CellValue::Blank) {
+                    continue;
+                } else if row.empty {
+                    empty_row_cells.extend(new_cell(row, cell, value));
+                } else {
+                    let insertion = existing_cells
+                        .get(cell_position)
+                        .map_or(fallback, |&(_, index)| elements[index].start);
+                    edits.push(Edit {
+                        start: insertion,
+                        end: insertion,
+                        bytes: new_cell(row, cell, value),
+                    });
+                }
+                changed_cells.push(cell);
+                changed_columns.push(cell.column);
+            }
+            if !changed_columns.is_empty() {
+                let span = spans_edit(row, changed_columns.into_iter())?;
+                if row.empty {
+                    let mut bytes = opening(xml, row, span, true)?;
+                    bytes.extend(empty_row_cells);
+                    bytes.extend_from_slice(format!("</{}>", row.name).as_bytes());
+                    edits.push(Edit {
+                        start: row.start,
+                        end: row.end,
+                        bytes,
+                    });
+                } else if let Some(span) = span {
+                    edits.push(span);
+                }
+            }
+        } else {
+            let mut new_cells = Vec::new();
+            for (&cell, value) in row_changes {
+                if !matches!(value, CellValue::Blank) {
+                    new_cells.extend(new_cell(data, cell, value));
+                    changed_cells.push(cell);
+                }
+            }
+            if !new_cells.is_empty() {
+                let row_name = data.qualified("row");
+                let mut bytes = format!("<{row_name} r=\"{row_number}\">").into_bytes();
+                bytes.extend(new_cells);
+                bytes.extend_from_slice(format!("</{row_name}>").as_bytes());
+                if data.empty {
+                    empty_data_rows.extend(bytes);
+                } else {
+                    let insertion = index
+                        .rows
+                        .get(row_position)
+                        .map_or(data.close_start, |&(_, index, _)| elements[index].start);
+                    edits.push(Edit {
+                        start: insertion,
+                        end: insertion,
+                        bytes,
+                    });
+                }
+            }
+        }
+    }
+    if !empty_data_rows.is_empty() {
+        let mut bytes = opening(xml, data, None, true)?;
+        bytes.extend(empty_data_rows);
+        bytes.extend_from_slice(format!("</{}>", data.name).as_bytes());
+        edits.push(Edit {
+            start: data.start,
+            end: data.end,
+            bytes,
+        });
+    }
+    if !changed_cells.is_empty() {
+        let dimensions: Vec<_> = elements[0]
+            .children
+            .iter()
+            .map(|&index| &elements[index])
+            .filter(|element| element.is(namespace, "dimension"))
+            .collect();
+        if dimensions.len() > 1 {
+            return Err(unsupported("multiple worksheet dimensions"));
+        }
+        if let Some(dimension) = dimensions.first() {
+            let reference = dimension
+                .attr("ref")
+                .ok_or_else(|| unsupported("dimension without a reference"))?;
+            let old = reference_range(&reference.value)?;
+            let range = changed_cells
+                .iter()
+                .fold(old, |range, &cell| range.including(cell));
+            if (!old.contains(range.first) || !old.contains(range.last))
+                && let Some(edit) = attribute_edit(dimension, "ref", Some(&range.reference()))
+            {
                 edits.push(edit);
             }
         }
-    } else {
-        let row_name = data.qualified("row");
-        let mut bytes = format!("<{row_name} r=\"{}\">", cell.row).into_bytes();
-        bytes.extend(new_cell(data, cell, value));
-        bytes.extend_from_slice(format!("</{row_name}>").as_bytes());
-        if data.empty {
-            let mut expanded = opening(xml, data, None, true)?;
-            expanded.extend(bytes);
-            expanded.extend_from_slice(format!("</{}>", data.name).as_bytes());
-            edits.push(Edit {
-                start: data.start,
-                end: data.end,
-                bytes: expanded,
-            });
-        } else {
-            let insertion = rows
-                .iter()
-                .find(|(number, _, _)| *number > cell.row)
-                .map(|(_, index, _)| elements[*index].start)
-                .unwrap_or(data.close_start);
-            edits.push(Edit {
-                start: insertion,
-                end: insertion,
-                bytes,
-            });
-        }
-    }
-    if existing_cell.is_some()
-        && let Some((_, row_index, _)) = existing_row
-        && let Some(edit) = spans_edit(&elements[*row_index], cell.column)?
-    {
-        edits.push(edit);
-    }
-    let dimensions: Vec<_> = root
-        .children
-        .iter()
-        .map(|&index| &elements[index])
-        .filter(|element| element.is(namespace, "dimension"))
-        .collect();
-    if dimensions.len() > 1 {
-        return Err(unsupported("multiple worksheet dimensions"));
-    }
-    if let Some(dimension) = dimensions.first() {
-        let reference = dimension
-            .attr("ref")
-            .ok_or_else(|| unsupported("dimension without a reference"))?;
-        let range = reference_range(&reference.value)?;
-        if !range.contains(cell)
-            && let Some(edit) =
-                attribute_edit(dimension, "ref", Some(&range.including(cell).reference()))
-        {
-            edits.push(edit);
-        }
     }
     edits_applied(xml, edits)
+}
+
+#[cfg(test)]
+fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
+    patch_cells(xml, &BTreeMap::from([(cell, value.clone())]))
+}
+
+// XML normalizes literal CR/CRLF before expanding character references. Doing
+// that in the opposite order would silently turn a deliberate &#13; into LF.
+fn normalized_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn element_text(xml: &[u8], element: &Element) -> Result<String> {
+    if !element.children.is_empty() {
+        return Err(unsupported("elements inside a simple cell text value"));
+    }
+    if element.empty {
+        return Ok(String::new());
+    }
+    let mut reader = quick_xml::Reader::from_reader(&xml[element.open_end..element.close_start]);
+    let mut text = String::new();
+    loop {
+        match reader.read_event()? {
+            Event::Text(value) => {
+                let value =
+                    std::str::from_utf8(value.as_ref()).map_err(|e| xml_error(e.to_string()))?;
+                text.push_str(&normalized_text(value));
+            }
+            Event::CData(value) => {
+                let value =
+                    std::str::from_utf8(value.as_ref()).map_err(|e| xml_error(e.to_string()))?;
+                text.push_str(&normalized_text(value));
+            }
+            Event::GeneralRef(reference) => {
+                let name = std::str::from_utf8(reference.as_ref())
+                    .map_err(|e| xml_error(e.to_string()))?;
+                text.push_str(&decoded(&format!("&{name};"))?);
+            }
+            Event::Comment(_) | Event::PI(_) => {}
+            Event::Eof => return Ok(text),
+            _ => {
+                return Err(unsupported(
+                    "unexpected markup inside a simple cell text value",
+                ));
+            }
+        }
+    }
+}
+
+fn excel_text(text: &str) -> Result<String> {
+    let bytes = text.as_bytes();
+    let mut units = Vec::with_capacity(text.len());
+    let mut position = 0;
+    while position < bytes.len() {
+        if bytes[position] == b'_'
+            && position + 7 <= bytes.len()
+            && matches!(bytes[position + 1], b'x' | b'X')
+            && bytes[position + 2..position + 6]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            && bytes[position + 6] == b'_'
+        {
+            units.push(u16::from_str_radix(&text[position + 2..position + 6], 16).unwrap());
+            position += 7;
+        } else {
+            let character = text[position..].chars().next().unwrap();
+            let mut encoded = [0; 2];
+            units.extend_from_slice(character.encode_utf16(&mut encoded));
+            position += character.len_utf8();
+        }
+    }
+    String::from_utf16(&units).map_err(|_| xml_error("invalid UTF-16 Excel text escape"))
+}
+
+fn rich_text(xml: &[u8], elements: &[Element], index: usize, namespace: &str) -> Result<String> {
+    let mut text = String::new();
+    for &child in &elements[index].children {
+        let element = &elements[child];
+        if element.is(namespace, "t") {
+            text.push_str(&excel_text(&element_text(xml, element)?)?);
+        } else if element.is(namespace, "r") {
+            for &child in &element.children {
+                let element = &elements[child];
+                if element.is(namespace, "t") {
+                    text.push_str(&excel_text(&element_text(xml, element)?)?);
+                }
+            }
+        }
+    }
+    Ok(text)
+}
+
+pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
+    let elements = parse(xml)?;
+    let root = &elements[0];
+    let namespace = root.namespace.as_deref().unwrap_or_default();
+    if root.local_name() != "sst" || !matches!(namespace, TRANSITIONAL | STRICT) {
+        return Err(unsupported("expected an OOXML shared-string table"));
+    }
+    root.children
+        .iter()
+        .copied()
+        .filter(|&index| elements[index].is(namespace, "si"))
+        .map(|index| rich_text(xml, &elements, index, namespace))
+        .collect()
+}
+
+fn cell_content(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    address: CellRef,
+    shared_strings: Option<&[String]>,
+) -> Result<CellContent> {
+    let Some(cell_index) = index.cell(address) else {
+        return Ok(CellContent {
+            value: CellValue::Blank,
+            formula: None,
+            style_index: None,
+        });
+    };
+    let elements = &index.elements;
+    let namespace = &index.namespace;
+    let cell = &elements[cell_index];
+    let style_index = cell
+        .attr("s")
+        .map(|attribute| {
+            attribute
+                .value
+                .parse::<u32>()
+                .map_err(|_| unsupported("invalid cell style index"))
+        })
+        .transpose()?;
+    let children = |name| {
+        cell.children
+            .iter()
+            .copied()
+            .filter(move |&child| elements[child].is(namespace, name))
+    };
+    let formulas: Vec<_> = children("f").collect();
+    if formulas.len() > 1 {
+        return Err(unsupported("cell has multiple formulas"));
+    }
+    let formula = formulas
+        .first()
+        .map(|&index| element_text(xml, &elements[index]))
+        .transpose()?;
+    let values: Vec<_> = cell
+        .children
+        .iter()
+        .copied()
+        .filter(|&child| elements[child].is(namespace, "v") || elements[child].is(namespace, "is"))
+        .collect();
+    if values.len() > 1 {
+        return Err(unsupported("cell has multiple value payloads"));
+    }
+    let value = if let Some(&payload_index) = values.first() {
+        let payload = &elements[payload_index];
+        let kind = cell
+            .attr("t")
+            .map_or("n", |attribute| attribute.value.as_str());
+        if kind == "inlineStr" {
+            if !payload.is(namespace, "is") {
+                return Err(unsupported("inline string cell without an inline payload"));
+            }
+            CellValue::Text(rich_text(xml, elements, payload_index, namespace)?)
+        } else {
+            if !payload.is(namespace, "v") {
+                return Err(unsupported("non-inline cell has an inline payload"));
+            }
+            let text = element_text(xml, payload)?;
+            match kind {
+                "n" if text.trim().is_empty() => CellValue::Blank,
+                "n" => {
+                    let number = text
+                        .trim()
+                        .parse::<f64>()
+                        .map_err(|_| unsupported("invalid numeric cell value"))?;
+                    if !number.is_finite() {
+                        return Err(unsupported("non-finite numeric cell value"));
+                    }
+                    CellValue::Number(number)
+                }
+                "b" => CellValue::Bool(match text.trim() {
+                    "0" | "false" => false,
+                    "1" | "true" => true,
+                    _ => return Err(unsupported("invalid boolean cell value")),
+                }),
+                "str" => CellValue::Text(excel_text(&text)?),
+                "e" => CellValue::Error(excel_text(&text)?),
+                "s" => {
+                    let position = text
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| unsupported("invalid shared-string index"))?;
+                    let strings = shared_strings.ok_or(Error::SharedStringsUnavailable)?;
+                    CellValue::Text(
+                        strings
+                            .get(position)
+                            .ok_or_else(|| {
+                                Error::InvalidWorkbook(
+                                    "shared-string index is out of bounds".into(),
+                                )
+                            })?
+                            .clone(),
+                    )
+                }
+                _ => return Err(unsupported(format!("unsupported cell value type {kind:?}"))),
+            }
+        }
+    } else {
+        CellValue::Blank
+    };
+    Ok(CellContent {
+        value,
+        formula,
+        style_index,
+    })
+}
+
+pub(crate) fn read_cells(
+    xml: &[u8],
+    cells: &[CellRef],
+    shared_strings: Option<&[String]>,
+) -> Result<Vec<CellContent>> {
+    if cells.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = WorksheetIndex::parse(xml)?;
+    cells
+        .iter()
+        .map(|&cell| cell_content(xml, &index, cell, shared_strings))
+        .collect()
+}
+
+#[cfg(test)]
+fn read_cell(xml: &[u8], cell: CellRef, shared_strings: Option<&[String]>) -> Result<CellContent> {
+    read_cells(xml, &[cell], shared_strings).map(|mut cells| cells.remove(0))
 }
 
 #[cfg(test)]
@@ -1028,5 +1532,290 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    fn batch(xml: &str, changes: &[(&str, CellValue)]) -> Result<String> {
+        let cells = changes
+            .iter()
+            .map(|(address, value)| (address.parse().unwrap(), value.clone()))
+            .collect();
+        Ok(String::from_utf8(patch_cells(xml.as_bytes(), &cells)?).unwrap())
+    }
+
+    #[test]
+    fn batch_inserts_at_shared_gaps_and_extends_metadata_once() {
+        let input = sheet(
+            r#"<dimension ref='C4'/><sheetData><!--keep--><row r='4' spans='3:3'><c r='C4' s='7'><v>3</v></c><extLst><x:future/></extLst></row><row r='8' spans='2:2' /></sheetData>"#,
+        );
+        let changed = batch(
+            &input,
+            &[
+                ("B8", 8.0.into()),
+                ("E4", 5.0.into()),
+                ("B2", 2.0.into()),
+                ("B4", 2.0.into()),
+                ("D4", 4.0.into()),
+                ("A4", 1.0.into()),
+                ("A2", 1.0.into()),
+                ("D3", 3.0.into()),
+                ("A8", 1.0.into()),
+                ("XFD1048576", CellValue::Blank),
+            ],
+        )
+        .unwrap();
+        assert!(changed.contains("<dimension ref='A2:E8'/><sheetData><!--keep--><row r=\"2\"><c r=\"A2\"><v>1</v></c><c r=\"B2\"><v>2</v></c></row><row r=\"3\"><c r=\"D3\"><v>3</v></c></row><row r='4' spans='1:5'>"));
+        assert!(changed.contains("<c r=\"A4\"><v>1</v></c><c r=\"B4\"><v>2</v></c><c r='C4' s='7'><v>3</v></c><c r=\"D4\"><v>4</v></c><c r=\"E4\"><v>5</v></c><extLst><x:future/></extLst>"));
+        assert!(changed.contains(
+            "<row r='8' spans='1:2' ><c r=\"A8\"><v>1</v></c><c r=\"B8\"><v>8</v></c></row>"
+        ));
+    }
+
+    #[test]
+    fn batch_expands_one_empty_data_element_for_many_rows() {
+        let input = sheet("<sheetData />");
+        let changed = batch(
+            &input,
+            &[
+                ("C7", true.into()),
+                ("A1", 1.0.into()),
+                ("B1", 2.0.into()),
+                ("A5", "five".into()),
+            ],
+        )
+        .unwrap();
+        assert!(changed.contains("<sheetData ><row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c></row><row r=\"5\">"));
+        assert_eq!(changed.matches("<sheetData").count(), 1);
+        assert_eq!(changed.matches("</sheetData>").count(), 1);
+        assert_eq!(
+            read_cell(changed.as_bytes(), "C7".parse().unwrap(), None)
+                .unwrap()
+                .value,
+            CellValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn batch_replaces_and_inserts_at_the_same_byte_position() {
+        let input = sheet(
+            r#"<sheetData><row r="1"><c r="B1" t="inlineStr"><is><t>old</t></is></c><c r="D1"><v>4</v></c></row></sheetData>"#,
+        );
+        let changed = batch(
+            &input,
+            &[
+                ("A1", 1.0.into()),
+                ("B1", CellValue::Blank),
+                ("C1", 3.0.into()),
+                ("D1", 8.0.into()),
+            ],
+        )
+        .unwrap();
+        assert!(changed.contains(
+            r#"<c r="A1"><v>1</v></c><c r="B1"></c><c r="C1"><v>3</v></c><c r="D1"><v>8</v></c>"#
+        ));
+    }
+
+    #[test]
+    fn batch_guards_include_all_edits_and_accept_merged_anchors() {
+        let input = sheet(
+            r#"<sheetData><row r="1"><c r="A1"><f t="array" ref="A1:C2">1</f><v>1</v></c></row></sheetData><mergeCells><mergeCell ref="E3:G5"/><mergeCell ref="A7:XFD1048576"/></mergeCells>"#,
+        );
+        assert!(batch(&input, &[("D1", 2.0.into()), ("C2", 8.0.into())]).is_err());
+        assert!(batch(&input, &[("D1", 2.0.into()), ("E4", CellValue::Blank)]).is_err());
+        assert!(batch(&input, &[("E3", 2.0.into()), ("A7", 8.0.into())]).is_ok());
+        assert!(batch(&input, &[("XFD1048576", 8.0.into())]).is_err());
+        assert!(batch(&input, &[("G2", 2.0.into()), ("H6", 8.0.into())]).is_ok());
+    }
+
+    #[test]
+    fn reads_values_formulas_styles_and_preserves_requested_order() {
+        let input = sheet(
+            r#"<sheetData><row r="1"><c r="A1" s="7"><f>SUM(B1,C1)&amp;2</f><v>42.5</v></c><c r="B1" t="b"><v>1</v></c><c r="C1" t="inlineStr"><is><r><rPr><b/></rPr><t>rich &amp; </t></r><r><t>text</t></r><rPh sb="0" eb="1"><t>phonetic</t></rPh></is></c><c r="D1" t="s"><v>1</v></c><c r="E1" t="e"><v>#DIV/0!</v></c><c r="F1" t="str"><f>"cached"</f><v>cached</v></c><c r="G1" s="9"/></row></sheetData>"#,
+        );
+        let addresses: Vec<_> = ["C1", "A1", "D1", "B1", "E1", "F1", "G1", "A2", "C1"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let cells = read_cells(
+            input.as_bytes(),
+            &addresses,
+            Some(&["first".into(), "second".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            cells
+                .iter()
+                .map(|cell| cell.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "rich & text".into(),
+                42.5.into(),
+                "second".into(),
+                true.into(),
+                CellValue::Error("#DIV/0!".into()),
+                "cached".into(),
+                CellValue::Blank,
+                CellValue::Blank,
+                "rich & text".into(),
+            ]
+        );
+        assert_eq!(cells[1].formula.as_deref(), Some("SUM(B1,C1)&2"));
+        assert_eq!(cells[1].style_index, Some(7));
+        assert_eq!(cells[6].style_index, Some(9));
+        assert_eq!(cells[7].style_index, None);
+    }
+
+    #[test]
+    fn reads_shared_rich_strings_excel_escapes_and_xml_newlines() {
+        let table = format!(r#"<sst xmlns="{STRICT}"><si><t>first</t></si><si><r><t>_x005F_x0041_</t></r><r><t>_xD83D__xDE00_&#13;<![CDATA[\r\nline\r]]></t></r><rPh sb="0" eb="1"><t>ignore</t></rPh></si><si><r><t>_</t></r><r><t>x0041_</t></r></si></sst>"#).replace("\\r", "\r").replace("\\n", "\n");
+        assert_eq!(
+            read_shared_strings(table.as_bytes()).unwrap(),
+            vec!["first", "_x0041_😀\r\nline\n", "_x0041_"]
+        );
+        let input = sheet(
+            "<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>a\r\nb\rc&#13;d&amp;_x000A_</t></is></c></row></sheetData>",
+        );
+        assert_eq!(
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), None)
+                .unwrap()
+                .value,
+            CellValue::Text("a\nb\nc\rd&\n".into())
+        );
+        let original = "_x0041_\r😀&_Xabcd_";
+        let changed = edit(&sheet("<sheetData/>"), "A1", original.into()).unwrap();
+        assert_eq!(
+            read_cell(changed.as_bytes(), "A1".parse().unwrap(), None)
+                .unwrap()
+                .value,
+            CellValue::Text(original.into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_read_values_and_missing_shared_strings() {
+        for (kind, payload) in [
+            ("n", "NaN"),
+            ("n", "infinity"),
+            ("b", "2"),
+            ("s", "-1"),
+            ("d", "2026-01-01"),
+        ] {
+            let input = sheet(&format!(
+                r#"<sheetData><row r="1"><c r="A1" t="{kind}"><v>{payload}</v></c></row></sheetData>"#
+            ));
+            assert!(read_cell(input.as_bytes(), "A1".parse().unwrap(), Some(&[])).is_err());
+        }
+        let input =
+            sheet(r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>"#);
+        assert!(matches!(
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), None),
+            Err(Error::SharedStringsUnavailable)
+        ));
+        assert!(matches!(
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), Some(&[])),
+            Err(Error::InvalidWorkbook(_))
+        ));
+    }
+
+    #[test]
+    fn can_write_and_read_excel_error_values() {
+        let input =
+            sheet(r#"<sheetData><row r="1"><c r="A1" s="8"><v>1</v></c></row></sheetData>"#);
+        let changed = edit(&input, "A1", CellValue::Error("#SPILL!".into())).unwrap();
+        let cell = read_cell(changed.as_bytes(), "A1".parse().unwrap(), None).unwrap();
+        assert_eq!(cell.value, CellValue::Error("#SPILL!".into()));
+        assert_eq!(cell.style_index, Some(8));
+    }
+
+    #[test]
+    fn matching_values_retain_exact_xml_and_do_not_change_metadata() {
+        let input = sheet(
+            r#"<dimension ref='C3'/><sheetData><row r='1' spans='2:3'><c r='A1' t='n'><v> 1.00 </v></c><c r='B1' t='b'><v>true</v></c><c r='C1' t='inlineStr'><is><r><rPr><b/></rPr><t>same</t></r></is></c><c r='D1' t='str'><v>_x005F_x0041_</v></c><c r='E1' t='e'><v>#REF!</v></c><c r='F1' s='2' /></row></sheetData>"#,
+        );
+        assert_eq!(
+            batch(
+                &input,
+                &[
+                    ("A1", 1.0.into()),
+                    ("B1", true.into()),
+                    ("C1", "same".into()),
+                    ("D1", "_x0041_".into()),
+                    ("E1", CellValue::Error("#REF!".into())),
+                    ("F1", CellValue::Blank)
+                ]
+            )
+            .unwrap(),
+            input
+        );
+        let unknown = input.replace("<rPr><b/></rPr>", "<rPr><x:future/></rPr>");
+        assert!(batch(&unknown, &[("C1", "same".into())]).is_err());
+    }
+
+    #[test]
+    fn range_sweep_matches_rectangle_membership_with_overlapping_ranges() {
+        let mut seed = 17u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let mut ranges = Vec::new();
+        for _ in 0..100 {
+            let first_row = 1 + next() % 30;
+            let first_column = 1 + (next() % 10) as u16;
+            ranges.push(Range {
+                first: CellRef {
+                    row: first_row,
+                    column: first_column,
+                },
+                last: CellRef {
+                    row: first_row + next() % 5,
+                    column: first_column + (next() % 3) as u16,
+                },
+            });
+        }
+        for merged in [false, true] {
+            for row in 1..=35 {
+                for column in 1..=14 {
+                    let cell = CellRef { row, column };
+                    let blocked = ranges
+                        .iter()
+                        .any(|range| range.contains(cell) && (!merged || cell != range.first));
+                    assert_eq!(
+                        validate_ranges(
+                            &BTreeMap::from([(cell, CellValue::Blank)]),
+                            &ranges,
+                            merged
+                        )
+                        .is_err(),
+                        blocked
+                    );
+                }
+            }
+        }
+        let boundary = Range {
+            first: CellRef {
+                row: 1,
+                column: 16_384,
+            },
+            last: CellRef {
+                row: 1_048_576,
+                column: 16_384,
+            },
+        };
+        assert!(
+            validate_ranges(
+                &BTreeMap::from([("XFD1".parse().unwrap(), CellValue::Blank)]),
+                &[boundary],
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_ranges(
+                &BTreeMap::from([("XFD1048576".parse().unwrap(), CellValue::Blank)]),
+                &[boundary],
+                true
+            )
+            .is_err()
+        );
     }
 }

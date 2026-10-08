@@ -1,6 +1,6 @@
 [package]
 name = "sheetpatch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Surgical cell edits in existing Excel workbooks, preserving untouched package parts"
@@ -13,6 +13,10 @@ categories = ["encoding", "parser-implementations"]
 [dependencies]
 quick-xml = { version = "0.41", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+[[bench]]
+name = "editing"
+harness = false
 
 [profile.release]
 lto = "thin"
