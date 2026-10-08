@@ -1,9 +1,12 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
+use quick_xml::{events::Event, reader::NsReader};
 
-use crate::xml::valid_char as valid_xml_char;
+use crate::xml::{
+    excel_text, namespace as decoded_namespace, valid_char as valid_xml_char, valid_name,
+    valid_qname, validate_declaration, whitespace as xml_whitespace,
+};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 
 const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -92,6 +95,9 @@ fn attribute_spans(
         if matches!(xml.get(position), Some(b'/' | b'>')) {
             break;
         }
+        if position == whitespace_start {
+            return Err(xml_error("missing XML attribute separator"));
+        }
         let name_start = position;
         while position < open_end && !xml[position].is_ascii_whitespace() && xml[position] != b'=' {
             position += 1;
@@ -129,7 +135,9 @@ fn attribute_spans(
         if raw.contains('<') {
             return Err(xml_error("less-than sign in an XML attribute"));
         }
-        let value = decoded(raw)?;
+        // XML normalizes literal attribute whitespace before expanding entity
+        // references; referenced whitespace keeps its actual value.
+        let value = decoded(&normalized_text(raw).replace(['\t', '\n'], " "))?;
         position += 1;
         result.push(Attribute {
             name,
@@ -179,44 +187,31 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                     }
                     root_seen = true;
                 }
+                let name = std::str::from_utf8(tag.name().as_ref())
+                    .map_err(|e| xml_error(e.to_string()))?
+                    .to_owned();
+                if !valid_qname(&name) {
+                    return Err(xml_error("invalid XML element name"));
+                }
                 let (namespace, _) = reader.resolver().resolve_element(tag.name());
-                let namespace = match namespace {
-                    ResolveResult::Bound(ns) => Some(
-                        std::str::from_utf8(ns.as_ref())
-                            .map_err(|e| xml_error(e.to_string()))?
-                            .to_owned(),
-                    ),
-                    ResolveResult::Unbound => None,
-                    ResolveResult::Unknown(prefix) => {
-                        return Err(xml_error(format!(
-                            "unbound namespace prefix {}",
-                            String::from_utf8_lossy(&prefix)
-                        )));
-                    }
-                };
+                let namespace = decoded_namespace(namespace)?;
+                let namespace = (!namespace.is_empty()).then_some(namespace);
                 // Let quick-xml check attribute syntax and duplicate names, and
                 // independently reject duplicate expanded names/prefix errors.
                 let mut expanded = HashSet::new();
                 for attribute in tag.attributes() {
                     let attribute = attribute.map_err(|e| xml_error(e.to_string()))?;
+                    let attribute_name = std::str::from_utf8(attribute.key.as_ref())
+                        .map_err(|e| xml_error(e.to_string()))?;
+                    if !valid_qname(attribute_name) {
+                        return Err(xml_error("invalid XML attribute name"));
+                    }
                     let (ns, local) = reader.resolver().resolve_attribute(attribute.key);
-                    let ns = match ns {
-                        ResolveResult::Bound(ns) => ns.as_ref().to_vec(),
-                        ResolveResult::Unbound => Vec::new(),
-                        ResolveResult::Unknown(prefix) => {
-                            return Err(xml_error(format!(
-                                "unbound attribute prefix {}",
-                                String::from_utf8_lossy(&prefix)
-                            )));
-                        }
-                    };
+                    let ns = decoded_namespace(ns)?;
                     if !expanded.insert((ns, local.as_ref().to_vec())) {
                         return Err(xml_error("duplicate expanded attribute name"));
                     }
                 }
-                let name = std::str::from_utf8(tag.name().as_ref())
-                    .map_err(|e| xml_error(e.to_string()))?
-                    .to_owned();
                 let attributes = attribute_spans(xml, start, end, name.len())?;
                 let empty = matches!(event, Event::Empty(_));
                 let parent = stack.last().copied();
@@ -254,7 +249,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                 if raw.contains("]]>") {
                     return Err(xml_error("CDATA terminator in ordinary XML text"));
                 }
-                if stack.is_empty() && !raw.trim().is_empty() {
+                if stack.is_empty() && !xml_whitespace(raw) {
                     return Err(xml_error("text outside the XML root"));
                 }
             }
@@ -269,29 +264,28 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
             Event::CData(_) if stack.is_empty() => {
                 return Err(xml_error("CDATA outside the XML root"));
             }
-            Event::Comment(_) | Event::PI(_) => {
+            Event::Comment(_) => {
+                if let Some(&index) = stack.last() {
+                    elements[index].opaque_markup = true;
+                }
+            }
+            Event::PI(instruction) => {
+                let target = std::str::from_utf8(instruction.target())
+                    .map_err(|e| xml_error(e.to_string()))?;
+                if !valid_name(target) || target.eq_ignore_ascii_case("xml") {
+                    return Err(xml_error("invalid XML processing instruction target"));
+                }
                 if let Some(&index) = stack.last() {
                     elements[index].opaque_markup = true;
                 }
             }
             Event::DocType(_) => return Err(unsupported("XML document type declarations")),
             Event::Decl(declaration) => {
-                if root_seen || declaration_seen {
+                if root_seen || declaration_seen || start != bom {
                     return Err(xml_error("misplaced XML declaration"));
                 }
                 declaration_seen = true;
-                let version = declaration
-                    .version()
-                    .map_err(|e| xml_error(e.to_string()))?;
-                if version.as_ref() != b"1.0" {
-                    return Err(unsupported("XML versions other than 1.0"));
-                }
-                if let Some(encoding) = declaration.encoding() {
-                    let encoding = encoding.map_err(|e| xml_error(e.to_string()))?;
-                    if !encoding.eq_ignore_ascii_case(b"UTF-8") {
-                        return Err(unsupported("non-UTF-8 worksheet XML"));
-                    }
-                }
+                validate_declaration(&declaration)?;
             }
             Event::Eof => break,
             _ => {}
@@ -490,7 +484,7 @@ fn patched_cell(
             _ => false,
         }
     } else {
-        matches!(value, CellValue::Blank)
+        matches!(value, CellValue::Blank) && cell.attr("t").is_none()
     };
     if unchanged {
         return Ok(xml[cell.start..cell.end].to_vec());
@@ -1181,31 +1175,6 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     }
 }
 
-fn excel_text(text: &str) -> Result<String> {
-    let bytes = text.as_bytes();
-    let mut units = Vec::with_capacity(text.len());
-    let mut position = 0;
-    while position < bytes.len() {
-        if bytes[position] == b'_'
-            && position + 7 <= bytes.len()
-            && matches!(bytes[position + 1], b'x' | b'X')
-            && bytes[position + 2..position + 6]
-                .iter()
-                .all(u8::is_ascii_hexdigit)
-            && bytes[position + 6] == b'_'
-        {
-            units.push(u16::from_str_radix(&text[position + 2..position + 6], 16).unwrap());
-            position += 7;
-        } else {
-            let character = text[position..].chars().next().unwrap();
-            let mut encoded = [0; 2];
-            units.extend_from_slice(character.encode_utf16(&mut encoded));
-            position += character.len_utf8();
-        }
-    }
-    String::from_utf16(&units).map_err(|_| xml_error("invalid UTF-16 Excel text escape"))
-}
-
 fn rich_text(xml: &[u8], elements: &[Element], index: usize, namespace: &str) -> Result<String> {
     let mut text = String::new();
     for &child in &elements[index].children {
@@ -1449,6 +1418,46 @@ mod tests {
     }
 
     #[test]
+    fn resolves_escaped_namespace_names_and_rejects_expanded_attribute_duplicates() {
+        for namespace in [TRANSITIONAL, STRICT] {
+            let encoded = namespace.replace('/', "&#47;");
+            let input = format!(
+                r#"<s:worksheet xmlns:s="{encoded}"><s:sheetData><s:row r="1"><s:c r="A1"><s:v>1</s:v></s:c></s:row></s:sheetData></s:worksheet>"#
+            );
+            let changed = edit(&input, "A1", 2.0.into()).unwrap();
+            assert_eq!(changed, input.replace("<s:v>1</s:v>", "<s:v>2</s:v>"));
+            assert_eq!(
+                read_cell(changed.as_bytes(), "A1".parse().unwrap(), None)
+                    .unwrap()
+                    .value,
+                CellValue::Number(2.0)
+            );
+        }
+        let duplicate = sheet(
+            r#"<sheetData><row r="1"><c r="A1" xmlns:a="urn:x" xmlns:b="urn&#58;x" a:flag="one" b:flag="two"/></row></sheetData>"#,
+        );
+        assert!(matches!(
+            edit(&duplicate, "A1", 2.0.into()),
+            Err(Error::Xml(_))
+        ));
+    }
+
+    #[test]
+    fn normalizes_literal_attribute_whitespace_before_character_references() {
+        let input = sheet(
+            "<sheetData><row r=\"1\"><c r=\"A1\" x:flag=\"a\r\nb\rc\nd\te&#13;f&#10;g&#9;h\"/></row></sheetData>",
+        );
+        let elements = parse(input.as_bytes()).unwrap();
+        let cell = elements
+            .iter()
+            .find(|element| element.is(TRANSITIONAL, "c"))
+            .unwrap();
+        assert_eq!(cell.attr("x:flag").unwrap().value, "a b c d e\rf\ng\th");
+        let changed = edit(&input, "A1", 2.0.into()).unwrap();
+        assert!(changed.contains("x:flag=\"a\r\nb\rc\nd\te&#13;f&#10;g&#9;h\""));
+    }
+
+    #[test]
     fn rejects_formula_cells_and_formula_followers() {
         for kind in ["shared", "array", "dataTable"] {
             let si = if kind == "shared" { " si=\"0\"" } else { "" };
@@ -1473,6 +1482,30 @@ mod tests {
                 .replace("<is><t>hello</t></is>", "")
         );
         assert_eq!(edit(&input, "XFD1048576", CellValue::Blank).unwrap(), input);
+    }
+
+    #[test]
+    fn clearing_empty_typed_cells_removes_type_and_retains_unknown_content() {
+        for cell in [
+            r#"<c r="A1" s="4" t = 'inlineStr' x:flag="keep" />"#,
+            r#"<c r="A1" s="4" t = 's' x:flag="keep"><x:future/><!--keep--></c>"#,
+            r#"<c r="A1" s="4" t = 'n' x:flag="keep"></c>"#,
+        ] {
+            let input = sheet(&format!("<sheetData><row r=\"1\">{cell}</row></sheetData>"));
+            let typed = cell.find(" t = '").unwrap();
+            let type_end = typed + cell[typed + 6..].find('\'').unwrap() + 7;
+            let mut expected = cell.to_owned();
+            expected.replace_range(typed..type_end, "");
+            let output = edit(&input, "A1", CellValue::Blank).unwrap();
+            assert_eq!(output, input.replace(cell, &expected));
+            assert_eq!(edit(&output, "A1", CellValue::Blank).unwrap(), output);
+            assert_eq!(
+                read_cell(output.as_bytes(), "A1".parse().unwrap(), None)
+                    .unwrap()
+                    .value,
+                CellValue::Blank
+            );
+        }
     }
 
     #[test]
@@ -1525,6 +1558,7 @@ mod tests {
             r#"<sheetData><row r="1"><c r="B1"/><c r="A1"/></row></sheetData>"#,
             r#"<sheetData><row r="1"><c r="A1"><v>1</v><is><t>x</t></is></c></row></sheetData>"#,
             r#"<sheetData><row r="1"><c r="A1" t="n" t="b"/></row></sheetData>"#,
+            r#"<sheetData><row r="1"><c r="A1"t="n"/></row></sheetData>"#,
             r#"<sheetData><row r="1"><c r="A1"><v>&unknown;</v></c></row></sheetData>"#,
         ] {
             assert!(
@@ -1532,6 +1566,54 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invalid_xml_names_and_non_xml_whitespace_outside_root() {
+        for input in [
+            sheet(r#"<sheetData 0bad="one"/>"#),
+            sheet("<sheetData><0bad/></sheetData>"),
+            sheet("<sheetData><x:bad:name/></sheetData>"),
+            sheet("<sheetData><?0bad data?></sheetData>"),
+            sheet("<sheetData><?XML data?></sheetData>"),
+            format!("\u{a0}{}", sheet("<sheetData/>")),
+            format!("{}\u{a0}", sheet("<sheetData/>")),
+        ] {
+            assert!(
+                matches!(edit(&input, "A1", 2.0.into()), Err(Error::Xml(_))),
+                "accepted malformed XML: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_xml_declarations_and_retains_valid_unicode_names() {
+        for declaration in [
+            " <?xml version='1.0'?>",
+            "<!--first--><?xml version='1.0'?>",
+            "<?xml version='1.0' version='1.0'?>",
+            "<?xml version='1.0' standalone='maybe'?>",
+            "<?xml version='1.0' standalone='yes' encoding='UTF-8'?>",
+            "<?xml version='1.0' unknown='value'?>",
+        ] {
+            let input = sheet("<sheetData/>").replace("<?xml version=\"1.0\"?>", declaration);
+            assert!(edit(&input, "A1", 2.0.into()).is_err(), "{input}");
+        }
+        let input = sheet(
+            "<?vendor:tool untouched?><sheetData/><x:外 x:À·=\"keep\"/><x:\u{10000} x:\u{200c}start=\"keep\"/>",
+        )
+        .replace(
+            "<?xml version=\"1.0\"?>",
+            "<?xml version='1.0' encoding='utf-8' standalone='yes'?>\r\n",
+        );
+        let changed = edit(&input, "A1", 2.0.into()).unwrap();
+        assert_eq!(
+            changed,
+            input.replace(
+                "<sheetData/>",
+                "<sheetData><row r=\"1\"><c r=\"A1\"><v>2</v></c></row></sheetData>"
+            )
+        );
     }
 
     fn batch(xml: &str, changes: &[(&str, CellValue)]) -> Result<String> {

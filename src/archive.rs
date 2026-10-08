@@ -1,8 +1,8 @@
 //! A ZIP32 container that retains every untouched record verbatim.
 //!
-//! Changed members are appended to the original local-record area; only their
-//! central-directory records are repointed. This deliberately avoids decoding
-//! and re-encoding unrelated workbook parts.
+//! Changed members replace their original local records; untouched records and
+//! opaque gaps are copied verbatim. This avoids decoding unrelated parts and
+//! introducing unreferenced local records that some spreadsheet readers reject.
 
 use std::{
     borrow::Cow,
@@ -413,11 +413,60 @@ impl Archive {
         Ok(output)
     }
 
-    /// Stream the original local-record area and append changed members.
+    /// Stream local records in their original order, replacing changed members.
     ///
     /// Only one changed member's compressed payload is held in memory at a
     /// time. As with `Write::write_all`, a writer error may leave partial output.
     pub(crate) fn write_to<W: Write>(
+        &self,
+        changes: &BTreeMap<String, Vec<u8>>,
+        writer: &mut W,
+    ) -> Result<()> {
+        if changes.is_empty() {
+            writer.write_all(&self.original)?;
+            return Ok(());
+        }
+        self.validate_changes(changes)?;
+        let mut position = 0;
+        let mut original_position = 0;
+        let mut replacements = vec![None; self.entries.len()];
+        let mut offsets = vec![0; self.entries.len()];
+        let mut order: Vec<_> = (0..self.entries.len()).collect();
+        order.sort_unstable_by_key(|&index| self.entries[index].local_record.start);
+        for index in order {
+            let entry = &self.entries[index];
+            // Prefixes, gaps and any obsolete records from older versions are
+            // opaque here. Preserve them; only explicit compaction removes
+            // obsolete records after proving their boundaries and checksums.
+            emit(
+                writer,
+                &mut position,
+                &self.original[original_position..entry.local_record.start],
+            )?;
+            offsets[index] = zip32(position, "ZIP local-record offset")?;
+            if let Some(data) = changes.get(&entry.name) {
+                replacements[index] =
+                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
+            } else {
+                emit(
+                    writer,
+                    &mut position,
+                    &self.original[entry.local_record.clone()],
+                )?;
+            }
+            original_position = entry.local_record.end;
+        }
+        emit(
+            writer,
+            &mut position,
+            &self.original[original_position..self.central_start],
+        )?;
+        self.emit_directory(writer, &mut position, &offsets, &replacements)
+    }
+
+    /// Reproduce pre-1.0 append saves to exercise migration and compaction.
+    #[cfg(test)]
+    fn append_to<W: Write>(
         &self,
         changes: &BTreeMap<String, Vec<u8>>,
         writer: &mut W,
@@ -853,6 +902,12 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<(u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    fn append(archive: &Archive, changes: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        archive.append_to(changes, &mut bytes).unwrap();
+        bytes
+    }
+
     fn fixture(descriptor: bool) -> Vec<u8> {
         let name = b"part.xml";
         let data = b"<part/>";
@@ -918,7 +973,7 @@ mod tests {
             let archive = Archive::new(original.clone()).unwrap();
             let changes =
                 BTreeMap::from([("part.xml".into(), b"<part changed=\"yes\"/>".to_vec())]);
-            let edited = archive.write(&changes).unwrap();
+            let edited = append(&archive, &changes);
             assert_eq!(
                 &edited[..archive.central_start],
                 &original[..archive.central_start]
@@ -928,6 +983,92 @@ mod tests {
             assert_eq!(reopened.read("part.xml").unwrap(), changes["part.xml"]);
             assert_eq!(reopened.entries[0].flags & 8, 0);
         }
+    }
+
+    #[test]
+    fn replacements_leave_no_unreferenced_records_and_preserve_untouched_metadata() {
+        let original = Archive::new(combine(
+            decorate_fixture(b"part.xml", false),
+            decorate_fixture(b"keep.xml", true),
+        ))
+        .unwrap();
+        // Central-directory order need not match physical local-record order.
+        let mut bytes = original.original[..original.central_start].to_vec();
+        bytes.extend_from_slice(&original.original[original.entries[1].central.clone()]);
+        bytes.extend_from_slice(&original.original[original.entries[0].central.clone()]);
+        bytes.extend_from_slice(&original.original[original.end..]);
+        let mut archive = Archive::new(bytes).unwrap();
+        let untouched = &archive.entries[archive.index["keep.xml"]];
+        let local = archive.original[untouched.local_record.clone()].to_vec();
+        let central = archive.original[untouched.central.clone()].to_vec();
+        for data in [b"longer replacement".as_slice(), b"short".as_slice()] {
+            archive = Archive::new(
+                archive
+                    .write(&BTreeMap::from([("part.xml".into(), data.to_vec())]))
+                    .unwrap(),
+            )
+            .unwrap();
+            let changed = &archive.entries[archive.index["part.xml"]];
+            let untouched = &archive.entries[archive.index["keep.xml"]];
+            // All bytes before the directory belong to exactly two records.
+            assert_eq!(changed.local_record.start, 0);
+            assert_eq!(changed.local_record.end, untouched.local_record.start);
+            assert_eq!(untouched.local_record.end, archive.central_start);
+            assert_eq!(archive.read("part.xml").unwrap(), data);
+            assert_eq!(archive.original[untouched.local_record.clone()], local);
+            let updated_central = &archive.original[untouched.central.clone()];
+            assert_eq!(updated_central[..42], central[..42]);
+            assert_eq!(updated_central[46..], central[46..]);
+            assert_eq!(archive.entries[0].name, "keep.xml");
+            assert!(archive.original.ends_with(b"comment"));
+        }
+    }
+
+    #[test]
+    fn replacements_preserve_opaque_prefixes_gaps_and_tails() {
+        let original =
+            Archive::new(combine(fixture(false), decorate_fixture(b"keep.xml", true))).unwrap();
+        let prefix = b"opaque prefix";
+        let gap = b"opaque gap";
+        let tail = b"opaque tail";
+        let first = &original.entries[0];
+        let second = &original.entries[1];
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&original.original[first.local_record.clone()]);
+        bytes.extend_from_slice(gap);
+        let second_start = bytes.len();
+        bytes.extend_from_slice(&original.original[second.local_record.clone()]);
+        bytes.extend_from_slice(tail);
+        let central_start = bytes.len();
+        for (entry, offset) in [(first, prefix.len()), (second, second_start)] {
+            let mut record = original.original[entry.central.clone()].to_vec();
+            set_u32(&mut record, 42, offset as u32);
+            bytes.extend_from_slice(&record);
+        }
+        let mut ending = original.original[original.end..].to_vec();
+        set_u32(&mut ending, 16, central_start as u32);
+        bytes.extend_from_slice(&ending);
+        let archive = Archive::new(bytes).unwrap();
+        let edited = archive
+            .write(&BTreeMap::from([("part.xml".into(), b"updated".to_vec())]))
+            .unwrap();
+        let updated = Archive::new(edited).unwrap();
+        let first = &updated.entries[0];
+        let second = &updated.entries[1];
+        assert_eq!(&updated.original[..first.local_record.start], prefix);
+        assert_eq!(
+            &updated.original[first.local_record.end..second.local_record.start],
+            gap
+        );
+        assert_eq!(
+            &updated.original[second.local_record.end..updated.central_start],
+            tail
+        );
+        assert_eq!(updated.read("part.xml").unwrap(), b"updated");
+        assert_eq!(
+            updated.original[second.local_record.clone()],
+            original.original[original.entries[1].local_record.clone()]
+        );
     }
 
     #[test]
@@ -1170,9 +1311,10 @@ mod tests {
             let mut output = Vec::new();
             archive.compact_to(&BTreeMap::new(), &mut output).unwrap();
             assert_eq!(output, original);
-            let changed = archive
-                .write(&BTreeMap::from([("part.xml".into(), b"new".to_vec())]))
-                .unwrap();
+            let changed = append(
+                &archive,
+                &BTreeMap::from([("part.xml".into(), b"new".to_vec())]),
+            );
             let mut compacted = Vec::new();
             Archive::new(changed)
                 .unwrap()
@@ -1200,7 +1342,7 @@ mod tests {
         for index in 0..10 {
             let changes =
                 BTreeMap::from([("part.xml".into(), format!("value {index}").into_bytes())]);
-            let appended = current.write(&changes).unwrap();
+            let appended = append(&current, &changes);
             let mut compacted = Vec::new();
             let appended = Archive::new(appended).unwrap();
             appended
@@ -1257,7 +1399,7 @@ mod tests {
                 )
             })
             .collect();
-        let appended = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        let appended = Archive::new(append(&archive, &changes)).unwrap();
         let mut compacted = Vec::new();
         appended
             .compact_to(&BTreeMap::new(), &mut compacted)
@@ -1320,9 +1462,10 @@ mod tests {
     #[test]
     fn compaction_does_not_discard_corrupt_obsolete_records() {
         let archive = Archive::new(fixture(true)).unwrap();
-        let mut changed = archive
-            .write(&BTreeMap::from([("part.xml".into(), b"updated".to_vec())]))
-            .unwrap();
+        let mut changed = append(
+            &archive,
+            &BTreeMap::from([("part.xml".into(), b"updated".to_vec())]),
+        );
         changed[archive.entries[0].data.start] ^= 1;
         let archive = Archive::new(changed).unwrap();
         let mut output = Vec::new();

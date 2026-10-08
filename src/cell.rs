@@ -18,9 +18,11 @@ impl CellRef {
         }
         Ok(Self { row, column })
     }
+    /// Return the one-based row number.
     pub fn row(self) -> u32 {
         self.row
     }
+    /// Return the one-based column number.
     pub fn column(self) -> u16 {
         self.column
     }
@@ -81,8 +83,11 @@ impl fmt::Display for CellRef {
 /// Text is stored inline, so the workbook's shared-string table stays untouched.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellValue {
+    /// Text, written as an inline string without creating a formula.
     Text(String),
+    /// A finite numeric value. Existing number formats determine its display.
     Number(f64),
+    /// A boolean value.
     Bool(bool),
     /// An Excel error value, such as `#DIV/0!` or `#N/A`.
     Error(String),
@@ -123,8 +128,14 @@ impl CellValue {
 /// Formula values are cached results; no calculation is performed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellContent {
+    /// The scalar value, or a formula's stored cached result.
     pub value: CellValue,
+    /// Stored formula text, without a leading equals sign.
+    ///
+    /// Shared-formula followers can contain empty formula text; formulas are
+    /// neither expanded nor calculated.
     pub formula: Option<String>,
+    /// The existing cell style index, when explicitly present.
     pub style_index: Option<u32>,
 }
 
@@ -137,6 +148,10 @@ pub struct CellEdit {
 }
 
 impl CellEdit {
+    /// Construct an edit from a sheet name, an A1 address, and a value.
+    ///
+    /// The address and value are validated immediately. The sheet's existence
+    /// and its formula or merged-cell restrictions are checked when applied.
     pub fn new(
         sheet: impl Into<String>,
         address: &str,
@@ -145,6 +160,10 @@ impl CellEdit {
         Self::at(sheet, address.parse()?, value)
     }
 
+    /// Construct an edit from a sheet name, a typed address, and a value.
+    ///
+    /// The value is validated immediately; worksheet restrictions are checked
+    /// when the edit is applied to a workbook.
     pub fn at(
         sheet: impl Into<String>,
         cell: CellRef,
@@ -159,12 +178,15 @@ impl CellEdit {
         })
     }
 
+    /// Return the target sheet name.
     pub fn sheet(&self) -> &str {
         &self.sheet
     }
+    /// Return the target cell address.
     pub fn cell(&self) -> CellRef {
         self.cell
     }
+    /// Return the validated value to write.
     pub fn value(&self) -> &CellValue {
         &self.value
     }

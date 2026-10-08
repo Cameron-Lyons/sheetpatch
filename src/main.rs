@@ -2,14 +2,15 @@
 
 use std::{
     env,
+    ffi::OsString,
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     process::ExitCode,
 };
 
 use sheetpatch::{CellEdit, CellValue, Workbook};
 
-const USAGE: &str = "Usage:\n  sheetpatch list INPUT\n  sheetpatch get INPUT SHEET CELL\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints the stored value; formula results are cached and are not recalculated.";
+const USAGE: &str = "Usage:\n  sheetpatch list INPUT\n  sheetpatch get INPUT SHEET CELL\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch --help\n  sheetpatch --version\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints the stored value; formula results are cached and are not recalculated.";
 
 #[derive(Debug)]
 enum Failure {
@@ -75,30 +76,50 @@ fn read_patch(reader: impl BufRead) -> Result<Vec<CellEdit>, Failure> {
     Ok(edits)
 }
 
-fn run(args: &[String]) -> Result<(), Failure> {
-    match args.get(1).map(String::as_str) {
+fn text_arg(args: &[OsString], index: usize) -> Result<&str, Failure> {
+    args[index]
+        .to_str()
+        .ok_or_else(|| Failure::Usage(format!("Argument {index} must be valid Unicode text.")))
+}
+
+fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("--help" | "-h") if args.len() == 2 => {
+            writeln!(output, "{USAGE}")?;
+            Ok(())
+        }
+        Some("--version" | "-V") if args.len() == 2 => {
+            writeln!(output, "sheetpatch {}", env!("CARGO_PKG_VERSION"))?;
+            Ok(())
+        }
         Some("list") if args.len() == 3 => {
             let workbook = Workbook::open(&args[2])?;
             for sheet in workbook.sheets() {
-                println!("{}", sheet.name());
+                writeln!(output, "{}", sheet.name())?;
             }
             Ok(())
         }
         Some("get") if args.len() == 5 => {
             let workbook = Workbook::open(&args[2])?;
-            match workbook.get_cell(&args[3], &args[4])?.value {
-                CellValue::Text(value) | CellValue::Error(value) => println!("{value}"),
-                CellValue::Number(value) => println!("{value}"),
-                CellValue::Bool(value) => println!("{value}"),
-                CellValue::Blank => println!(),
+            match workbook
+                .get_cell(text_arg(args, 3)?, text_arg(args, 4)?)?
+                .value
+            {
+                CellValue::Text(value) | CellValue::Error(value) => writeln!(output, "{value}")?,
+                CellValue::Number(value) => writeln!(output, "{value}")?,
+                CellValue::Bool(value) => writeln!(output, "{value}")?,
+                CellValue::Blank => writeln!(output)?,
             }
             Ok(())
         }
         Some("set") if args.len() == 7 || args.len() == 8 => {
-            let value =
-                parse_value(&args[6], args.get(7).map(String::as_str)).map_err(Failure::Usage)?;
+            let value = parse_value(
+                text_arg(args, 6)?,
+                args.get(7).map(|_| text_arg(args, 7)).transpose()?,
+            )
+            .map_err(Failure::Usage)?;
             let mut workbook = Workbook::open(&args[2])?;
-            workbook.set_cell(&args[4], &args[5], value)?;
+            workbook.set_cell(text_arg(args, 4)?, text_arg(args, 5)?, value)?;
             workbook.save(&args[3])?;
             Ok(())
         }
@@ -122,19 +143,20 @@ fn run(args: &[String]) -> Result<(), Failure> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    match run(&args) {
+    let args: Vec<OsString> = env::args_os().collect();
+    match run(&args, io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Usage(message)) => {
-            eprintln!("sheetpatch: {message}\n\n{USAGE}");
+            let _ = writeln!(io::stderr().lock(), "sheetpatch: {message}\n\n{USAGE}");
             ExitCode::from(2)
         }
+        Err(Failure::Workbook(sheetpatch::Error::Io(error)))
+            if error.kind() == io::ErrorKind::BrokenPipe =>
+        {
+            ExitCode::SUCCESS
+        }
         Err(Failure::Workbook(error)) => {
-            eprintln!("sheetpatch: {error}");
+            let _ = writeln!(io::stderr().lock(), "sheetpatch: {error}");
             ExitCode::FAILURE
         }
     }
@@ -143,6 +165,28 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_failures_are_returned_without_panicking() {
+        struct FailedWriter;
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed consumer"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for flag in ["--help", "--version"] {
+            let args = [OsString::from("sheetpatch"), OsString::from(flag)];
+            match run(&args, FailedWriter) {
+                Err(Failure::Workbook(sheetpatch::Error::Io(error))) => {
+                    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                }
+                other => panic!("unexpected output result: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn patch_preserves_text_tabs_whitespace_and_empty_values() {

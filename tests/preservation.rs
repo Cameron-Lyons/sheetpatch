@@ -150,6 +150,7 @@ struct ArchiveEntry {
     uncompressed_size: usize,
     compressed_start: usize,
     compressed_size: usize,
+    local_bytes: Vec<u8>,
     central_bytes: Vec<u8>,
 }
 
@@ -178,6 +179,7 @@ fn archive_entries(bytes: &[u8]) -> Vec<ArchiveEntry> {
             uncompressed_size: u32_at(bytes, offset + 24) as usize,
             compressed_start: data_start,
             compressed_size: u32_at(bytes, offset + 20) as usize,
+            local_bytes: bytes[local..data_start + u32_at(bytes, offset + 20) as usize].to_vec(),
             central_bytes: bytes[offset..offset + entry_len].to_vec(),
         });
         offset += entry_len;
@@ -268,11 +270,45 @@ fn assert_untouched_parts(original: &[u8], updated: &[u8]) {
             .find(|updated| updated.name == entry.name)
             .unwrap();
         assert_eq!(
-            updated_entry.central_bytes, entry.central_bytes,
+            updated_entry.local_bytes, entry.local_bytes,
+            "changed local record in {}",
+            entry.name
+        );
+        let mut original_metadata = entry.central_bytes;
+        let mut updated_metadata = updated_entry.central_bytes;
+        // Local offsets necessarily move when an earlier worksheet changes size.
+        // Every other central-directory byte must remain identical.
+        original_metadata[42..46].fill(0);
+        updated_metadata[42..46].fill(0);
+        assert_eq!(
+            updated_metadata, original_metadata,
             "changed metadata in {}",
             entry.name
         );
     }
+}
+
+fn assert_contiguous_local_records(bytes: &[u8]) {
+    let mut ranges: Vec<_> = archive_entries(bytes)
+        .into_iter()
+        .map(|entry| {
+            (
+                u32_at(&entry.central_bytes, 42) as usize,
+                entry.compressed_start + entry.compressed_size,
+            )
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        assert_eq!(start, cursor, "unexpected unused bytes between ZIP records");
+        cursor = end;
+    }
+    let end = bytes
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .unwrap();
+    assert_eq!(cursor, u32_at(bytes, end + 16) as usize);
 }
 
 #[test]
@@ -606,6 +642,90 @@ fn cli_lists_sheets_and_can_atomically_replace_the_input() {
 }
 
 #[test]
+fn cli_help_version_and_usage_have_stable_exit_codes() {
+    for flag in ["--help", "-h"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(result.stderr.is_empty());
+        assert!(
+            String::from_utf8(result.stdout)
+                .unwrap()
+                .contains("sheetpatch patch")
+        );
+    }
+    for flag in ["--version", "-V"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(result.stderr.is_empty());
+        assert_eq!(
+            result.stdout,
+            format!("sheetpatch {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("unknown-command")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8(result.stderr).unwrap().contains("Usage:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_accepts_non_unicode_paths_and_reports_non_unicode_text() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let directory = TempDir::new();
+    let input = directory
+        .0
+        .join(OsString::from_vec(b"input-\xff.xlsx".to_vec()));
+    let output = directory
+        .0
+        .join(OsString::from_vec(b"output-\xfe.xlsx".to_vec()));
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    let edited = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("set")
+        .arg(&input)
+        .arg(&output)
+        .args(["Data & Notes", "C1", "number", "123"])
+        .output()
+        .unwrap();
+    assert!(edited.status.success(), "{:?}", edited.stderr);
+    assert_eq!(
+        Workbook::open(&output)
+            .unwrap()
+            .get_cell("Data & Notes", "C1")
+            .unwrap()
+            .value,
+        CellValue::Number(123.0)
+    );
+
+    let before = fs::read(&output).unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("set")
+        .arg(&input)
+        .arg(&output)
+        .args(["Data & Notes", "C1", "text"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .unwrap()
+            .contains("must be valid Unicode")
+    );
+    assert_eq!(fs::read(&output).unwrap(), before);
+}
+
+#[test]
 fn failed_cli_edits_leave_existing_output_unchanged() {
     let directory = TempDir::new();
     let input = directory.0.join("input.xlsx");
@@ -644,6 +764,7 @@ fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
         workbook.save(&input).unwrap();
         let updated = fs::read(&input).unwrap();
         assert_untouched_parts(&original, &updated);
+        assert_contiguous_local_records(&updated);
         let reopened = Workbook::from_bytes(updated.clone()).unwrap();
         assert_eq!(reopened.to_bytes().unwrap(), updated);
     }
@@ -842,10 +963,11 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
         book.write_to(&mut streamed).unwrap();
         assert_eq!(streamed, book.to_bytes().unwrap());
         current = streamed;
+        assert_contiguous_local_records(&current);
     }
     let book = Workbook::from_bytes(current.clone()).unwrap();
     let compact = book.to_bytes_compact().unwrap();
-    assert!(compact.len() < current.len());
+    assert_eq!(compact, current);
     let reopened = Workbook::from_bytes(compact.clone()).unwrap();
     assert_eq!(
         reopened.get_cell("Data & Notes", "A1").unwrap().value,
@@ -922,7 +1044,7 @@ fn cli_patch_get_and_compact_support_atomic_batch_workflows() {
         "{}",
         String::from_utf8_lossy(&compacted.stderr)
     );
-    assert!(fs::read(&output).unwrap().len() < before.len());
+    assert_eq!(fs::read(&output).unwrap(), before);
     assert_eq!(
         Workbook::open(&output)
             .unwrap()

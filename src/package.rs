@@ -2,8 +2,9 @@ use crate::{
     CellContent, CellEdit, CellRef, CellValue, Error, Result,
     archive::Archive,
     worksheet::{patch_cells, read_cells, read_shared_strings},
+    xml::{excel_text, namespace, valid_qname},
 };
-use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
+use quick_xml::{events::Event, reader::NsReader};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -13,6 +14,7 @@ use std::{
 };
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const CONTENT_TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -26,9 +28,11 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// The decoded worksheet name used by the workbook's read and edit methods.
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// The worksheet part's resolved path within the ZIP archive.
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -36,9 +40,11 @@ impl Sheet {
 
 /// An existing OOXML workbook with pending surgical cell edits.
 ///
-/// Untouched ZIP entries retain their compressed bytes and metadata. Only edited
-/// worksheet XML is replaced. A save with no edits returns the original archive
-/// byte for byte. This does not calculate formulas or refresh charts/pivot caches.
+/// Untouched ZIP entries retain their local headers, compressed bytes, extra
+/// fields, and comments. Changed worksheet records are replaced in the archive's
+/// local-record sequence; central-directory offsets may change. A save with no
+/// edits returns the original archive byte for byte. This does not calculate
+/// formulas or refresh charts/pivot caches.
 ///
 /// ```no_run
 /// use sheetpatch::{CellValue, Workbook};
@@ -62,14 +68,22 @@ pub struct Workbook {
 }
 
 impl Workbook {
+    /// Read a workbook file and discover worksheets through its relationships.
+    /// Worksheet XML and shared strings are parsed lazily when first accessed.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_bytes(fs::read(path)?)
     }
 
+    /// Open an in-memory workbook, retaining its original archive bytes.
+    /// Worksheet XML and shared strings are parsed lazily when first accessed.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::new(bytes)?;
         if !archive.contains("[Content_Types].xml") {
             return Err(Error::InvalidWorkbook("missing [Content_Types].xml".into()));
+        }
+        let content_types = xml_nodes(&archive.read("[Content_Types].xml")?)?;
+        if content_types[0].local != "Types" || content_types[0].namespace != CONTENT_TYPES_NS {
+            return Err(Error::InvalidWorkbook("invalid content-types root".into()));
         }
         let roots = relationships(&archive.read("_rels/.rels")?)?;
         let office: Vec<_> = roots
@@ -94,6 +108,17 @@ impl Workbook {
                 "officeDocument is not a SpreadsheetML workbook".into(),
             ));
         }
+        let sheet_containers: Vec<_> = workbook_nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.local == "sheets" && node.namespace == root.namespace)
+            .collect();
+        if sheet_containers.len() != 1 || sheet_containers[0].1.parent != Some(0) {
+            return Err(Error::InvalidWorkbook(
+                "workbook must contain exactly one direct sheets element".into(),
+            ));
+        }
+        let sheets_index = sheet_containers[0].0;
         let rels = relationships(&archive.read(&relationships_path(&workbook_path))?)?;
         let shared: Vec<_> = rels
             .iter()
@@ -112,21 +137,19 @@ impl Workbook {
         let mut names = BTreeSet::new();
         let mut paths = BTreeSet::new();
         for node in &workbook_nodes {
-            let Some(parent_index) = node.parent else {
-                continue;
-            };
-            let parent = &workbook_nodes[parent_index];
-            if node.local != "sheet"
-                || node.namespace != root.namespace
-                || parent.local != "sheets"
-                || parent.namespace != root.namespace
-                || parent.parent != Some(0)
-            {
+            if node.local != "sheet" || node.namespace != root.namespace {
                 continue;
             }
-            let name = node
-                .attr("", "name")
-                .ok_or_else(|| Error::InvalidWorkbook("sheet lacks a name".into()))?;
+            if node.parent != Some(sheets_index) {
+                return Err(Error::Unsupported("sheet outside workbook sheets".into()));
+            }
+            let name = excel_text(
+                node.attr("", "name")
+                    .ok_or_else(|| Error::InvalidWorkbook("sheet lacks a name".into()))?,
+            )?;
+            if !names.insert(name.clone()) {
+                return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
+            }
             let ids: Vec<_> = node
                 .attributes
                 .iter()
@@ -156,15 +179,12 @@ impl Workbook {
                     "missing worksheet part {path}"
                 )));
             }
-            if !names.insert(name.to_owned()) || !paths.insert(path.clone()) {
+            if !paths.insert(path.clone()) {
                 return Err(Error::InvalidWorkbook(
                     "duplicate worksheet name or target".into(),
                 ));
             }
-            sheets.push(Sheet {
-                name: name.to_owned(),
-                path,
-            });
+            sheets.push(Sheet { name, path });
         }
         let signed = roots
             .iter()
@@ -191,6 +211,9 @@ impl Workbook {
         })
     }
 
+    /// The editable worksheets in workbook tab order.
+    /// Chart, dialog, and macro sheets are omitted. Names match exactly,
+    /// including case, in all read and edit methods.
     pub fn sheets(&self) -> &[Sheet] {
         &self.sheets
     }
@@ -218,6 +241,7 @@ impl Workbook {
         S: AsRef<str>,
         V: Into<CellValue>,
     {
+        self.sheet_index(sheet)?;
         let edits = cells
             .into_iter()
             .map(|(address, value)| CellEdit::new(sheet, address.as_ref(), value))
@@ -333,22 +357,34 @@ impl Workbook {
         Ok(cache.get().expect("worksheet cache initialized").as_slice())
     }
 
+    /// Serialize the current workbook, replacing changed worksheet ZIP records.
+    /// Untouched local records and pre-existing ZIP gaps are retained. An archive
+    /// with contiguous local records stays contiguous; edited records do not
+    /// accumulate as obsolete copies. Central-directory offsets may change.
+    /// Without edits this returns the original bytes. Pending edits are retained.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.archive.write(&self.changes)
     }
 
     /// Serialize into a writer without allocating a second complete archive.
+    /// Changed worksheet records replace their original records in the local
+    /// record sequence. Untouched local records and pre-existing ZIP gaps remain;
+    /// central-directory offsets may change.
     /// A failing writer may contain a partial archive; use `save` for atomic files.
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.write_to(&self.changes, &mut writer)
     }
 
-    /// Remove obsolete ZIP records while retaining compressed bytes of untouched
-    /// entries. Central-directory offsets change. Opaque ZIP gaps are protected.
+    /// Remove pre-existing obsolete ZIP records while retaining untouched active
+    /// local headers, compressed bytes, and descriptors. Central-directory
+    /// offsets may change. Opaque ZIP prefixes or gaps cause an error.
+    /// A failing writer may contain a partial archive; use `save_compact` for files.
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changes, &mut writer)
     }
 
+    /// Serialize a compact archive, removing obsolete ZIP records.
+    /// Opaque ZIP prefixes or gaps cause an error. Pending edits are retained.
     pub fn to_bytes_compact(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.write_compact_to(&mut bytes)?;
@@ -358,12 +394,14 @@ impl Workbook {
     /// Save through a temporary file in the destination directory, then rename.
     /// The original destination is retained if generation or writing fails.
     /// Using the input path as destination is supported.
+    /// Saving does not clear pending edits or replace the retained original.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         crate::atomic::write(path.as_ref(), |writer| self.write_to(writer))
     }
 
-    /// Atomically save a compact archive. Compaction is explicit because normal
-    /// saves preserve the entire original ZIP local-record area.
+    /// Atomically save while removing recognizable obsolete ZIP records already
+    /// present in the input. Opaque ZIP prefixes or gaps cause an error.
+    /// Saving does not clear pending edits or replace the retained original.
     pub fn save_compact(&self, path: impl AsRef<Path>) -> Result<()> {
         crate::atomic::write(path.as_ref(), |writer| self.write_compact_to(writer))
     }
@@ -389,32 +427,20 @@ impl Node {
     }
 }
 
-fn namespace(result: ResolveResult<'_>) -> Result<String> {
-    match result {
-        ResolveResult::Bound(ns) => std::str::from_utf8(ns.as_ref())
-            .map(str::to_owned)
-            .map_err(|e| Error::Xml(e.to_string())),
-        ResolveResult::Unbound => Ok(String::new()),
-        ResolveResult::Unknown(prefix) => Err(Error::Xml(format!(
-            "unbound namespace prefix {}",
-            String::from_utf8_lossy(&prefix)
-        ))),
-    }
-}
-
 fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
     let xml = std::str::from_utf8(bytes)
         .map_err(|_| Error::Unsupported("only UTF-8 workbook XML is supported".into()))?;
     if !xml.chars().all(crate::xml::valid_char) {
         return Err(Error::Xml("invalid XML character".into()));
     }
-    let mut reader = NsReader::from_str(xml);
+    let mut reader = NsReader::from_str(xml.strip_prefix('\u{feff}').unwrap_or(xml));
     reader.config_mut().check_comments = true;
     let mut nodes = Vec::new();
     let mut stack = Vec::new();
     let mut roots = 0;
     let mut declaration_seen = false;
     loop {
+        let event_start = reader.buffer_position();
         let event = reader.read_event()?;
         let is_empty = matches!(event, Event::Empty(_));
         match event {
@@ -422,14 +448,29 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 if stack.is_empty() {
                     roots += 1;
                 }
-                if stack.len() > 256 {
+                if stack.len() >= 256 {
                     return Err(Error::Xml("XML nesting exceeds 256 levels".into()));
                 }
+                let name = e.name();
+                let name =
+                    std::str::from_utf8(name.as_ref()).map_err(|e| Error::Xml(e.to_string()))?;
+                if !valid_qname(name) || name.starts_with("xmlns:") {
+                    return Err(Error::Xml("invalid XML element name".into()));
+                }
+                crate::xml::validate_attribute_spacing(&e)?;
                 let ns = namespace(reader.resolver().resolve_element(e.name()).0)?;
                 let mut attributes = Vec::new();
                 let mut keys = BTreeSet::new();
                 for attr in e.attributes() {
                     let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
+                    let name = std::str::from_utf8(attr.key.as_ref())
+                        .map_err(|e| Error::Xml(e.to_string()))?;
+                    if !valid_qname(name) {
+                        return Err(Error::Xml("invalid XML attribute name".into()));
+                    }
+                    if attr.value.contains(&b'<') {
+                        return Err(Error::Xml("literal '<' in XML attribute value".into()));
+                    }
                     let (resolved, local) = reader.resolver().resolve_attribute(attr.key);
                     let namespace = namespace(resolved)?;
                     let local = std::str::from_utf8(local.as_ref())
@@ -472,19 +513,11 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 }
             }
             Event::Decl(d) => {
-                if roots != 0 || declaration_seen {
+                if event_start != 0 || roots != 0 || declaration_seen {
                     return Err(Error::Xml("misplaced XML declaration".into()));
                 }
                 declaration_seen = true;
-                if d.version().map_err(|e| Error::Xml(e.to_string()))?.as_ref() != b"1.0" {
-                    return Err(Error::Unsupported("only XML 1.0 is supported".into()));
-                }
-                if let Some(encoding) = d.encoding() {
-                    let encoding = encoding.map_err(|e| Error::Xml(e.to_string()))?;
-                    if !encoding.eq_ignore_ascii_case(b"UTF-8") {
-                        return Err(Error::Unsupported("only UTF-8 XML is supported".into()));
-                    }
-                }
+                crate::xml::validate_declaration(&d)?;
             }
             Event::DocType(_) => {
                 return Err(Error::Unsupported(
@@ -495,7 +528,9 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 if e.as_ref().windows(3).any(|s| s == b"]]>") {
                     return Err(Error::Xml("CDATA terminator in XML text".into()));
                 }
-                if stack.is_empty() && !e.as_ref().iter().all(u8::is_ascii_whitespace) {
+                if stack.is_empty()
+                    && !crate::xml::whitespace(std::str::from_utf8(e.as_ref()).unwrap())
+                {
                     return Err(Error::Xml("text outside XML root".into()));
                 }
             }
@@ -513,6 +548,15 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                     .map_err(|e| Error::Xml(e.to_string()))?;
                 if !value.chars().all(crate::xml::valid_char) {
                     return Err(Error::Xml("invalid XML character reference".into()));
+                }
+            }
+            Event::PI(e) => {
+                let target =
+                    std::str::from_utf8(e.target()).map_err(|e| Error::Xml(e.to_string()))?;
+                if !crate::xml::valid_name(target) || target.eq_ignore_ascii_case("xml") {
+                    return Err(Error::Xml(
+                        "invalid XML processing-instruction target".into(),
+                    ));
                 }
             }
             Event::Eof => break,
@@ -538,6 +582,13 @@ fn relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
     }
     let mut ids = BTreeSet::new();
     let mut result = Vec::new();
+    if nodes.iter().any(|node| {
+        node.namespace == PACKAGE_NS && node.local == "Relationship" && node.parent != Some(0)
+    }) {
+        return Err(Error::InvalidWorkbook(
+            "relationship outside relationships root".into(),
+        ));
+    }
     for node in nodes
         .iter()
         .filter(|n| n.parent == Some(0) && n.namespace == PACKAGE_NS && n.local == "Relationship")
@@ -674,8 +725,32 @@ mod tests {
             "<a>&unknown;</a>",
             "<a>&#0;</a>",
             "<a x='&#0;'/>",
+            "<a 0bad='one'/>",
+            "<a x='<'/>",
+            "<a x='one'y='two'/>",
+            "<a><0bad/></a>",
+            "\u{a0}<a/>",
+            "<?0bad instruction?><a/>",
+            "<?XML version='1.0'?><a/>",
+            " <?xml version='1.0'?><a/>",
+            "<!--comment--><?xml version='1.0'?><a/>",
+            "<?xml version='1.0' standalone='invalid'?><a/>",
+            "<?xml version='1.0' version='1.0'?><a/>",
+            "<?xml version='1.0' ignored='one'?><a/>",
+            "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>",
+            "<?xml version='1.0'encoding='UTF-8'?><a/>",
         ] {
             assert!(xml_nodes(xml.as_bytes()).is_err(), "{xml}");
+        }
+    }
+    #[test]
+    fn complete_xml_supports_bom_declarations_and_unicode_names() {
+        for xml in [
+            "\u{feff}<?xml version='1.0' encoding='UTF-8' standalone='yes'?><a/>",
+            "<?xml version='1.0' standalone='no'?><a/>",
+            "<?xml-stylesheet href='style.xsl'?><a xmlns:雪='urn:vendor' 雪:属性='value'/>",
+        ] {
+            assert!(xml_nodes(xml.as_bytes()).is_ok(), "{xml}");
         }
     }
 }

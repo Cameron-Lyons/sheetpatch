@@ -345,9 +345,9 @@ fn main() {
             .to_bytes_compact()
             .unwrap();
         verify_output(&input, &compacted, &worksheet(cells, &values));
-        assert!(compacted.len() < repeated.len());
+        assert_eq!(compacted, repeated);
         println!(
-            "growth,{cells},saves=5,append={},compact={}",
+            "growth,{cells},saves=5,normal={},compact={}",
             repeated.len(),
             compacted.len()
         );

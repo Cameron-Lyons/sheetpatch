@@ -80,11 +80,39 @@ jobs:
         run: cargo build --locked --release --all-targets --all-features
       - name: Verify publishable package
         run: cargo package --locked
+      - name: Verify registry publishing dry run
+        run: cargo publish --locked --dry-run
+      - name: Test extracted release package
+        run: |
+          for manifest in target/package/sheetpatch-*/Cargo.toml; do
+            cargo test --locked --all-targets --all-features --manifest-path "$manifest"
+            cargo test --locked --doc --all-features --manifest-path "$manifest"
+          done
+
+  interoperability:
+    name: LibreOffice interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+      - name: Install independent spreadsheet application
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libreoffice-calc
+      - name: Release CLI
+        run: cargo build --locked --release
+      - name: Export, edit, and reopen normal and compacted workbooks
+        run: python3 scripts/check_interoperability.py --sheetpatch target/release/sheetpatch
 
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [quality, tests, package]
+    needs: [quality, tests, package, interoperability]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -93,7 +121,9 @@ jobs:
           QUALITY: ${{ needs.quality.result }}
           TESTS: ${{ needs.tests.result }}
           PACKAGE: ${{ needs.package.result }}
+          INTEROPERABILITY: ${{ needs.interoperability.result }}
         run: |
           test "$QUALITY" = success
           test "$TESTS" = success
           test "$PACKAGE" = success
+          test "$INTEROPERABILITY" = success
