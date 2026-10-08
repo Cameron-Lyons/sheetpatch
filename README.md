@@ -68,6 +68,10 @@ worksheets in workbook order; chart sheets are retained as opaque parts. Saving
 does not clear pending changes or replace the in-memory original archive. Reopen
 the saved file to use it as the new baseline.
 
+Package discovery resolves URI-escaped relationship targets and compares part
+paths without ASCII case, retaining the actual ZIP member names. Ambiguous
+equivalent names for an accessed part are rejected.
+
 `get_cell` returns a `CellContent` with a scalar `value`, stored `formula` text,
 and `style_index`. `get_cells` reads multiple addresses with one worksheet parse,
 preserving input order. Shared strings and rich text are decoded without changing
@@ -102,9 +106,9 @@ cargo build --release --locked
 `get` prints the current scalar value, or an empty line for a blank cell. A patch
 file contains tab-separated `sheet`, `cell`, `type`, and `value` fields, one edit
 per line. Types are `text`, `number`, `bool`, `error`, and `blank`; `blank` may omit
-its value. Text keeps trailing whitespace and additional tabs. UTF-8 BOM and
-CRLF files are supported. Empty lines and tab-free lines beginning with `#` are
-ignored. Literal multiline values use the Rust API. Invalid rows report their
+its value. Text keeps trailing whitespace and additional tabs. Patch files must
+use UTF-8; BOM and CRLF files are supported. Empty lines and tab-free lines
+beginning with `#` are ignored. Literal multiline values use the Rust API. Invalid rows report their
 line number and leave the destination unchanged.
 
 `--help` (`-h`) and `--version` (`-V`) exit successfully. Invalid command syntax,
@@ -166,8 +170,14 @@ in cached results. The original workbook's calculation settings are retained.
 - Formula cells and shared, array, or data-table formula ranges are protected
   against overwriting. Existing formulas remain untouched. Formula creation,
   structural edits, style creation, and calculation are outside this version's scope.
+- Cells with value metadata (`vm`, including linked and rich data types) are
+  preserved; edits that would change their scalar value or representation are
+  refused so metadata cannot remain attached to a replacement value.
 - Merged cells can be edited through their top-left anchor. Other cells in a
   merged range are protected.
+- Cell values, formulas, and merged ranges inside unsupported XML containers
+  are refused when accessing that worksheet, preventing hidden content from
+  bypassing these protections.
 - Unfamiliar XML inside a value payload is protected against replacement;
   unfamiliar cell attributes and sibling elements are preserved.
 - Legacy `.xls`, binary `.xlsb`, encrypted workbooks, ZIP64, multi-disk ZIP,
@@ -176,13 +186,14 @@ in cached results. The original workbook's calculation settings are retained.
 
 ## Dependencies and checks
 
-Only two direct dependencies, both with default features disabled:
+Three direct dependencies; XML parsing and compression disable default features:
 
 - [`quick-xml`](https://docs.rs/quick-xml/0.41.0/quick_xml/): namespace-aware parsing.
 - [`flate2`](https://docs.rs/flate2/1.1.9/flate2/): pure Rust Deflate compression.
+- [`crc32fast`](https://docs.rs/crc32fast/1.5.0/crc32fast/): optimized ZIP checksums.
 
-There are no additional Rust CLI or test dependencies. ZIP records and CRC32 are
-handled in the crate so untouched records can remain unchanged.
+There are no additional Rust CLI or test dependencies. ZIP records are handled
+in the crate so untouched records can remain unchanged.
 
 ```sh
 cargo fmt --check
@@ -206,8 +217,14 @@ checks Cargo dependencies and GitHub Actions weekly.
 
 Batch edits parse each affected worksheet once and apply all XML changes in one
 pass. Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
-scans. Streaming saves hold one replacement compressed part at a time, in
-addition to the input archive, cached original XML, and pending worksheet XML.
+scans. ZIP physical order is cached for repeated saves, and worksheet parsing
+borrows names and attribute values from the original XML. Direct children use
+ranges in the parse index, avoiding an allocation for each parent. Edits that
+leave a worksheet unchanged retain its current XML without copying it.
+Shared-string reads load the table on demand during the same worksheet parse.
+Streaming saves borrow ZIP metadata and hold one replacement compressed part at
+a time, in addition to the input archive, cached original XML, and pending
+worksheet XML.
 
 Run the dependency-free benchmark with:
 
@@ -217,8 +234,9 @@ SHEETPATCH_BENCH_SAMPLES=3 cargo bench --locked --bench editing
 
 The harness independently checks expected worksheet XML and untouched compressed
 ZIP parts before measuring, and compares sequential edits, batching, streaming,
-and compaction. Initial 0.2 measurements used one release-mode sample per synthetic
-workload on an Intel Core Ultra 5 325, Linux x86_64, Rust 1.99.0:
+compaction, batch reads, and unchanged batches. Initial 0.2 measurements used one
+release-mode sample per synthetic workload on an Intel Core Ultra 5 325, Linux
+x86_64, Rust 1.99.0:
 
 | Worksheet cells / edits | Original sequential editor | Batch editor |
 | --- | ---: | ---: |

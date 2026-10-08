@@ -62,6 +62,7 @@ dependencies = [
 name = "sheetpatch"
 version = "1.0.0"
 dependencies = [
+ "crc32fast",
  "flate2",
  "quick-xml",
 ]

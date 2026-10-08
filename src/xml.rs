@@ -75,6 +75,45 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
     Ok(())
 }
 
+// Namespace constraints apply to normalized attribute values. quick-xml's
+// resolver also checks reserved bindings, but does so against the raw spelling
+// and permits prefix undeclarations used by Namespaces in XML 1.1.
+pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    if start.name().as_ref().starts_with(b"xmlns:") {
+        return Err(Error::Xml("xmlns cannot be an element prefix".into()));
+    }
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(|e| Error::Xml(e.to_string()))?;
+        let name = attribute.key.as_ref();
+        let prefix = if name == b"xmlns" {
+            None
+        } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+            Some(prefix)
+        } else {
+            continue;
+        };
+        let value = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+        if !value.chars().all(valid_char) {
+            return Err(Error::Xml("invalid XML namespace character".into()));
+        }
+        if prefix == Some(b"xmlns".as_slice())
+            || value == XMLNS
+            || (value == XML && prefix != Some(b"xml".as_slice()))
+            || (prefix == Some(b"xml".as_slice()) && value != XML)
+        {
+            return Err(Error::Xml("invalid reserved XML namespace binding".into()));
+        }
+        if prefix.is_some() && value.is_empty() {
+            return Err(Error::Xml(
+                "namespace prefixes cannot be undeclared in XML 1.0".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
     let content =
         std::str::from_utf8(declaration.as_ref()).map_err(|e| Error::Xml(e.to_string()))?;
@@ -140,6 +179,9 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
 // Decode only once so the escaped underscore in `_x005F_x0041_` stays literal.
 pub(crate) fn excel_text(text: &str) -> Result<String> {
     let bytes = text.as_bytes();
+    if !bytes.contains(&b'_') {
+        return Ok(text.to_owned());
+    }
     let mut units = Vec::with_capacity(text.len());
     let mut position = 0;
     while position < bytes.len() {
@@ -166,6 +208,36 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_constraints_use_decoded_values_and_xml_10_rules() {
+        for raw in [
+            "tag xmlns:p=''",
+            "tag xmlns:p='http://www.w3.org/XML/1998/namespac&#101;'",
+            "tag xmlns:p='http://www.w3.org/2000/xmlns&#47;'",
+            "tag xmlns='http://www.w3.org/XML/1998/namespac&#101;'",
+            "tag xmlns='http://www.w3.org/2000/xmlns&#47;'",
+            "tag xmlns:xml='urn:incorrect'",
+            "tag xmlns:xmlns='urn:incorrect'",
+            "xmlns:tag",
+        ] {
+            let name_len = raw.find(' ').unwrap_or(raw.len());
+            assert!(
+                matches!(
+                    validate_namespaces(&BytesStart::from_content(raw, name_len)),
+                    Err(Error::Xml(_))
+                ),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "tag xmlns=''",
+            "tag xmlns:p='urn&#58;correct'",
+            "tag xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'",
+        ] {
+            validate_namespaces(&BytesStart::from_content(raw, 3)).unwrap();
+        }
+    }
 
     #[test]
     fn qualified_names_accept_the_xml_unicode_ranges() {
@@ -209,6 +281,7 @@ mod tests {
 
     #[test]
     fn excel_escape_decoding_is_single_pass_and_utf16_aware() {
+        assert_eq!(excel_text("Plain 雪😀").unwrap(), "Plain 雪😀");
         assert_eq!(excel_text("_x005F_x0041_").unwrap(), "_x0041_");
         assert_eq!(excel_text("_xD83D__xDE00_").unwrap(), "😀");
         assert_eq!(excel_text("_X0041_雪").unwrap(), "A雪");

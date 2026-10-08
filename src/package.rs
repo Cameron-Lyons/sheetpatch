@@ -6,6 +6,7 @@ use crate::{
 };
 use quick_xml::{events::Event, reader::NsReader};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
@@ -14,6 +15,8 @@ use std::{
 };
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const SIGNATURE_ORIGIN: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin";
 const CONTENT_TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
@@ -85,18 +88,25 @@ impl Workbook {
         if content_types[0].local != "Types" || content_types[0].namespace != CONTENT_TYPES_NS {
             return Err(Error::InvalidWorkbook("invalid content-types root".into()));
         }
-        let roots = relationships(&archive.read("_rels/.rels")?)?;
-        let office: Vec<_> = roots
+        let root_rels_path = archive.part_name("_rels/.rels")?.unwrap_or("_rels/.rels");
+        let roots = relationships(&archive.read(root_rels_path)?)?;
+        let mut office = roots
             .iter()
-            .filter(|r| office_type(&r.kind, "officeDocument"))
-            .collect();
-        if office.len() != 1 || office[0].external {
-            return Err(Error::InvalidWorkbook(
-                "expected one internal officeDocument relationship".into(),
-            ));
-        }
-        let workbook_path = resolve_target("", &office[0].target)?;
-        if workbook_path.ends_with(".bin") {
+            .filter(|r| office_type(&r.kind, "officeDocument"));
+        let office = match (office.next(), office.next()) {
+            (Some(relationship), None) if !relationship.external => relationship,
+            _ => {
+                return Err(Error::InvalidWorkbook(
+                    "expected one internal officeDocument relationship".into(),
+                ));
+            }
+        };
+        let workbook_uri = resolve_target("", &office.target)?;
+        let workbook_path = resolve_part_target(&archive, "", &office.target)?;
+        if workbook_path
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("bin"))
+        {
             return Err(Error::Unsupported(
                 "binary Excel workbooks (.xlsb) are not supported".into(),
             ));
@@ -108,31 +118,37 @@ impl Workbook {
                 "officeDocument is not a SpreadsheetML workbook".into(),
             ));
         }
-        let sheet_containers: Vec<_> = workbook_nodes
+        let mut sheet_containers = workbook_nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| node.local == "sheets" && node.namespace == root.namespace)
-            .collect();
-        if sheet_containers.len() != 1 || sheet_containers[0].1.parent != Some(0) {
-            return Err(Error::InvalidWorkbook(
-                "workbook must contain exactly one direct sheets element".into(),
-            ));
-        }
-        let sheets_index = sheet_containers[0].0;
-        let rels = relationships(&archive.read(&relationships_path(&workbook_path))?)?;
-        let shared: Vec<_> = rels
+            .filter(|(_, node)| node.local == "sheets" && node.namespace == root.namespace);
+        let sheets_index = match (sheet_containers.next(), sheet_containers.next()) {
+            (Some((index, node)), None) if node.parent == Some(0) => index,
+            _ => {
+                return Err(Error::InvalidWorkbook(
+                    "workbook must contain exactly one direct sheets element".into(),
+                ));
+            }
+        };
+        let rels_path = relationships_path(&workbook_path);
+        let rels_path = archive.part_name(&rels_path)?.unwrap_or(&rels_path);
+        let rels = relationships(&archive.read(rels_path)?)?;
+        let mut shared = rels
             .iter()
-            .filter(|r| office_type(&r.kind, "sharedStrings"))
-            .collect();
-        if shared.len() > 1 || shared.first().is_some_and(|r| r.external) {
-            return Err(Error::InvalidWorkbook(
-                "expected at most one internal shared-string relationship".into(),
-            ));
-        }
+            .filter(|r| office_type(&r.kind, "sharedStrings"));
+        let shared = match (shared.next(), shared.next()) {
+            (Some(relationship), None) if !relationship.external => Some(relationship),
+            (None, None) => None,
+            _ => {
+                return Err(Error::InvalidWorkbook(
+                    "expected at most one internal shared-string relationship".into(),
+                ));
+            }
+        };
         let shared_strings_path = shared
-            .first()
-            .map(|r| resolve_target(&workbook_path, &r.target))
+            .map(|r| resolve_part_target(&archive, &workbook_uri, &r.target))
             .transpose()?;
+        let relationships_by_id: BTreeMap<_, _> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
         let mut sheets = Vec::new();
         let mut names = BTreeSet::new();
         let mut paths = BTreeSet::new();
@@ -150,19 +166,18 @@ impl Workbook {
             if !names.insert(name.clone()) {
                 return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
             }
-            let ids: Vec<_> = node
-                .attributes
-                .iter()
-                .filter(|a| {
-                    a.local == "id" && matches!(a.namespace.as_str(), OFFICE_NS | STRICT_OFFICE_NS)
-                })
-                .collect();
-            if ids.len() != 1 {
-                return Err(Error::InvalidWorkbook(format!(
-                    "sheet {name} needs one relationship id"
-                )));
-            }
-            let relationship = rels.iter().find(|r| r.id == ids[0].value).ok_or_else(|| {
+            let mut ids = node.attributes.iter().filter(|a| {
+                a.local == "id" && matches!(a.namespace.as_str(), OFFICE_NS | STRICT_OFFICE_NS)
+            });
+            let id = match (ids.next(), ids.next()) {
+                (Some(attribute), None) => attribute.value.as_str(),
+                _ => {
+                    return Err(Error::InvalidWorkbook(format!(
+                        "sheet {name} needs one relationship id"
+                    )));
+                }
+            };
+            let relationship = relationships_by_id.get(id).ok_or_else(|| {
                 Error::InvalidWorkbook(format!("missing relationship for sheet {name}"))
             })?;
             if relationship.external {
@@ -173,7 +188,7 @@ impl Workbook {
             if !office_type(&relationship.kind, "worksheet") {
                 continue;
             }
-            let path = resolve_target(&workbook_path, &relationship.target)?;
+            let path = resolve_part_target(&archive, &workbook_uri, &relationship.target)?;
             if !archive.contains(&path) {
                 return Err(Error::InvalidWorkbook(format!(
                     "missing worksheet part {path}"
@@ -186,13 +201,12 @@ impl Workbook {
             }
             sheets.push(Sheet { name, path });
         }
-        let signed = roots
-            .iter()
-            .any(|r| r.kind == format!("{PACKAGE_NS}/digital-signature/origin"))
-            || archive
-                .entries()
-                .iter()
-                .any(|e| e.name.to_ascii_lowercase().starts_with("_xmlsignatures/"));
+        let signed = roots.iter().any(|r| r.kind == SIGNATURE_ORIGIN)
+            || archive.entries().iter().any(|e| {
+                e.name
+                    .split_once('/')
+                    .is_some_and(|(root, _)| root.eq_ignore_ascii_case("_xmlsignatures"))
+            });
         let originals = (0..sheets.len()).map(|_| OnceLock::new()).collect();
         let sheet_indexes = sheets
             .iter()
@@ -229,7 +243,11 @@ impl Workbook {
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        self.apply_edits([CellEdit::new(sheet, address, value)?])
+        let cell = address.parse()?;
+        let value = value.into();
+        value.validate()?;
+        let index = self.sheet_index(sheet)?;
+        self.apply_grouped_edits([(index, BTreeMap::from([(cell, value)]))])
     }
 
     /// Apply edits to a worksheet in one parse and one XML patch.
@@ -241,12 +259,18 @@ impl Workbook {
         S: AsRef<str>,
         V: Into<CellValue>,
     {
-        self.sheet_index(sheet)?;
-        let edits = cells
-            .into_iter()
-            .map(|(address, value)| CellEdit::new(sheet, address.as_ref(), value))
-            .collect::<Result<Vec<_>>>()?;
-        self.apply_edits(edits)
+        let index = self.sheet_index(sheet)?;
+        let mut values = BTreeMap::new();
+        for (address, value) in cells {
+            let cell = address.as_ref().parse()?;
+            let value = value.into();
+            value.validate()?;
+            values.insert(cell, value);
+        }
+        if values.is_empty() {
+            return Ok(());
+        }
+        self.apply_grouped_edits([(index, values)])
     }
 
     /// Apply a transaction across worksheets. On any error, all pending cell
@@ -260,7 +284,15 @@ impl Workbook {
                 .or_default()
                 .insert(edit.cell, edit.value);
         }
-        if grouped.is_empty() {
+        self.apply_grouped_edits(grouped)
+    }
+
+    fn apply_grouped_edits(
+        &mut self,
+        grouped: impl IntoIterator<Item = (usize, BTreeMap<CellRef, CellValue>)>,
+    ) -> Result<()> {
+        let mut grouped = grouped.into_iter().peekable();
+        if grouped.peek().is_none() {
             return Ok(());
         }
         if self.signed {
@@ -268,7 +300,7 @@ impl Workbook {
                 "editing a digitally signed OOXML package would invalidate its signature".into(),
             ));
         }
-        let mut staged = Vec::with_capacity(grouped.len());
+        let mut staged = Vec::with_capacity(grouped.size_hint().0);
         for (index, cells) in grouped {
             let sheet = &self.sheets[index];
             let original = self.original_sheet(index)?;
@@ -277,7 +309,9 @@ impl Workbook {
                 .get(&sheet.path)
                 .map(Vec::as_slice)
                 .unwrap_or(original);
-            let patched = patch_cells(current, &cells)?;
+            let Cow::Owned(patched) = patch_cells(current, &cells)? else {
+                continue;
+            };
             let changed = (patched != original).then_some(patched);
             staged.push((sheet.path.clone(), changed));
         }
@@ -317,18 +351,7 @@ impl Workbook {
             .map(Vec::as_slice)
             .map(Ok)
             .unwrap_or_else(|| self.original_sheet(index))?;
-        match read_cells(xml, &cells, self.shared_strings.get().map(Vec::as_slice)) {
-            Err(Error::SharedStringsUnavailable) => {
-                let path = self
-                    .shared_strings_path
-                    .as_ref()
-                    .ok_or(Error::SharedStringsUnavailable)?;
-                let strings = read_shared_strings(&self.archive.read(path)?)?;
-                let _ = self.shared_strings.set(strings);
-                read_cells(xml, &cells, self.shared_strings.get().map(Vec::as_slice))
-            }
-            result => result,
-        }
+        read_cells(xml, &cells, || self.shared_strings())
     }
 
     /// Whether any package parts have pending edits.
@@ -355,6 +378,22 @@ impl Workbook {
             let _ = cache.set(xml);
         }
         Ok(cache.get().expect("worksheet cache initialized").as_slice())
+    }
+
+    fn shared_strings(&self) -> Result<&[String]> {
+        if self.shared_strings.get().is_none() {
+            let path = self
+                .shared_strings_path
+                .as_ref()
+                .ok_or(Error::SharedStringsUnavailable)?;
+            let strings = read_shared_strings(&self.archive.read(path)?)?;
+            let _ = self.shared_strings.set(strings);
+        }
+        Ok(self
+            .shared_strings
+            .get()
+            .expect("shared-string cache initialized")
+            .as_slice())
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
@@ -457,6 +496,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 if !valid_qname(name) || name.starts_with("xmlns:") {
                     return Err(Error::Xml("invalid XML element name".into()));
                 }
+                crate::xml::validate_namespaces(&e)?;
                 crate::xml::validate_attribute_spacing(&e)?;
                 let ns = namespace(reader.resolver().resolve_element(e.name()).0)?;
                 let mut attributes = Vec::new();
@@ -622,8 +662,8 @@ fn main_namespace(ns: &str) -> bool {
     matches!(ns, MAIN_NS | STRICT_MAIN_NS)
 }
 fn office_type(kind: &str, suffix: &str) -> bool {
-    kind.strip_suffix(suffix).is_some_and(|prefix| {
-        prefix == format!("{OFFICE_NS}/") || prefix == format!("{STRICT_OFFICE_NS}/")
+    kind.rsplit_once('/').is_some_and(|(namespace, local)| {
+        local == suffix && matches!(namespace, OFFICE_NS | STRICT_OFFICE_NS)
     })
 }
 fn relationships_path(part: &str) -> String {
@@ -633,33 +673,20 @@ fn relationships_path(part: &str) -> String {
     }
 }
 fn resolve_target(source: &str, target: &str) -> Result<String> {
-    if target.is_empty() || target.contains(['\\', '#', '?', ':']) {
+    if target.is_empty()
+        || target.starts_with("//")
+        || target.contains(['\\', '#', '?', '\0'])
+        || target
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
+    {
         return Err(Error::InvalidWorkbook(format!(
             "invalid internal relationship target {target}"
         )));
     }
-    let mut decoded = Vec::new();
-    let mut input = target.as_bytes().iter().copied();
-    while let Some(b) = input.next() {
-        if b == b'%' {
-            let high = input.next().and_then(|c| (c as char).to_digit(16));
-            let low = input.next().and_then(|c| (c as char).to_digit(16));
-            let value = high
-                .zip(low)
-                .ok_or_else(|| Error::InvalidWorkbook("invalid percent-encoded target".into()))?;
-            let decoded_byte = (value.0 * 16 + value.1) as u8;
-            if matches!(decoded_byte, b'/' | b'\\' | 0) {
-                return Err(Error::InvalidWorkbook(
-                    "encoded path separator in target".into(),
-                ));
-            }
-            decoded.push(decoded_byte);
-        } else {
-            decoded.push(b);
-        }
-    }
-    let target = std::str::from_utf8(&decoded)
-        .map_err(|_| Error::InvalidWorkbook("target path is not UTF-8".into()))?;
+    let target = escape_path(target)?;
+    let source = escape_path(source)?;
     let mut parts: Vec<&str> = if target.starts_with('/') {
         Vec::new()
     } else {
@@ -689,6 +716,88 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+// ZIP item names in OPC retain URI escapes rather than storing decoded file
+// system names. Normalize escape spelling and escape raw UTF-8/space bytes.
+fn escape_path(path: &str) -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut escaped = String::with_capacity(path.len());
+    let mut input = path.as_bytes().iter().copied();
+    while let Some(b) = input.next() {
+        let (byte, was_escaped) = if b == b'%' {
+            let high = input.next().and_then(|c| (c as char).to_digit(16));
+            let low = input.next().and_then(|c| (c as char).to_digit(16));
+            let value = high
+                .zip(low)
+                .ok_or_else(|| Error::InvalidWorkbook("invalid percent-encoded target".into()))?;
+            let decoded_byte = (value.0 * 16 + value.1) as u8;
+            if matches!(decoded_byte, b'/' | b'\\' | b'.' | 0) {
+                return Err(Error::InvalidWorkbook(
+                    "encoded path separator, dot, or null in target".into(),
+                ));
+            }
+            (decoded_byte, true)
+        } else {
+            (b, false)
+        };
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let path_character = matches!(
+            byte,
+            b'/' | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b':'
+                | b'='
+                | b'@'
+        );
+        if unreserved || (!was_escaped && path_character) {
+            escaped.push(byte as char);
+        } else {
+            escaped.push('%');
+            escaped.push(HEX[(byte >> 4) as usize] as char);
+            escaped.push(HEX[(byte & 15) as usize] as char);
+        }
+    }
+    Ok(escaped)
+}
+
+fn resolve_part_target(archive: &Archive, source: &str, target: &str) -> Result<String> {
+    let path = resolve_target(source, target)?;
+    if let Some(name) = archive.part_name(&path)? {
+        return Ok(name.to_owned());
+    }
+    // Earlier versions accepted ZIP names with decoded spaces and Unicode.
+    // Keep those packages readable when the canonical encoded part is absent.
+    // An encoded name always wins when both spellings occur in the archive.
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = (input.next().expect("validated escape") as char)
+                .to_digit(16)
+                .unwrap();
+            let low = (input.next().expect("validated escape") as char)
+                .to_digit(16)
+                .unwrap();
+            decoded.push((high * 16 + low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    if let Ok(decoded) = std::str::from_utf8(&decoded)
+        && let Some(name) = archive.part_name(decoded)?
+    {
+        return Ok(name.to_owned());
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,16 +805,32 @@ mod tests {
     fn resolve_relative_and_absolute_part_uris() {
         assert_eq!(
             resolve_target("books/main.xml", "../tabs/sheet%201.xml").unwrap(),
-            "tabs/sheet 1.xml"
+            "tabs/sheet%201.xml"
         );
         assert_eq!(
             resolve_target("books/main.xml", "/xl/worksheets/sheet1.xml").unwrap(),
             "xl/worksheets/sheet1.xml"
         );
+        for (target, resolved) in [
+            ("../tabs/sheet%20%3f.xml", "tabs/sheet%20%3F.xml"),
+            ("../tabs/sheet%25.xml", "tabs/sheet%25.xml"),
+            ("../tabs/雪.xml", "tabs/%E9%9B%AA.xml"),
+            ("../tabs/sheet:1.xml", "tabs/sheet:1.xml"),
+            ("./sheet:1.xml", "books/sheet:1.xml"),
+            ("/tabs/sheet:1.xml", "tabs/sheet:1.xml"),
+            ("workshee%74s/sheet1.xml", "books/worksheets/sheet1.xml"),
+        ] {
+            assert_eq!(resolve_target("books/main.xml", target).unwrap(), resolved);
+        }
         for target in [
             "../../escape",
             "http://example.com/x",
             "a%2fb",
+            "a%5cb",
+            "a%00b",
+            "%2e%2e/escape",
+            "//example.com/a",
+            "sheet:1.xml",
             "a%",
             "a\\b",
             "",

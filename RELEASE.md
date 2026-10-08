@@ -51,6 +51,21 @@ UI or execute VBA.
 
 ## Publication
 
+Local candidate verification on 2026-10-08 passed with Rust 1.99.0 on Linux:
+
+- Formatting, strict Clippy, all 102 tests, both documentation examples,
+  documentation with warnings denied, and release builds.
+- Offline packaging and the complete test suite in the extracted crate.
+- Installation from the extracted crate, version output, and a fixture read.
+- LibreOffice export/edit/reopen checks for default and compact saves, plus
+  independent reopens of edits to a workbook with URI-escaped worksheet names.
+
+These results cover the local candidate. Git metadata and remote CI results are
+unavailable in this workspace. Rust 1.88.0 is not installed, and its download and
+the online publishing dry run failed because network hostnames could not resolve.
+Before publication, require the configured Windows/macOS/MSRV CI jobs and the
+online dry run to pass for the final candidate commit.
+
 1. Confirm Cargo.toml and Cargo.lock both contain `1.0.0`, and update the changelog
    from release candidate to the actual release date.
 2. Commit the candidate in a normal Git checkout and require the complete CI

@@ -46,6 +46,43 @@ impl Drop for Temporary {
     }
 }
 
+fn create_temporary(parent: &Path, permissions: Option<&fs::Permissions>) -> Result<Temporary> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        // Keep the temporary name independent of the destination's length.
+        // A valid destination can already use the filesystem's full name limit.
+        let name = OsString::from(format!(
+            ".sheetpatch-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let candidate = parent.join(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(permissions) = permissions {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            // Set the mode at creation: chmod afterward cannot revoke access
+            // from a process that already opened the temporary file.
+            options.mode(permissions.mode() & 0o777);
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+        match options.open(&candidate) {
+            Ok(file) => {
+                return Ok(Temporary {
+                    path: candidate,
+                    file: Some(file),
+                    renamed: false,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 pub(crate) fn write(
     path: &Path,
     serialize: impl FnOnce(&mut BufWriter<&File>) -> Result<()>,
@@ -56,38 +93,18 @@ pub(crate) fn write(
         .unwrap_or(Path::new("."));
     path.file_name()
         .ok_or_else(|| Error::InvalidValue("destination must name a file".into()))?;
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut temp = loop {
-        // Keep the temporary name independent of the destination's length.
-        // A valid destination can already use the filesystem's full name limit.
-        let name = OsString::from(format!(
-            ".sheetpatch-{}-{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let candidate = parent.join(name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                break Temporary {
-                    path: candidate,
-                    file: Some(file),
-                    renamed: false,
-                };
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
+    let mut temp = create_temporary(parent, permissions.as_ref())?;
     let file = temp.file.as_ref().expect("temporary file is open");
     // Restrict an existing private workbook's replacement before any contents
     // are written; applying permissions afterward would expose a temporary
     // copy under the process's default creation permissions.
-    if let Ok(metadata) = fs::metadata(path) {
-        file.set_permissions(metadata.permissions())?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
     }
     {
         let mut writer = BufWriter::new(file);
@@ -124,6 +141,35 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"original");
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_temporary_files_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("sheetpatch-created-private-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let permissions = fs::Permissions::from_mode(0o600);
+        let temporary = create_temporary(&directory, Some(&permissions)).unwrap();
+        // Check immediately after opening, before write() restores the mode.
+        // No group or other reader can open an existing private replacement.
+        assert_eq!(
+            temporary
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        drop(temporary);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(unix)]

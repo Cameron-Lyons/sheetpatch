@@ -554,6 +554,13 @@ fn signed_packages_can_be_read_but_cannot_be_edited() {
         .collect();
     let signed = archive(&borrowed);
     let mut workbook = Workbook::from_bytes(signed.clone()).unwrap();
+    workbook
+        .set_cells("Data & Notes", std::iter::empty::<(&str, i32)>())
+        .unwrap();
+    workbook
+        .apply_edits(std::iter::empty::<CellEdit>())
+        .unwrap();
+    assert!(!workbook.has_changes());
     assert!(workbook.set_cell("Data & Notes", "A1", 3).is_err());
     assert_eq!(workbook.to_bytes().unwrap(), signed);
 }
@@ -765,6 +772,43 @@ fn failed_cli_edits_leave_existing_output_unchanged() {
 }
 
 #[test]
+fn cli_rejects_non_utf8_patch_rows_with_the_line_number_and_usage_exit_code() {
+    use std::process::Stdio;
+
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    let patch = directory.0.join("edits.tsv");
+    let invalid = b"Data & Notes\tA1\ttext\tvalid edit\nData & Notes\tC1\ttext\t\xff\n";
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    fs::write(&output, b"existing output").unwrap();
+    fs::write(&patch, invalid).unwrap();
+
+    for from_stdin in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sheetpatch"));
+        command.arg("patch").arg(&input).arg(&output);
+        let result = if from_stdin {
+            let mut child = command
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(invalid).unwrap();
+            child.wait_with_output().unwrap()
+        } else {
+            command.arg(&patch).output().unwrap()
+        };
+        assert_eq!(result.status.code(), Some(2));
+        let message = String::from_utf8(result.stderr).unwrap();
+        assert!(message.contains("Patch line 2:"), "{message}");
+        assert!(message.contains("UTF-8"), "{message}");
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+    }
+}
+
+#[test]
 fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
     let directory = TempDir::new();
     let input = directory.0.join("repeated.xlsm");
@@ -883,27 +927,83 @@ fn batch_edits_are_ordered_transactional_and_preserve_opaque_parts() {
     assert_eq!(workbook.to_bytes().unwrap(), original);
 }
 
-#[test]
-fn multi_sheet_transaction_rolls_back_every_sheet_on_failure() {
-    let original = fixture(WORKSHEET);
-    let workbook_xml = String::from_utf8(payload(&original, "xl/workbook.xml"))
+fn add_other_sheet(original: &[u8], other: &str) -> Vec<u8> {
+    let workbook_xml = String::from_utf8(payload(original, "xl/workbook.xml"))
         .unwrap()
         .replace(
             "</sheets>",
             "<sheet name=\"Other\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
         );
-    let rels = String::from_utf8(payload(&original, "xl/_rels/workbook.xml.rels")).unwrap().replace("</Relationships>", "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/other.xml\"/></Relationships>");
-    let other = format!(
-        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"
-    );
-    let bytes = replace_parts(
-        &original,
+    let rels = String::from_utf8(payload(original, "xl/_rels/workbook.xml.rels")).unwrap().replace("</Relationships>", "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/other.xml\"/></Relationships>");
+    replace_parts(
+        original,
         &[
             ("xl/workbook.xml", workbook_xml.as_bytes()),
             ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
             ("xl/worksheets/other.xml", other.as_bytes()),
         ],
+    )
+}
+
+#[test]
+fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
+    let other = format!(
+        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>"
     );
+    let original = add_other_sheet(&fixture(WORKSHEET), &other);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    book.set_cells(
+        "Data & Notes",
+        [
+            ("C1", CellValue::Number(99.0)),
+            ("A2", CellValue::Bool(true)),
+            ("Z99", CellValue::Blank),
+        ],
+    )
+    .unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+
+    book.set_cell("Data & Notes", "C1", 101).unwrap();
+    let pending = book.to_bytes().unwrap();
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::new("Other", "A1", 7).unwrap(),
+    ])
+    .unwrap();
+    assert!(book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), pending);
+
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::new("Other", "A1", 8).unwrap(),
+    ])
+    .unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data & Notes", "C1").unwrap().value,
+        CellValue::Number(101.0)
+    );
+    assert_eq!(
+        reopened.get_cell("Other", "A1").unwrap().value,
+        CellValue::Number(8.0)
+    );
+
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 99).unwrap(),
+        CellEdit::new("Other", "A1", 7).unwrap(),
+    ])
+    .unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+}
+
+#[test]
+fn multi_sheet_transaction_rolls_back_every_sheet_on_failure() {
+    let other = format!(
+        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"
+    );
+    let bytes = add_other_sheet(&fixture(WORKSHEET), &other);
     let mut book = Workbook::from_bytes(bytes).unwrap();
     book.set_cell("Data & Notes", "A2", false).unwrap();
     let before = book.to_bytes().unwrap();

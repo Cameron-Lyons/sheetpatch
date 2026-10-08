@@ -38,7 +38,9 @@ pub(crate) struct Entry {
 pub(crate) struct Archive {
     original: Vec<u8>,
     entries: Vec<Entry>,
+    local_order: Vec<usize>,
     index: HashMap<String, usize>,
+    part_index: HashMap<String, Option<usize>>,
     central_start: usize,
     end: usize,
 }
@@ -48,6 +50,13 @@ struct StoredDescriptor {
     data_end: usize,
     end: usize,
     crc: u32,
+    size: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Replacement {
+    crc: u32,
+    compressed_size: u32,
     size: u32,
 }
 
@@ -213,7 +222,7 @@ impl Archive {
         }
         let mut entries = Vec::with_capacity(count as usize);
         let mut index = HashMap::with_capacity(count as usize);
-        let mut local_ranges = Vec::with_capacity(count as usize);
+        let mut part_index = HashMap::with_capacity(count as usize);
         let mut position = central_start;
         for _ in 0..count {
             if add(position, 46)? > end || u32_at(&original, position)? != CENTRAL {
@@ -268,6 +277,13 @@ impl Archive {
                 return Err(invalid("empty, invalid, or duplicate ZIP member name"));
             }
             check_extra(&original[name_end..extra_end])?;
+            // OPC part names compare without ASCII case, including the hex
+            // digits in URI escapes. Retain exact ZIP names for preservation;
+            // reject an ambiguous equivalent name only if that part is used.
+            part_index
+                .entry(name.to_ascii_lowercase())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(entries.len()));
 
             let local_start = local_offset as usize;
             if add(local_start, 30)? > central_start || u32_at(&original, local_start)? != LOCAL {
@@ -321,7 +337,6 @@ impl Archive {
             } else {
                 data_end
             };
-            local_ranges.push(local_start..local_end);
             entries.push(Entry {
                 name,
                 flags,
@@ -339,17 +354,20 @@ impl Archive {
         if position != end {
             return Err(invalid("ZIP central-directory entry count is inconsistent"));
         }
-        local_ranges.sort_unstable_by_key(|range| range.start);
-        if local_ranges
+        let mut local_order: Vec<_> = (0..entries.len()).collect();
+        local_order.sort_unstable_by_key(|&index| entries[index].local_record.start);
+        if local_order
             .windows(2)
-            .any(|pair| pair[0].end > pair[1].start)
+            .any(|pair| entries[pair[0]].local_record.end > entries[pair[1]].local_record.start)
         {
             return Err(invalid("overlapping ZIP local records"));
         }
         Ok(Self {
             original,
             entries,
+            local_order,
             index,
+            part_index,
             central_start,
             end,
         })
@@ -361,6 +379,21 @@ impl Archive {
 
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.index.contains_key(name)
+    }
+
+    pub(crate) fn part_name(&self, name: &str) -> Result<Option<&str>> {
+        let key = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        };
+        match self.part_index.get(key.as_ref()) {
+            Some(Some(index)) => Ok(Some(&self.entries[*index].name)),
+            Some(None) => Err(invalid(format!(
+                "ambiguous equivalent OPC part names: {name}"
+            ))),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>> {
@@ -408,7 +441,7 @@ impl Archive {
     }
 
     pub(crate) fn write(&self, changes: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(self.original.len());
         self.write_to(changes, &mut output)?;
         Ok(output)
     }
@@ -431,9 +464,7 @@ impl Archive {
         let mut original_position = 0;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = vec![0; self.entries.len()];
-        let mut order: Vec<_> = (0..self.entries.len()).collect();
-        order.sort_unstable_by_key(|&index| self.entries[index].local_record.start);
-        for index in order {
+        for &index in &self.local_order {
             let entry = &self.entries[index];
             // Prefixes, gaps and any obsolete records from older versions are
             // opaque here. Preserve them; only explicit compaction removes
@@ -505,7 +536,7 @@ impl Archive {
         let mut position = 0;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = vec![0; self.entries.len()];
-        for index in order {
+        for &index in order {
             let entry = &self.entries[index];
             offsets[index] = zip32(position, "ZIP local-record offset")?;
             if let Some(data) = changes.get(&entry.name) {
@@ -550,7 +581,7 @@ impl Archive {
         data: &[u8],
         writer: &mut W,
         position: &mut usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Replacement> {
         let size = zip32(data.len(), "ZIP member size")?;
         let compressed = if entry.method == 0 {
             Cow::Borrowed(data)
@@ -560,27 +591,27 @@ impl Archive {
             Cow::Owned(encoder.finish()?)
         };
         let compressed_size = zip32(compressed.len(), "compressed ZIP member size")?;
-        let local_offset = zip32(*position, "ZIP local-record offset")?;
         let crc = crc32(data);
         let flags = entry.flags & !8;
-        let mut header = self.original[entry.local_header.clone()].to_vec();
+        let original_header = &self.original[entry.local_header.clone()];
+        let mut header = [0; 30];
+        header.copy_from_slice(&original_header[..30]);
         set_u16(&mut header, 6, flags);
         set_u32(&mut header, 14, crc);
         set_u32(&mut header, 18, compressed_size);
         set_u32(&mut header, 22, size);
         zip32(
-            add(add(*position, header.len())?, compressed.len())?,
+            add(add(*position, original_header.len())?, compressed.len())?,
             "ZIP local-record area",
         )?;
         emit(writer, position, &header)?;
+        emit(writer, position, &original_header[30..])?;
         emit(writer, position, &compressed)?;
-        let mut central = self.original[entry.central.clone()].to_vec();
-        set_u16(&mut central, 8, flags);
-        set_u32(&mut central, 16, crc);
-        set_u32(&mut central, 20, compressed_size);
-        set_u32(&mut central, 24, size);
-        set_u32(&mut central, 42, local_offset);
-        Ok(central)
+        Ok(Replacement {
+            crc,
+            compressed_size,
+            size,
+        })
     }
 
     fn emit_directory<W: Write>(
@@ -588,35 +619,41 @@ impl Archive {
         writer: &mut W,
         position: &mut usize,
         offsets: &[u32],
-        replacements: &[Option<Vec<u8>>],
+        replacements: &[Option<Replacement>],
     ) -> Result<()> {
         let central_start = zip32(*position, "ZIP central-directory offset")?;
         for (index, entry) in self.entries.iter().enumerate() {
-            let record = replacements[index]
-                .as_deref()
-                .unwrap_or(&self.original[entry.central.clone()]);
+            let record = &self.original[entry.central.clone()];
+            let mut header = [0; 46];
+            header.copy_from_slice(&record[..46]);
+            if let Some(replacement) = replacements[index] {
+                set_u16(&mut header, 8, entry.flags & !8);
+                set_u32(&mut header, 16, replacement.crc);
+                set_u32(&mut header, 20, replacement.compressed_size);
+                set_u32(&mut header, 24, replacement.size);
+            }
             // The local offset is the only field compaction changes for an
             // untouched member; comments, extras and all other metadata survive.
-            emit(writer, position, &record[..42])?;
-            emit(writer, position, &offsets[index].to_le_bytes())?;
+            set_u32(&mut header, 42, offsets[index]);
+            emit(writer, position, &header)?;
             emit(writer, position, &record[46..])?;
         }
         let central_size = zip32(
             *position - central_start as usize,
             "ZIP central-directory size",
         )?;
-        let mut ending = self.original[self.end..].to_vec();
+        let mut ending = [0; 22];
+        ending.copy_from_slice(&self.original[self.end..self.end + 22]);
         set_u32(&mut ending, 12, central_size);
         set_u32(&mut ending, 16, central_start);
-        emit(writer, position, &ending)
+        emit(writer, position, &ending)?;
+        emit(writer, position, &self.original[self.end + 22..])
     }
 
-    fn compaction_order(&self) -> Result<Vec<usize>> {
-        let mut order: Vec<_> = (0..self.entries.len()).collect();
-        order.sort_unstable_by_key(|&index| self.entries[index].local_record.start);
+    fn compaction_order(&self) -> Result<&[usize]> {
         let mut position = 0;
         let mut stored_descriptors = None;
-        for &index in &order {
+        for &index in &self.local_order {
             let entry = &self.entries[index];
             while position < entry.local_record.start {
                 position = self.orphan_end(position, &mut stored_descriptors)?;
@@ -636,7 +673,7 @@ impl Archive {
                 "cannot compact unrecognized data before the ZIP directory".into(),
             ));
         }
-        Ok(order)
+        Ok(&self.local_order)
     }
 
     fn orphan_end(
@@ -826,42 +863,14 @@ impl Archive {
     }
 }
 
-const fn crc_table() -> [u32; 256] {
-    let mut table = [0; 256];
-    let mut i = 0;
-    while i < table.len() {
-        let mut value = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            value = if value & 1 != 0 {
-                0xedb8_8320 ^ (value >> 1)
-            } else {
-                value >> 1
-            };
-            bit += 1;
-        }
-        table[i] = value;
-        i += 1;
-    }
-    table
-}
-
-fn crc_update(mut value: u32, bytes: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = crc_table();
-    for &byte in bytes {
-        value = TABLE[((value as u8) ^ byte) as usize] ^ (value >> 8);
-    }
-    value
-}
-
 fn crc32(bytes: &[u8]) -> u32 {
-    !crc_update(u32::MAX, bytes)
+    crc32fast::hash(bytes)
 }
 
 fn inspect_deflate(compressed: &[u8], name: &str) -> Result<(u32, u32, u32)> {
     let mut decoder = Decompress::new(false);
     let mut buffer = [0; 8192];
-    let mut crc = u32::MAX;
+    let mut crc = crc32fast::Hasher::new();
     loop {
         let previous_in = decoder.total_in();
         let previous_out = decoder.total_out();
@@ -882,12 +891,12 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<(u32, u32, u32)> {
             )));
         }
         let produced = (decoder.total_out() - previous_out) as usize;
-        crc = crc_update(crc, &buffer[..produced]);
+        crc.update(&buffer[..produced]);
         if status == Status::StreamEnd {
             return Ok((
                 zip32(decoder.total_in() as usize, "compressed ZIP member size")?,
                 decoder.total_out() as u32,
-                !crc,
+                crc.finalize(),
             ));
         }
         if decoder.total_in() == previous_in && decoder.total_out() == previous_out {
@@ -967,6 +976,21 @@ mod tests {
     }
 
     #[test]
+    fn opc_part_lookup_preserves_spelling_and_refuses_equivalent_duplicates() {
+        let archive = Archive::new(fixture(false)).unwrap();
+        assert_eq!(archive.part_name("PART.XML").unwrap(), Some("part.xml"));
+        assert_eq!(archive.part_name("missing.xml").unwrap(), None);
+        let original = combine(fixture(false), decorate_fixture(b"PART.XML", false));
+        let archive = Archive::new(original.clone()).unwrap();
+        assert!(archive.part_name("part.xml").is_err());
+        // ZIP indexing itself remains exact, so opaque duplicate OPC names do
+        // not prevent preserving an otherwise unaccessed archive member.
+        assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
+        assert!(archive.contains("PART.XML"));
+        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+    }
+
+    #[test]
     fn appends_replacement_and_retains_original_records_and_comment() {
         for descriptor in [false, true] {
             let original = fixture(descriptor);
@@ -1002,12 +1026,12 @@ mod tests {
         let local = archive.original[untouched.local_record.clone()].to_vec();
         let central = archive.original[untouched.central.clone()].to_vec();
         for data in [b"longer replacement".as_slice(), b"short".as_slice()] {
-            archive = Archive::new(
-                archive
-                    .write(&BTreeMap::from([("part.xml".into(), data.to_vec())]))
-                    .unwrap(),
-            )
-            .unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), data.to_vec())]);
+            let edited = archive.write(&changes).unwrap();
+            let mut compacted = Vec::new();
+            archive.compact_to(&changes, &mut compacted).unwrap();
+            assert_eq!(edited, compacted);
+            archive = Archive::new(edited).unwrap();
             let changed = &archive.entries[archive.index["part.xml"]];
             let untouched = &archive.entries[archive.index["keep.xml"]];
             // All bytes before the directory belong to exactly two records.
@@ -1068,6 +1092,41 @@ mod tests {
         assert_eq!(
             updated.original[second.local_record.clone()],
             original.original[original.entries[1].local_record.clone()]
+        );
+    }
+
+    #[test]
+    fn replacements_preserve_changed_member_metadata_and_large_archive_comments() {
+        let mut original = decorate_fixture(b"part.xml", false);
+        let end = original.len() - 29;
+        original.truncate(end + 22);
+        set_u16(&mut original, end + 20, u16::MAX);
+        original.extend(std::iter::repeat_n(b'!', u16::MAX as usize));
+        let archive = Archive::new(original).unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"updated payload".to_vec())]);
+        let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        assert_eq!(updated.read("part.xml").unwrap(), changes["part.xml"]);
+
+        let before = &archive.entries[0];
+        let after = &updated.entries[0];
+        let mut expected_local = archive.original[before.local_header.clone()].to_vec();
+        set_u16(&mut expected_local, 6, after.flags);
+        set_u32(&mut expected_local, 14, after.crc);
+        set_u32(&mut expected_local, 18, after.compressed_size);
+        set_u32(&mut expected_local, 22, after.size);
+        assert_eq!(updated.original[after.local_header.clone()], expected_local);
+        assert_eq!(after.local_record.end, after.data.end);
+
+        let mut expected_central = archive.original[before.central.clone()].to_vec();
+        set_u16(&mut expected_central, 8, after.flags);
+        set_u32(&mut expected_central, 16, after.crc);
+        set_u32(&mut expected_central, 20, after.compressed_size);
+        set_u32(&mut expected_central, 24, after.size);
+        set_u32(&mut expected_central, 42, after.local_record.start as u32);
+        assert_eq!(updated.original[after.central.clone()], expected_central);
+        assert_eq!(
+            updated.original[updated.end + 22..],
+            archive.original[archive.end + 22..]
         );
     }
 
@@ -1378,6 +1437,33 @@ mod tests {
         archive.compact_to(&changes, &mut compacted).unwrap();
         let expected_len = archive.original.len() - b"<part/>".len() + b"updated".len();
         assert_eq!(compacted.len(), expected_len);
+        assert_eq!(
+            Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+            b"updated"
+        );
+    }
+
+    #[test]
+    fn compaction_checks_obsolete_deflate_payloads_across_output_chunks() {
+        let archive = Archive::new(deflate_descriptor_fixture(true)).unwrap();
+        let large = b"123456789".repeat(3000);
+        let archive = Archive::new(
+            archive
+                .write(&BTreeMap::from([("part.xml".into(), large.clone())]))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), large);
+        let appended = Archive::new(append(
+            &archive,
+            &BTreeMap::from([("part.xml".into(), b"updated".to_vec())]),
+        ))
+        .unwrap();
+        let mut compacted = Vec::new();
+        appended
+            .compact_to(&BTreeMap::new(), &mut compacted)
+            .unwrap();
+        assert!(compacted.len() < appended.original.len());
         assert_eq!(
             Archive::new(compacted).unwrap().read("part.xml").unwrap(),
             b"updated"

@@ -48,11 +48,29 @@ fn parse_value(kind: &str, value: Option<&str>) -> Result<CellValue, String> {
     }
 }
 
-fn read_patch(reader: impl BufRead) -> Result<Vec<CellEdit>, Failure> {
+fn read_patch(mut reader: impl BufRead) -> Result<Vec<CellEdit>, Failure> {
     let mut edits = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = if index == 0 {
+    let mut line = String::new();
+    let mut line_number = 0usize;
+    loop {
+        line.clear();
+        line_number += 1;
+        let invalid = |message| Failure::Usage(format!("Patch line {line_number}: {message}"));
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(invalid(format!("expected UTF-8 text: {error}")));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        let line = if line_number == 1 {
             line.strip_prefix('\u{feff}').unwrap_or(&line)
         } else {
             &line
@@ -60,7 +78,6 @@ fn read_patch(reader: impl BufRead) -> Result<Vec<CellEdit>, Failure> {
         if line.trim().is_empty() || (line.starts_with('#') && !line.contains('\t')) {
             continue;
         }
-        let invalid = |message| Failure::Usage(format!("Patch line {}: {message}", index + 1));
         let mut fields = line.splitn(4, '\t');
         let sheet = fields.next().unwrap();
         let cell = fields
@@ -100,11 +117,10 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
             Ok(())
         }
         Some("get") if args.len() == 5 => {
+            let sheet = text_arg(args, 3)?;
+            let cell = text_arg(args, 4)?;
             let workbook = Workbook::open(&args[2])?;
-            match workbook
-                .get_cell(text_arg(args, 3)?, text_arg(args, 4)?)?
-                .value
-            {
+            match workbook.get_cell(sheet, cell)?.value {
                 CellValue::Text(value) | CellValue::Error(value) => writeln!(output, "{value}")?,
                 CellValue::Number(value) => writeln!(output, "{value}")?,
                 CellValue::Bool(value) => writeln!(output, "{value}")?,
@@ -118,8 +134,10 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
                 args.get(7).map(|_| text_arg(args, 7)).transpose()?,
             )
             .map_err(Failure::Usage)?;
+            let sheet = text_arg(args, 4)?;
+            let cell = text_arg(args, 5)?;
             let mut workbook = Workbook::open(&args[2])?;
-            workbook.set_cell(text_arg(args, 4)?, text_arg(args, 5)?, value)?;
+            workbook.set_cell(sheet, cell, value)?;
             workbook.save(&args[3])?;
             Ok(())
         }
@@ -165,6 +183,40 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_unicode_text_arguments_are_rejected_before_opening_workbooks() {
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        for (args, text_indexes) in [
+            (vec!["sheetpatch", "get", "", "Data", "A1"], 3..5),
+            (
+                vec!["sheetpatch", "set", "", "", "Data", "A1", "text", "value"],
+                4..8,
+            ),
+        ] {
+            let args: Vec<_> = args.into_iter().map(OsString::from).collect();
+            for index in text_indexes {
+                let mut args = args.clone();
+                args[index] = invalid.clone();
+                match run(&args, Vec::new()) {
+                    Err(Failure::Usage(message)) => {
+                        assert!(message.starts_with(&format!("Argument {index} ")));
+                    }
+                    other => panic!("unexpected argument validation result: {other:?}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn output_failures_are_returned_without_panicking() {
@@ -215,6 +267,23 @@ mod tests {
                 &CellValue::Error("#N/A".into()),
             ]
         );
+    }
+
+    #[test]
+    fn patch_preserves_a_carriage_return_without_a_line_feed() {
+        let edits = read_patch("Data\tA1\ttext\tvalue\r".as_bytes()).unwrap();
+        assert_eq!(edits[0].value(), &CellValue::Text("value\r".into()));
+    }
+
+    #[test]
+    fn non_utf8_patch_reports_the_failing_line() {
+        let source = b"Data\tA1\tnumber\t1\nData\tA2\ttext\t\xff\n";
+        match read_patch(source.as_slice()) {
+            Err(Failure::Usage(message)) => {
+                assert!(message.starts_with("Patch line 2: expected UTF-8 text:"));
+            }
+            other => panic!("unexpected UTF-8 validation result: {other:?}"),
+        }
     }
 
     #[test]

@@ -282,6 +282,21 @@ fn main() {
         assert_eq!(streamed, output);
         let compact = batched.to_bytes_compact().unwrap();
         verify_output(&input, &compact, &expected);
+        let addresses: Vec<_> = edits.iter().map(|(address, _)| address.as_str()).collect();
+        let values = batched.get_cells("Data", &addresses).unwrap();
+        for (cell, (_, expected_value)) in values.iter().zip(&edits) {
+            assert_eq!(&cell.value, expected_value);
+        }
+        let mut unchanged = bulk(&input, &edits);
+        unchanged
+            .set_cells(
+                "Data",
+                edits
+                    .iter()
+                    .map(|(address, value)| (address.as_str(), value.clone())),
+            )
+            .unwrap();
+        assert_eq!(unchanged.to_bytes().unwrap(), output);
 
         report(
             "sequential",
@@ -297,6 +312,30 @@ fn main() {
             samples,
             measure(samples, || bulk(&input, &edits)),
         );
+        report(
+            "get_cells",
+            cells,
+            count,
+            samples,
+            measure(samples, || batched.get_cells("Data", &addresses).unwrap()),
+        );
+        report(
+            "unchanged_bulk",
+            cells,
+            count,
+            samples,
+            measure(samples, || {
+                unchanged
+                    .set_cells(
+                        "Data",
+                        edits
+                            .iter()
+                            .map(|(address, value)| (address.as_str(), value.clone())),
+                    )
+                    .unwrap()
+            }),
+        );
+        assert_eq!(unchanged.to_bytes().unwrap(), output);
         report(
             "to_bytes",
             cells,

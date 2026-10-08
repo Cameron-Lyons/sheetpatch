@@ -1,11 +1,19 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+    rc::Rc,
+};
 
-use quick_xml::{events::Event, reader::NsReader};
+use quick_xml::{
+    events::{Event, attributes::Attribute as XmlAttribute},
+    name::{QName, ResolveResult},
+    reader::NsReader,
+};
 
 use crate::xml::{
     excel_text, namespace as decoded_namespace, valid_char as valid_xml_char, valid_name,
-    valid_qname, validate_declaration, whitespace as xml_whitespace,
+    valid_qname, validate_declaration, validate_namespaces, whitespace as xml_whitespace,
 };
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 
@@ -13,9 +21,9 @@ const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006
 const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
 #[derive(Debug)]
-struct Attribute {
-    name: String,
-    value: String,
+struct Attribute<'a> {
+    name: &'a str,
+    value: Cow<'a, str>,
     start: usize,
     value_start: usize,
     value_end: usize,
@@ -23,12 +31,13 @@ struct Attribute {
 }
 
 #[derive(Debug)]
-struct Element {
-    name: String,
-    namespace: Option<String>,
+struct Element<'a> {
+    name: &'a str,
+    namespace: Option<Rc<str>>,
     parent: Option<usize>,
-    children: Vec<usize>,
-    attributes: Vec<Attribute>,
+    children_start: usize,
+    children_end: usize,
+    attributes: Vec<Attribute<'a>>,
     start: usize,
     open_end: usize,
     close_start: usize,
@@ -37,20 +46,53 @@ struct Element {
     opaque_markup: bool,
 }
 
-impl Element {
+impl<'xml> Element<'xml> {
     fn local_name(&self) -> &str {
         self.name.rsplit(':').next().unwrap()
     }
     fn is(&self, namespace: &str, name: &str) -> bool {
         self.namespace.as_deref() == Some(namespace) && self.local_name() == name
     }
-    fn attr(&self, name: &str) -> Option<&Attribute> {
+    fn attr(&self, name: &str) -> Option<&Attribute<'_>> {
         self.attributes.iter().find(|attr| attr.name == name)
     }
     fn qualified(&self, name: &str) -> String {
         self.name
             .rsplit_once(':')
             .map_or_else(|| name.to_owned(), |(prefix, _)| format!("{prefix}:{name}"))
+    }
+
+    fn has_children(&self) -> bool {
+        self.children_start < self.children_end
+    }
+
+    fn children<'a>(&self, elements: &'a [Element<'xml>]) -> Children<'a, 'xml> {
+        Children {
+            elements,
+            next: self.children_start,
+            end: self.children_end,
+        }
+    }
+}
+
+// Elements are recorded in preorder. A child's subtree ends at the next
+// sibling, so the index needs no separately allocated list for each parent.
+struct Children<'a, 'xml> {
+    elements: &'a [Element<'xml>],
+    next: usize,
+    end: usize,
+}
+
+impl Iterator for Children<'_, '_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
+        let index = self.next;
+        self.next = self.elements[index].children_end;
+        Some(index)
     }
 }
 
@@ -69,6 +111,14 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }
 
+fn unique<T>(mut items: impl Iterator<Item = T>, message: &'static str) -> Result<Option<T>> {
+    let first = items.next();
+    if items.next().is_some() {
+        return Err(unsupported(message));
+    }
+    Ok(first)
+}
+
 fn decoded(input: &str) -> Result<String> {
     let value = quick_xml::escape::unescape(input).map_err(|e| xml_error(e.to_string()))?;
     if !value.chars().all(valid_xml_char) {
@@ -84,7 +134,7 @@ fn attribute_spans(
     start: usize,
     open_end: usize,
     name_len: usize,
-) -> Result<Vec<Attribute>> {
+) -> Result<Vec<Attribute<'_>>> {
     let mut position = start + 1 + name_len;
     let mut result = Vec::new();
     while position < open_end {
@@ -103,8 +153,7 @@ fn attribute_spans(
             position += 1;
         }
         let name = std::str::from_utf8(&xml[name_start..position])
-            .map_err(|e| xml_error(e.to_string()))?
-            .to_owned();
+            .map_err(|e| xml_error(e.to_string()))?;
         while position < open_end && xml[position].is_ascii_whitespace() {
             position += 1;
         }
@@ -130,14 +179,20 @@ fn attribute_spans(
             return Err(xml_error("unterminated XML attribute"));
         }
         let value_end = position;
-        let raw = std::str::from_utf8(&xml[value_start..value_end])
-            .map_err(|e| xml_error(e.to_string()))?;
-        if raw.contains('<') {
+        let raw = &xml[value_start..value_end];
+        if raw.contains(&b'<') {
             return Err(xml_error("less-than sign in an XML attribute"));
         }
         // XML normalizes literal attribute whitespace before expanding entity
         // references; referenced whitespace keeps its actual value.
-        let value = decoded(&normalized_text(raw).replace(['\t', '\n'], " "))?;
+        let value = XmlAttribute {
+            key: QName(name.as_bytes()),
+            value: Cow::Borrowed(raw),
+        }
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+        if !value.chars().all(valid_xml_char) {
+            return Err(xml_error("invalid XML character reference"));
+        }
         position += 1;
         result.push(Attribute {
             name,
@@ -151,7 +206,29 @@ fn attribute_spans(
     Ok(result)
 }
 
-fn parse(xml: &[u8]) -> Result<Vec<Element>> {
+// Namespace URIs usually repeat for every row, cell, and value. Decode each raw
+// spelling once and share it rather than allocating a URI per element.
+fn cached_namespace(
+    result: ResolveResult<'_>,
+    cache: &mut HashMap<Vec<u8>, Rc<str>>,
+) -> Result<Option<Rc<str>>> {
+    match result {
+        ResolveResult::Unbound => Ok(None),
+        ResolveResult::Bound(namespace) => {
+            let value = if let Some(value) = cache.get(namespace.as_ref()) {
+                Rc::clone(value)
+            } else {
+                let value: Rc<str> = decoded_namespace(ResolveResult::Bound(namespace))?.into();
+                cache.insert(namespace.as_ref().to_vec(), Rc::clone(&value));
+                value
+            };
+            Ok((!value.is_empty()).then_some(value))
+        }
+        unknown => decoded_namespace(unknown).map(|_| None),
+    }
+}
+
+fn parse(xml: &[u8]) -> Result<Vec<Element<'_>>> {
     let source =
         std::str::from_utf8(xml).map_err(|e| xml_error(format!("worksheet must be UTF-8: {e}")))?;
     if !source.chars().all(valid_xml_char) {
@@ -167,6 +244,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
     let mut reader = NsReader::from_reader(&xml[bom..]);
     reader.config_mut().check_comments = true;
     let mut elements: Vec<Element> = Vec::new();
+    let mut namespaces = HashMap::new();
     let mut stack = Vec::new();
     let mut root_seen = false;
     let mut declaration_seen = false;
@@ -187,17 +265,18 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                     }
                     root_seen = true;
                 }
-                let name = std::str::from_utf8(tag.name().as_ref())
-                    .map_err(|e| xml_error(e.to_string()))?
-                    .to_owned();
-                if !valid_qname(&name) {
+                let name =
+                    std::str::from_utf8(&xml[start + 1..start + 1 + tag.name().as_ref().len()])
+                        .map_err(|e| xml_error(e.to_string()))?;
+                if !valid_qname(name) {
                     return Err(xml_error("invalid XML element name"));
                 }
+                validate_namespaces(tag)?;
                 let (namespace, _) = reader.resolver().resolve_element(tag.name());
-                let namespace = decoded_namespace(namespace)?;
-                let namespace = (!namespace.is_empty()).then_some(namespace);
+                let namespace = cached_namespace(namespace, &mut namespaces)?;
                 // Let quick-xml check attribute syntax and duplicate names, and
                 // independently reject duplicate expanded names/prefix errors.
+                let mut first_expanded = None;
                 let mut expanded = HashSet::new();
                 for attribute in tag.attributes() {
                     let attribute = attribute.map_err(|e| xml_error(e.to_string()))?;
@@ -207,9 +286,19 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                         return Err(xml_error("invalid XML attribute name"));
                     }
                     let (ns, local) = reader.resolver().resolve_attribute(attribute.key);
-                    let ns = decoded_namespace(ns)?;
-                    if !expanded.insert((ns, local.as_ref().to_vec())) {
-                        return Err(xml_error("duplicate expanded attribute name"));
+                    let ns = cached_namespace(ns, &mut namespaces)?;
+                    // Unprefixed names and namespace declarations are already
+                    // checked for exact duplicates by quick-xml. Only ordinary
+                    // prefixed attributes can alias another expanded name.
+                    if attribute_name.contains(':') && !attribute_name.starts_with("xmlns:") {
+                        let name = (ns, local.into_inner());
+                        if let Some(first) = &first_expanded {
+                            if first == &name || !expanded.insert(name) {
+                                return Err(xml_error("duplicate expanded attribute name"));
+                            }
+                        } else {
+                            first_expanded = Some(name);
+                        }
                     }
                 }
                 let attributes = attribute_spans(xml, start, end, name.len())?;
@@ -220,7 +309,8 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                     name,
                     namespace,
                     parent,
-                    children: Vec::new(),
+                    children_start: index + 1,
+                    children_end: index + 1,
                     attributes,
                     start,
                     open_end: end,
@@ -229,9 +319,6 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                     empty,
                     opaque_markup: false,
                 });
-                if let Some(parent) = parent {
-                    elements[parent].children.push(index);
-                }
                 if !empty {
                     stack.push(index);
                 }
@@ -242,6 +329,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element>> {
                     .ok_or_else(|| xml_error("unmatched closing XML tag"))?;
                 elements[index].close_start = start;
                 elements[index].end = end;
+                elements[index].children_end = elements.len();
             }
             Event::Text(text) => {
                 let raw =
@@ -436,30 +524,27 @@ fn new_cell(context: &Element, cell: CellRef, value: &CellValue) -> Vec<u8> {
     output
 }
 
-fn patched_cell(
-    xml: &[u8],
+fn patched_cell<'a>(
+    xml: &'a [u8],
     elements: &[Element],
     index: usize,
     namespace: &str,
     value: &CellValue,
-) -> Result<Vec<u8>> {
+) -> Result<Cow<'a, [u8]>> {
     let cell = &elements[index];
-    let value_children: Vec<_> = cell
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| elements[child].is(namespace, "v") || elements[child].is(namespace, "is"))
-        .collect();
-    if value_children.len() > 1 {
-        return Err(unsupported("cell has multiple value payloads"));
-    }
-    if let Some(&child) = value_children.first() {
+    let value_child = unique(
+        cell.children(elements).filter(|&child| {
+            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
+        }),
+        "cell has multiple value payloads",
+    )?;
+    if let Some(child) = value_child {
         validate_payload(elements, child, namespace)?;
     }
     let kind = cell
         .attr("t")
-        .map_or("n", |attribute| attribute.value.as_str());
-    let unchanged = if let Some(&child) = value_children.first() {
+        .map_or("n", |attribute| attribute.value.as_ref());
+    let unchanged = if let Some(child) = value_child {
         let old = &elements[child];
         match value {
             CellValue::Number(number) if kind == "n" && old.is(namespace, "v") => {
@@ -487,24 +572,30 @@ fn patched_cell(
         matches!(value, CellValue::Blank) && cell.attr("t").is_none()
     };
     if unchanged {
-        return Ok(xml[cell.start..cell.end].to_vec());
+        return Ok(Cow::Borrowed(&xml[cell.start..cell.end]));
+    }
+    // Unlike cell metadata (`cm`), value metadata describes the old value and
+    // can link to rich data in other package parts. Retaining that link after
+    // replacing a scalar payload would silently leave stale value semantics.
+    if cell.attr("vm").is_some() {
+        return Err(unsupported("cell value has associated metadata"));
     }
     let value_bytes = payload(cell, value);
     let kind = attribute_edit(cell, "t", value_type(value));
     if cell.empty {
         if value_bytes.is_empty() {
-            return opening(xml, cell, kind, false);
+            return opening(xml, cell, kind, false).map(Cow::Owned);
         }
         let mut output = opening(xml, cell, kind, true)?;
         output.extend(value_bytes);
         output.extend_from_slice(format!("</{}>", cell.name).as_bytes());
-        return Ok(output);
+        return Ok(Cow::Owned(output));
     }
     let mut edits = Vec::new();
     if let Some(kind) = kind {
         edits.push(kind);
     }
-    if let Some(&child) = value_children.first() {
+    if let Some(child) = value_child {
         edits.push(Edit {
             start: elements[child].start,
             end: elements[child].end,
@@ -512,9 +603,8 @@ fn patched_cell(
         });
     } else if !value_bytes.is_empty() {
         let position = cell
-            .children
-            .iter()
-            .map(|&child| &elements[child])
+            .children(elements)
+            .map(|child| &elements[child])
             .find(|child| child.is(namespace, "extLst"))
             .map_or(cell.close_start, |child| child.start);
         edits.push(Edit {
@@ -527,7 +617,7 @@ fn patched_cell(
         edit.start -= cell.start;
         edit.end -= cell.start;
     }
-    edits_applied(&xml[cell.start..cell.end], edits)
+    edits_applied(&xml[cell.start..cell.end], edits).map(Cow::Owned)
 }
 
 // Known rich text is the old value and may be replaced. Unfamiliar markup
@@ -550,16 +640,16 @@ fn validate_payload(elements: &[Element], index: usize, namespace: &str) -> Resu
     if element.attributes.iter().any(|attribute| {
         attribute.name != "xmlns"
             && !attribute.name.starts_with("xmlns:")
-            && !allowed_attributes.contains(&attribute.name.as_str())
+            && !allowed_attributes.contains(&attribute.name)
     }) {
         return Err(unsupported(
             "unfamiliar attributes inside the cell value payload",
         ));
     }
-    if matches!(element.local_name(), "v" | "t") && !element.children.is_empty() {
+    if matches!(element.local_name(), "v" | "t") && element.has_children() {
         return Err(unsupported("elements inside a simple cell value payload"));
     }
-    for &child in &element.children {
+    for child in element.children(elements) {
         validate_payload(elements, child, namespace)?;
     }
     Ok(())
@@ -621,8 +711,8 @@ fn reference_range(reference: &str) -> Result<Range> {
 
 // A worksheet's structure is indexed once. Byte spans remain relative to the
 // original document, so unrelated whitespace, prefixes and markup never move.
-struct WorksheetIndex {
-    elements: Vec<Element>,
+struct WorksheetIndex<'a> {
+    elements: Vec<Element<'a>>,
     namespace: String,
     data_index: usize,
     rows: Vec<RowCells>,
@@ -632,8 +722,8 @@ struct WorksheetIndex {
     incomplete_formula_group: bool,
 }
 
-impl WorksheetIndex {
-    fn parse(xml: &[u8]) -> Result<Self> {
+impl<'a> WorksheetIndex<'a> {
+    fn parse(xml: &'a [u8]) -> Result<Self> {
         let elements = parse(xml)?;
         let root = &elements[0];
         let namespace = root
@@ -643,25 +733,19 @@ impl WorksheetIndex {
         if root.local_name() != "worksheet" || !matches!(namespace, TRANSITIONAL | STRICT) {
             return Err(unsupported("expected an OOXML worksheet"));
         }
-        let data: Vec<_> = root
-            .children
-            .iter()
-            .copied()
-            .filter(|&index| elements[index].is(namespace, "sheetData"))
-            .collect();
-        if data.len() != 1 {
-            return Err(unsupported(
-                "worksheet must contain exactly one sheetData element",
-            ));
-        }
-        let data_index = data[0];
+        let data_index = unique(
+            root.children(&elements)
+                .filter(|&index| elements[index].is(namespace, "sheetData")),
+            "worksheet must contain exactly one sheetData element",
+        )?
+        .ok_or_else(|| unsupported("worksheet must contain exactly one sheetData element"))?;
         let mut rows = Vec::new();
         let mut previous_row = 0;
-        let mut shared: HashMap<String, bool> = HashMap::new();
+        let mut shared: HashMap<u32, bool> = HashMap::new();
         let mut formula_cells = HashSet::new();
         let mut formula_ranges = Vec::new();
         let mut incomplete_formula_group = false;
-        for &index in &elements[data_index].children {
+        for index in elements[data_index].children(&elements) {
             let row = &elements[index];
             if !row.is(namespace, "row") {
                 continue;
@@ -678,7 +762,7 @@ impl WorksheetIndex {
             previous_row = row_number;
             let mut cells = Vec::new();
             let mut previous_column = 0;
-            for &index in &row.children {
+            for index in row.children(&elements) {
                 let existing = &elements[index];
                 if !existing.is(namespace, "c") {
                     continue;
@@ -696,7 +780,7 @@ impl WorksheetIndex {
                 }
                 previous_column = address.column;
                 cells.push((address, index));
-                for &formula in &existing.children {
+                for formula in existing.children(&elements) {
                     let formula = &elements[formula];
                     if !formula.is(namespace, "f") {
                         continue;
@@ -709,13 +793,14 @@ impl WorksheetIndex {
                     if let Some(range) = range {
                         formula_ranges.push(range);
                     }
-                    match formula.attr("t").map(|attribute| attribute.value.as_str()) {
+                    match formula.attr("t").map(|attribute| attribute.value.as_ref()) {
                         Some("shared") => {
                             let index = formula
                                 .attr("si")
                                 .ok_or_else(|| unsupported("shared formula without an index"))?
                                 .value
-                                .clone();
+                                .parse::<u32>()
+                                .map_err(|_| unsupported("invalid shared formula index"))?;
                             let has_range = shared.entry(index).or_insert(false);
                             *has_range |= range.is_some();
                         }
@@ -730,12 +815,12 @@ impl WorksheetIndex {
         }
         incomplete_formula_group |= shared.values().any(|has_range| !has_range);
         let mut merged_ranges = Vec::new();
-        for &index in &root.children {
+        for index in root.children(&elements) {
             let merges = &elements[index];
             if !merges.is(namespace, "mergeCells") {
                 continue;
             }
-            for &index in &merges.children {
+            for index in merges.children(&elements) {
                 let merge = &elements[index];
                 if !merge.is(namespace, "mergeCell") {
                     continue;
@@ -759,6 +844,31 @@ impl WorksheetIndex {
                 })
             {
                 return Err(unsupported("cell outside a worksheet row"));
+            }
+            if element.is(namespace, "f")
+                && !element
+                    .parent
+                    .is_some_and(|parent| elements[parent].is(namespace, "c"))
+            {
+                return Err(unsupported("formula outside a worksheet cell"));
+            }
+            if (element.is(namespace, "v") || element.is(namespace, "is"))
+                && !element
+                    .parent
+                    .is_some_and(|parent| elements[parent].is(namespace, "c"))
+            {
+                return Err(unsupported("value payload outside a worksheet cell"));
+            }
+            if element.is(namespace, "mergeCells") && element.parent != Some(0) {
+                return Err(unsupported("merged ranges outside the worksheet root"));
+            }
+            if element.is(namespace, "mergeCell")
+                && !element.parent.is_some_and(|parent| {
+                    elements[parent].is(namespace, "mergeCells")
+                        && elements[parent].parent == Some(0)
+                })
+            {
+                return Err(unsupported("merged range outside mergeCells"));
             }
         }
         let namespace = namespace.to_owned();
@@ -965,9 +1075,12 @@ fn spans_edit(row: &Element, columns: impl Iterator<Item = u16>) -> Result<Optio
     ))
 }
 
-pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> Result<Vec<u8>> {
+pub(crate) fn patch_cells<'a>(
+    xml: &'a [u8],
+    cells: &BTreeMap<CellRef, CellValue>,
+) -> Result<Cow<'a, [u8]>> {
     if cells.is_empty() {
-        return Ok(xml.to_vec());
+        return Ok(Cow::Borrowed(xml));
     }
     for value in cells.values() {
         value.validate()?;
@@ -1004,9 +1117,8 @@ pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> R
             let mut changed_columns = Vec::new();
             let mut empty_row_cells = Vec::new();
             let fallback = row
-                .children
-                .iter()
-                .map(|&index| &elements[index])
+                .children(elements)
+                .map(|index| &elements[index])
                 .find(|child| child.is(namespace, "extLst"))
                 .map_or(row.close_start, |child| child.start);
             for (&cell, value) in row_changes {
@@ -1019,10 +1131,11 @@ pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> R
                     .get(cell_position)
                     .filter(|&&(address, _)| address == cell);
                 if let Some(&(_, cell_index)) = existing {
-                    let bytes = patched_cell(xml, elements, cell_index, namespace, value)?;
-                    if bytes == xml[elements[cell_index].start..elements[cell_index].end] {
+                    let Cow::Owned(bytes) =
+                        patched_cell(xml, elements, cell_index, namespace, value)?
+                    else {
                         continue;
-                    }
+                    };
                     edits.push(Edit {
                         start: elements[cell_index].start,
                         end: elements[cell_index].end,
@@ -1100,16 +1213,14 @@ pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> R
         });
     }
     if !changed_cells.is_empty() {
-        let dimensions: Vec<_> = elements[0]
-            .children
-            .iter()
-            .map(|&index| &elements[index])
-            .filter(|element| element.is(namespace, "dimension"))
-            .collect();
-        if dimensions.len() > 1 {
-            return Err(unsupported("multiple worksheet dimensions"));
-        }
-        if let Some(dimension) = dimensions.first() {
+        let dimension = unique(
+            elements[0]
+                .children(elements)
+                .map(|index| &elements[index])
+                .filter(|element| element.is(namespace, "dimension")),
+            "multiple worksheet dimensions",
+        )?;
+        if let Some(dimension) = dimension {
             let reference = dimension
                 .attr("ref")
                 .ok_or_else(|| unsupported("dimension without a reference"))?;
@@ -1124,22 +1235,22 @@ pub(crate) fn patch_cells(xml: &[u8], cells: &BTreeMap<CellRef, CellValue>) -> R
             }
         }
     }
-    edits_applied(xml, edits)
+    if edits.is_empty() {
+        Ok(Cow::Borrowed(xml))
+    } else {
+        edits_applied(xml, edits).map(Cow::Owned)
+    }
 }
 
 #[cfg(test)]
 fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
-    patch_cells(xml, &BTreeMap::from([(cell, value.clone())]))
+    patch_cells(xml, &BTreeMap::from([(cell, value.clone())])).map(Cow::into_owned)
 }
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
-fn normalized_text(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 fn element_text(xml: &[u8], element: &Element) -> Result<String> {
-    if !element.children.is_empty() {
+    if element.has_children() {
         return Err(unsupported("elements inside a simple cell text value"));
     }
     if element.empty {
@@ -1150,14 +1261,18 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Text(value) => {
-                let value =
-                    std::str::from_utf8(value.as_ref()).map_err(|e| xml_error(e.to_string()))?;
-                text.push_str(&normalized_text(value));
+                text.push_str(
+                    &value
+                        .xml10_content()
+                        .map_err(|e| xml_error(e.to_string()))?,
+                );
             }
             Event::CData(value) => {
-                let value =
-                    std::str::from_utf8(value.as_ref()).map_err(|e| xml_error(e.to_string()))?;
-                text.push_str(&normalized_text(value));
+                text.push_str(
+                    &value
+                        .xml10_content()
+                        .map_err(|e| xml_error(e.to_string()))?,
+                );
             }
             Event::GeneralRef(reference) => {
                 let name = std::str::from_utf8(reference.as_ref())
@@ -1177,12 +1292,12 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
 
 fn rich_text(xml: &[u8], elements: &[Element], index: usize, namespace: &str) -> Result<String> {
     let mut text = String::new();
-    for &child in &elements[index].children {
+    for child in elements[index].children(elements) {
         let element = &elements[child];
         if element.is(namespace, "t") {
             text.push_str(&excel_text(&element_text(xml, element)?)?);
         } else if element.is(namespace, "r") {
-            for &child in &element.children {
+            for child in element.children(elements) {
                 let element = &elements[child];
                 if element.is(namespace, "t") {
                     text.push_str(&excel_text(&element_text(xml, element)?)?);
@@ -1200,19 +1315,17 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     if root.local_name() != "sst" || !matches!(namespace, TRANSITIONAL | STRICT) {
         return Err(unsupported("expected an OOXML shared-string table"));
     }
-    root.children
-        .iter()
-        .copied()
+    root.children(&elements)
         .filter(|&index| elements[index].is(namespace, "si"))
         .map(|index| rich_text(xml, &elements, index, namespace))
         .collect()
 }
 
-fn cell_content(
+fn cell_content<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
-    shared_strings: Option<&[String]>,
+    shared_strings: &mut impl FnMut() -> Result<&'a [String]>,
 ) -> Result<CellContent> {
     let Some(cell_index) = index.cell(address) else {
         return Ok(CellContent {
@@ -1234,33 +1347,23 @@ fn cell_content(
         })
         .transpose()?;
     let children = |name| {
-        cell.children
-            .iter()
-            .copied()
+        cell.children(elements)
             .filter(move |&child| elements[child].is(namespace, name))
     };
-    let formulas: Vec<_> = children("f").collect();
-    if formulas.len() > 1 {
-        return Err(unsupported("cell has multiple formulas"));
-    }
-    let formula = formulas
-        .first()
-        .map(|&index| element_text(xml, &elements[index]))
+    let formula = unique(children("f"), "cell has multiple formulas")?
+        .map(|index| element_text(xml, &elements[index]))
         .transpose()?;
-    let values: Vec<_> = cell
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| elements[child].is(namespace, "v") || elements[child].is(namespace, "is"))
-        .collect();
-    if values.len() > 1 {
-        return Err(unsupported("cell has multiple value payloads"));
-    }
-    let value = if let Some(&payload_index) = values.first() {
+    let payload_index = unique(
+        cell.children(elements).filter(|&child| {
+            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
+        }),
+        "cell has multiple value payloads",
+    )?;
+    let value = if let Some(payload_index) = payload_index {
         let payload = &elements[payload_index];
         let kind = cell
             .attr("t")
-            .map_or("n", |attribute| attribute.value.as_str());
+            .map_or("n", |attribute| attribute.value.as_ref());
         if kind == "inlineStr" {
             if !payload.is(namespace, "is") {
                 return Err(unsupported("inline string cell without an inline payload"));
@@ -1295,7 +1398,7 @@ fn cell_content(
                         .trim()
                         .parse::<usize>()
                         .map_err(|_| unsupported("invalid shared-string index"))?;
-                    let strings = shared_strings.ok_or(Error::SharedStringsUnavailable)?;
+                    let strings = shared_strings()?;
                     CellValue::Text(
                         strings
                             .get(position)
@@ -1320,24 +1423,36 @@ fn cell_content(
     })
 }
 
-pub(crate) fn read_cells(
+pub(crate) fn read_cells<'a>(
     xml: &[u8],
     cells: &[CellRef],
-    shared_strings: Option<&[String]>,
+    mut shared_strings: impl FnMut() -> Result<&'a [String]>,
 ) -> Result<Vec<CellContent>> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }
     let index = WorksheetIndex::parse(xml)?;
+    let mut loaded_strings = None;
+    let mut load_strings = || {
+        if let Some(strings) = loaded_strings {
+            return Ok(strings);
+        }
+        let strings = shared_strings()?;
+        loaded_strings = Some(strings);
+        Ok(strings)
+    };
     cells
         .iter()
-        .map(|&cell| cell_content(xml, &index, cell, shared_strings))
+        .map(|&cell| cell_content(xml, &index, cell, &mut load_strings))
         .collect()
 }
 
 #[cfg(test)]
 fn read_cell(xml: &[u8], cell: CellRef, shared_strings: Option<&[String]>) -> Result<CellContent> {
-    read_cells(xml, &[cell], shared_strings).map(|mut cells| cells.remove(0))
+    read_cells(xml, &[cell], || {
+        shared_strings.ok_or(Error::SharedStringsUnavailable)
+    })
+    .map(|mut cells| cells.remove(0))
 }
 
 #[cfg(test)]
@@ -1418,6 +1533,60 @@ mod tests {
     }
 
     #[test]
+    fn indexes_direct_children_across_nested_extensions_and_empty_elements() {
+        let foreign = "<x:extension><x:empty/><x:nested><x:leaf/></x:nested></x:extension>";
+        let rich = "<is><r><rPr><b/></rPr><t>one</t></r><r><t>two</t></r></is>";
+        let input = sheet(&format!(
+            "{foreign}<sheetData>{foreign}<row r='1'>{foreign}<c r='A1' t='inlineStr'>{rich}{foreign}</c>{foreign}<c r='C1'/>{foreign}</row>{foreign}<row r='3'/>{foreign}</sheetData>{foreign}"
+        ));
+        let addresses: Vec<_> = ["A1", "C1", "A2", "B3"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        assert_eq!(
+            read_cells(input.as_bytes(), &addresses, || {
+                panic!("inline strings should not load shared strings")
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.value)
+            .collect::<Vec<_>>(),
+            vec![
+                "onetwo".into(),
+                CellValue::Blank,
+                CellValue::Blank,
+                CellValue::Blank
+            ]
+        );
+        let changed = batch(
+            &input,
+            &[
+                ("A1", "new".into()),
+                ("B1", 2.0.into()),
+                ("C1", 3.0.into()),
+                ("A2", 4.0.into()),
+                ("B3", 5.0.into()),
+            ],
+        )
+        .unwrap();
+        let expected = input
+            .replace(rich, "<is><t xml:space=\"preserve\">new</t></is>")
+            .replace("<c r='C1'/>", "<c r=\"B1\"><v>2</v></c><c r='C1'><v>3</v></c>")
+            .replace("<row r='3'/>", "<row r=\"2\"><c r=\"A2\"><v>4</v></c></row><row r='3'><c r=\"B3\"><v>5</v></c></row>");
+        assert_eq!(changed, expected);
+        assert_eq!(
+            read_cells(changed.as_bytes(), &addresses, || {
+                panic!("inline strings should not load shared strings")
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.value)
+            .collect::<Vec<_>>(),
+            vec!["new".into(), 3.0.into(), 4.0.into(), 5.0.into()]
+        );
+    }
+
+    #[test]
     fn resolves_escaped_namespace_names_and_rejects_expanded_attribute_duplicates() {
         for namespace in [TRANSITIONAL, STRICT] {
             let encoded = namespace.replace('/', "&#47;");
@@ -1438,6 +1607,24 @@ mod tests {
         );
         assert!(matches!(
             edit(&duplicate, "A1", 2.0.into()),
+            Err(Error::Xml(_))
+        ));
+        for attributes in [
+            "a:first='one' a:flag='two' b:flag='three'",
+            "a:flag='one' a:other='two' b:flag='three'",
+        ] {
+            let duplicate = sheet(&format!(
+                "<sheetData><row r='1'><c r='A1' xmlns:a='urn:x' xmlns:b='urn&#58;x' {attributes}/></row></sheetData>"
+            ));
+            assert!(matches!(
+                edit(&duplicate, "A1", 2.0.into()),
+                Err(Error::Xml(_))
+            ));
+        }
+        let unbound =
+            sheet("<sheetData><row r='1'><c r='A1' missing:flag='one'/></row></sheetData>");
+        assert!(matches!(
+            edit(&unbound, "A1", 2.0.into()),
             Err(Error::Xml(_))
         ));
     }
@@ -1468,6 +1655,152 @@ mod tests {
             assert!(edit(&input, "B2", CellValue::Number(8.0)).is_err());
             assert!(edit(&input, "D2", CellValue::Number(8.0)).is_ok());
         }
+    }
+
+    #[test]
+    fn shared_formula_indices_use_their_numeric_identity() {
+        let input = sheet(
+            "<sheetData><row r='1'><c r='A1'><f t='shared' si='1' ref='A1:B1'>1</f><v>1</v></c><c r='B1'><f t='shared' si='01'/><v>1</v></c><c r='C1'><v>1</v></c></row></sheetData>",
+        );
+        assert_eq!(
+            edit(&input, "C1", 2.0.into()).unwrap(),
+            input.replacen("<c r='C1'><v>1</v>", "<c r='C1'><v>2</v>", 1)
+        );
+        assert!(edit(&input, "B1", 2.0.into()).is_err());
+        for index in ["not-a-number", "-1", "4294967296"] {
+            let invalid = input.replace("si='01'", &format!("si='{index}'"));
+            assert!(matches!(
+                edit(&invalid, "C1", 2.0.into()),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_for_an_existing_value_cannot_survive_a_value_change() {
+        let input = sheet(
+            r#"<sheetData><row r="1"><c r="A1" t="e" vm="1" cm="2" ph="1"><v>#VALUE!</v></c><c r="B1"><v>3</v></c></row></sheetData>"#,
+        );
+        for value in [
+            CellValue::from("replacement"),
+            CellValue::Number(5.0),
+            CellValue::Bool(true),
+            CellValue::Error("#N/A".into()),
+            CellValue::Blank,
+        ] {
+            assert!(matches!(
+                edit(&input, "A1", value),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        assert_eq!(
+            edit(&input, "A1", CellValue::Error("#VALUE!".into())).unwrap(),
+            input
+        );
+        let output = edit(&input, "B1", CellValue::Number(4.0)).unwrap();
+        assert_eq!(output, input.replace("<v>3</v>", "<v>4</v>"));
+        let cell_metadata = input.replace(" vm=\"1\"", "");
+        assert!(edit(&cell_metadata, "A1", CellValue::from("replacement")).is_ok());
+    }
+
+    #[test]
+    fn unsupported_containers_cannot_hide_formulas_or_merged_ranges() {
+        let prefix = r#"<sheetData><row r="1"><c r="A1"><v>1</v>"#;
+        for body in [
+            format!("{prefix}<x:alternate><f>1+1</f></x:alternate></c></row></sheetData>"),
+            format!(
+                "{prefix}</c></row></sheetData><x:alternate><mergeCells><mergeCell ref=\"A1:C2\"/></mergeCells></x:alternate>"
+            ),
+            format!(
+                "{prefix}</c></row></sheetData><mergeCells><x:alternate><mergeCell ref=\"A1:C2\"/></x:alternate></mergeCells>"
+            ),
+        ] {
+            let input = sheet(&body);
+            assert!(
+                matches!(edit(&input, "B2", 8.0.into()), Err(Error::Unsupported(_))),
+                "{input}"
+            );
+        }
+        let input = sheet(&format!(
+            "{prefix}</c></row></sheetData><x:mergeCells><x:mergeCell ref=\"A1:C2\"/></x:mergeCells>"
+        ));
+        assert!(edit(&input, "B2", 8.0.into()).is_ok());
+    }
+
+    #[test]
+    fn markup_compatibility_branches_cannot_bypass_value_or_range_guards() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        let alternative = |contents: &str| {
+            format!(
+                "<mc:AlternateContent xmlns:mc=\"{mc}\"><mc:Choice Requires=\"x\">{contents}</mc:Choice><mc:Fallback/></mc:AlternateContent>"
+            )
+        };
+        for body in [
+            format!(
+                "<sheetData><row r=\"1\"><c r=\"A1\">{}</c></row></sheetData>",
+                alternative("<v>7</v>")
+            ),
+            format!(
+                "<sheetData><row r=\"1\"><c r=\"A1\">{}<v>7</v></c></row></sheetData>",
+                alternative("<f>1+6</f>")
+            ),
+            format!(
+                "<sheetData/>{}",
+                alternative("<mergeCells><mergeCell ref=\"A1:C2\"/></mergeCells>")
+            ),
+        ] {
+            let input = sheet(&body);
+            assert!(
+                matches!(edit(&input, "B2", 8.0.into()), Err(Error::Unsupported(_))),
+                "{input}"
+            );
+            assert!(
+                matches!(
+                    read_cell(input.as_bytes(), "A1".parse().unwrap(), None),
+                    Err(Error::Unsupported(_))
+                ),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_elements_use_the_context_prefix_after_default_namespace_rebinding() {
+        let input = format!(
+            r#"<s:worksheet xmlns:s="{TRANSITIONAL}" xmlns="urn:foreign"><s:sheetData><s:row r="1"><s:c r="A1"><s:v>1</s:v></s:c></s:row></s:sheetData></s:worksheet>"#
+        );
+        let output = batch(
+            &input,
+            &[
+                ("A1", CellValue::from("new")),
+                ("B1", CellValue::Number(2.0)),
+                ("C2", CellValue::Bool(true)),
+            ],
+        )
+        .unwrap();
+        let contents = read_cells(
+            output.as_bytes(),
+            &[
+                "A1".parse().unwrap(),
+                "B1".parse().unwrap(),
+                "C2".parse().unwrap(),
+            ],
+            || Err(Error::SharedStringsUnavailable),
+        )
+        .unwrap();
+        assert_eq!(
+            contents
+                .iter()
+                .map(|content| &content.value)
+                .collect::<Vec<_>>(),
+            vec![
+                &CellValue::from("new"),
+                &CellValue::Number(2.0),
+                &CellValue::Bool(true)
+            ]
+        );
+        assert!(output.contains("<s:is><s:t xml:space=\"preserve\">new</s:t></s:is>"));
+        assert!(output.contains("<s:row r=\"2\"><s:c r=\"C2\" t=\"b\"><s:v>1</s:v></s:c></s:row>"));
     }
 
     #[test]
@@ -1587,6 +1920,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_illegal_namespace_declarations_even_when_unused_or_escaped() {
+        for body in [
+            "<sheetData xmlns:p='' />",
+            "<sheetData xmlns:p='http://www.w3.org/XML/1998/namespac&#101;' />",
+            "<sheetData xmlns:p='http://www.w3.org/2000/xmlns&#47;' />",
+            "<sheetData/><x:foreign xmlns='http://www.w3.org/XML/1998/namespac&#101;'/>",
+            "<sheetData/><x:foreign xmlns='http://www.w3.org/2000/xmlns&#47;'/>",
+            "<sheetData/><xmlns:invalid/>",
+        ] {
+            let input = sheet(body);
+            assert!(
+                matches!(edit(&input, "A1", 2.0.into()), Err(Error::Xml(_))),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn validates_xml_declarations_and_retains_valid_unicode_names() {
         for declaration in [
             " <?xml version='1.0'?>",
@@ -1621,7 +1972,7 @@ mod tests {
             .iter()
             .map(|(address, value)| (address.parse().unwrap(), value.clone()))
             .collect();
-        Ok(String::from_utf8(patch_cells(xml.as_bytes(), &cells)?).unwrap())
+        Ok(String::from_utf8(patch_cells(xml.as_bytes(), &cells)?.into_owned()).unwrap())
     }
 
     #[test]
@@ -1717,12 +2068,8 @@ mod tests {
             .iter()
             .map(|address| address.parse().unwrap())
             .collect();
-        let cells = read_cells(
-            input.as_bytes(),
-            &addresses,
-            Some(&["first".into(), "second".into()]),
-        )
-        .unwrap();
+        let strings = ["first".into(), "second".into()];
+        let cells = read_cells(input.as_bytes(), &addresses, || Ok(&strings)).unwrap();
         assert_eq!(
             cells
                 .iter()
@@ -1744,6 +2091,42 @@ mod tests {
         assert_eq!(cells[1].style_index, Some(7));
         assert_eq!(cells[6].style_index, Some(9));
         assert_eq!(cells[7].style_index, None);
+    }
+
+    #[test]
+    fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
+        let input = sheet(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row></sheetData>"#,
+        );
+        let numeric = read_cells(input.as_bytes(), &["A1".parse().unwrap()], || {
+            panic!("reading a number should not access shared strings")
+        })
+        .unwrap();
+        assert_eq!(numeric[0].value, CellValue::Number(7.0));
+
+        let strings = ["first".into(), "second".into()];
+        let mut loads = 0;
+        let contents = read_cells(
+            input.as_bytes(),
+            &[
+                "B1".parse().unwrap(),
+                "C1".parse().unwrap(),
+                "B1".parse().unwrap(),
+            ],
+            || {
+                loads += 1;
+                Ok(&strings)
+            },
+        )
+        .unwrap();
+        assert_eq!(loads, 1);
+        assert_eq!(
+            contents
+                .into_iter()
+                .map(|cell| cell.value)
+                .collect::<Vec<_>>(),
+            vec!["first".into(), "second".into(), "first".into()]
+        );
     }
 
     #[test]
@@ -1830,6 +2213,24 @@ mod tests {
         );
         let unknown = input.replace("<rPr><b/></rPr>", "<rPr><x:future/></rPr>");
         assert!(batch(&unknown, &[("C1", "same".into())]).is_err());
+    }
+
+    #[test]
+    fn no_op_patches_borrow_the_original_xml() {
+        let input = sheet(
+            "<sheetData><row r='1'><c r='A1'><v>1.00</v></c><c r='B1' t='inlineStr'><is><r><t>same</t></r></is></c></row></sheetData>",
+        );
+        for changes in [
+            BTreeMap::new(),
+            BTreeMap::from([("A1".parse().unwrap(), 1.0.into())]),
+            BTreeMap::from([("B1".parse().unwrap(), "same".into())]),
+            BTreeMap::from([("C1".parse().unwrap(), CellValue::Blank)]),
+        ] {
+            assert!(matches!(
+                patch_cells(input.as_bytes(), &changes).unwrap(),
+                Cow::Borrowed(_)
+            ));
+        }
     }
 
     #[test]

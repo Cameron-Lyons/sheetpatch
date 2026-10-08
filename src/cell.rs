@@ -34,6 +34,9 @@ impl FromStr for CellRef {
     fn from_str(address: &str) -> Result<Self> {
         let invalid = || Error::InvalidCellReference(address.to_owned());
         let bytes = address.as_bytes();
+        if !(2..=10).contains(&bytes.len()) {
+            return Err(invalid());
+        }
         let split = bytes
             .iter()
             .position(|b| !b.is_ascii_alphabetic())
@@ -101,9 +104,11 @@ impl CellValue {
             Self::Number(n) if !n.is_finite() => {
                 Err(Error::InvalidValue("numbers must be finite".into()))
             }
-            Self::Text(s) if s.encode_utf16().count() > 32_767 => Err(Error::InvalidValue(
-                "text exceeds Excel's 32,767 UTF-16 code unit limit".into(),
-            )),
+            Self::Text(s) if s.len() > 32_767 && s.encode_utf16().take(32_768).count() > 32_767 => {
+                Err(Error::InvalidValue(
+                    "text exceeds Excel's 32,767 UTF-16 code unit limit".into(),
+                ))
+            }
             Self::Text(s) if !s.chars().all(crate::xml::valid_char) => Err(Error::InvalidValue(
                 "text contains a character forbidden by XML 1.0".into(),
             )),
@@ -254,6 +259,20 @@ mod tests {
             CellValue::Error("#BAD\nTOKEN".into()),
         ] {
             assert!(value.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn text_limit_counts_utf16_units_instead_of_utf8_bytes() {
+        for text in [
+            "a".repeat(32_767),
+            "é".repeat(32_767),
+            format!("{}a", "😀".repeat(16_383)),
+        ] {
+            assert!(CellValue::Text(text).validate().is_ok());
+        }
+        for text in ["é".repeat(32_768), "😀".repeat(16_384)] {
+            assert!(CellValue::Text(text).validate().is_err());
         }
     }
 

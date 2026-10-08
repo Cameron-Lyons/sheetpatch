@@ -183,6 +183,24 @@ fn accessed_package_metadata_must_be_complete_xml_of_the_expected_type() {
 }
 
 #[test]
+fn binary_workbooks_are_classified_independently_of_zip_name_case() {
+    for name in ["xl/workbook.bin", "xl/workbook.BIN"] {
+        let roots = format!(
+            "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.bin'/></Relationships>"
+        );
+        let original = fixture(
+            &format!("<sheets>{SHEET}</sheets>"),
+            RELATIONSHIP,
+            &[("_rels/.rels", &roots), (name, "binary\0workbook")],
+        );
+        assert!(matches!(
+            Workbook::from_bytes(original),
+            Err(sheetpatch::Error::Unsupported(message)) if message.contains(".xlsb")
+        ));
+    }
+}
+
+#[test]
 fn namespace_character_references_are_normalized_before_discovery_and_editing() {
     let encoded_main = MAIN_NS.replace("/main", "/&#109;ain");
     let encoded_office = OFFICE_NS.replace("/relationships", "/relation&#115;hips");
@@ -252,4 +270,140 @@ fn empty_batches_require_an_existing_worksheet_without_creating_changes() {
     );
     assert!(!workbook.has_changes());
     assert_eq!(workbook.to_bytes().unwrap(), original);
+}
+
+#[test]
+fn duplicate_batch_addresses_validate_every_input_and_keep_pending_changes_on_failure() {
+    let original = fixture(&format!("<sheets>{SHEET}</sheets>"), RELATIONSHIP, &[]);
+    let mut workbook = Workbook::from_bytes(original).unwrap();
+    workbook.set_cell("Data", "B2", "pending").unwrap();
+    let before = workbook.to_bytes().unwrap();
+    for invalid in [
+        CellValue::Number(f64::NAN),
+        CellValue::Number(f64::INFINITY),
+        CellValue::Text("invalid\0text".into()),
+    ] {
+        assert!(
+            workbook
+                .set_cells("Data", [("A1", invalid), ("a1", CellValue::Number(12.0))])
+                .is_err()
+        );
+        assert_eq!(workbook.to_bytes().unwrap(), before);
+    }
+    workbook
+        .set_cells("Data", [("A1", 11), ("a1", 12)])
+        .unwrap();
+    let reopened = Workbook::from_bytes(workbook.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data", "A1").unwrap().value,
+        CellValue::Number(12.0)
+    );
+    assert_eq!(
+        reopened.get_cell("Data", "B2").unwrap().value,
+        CellValue::Text("pending".into())
+    );
+}
+
+fn escaped_part_fixture(decoded_names: bool, include_decoys: bool) -> Vec<u8> {
+    let workbook_name = if decoded_names {
+        "books/Workbook Main.xml"
+    } else {
+        "books/Workbook%20Main.xml"
+    };
+    let rels_name = if decoded_names {
+        "books/_rels/Workbook Main.xml.rels"
+    } else {
+        "books/_rels/Workbook%20Main.xml.rels"
+    };
+    let sheet_name = if decoded_names {
+        "tabs/Sheet ?.xml"
+    } else {
+        "tabs/Sheet%20%3F.xml"
+    };
+    let strings_name = if decoded_names {
+        "strings/Shared Text.xml"
+    } else {
+        "strings/Shared%20Text.xml"
+    };
+    let worksheet = format!(
+        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>7</v></c></row></sheetData></worksheet>"
+    );
+    let mut parts = BTreeMap::from([
+        ("[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/><Override PartName='/books/Workbook%20Main.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/><Override PartName='/tabs/Sheet%20%3F.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/><Override PartName='/strings/Shared%20Text.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'/></Types>".into()),
+        ("_rels/.rels", format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='BOOKS/workbook%20main.xml'/></Relationships>")),
+        (workbook_name, format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>")),
+        (rels_name, format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='../tabs/sheet%20%3f.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='/strings/shared%20text.xml'/></Relationships>")),
+        (sheet_name, worksheet),
+        (strings_name, format!("<sst xmlns='{MAIN_NS}'><si><t>Canonical</t></si></sst>")),
+    ]);
+    if include_decoys {
+        parts.insert("tabs/Sheet ?.xml", format!("<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>99</v></c></row></sheetData></worksheet>"));
+        parts.insert(
+            "strings/Shared Text.xml",
+            format!("<sst xmlns='{MAIN_NS}'><si><t>Wrong</t></si></sst>"),
+        );
+    }
+    stored_archive(&parts)
+}
+
+#[test]
+fn escaped_opc_part_names_discover_read_edit_and_compact_without_decoding_zip_names() {
+    for include_decoys in [false, true] {
+        let original = escaped_part_fixture(false, include_decoys);
+        let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(workbook.sheets()[0].path(), "tabs/Sheet%20%3F.xml");
+        assert_eq!(workbook.to_bytes().unwrap(), original);
+        assert_eq!(
+            workbook.get_cell("Data", "A1").unwrap().value,
+            CellValue::Text("Canonical".into())
+        );
+        workbook.set_cell("Data", "B1", 12).unwrap();
+        for output in [
+            workbook.to_bytes().unwrap(),
+            workbook.to_bytes_compact().unwrap(),
+        ] {
+            let reopened = Workbook::from_bytes(output).unwrap();
+            assert_eq!(reopened.sheets()[0].path(), "tabs/Sheet%20%3F.xml");
+            assert_eq!(
+                reopened.get_cell("Data", "A1").unwrap().value,
+                CellValue::Text("Canonical".into())
+            );
+            assert_eq!(
+                reopened.get_cell("Data", "B1").unwrap().value,
+                CellValue::Number(12.0)
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_decoded_zip_part_names_remain_readable_when_encoded_parts_are_absent() {
+    let original = escaped_part_fixture(true, false);
+    let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
+    assert_eq!(workbook.sheets()[0].path(), "tabs/Sheet ?.xml");
+    assert_eq!(workbook.to_bytes().unwrap(), original);
+    assert_eq!(
+        workbook.get_cell("Data", "A1").unwrap().value,
+        CellValue::Text("Canonical".into())
+    );
+    workbook.set_cell("Data", "B1", 12).unwrap();
+    let reopened = Workbook::from_bytes(workbook.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data", "B1").unwrap().value,
+        CellValue::Number(12.0)
+    );
+}
+
+#[test]
+fn equivalent_worksheet_zip_names_are_rejected_before_editing() {
+    let duplicate = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let original = fixture(
+        &format!("<sheets>{SHEET}</sheets>"),
+        RELATIONSHIP,
+        &[("XL/WORKSHEETS/SHEET1.XML", &duplicate)],
+    );
+    assert!(matches!(
+        Workbook::from_bytes(original),
+        Err(sheetpatch::Error::InvalidWorkbook(message)) if message.contains("ambiguous equivalent OPC part names")
+    ));
 }
