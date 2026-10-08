@@ -677,9 +677,10 @@ fn cli_help_version_and_usage_have_stable_exit_codes() {
     assert!(String::from_utf8(result.stderr).unwrap().contains("Usage:"));
 }
 
-#[cfg(unix)]
+// macOS rejects invalid UTF-8 filenames, so exercise native byte paths on Linux.
+#[cfg(target_os = "linux")]
 #[test]
-fn cli_accepts_non_unicode_paths_and_reports_non_unicode_text() {
+fn cli_accepts_non_unicode_paths() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     let directory = TempDir::new();
@@ -706,7 +707,18 @@ fn cli_accepts_non_unicode_paths_and_reports_non_unicode_text() {
             .value,
         CellValue::Number(123.0)
     );
+}
 
+#[cfg(unix)]
+#[test]
+fn cli_rejects_non_unicode_text_without_modifying_output() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    fs::write(&output, b"existing output").unwrap();
     let before = fs::read(&output).unwrap();
     let invalid = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
         .arg("set")
