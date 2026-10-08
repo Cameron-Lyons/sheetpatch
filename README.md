@@ -163,10 +163,11 @@ handled in the crate so untouched records can remain unchanged.
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo build --locked --release
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo build --locked --release --all-targets --all-features
 cargo package --locked
 ```
 
@@ -182,7 +183,7 @@ checks Cargo dependencies and GitHub Actions weekly.
 Batch edits parse each affected worksheet once and apply all XML changes in one
 pass. Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
 scans. Streaming saves hold one replacement compressed part at a time, in
-addition to the input archive and pending worksheet XML.
+addition to the input archive, cached original XML, and pending worksheet XML.
 
 Run the dependency-free benchmark with:
 
