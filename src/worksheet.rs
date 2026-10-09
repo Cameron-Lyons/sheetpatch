@@ -951,7 +951,49 @@ fn validate_ranges(
     ranges: &[Range],
     merged: bool,
 ) -> Result<()> {
-    let mut events = Vec::with_capacity(ranges.len() * if merged { 4 } else { 2 });
+    if cells.is_empty() || ranges.is_empty() {
+        return Ok(());
+    }
+    let violation = |cell: CellRef| {
+        unsupported(if merged {
+            format!("{cell} is not the anchor of its merged range")
+        } else {
+            format!("{cell} belongs to a formula range")
+        })
+    };
+    // With either dimension small, direct membership checks cost less than
+    // sorting events and allocating a column index. Large batches still use
+    // the sweep so their work does not grow as cells times ranges.
+    if cells.len() <= 8 || ranges.len() <= 8 || cells.len().saturating_mul(ranges.len()) <= 256 {
+        for &cell in cells.keys() {
+            if ranges
+                .iter()
+                .any(|range| range.contains(cell) && (!merged || cell != range.first))
+            {
+                return Err(violation(cell));
+            }
+        }
+        return Ok(());
+    }
+    let first_row = cells.first_key_value().unwrap().0.row;
+    let last_row = cells.last_key_value().unwrap().0.row;
+    let (first_column, last_column) = cells.keys().fold((u16::MAX, 0), |(first, last), cell| {
+        (first.min(cell.column), last.max(cell.column))
+    });
+    // A rectangle outside the edited envelope cannot contain a requested
+    // cell. Count relevant ranges before reserving event storage, so unrelated
+    // worksheet ranges add no memory overhead to a batch.
+    let relevant_ranges = ranges.iter().filter(|range| {
+        range.first.row <= last_row
+            && range.last.row >= first_row
+            && range.first.column <= last_column
+            && range.last.column >= first_column
+    });
+    let relevant_count = relevant_ranges.clone().count();
+    if relevant_count == 0 {
+        return Ok(());
+    }
+    let mut events = Vec::with_capacity(relevant_count * if merged { 4 } else { 2 });
     let mut add_range = |first_row, last_row, first_column, last_column| {
         if first_row <= last_row && first_column <= last_column {
             events.push(GuardEvent {
@@ -968,7 +1010,7 @@ fn validate_ranges(
             });
         }
     };
-    for range in ranges {
+    for range in relevant_ranges {
         if merged {
             // The anchor remains editable; the rest of its rectangle does not.
             add_range(
@@ -1020,11 +1062,7 @@ fn validate_ranges(
             index &= index - 1;
         }
         if count > 0 {
-            return Err(unsupported(if merged {
-                format!("{cell} is not the anchor of its merged range")
-            } else {
-                format!("{cell} belongs to a formula range")
-            }));
+            return Err(violation(cell));
         }
     }
     Ok(())
@@ -2320,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn range_sweep_matches_rectangle_membership_with_overlapping_ranges() {
+    fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
         let mut seed = 17u32;
         let mut next = || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -2357,6 +2395,13 @@ mod tests {
                         .is_err(),
                         blocked
                     );
+                    // The same target in a large batch exercises the event
+                    // sweep. Other cells lie past every generated rectangle.
+                    let mut batch: BTreeMap<_, _> = (40..=70)
+                        .map(|row| (CellRef { row, column: 1 }, CellValue::Blank))
+                        .collect();
+                    batch.insert(cell, CellValue::Blank);
+                    assert_eq!(validate_ranges(&batch, &ranges, merged).is_err(), blocked);
                 }
             }
         }
@@ -2386,5 +2431,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() {
+        let mut ranges = vec![
+            Range {
+                first: "AF1".parse().unwrap(),
+                last: "AG30".parse().unwrap(),
+            };
+            40
+        ];
+        ranges.push(Range {
+            first: "B15".parse().unwrap(),
+            last: "F15".parse().unwrap(),
+        });
+        let mut cells: BTreeMap<_, _> = (1..=10)
+            .chain([30])
+            .map(|row| (CellRef::new(row, 26).unwrap(), CellValue::Blank))
+            .collect();
+        cells.insert("C15".parse().unwrap(), CellValue::Blank);
+        for merged in [false, true] {
+            let error = validate_ranges(&cells, &ranges, merged).unwrap_err();
+            assert!(error.to_string().contains("C15"));
+        }
+        cells.remove(&"C15".parse().unwrap());
+        cells.insert("B15".parse().unwrap(), CellValue::Blank);
+        assert!(validate_ranges(&cells, &ranges, true).is_ok());
+        assert!(validate_ranges(&cells, &ranges, false).is_err());
+        ranges.push(Range {
+            first: "A15".parse().unwrap(),
+            last: "D15".parse().unwrap(),
+        });
+        let error = validate_ranges(&cells, &ranges, true).unwrap_err();
+        assert!(error.to_string().contains("B15"));
     }
 }

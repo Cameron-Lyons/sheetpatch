@@ -243,7 +243,19 @@ impl Workbook {
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        let cell = address.parse()?;
+        self.set_cell_at(sheet, address.parse()?, value)
+    }
+
+    /// Set a scalar value using an already validated, one-based cell address.
+    ///
+    /// The value and worksheet restrictions are checked before applying changes,
+    /// just as with [`Self::set_cell`]. No A1 string conversion is needed.
+    pub fn set_cell_at(
+        &mut self,
+        sheet: &str,
+        cell: CellRef,
+        value: impl Into<CellValue>,
+    ) -> Result<()> {
         let value = value.into();
         value.validate()?;
         let index = self.sheet_index(sheet)?;
@@ -260,9 +272,36 @@ impl Workbook {
         V: Into<CellValue>,
     {
         let index = self.sheet_index(sheet)?;
+        self.set_cells_in_sheet(
+            index,
+            cells
+                .into_iter()
+                .map(|(address, value)| address.as_ref().parse().map(|cell| (cell, value))),
+        )
+    }
+
+    /// Apply a batch using typed addresses, parsing the worksheet once.
+    ///
+    /// Duplicate addresses use the last value, but every value is validated.
+    /// The entire batch commits only after every edit succeeds. An empty batch
+    /// still requires an existing worksheet. No A1 string conversions are needed.
+    pub fn set_cells_at<I, V>(&mut self, sheet: &str, cells: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (CellRef, V)>,
+        V: Into<CellValue>,
+    {
+        let index = self.sheet_index(sheet)?;
+        self.set_cells_in_sheet(index, cells.into_iter().map(Ok))
+    }
+
+    fn set_cells_in_sheet<I, V>(&mut self, index: usize, cells: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<(CellRef, V)>>,
+        V: Into<CellValue>,
+    {
         let mut values = BTreeMap::new();
-        for (address, value) in cells {
-            let cell = address.as_ref().parse()?;
+        for cell in cells {
+            let (cell, value) = cell?;
             let value = value.into();
             value.validate()?;
             values.insert(cell, value);
@@ -328,7 +367,19 @@ impl Workbook {
     /// Read a cell's current value, cached formula result, and style index.
     /// Missing cells return a blank value without modifying the workbook.
     pub fn get_cell(&self, sheet: &str, address: &str) -> Result<CellContent> {
-        Ok(self.get_cells(sheet, [address])?.remove(0))
+        let index = self.sheet_index(sheet)?;
+        Ok(self
+            .read_cells_in_sheet(index, &[address.parse()?])?
+            .remove(0))
+    }
+
+    /// Read a cell using an already validated, one-based address.
+    ///
+    /// Returns the current scalar value, cached formula result, and style index,
+    /// just as with [`Self::get_cell`]. Missing cells return a blank value.
+    pub fn get_cell_at(&self, sheet: &str, cell: CellRef) -> Result<CellContent> {
+        let index = self.sheet_index(sheet)?;
+        Ok(self.read_cells_in_sheet(index, &[cell])?.remove(0))
     }
 
     /// Read many cells with one worksheet parse, retaining input order.
@@ -342,6 +393,25 @@ impl Workbook {
             .into_iter()
             .map(|address| address.as_ref().parse())
             .collect::<Result<Vec<CellRef>>>()?;
+        self.read_cells_in_sheet(index, &cells)
+    }
+
+    /// Read a batch using typed addresses, parsing the worksheet once.
+    ///
+    /// Input order and duplicates are retained; missing cells return blanks.
+    /// An empty batch still requires an existing worksheet. No A1 string
+    /// conversions are needed.
+    pub fn get_cells_at(
+        &self,
+        sheet: &str,
+        cells: impl IntoIterator<Item = CellRef>,
+    ) -> Result<Vec<CellContent>> {
+        let index = self.sheet_index(sheet)?;
+        let cells: Vec<CellRef> = cells.into_iter().collect();
+        self.read_cells_in_sheet(index, &cells)
+    }
+
+    fn read_cells_in_sheet(&self, index: usize, cells: &[CellRef]) -> Result<Vec<CellContent>> {
         if cells.is_empty() {
             return Ok(Vec::new());
         }
@@ -351,7 +421,7 @@ impl Workbook {
             .map(Vec::as_slice)
             .map(Ok)
             .unwrap_or_else(|| self.original_sheet(index))?;
-        read_cells(xml, &cells, || self.shared_strings())
+        read_cells(xml, cells, || self.shared_strings())
     }
 
     /// Whether any package parts have pending edits.

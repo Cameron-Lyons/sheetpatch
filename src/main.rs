@@ -10,7 +10,29 @@ use std::{
 
 use sheetpatch::{CellContent, CellEdit, CellRef, CellValue, Workbook};
 
-const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch --help\n  sheetpatch --version\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\n--json returns an array: list includes names and paths; get includes types, values, formulas and styles.";
+const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\n--json returns an array: list includes names and paths; get includes types, values, formulas and styles.";
+
+fn command_help(command: &str) -> Option<&'static str> {
+    match command {
+        "help" => Some(USAGE),
+        "list" => Some(
+            "Usage: sheetpatch list [--json] INPUT\n\nList editable worksheets in workbook order. --json includes each worksheet's name and package path.",
+        ),
+        "get" => Some(
+            "Usage: sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n\nRead A1 addresses in input order with one worksheet parse. Names are case-sensitive; addresses accept lowercase letters. Formula results are stored caches, without recalculation. --json includes normalized addresses, scalar types, values, formulas and style indices. Blank values use null in JSON and an empty line in plain output.",
+        ),
+        "set" => Some(
+            "Usage:\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n\nSet one scalar cell value and save atomically. Text stays text even when it starts with =. Numbers must be finite; booleans are true or false; error tokens include #N/A and #DIV/0!. Blank clears the value while retaining formatting. Formula cells and merged-range followers are protected. INPUT and OUTPUT may be the same path.",
+        ),
+        "patch" => Some(
+            "Usage:\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n\nApply a transaction of tab-separated SHEET, CELL, TYPE and VALUE fields. Types: text, number, bool, error, blank. Blank may omit VALUE. Duplicate cells use the last value. Text retains extra tabs and trailing whitespace. UTF-8 BOM and CRLF files are accepted; empty lines and tab-free lines starting with # are ignored. Use - as PATCH.tsv to read standard input. --check validates the complete transaction and output generation without saving; success reports the number of patch rows. Check and apply both use the same edit protections and ZIP limits.",
+        ),
+        "compact" => Some(
+            "Usage: sheetpatch compact INPUT OUTPUT\n\nRemove safely recognized obsolete ZIP records and save atomically. Unknown archive prefixes or gaps are protected. Compaction retains untouched active records, does not calculate formulas, and does not securely erase copies or filesystem history. INPUT and OUTPUT may be the same path.",
+        ),
+        _ => None,
+    }
+}
 
 #[derive(Debug)]
 enum Failure {
@@ -99,6 +121,14 @@ fn text_arg(args: &[OsString], index: usize) -> Result<&str, Failure> {
         .ok_or_else(|| Failure::Usage(format!("Argument {index} must be valid Unicode text.")))
 }
 
+fn patch_arg(path: &OsString) -> Result<Vec<CellEdit>, Failure> {
+    if path == "-" {
+        read_patch(io::stdin().lock())
+    } else {
+        read_patch(BufReader::new(File::open(path)?))
+    }
+}
+
 fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")?;
     let mut start = 0;
@@ -143,8 +173,7 @@ fn write_json_cell(
 ) -> io::Result<()> {
     output.write_all(b"{\"sheet\":")?;
     write_json_string(output, sheet)?;
-    output.write_all(b",\"cell\":")?;
-    write_json_string(output, &cell.to_string())?;
+    write!(output, ",\"cell\":\"{cell}\"")?;
     let kind = match content.value {
         CellValue::Text(_) => "text",
         CellValue::Number(_) => "number",
@@ -173,6 +202,13 @@ fn write_json_cell(
 }
 
 fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
+    if args.len() == 3
+        && matches!(args[2].to_str(), Some("--help" | "-h"))
+        && let Some(help) = args[1].to_str().and_then(command_help)
+    {
+        writeln!(output, "{help}")?;
+        return Ok(());
+    }
     match args.get(1).and_then(|arg| arg.to_str()) {
         Some("--help" | "-h") if args.len() == 2 => {
             writeln!(output, "{USAGE}")?;
@@ -180,6 +216,16 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
         }
         Some("--version" | "-V") if args.len() == 2 => {
             writeln!(output, "sheetpatch {}", env!("CARGO_PKG_VERSION"))?;
+            Ok(())
+        }
+        Some("help") if args.len() == 2 || args.len() == 3 => {
+            let help = if args.len() == 2 {
+                USAGE
+            } else {
+                command_help(text_arg(args, 2)?)
+                    .ok_or_else(|| Failure::Usage("Unknown command for help.".into()))?
+            };
+            writeln!(output, "{help}")?;
             Ok(())
         }
         Some("list") => {
@@ -228,7 +274,7 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let workbook = Workbook::open(&args[input_index])?;
-            let contents = workbook.get_cells(sheet, cells.iter().map(ToString::to_string))?;
+            let contents = workbook.get_cells_at(sheet, cells.iter().copied())?;
             if json {
                 output.write_all(b"[")?;
             }
@@ -263,14 +309,18 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
             Ok(())
         }
         Some("patch") if args.len() == 5 => {
-            let edits = if args[4] == "-" {
-                read_patch(io::stdin().lock())?
-            } else {
-                read_patch(BufReader::new(File::open(&args[4])?))?
-            };
-            let mut workbook = Workbook::open(&args[2])?;
+            let check = args[2] == "--check";
+            let edits = patch_arg(&args[4])?;
+            let count = edits.len();
+            let mut workbook = Workbook::open(&args[if check { 3 } else { 2 }])?;
             workbook.apply_edits(edits)?;
-            workbook.save(&args[3])?;
+            if check {
+                workbook.write_to(io::sink())?;
+                let noun = if count == 1 { "row" } else { "rows" };
+                writeln!(output, "Validated {count} patch {noun}.")?;
+            } else {
+                workbook.save(&args[3])?;
+            }
             Ok(())
         }
         Some("compact") if args.len() == 4 => {

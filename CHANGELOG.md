@@ -17,12 +17,22 @@ workbooks. See README.md for the preservation contract and supported scope.
 - CLI reads accept multiple cells with one worksheet parse and preserve input
   order. `get --json` includes scalar types, values, stored formulas, and styles;
   `list --json` exposes worksheet names and package paths for scripts.
+- `patch --check` validates a complete edit transaction and output generation
+  against workbook protections and ZIP limits without writing a file, with
+  support for TSV files and stdin.
+- Per-command help is available through `help COMMAND` and `COMMAND --help`/`-h`.
+- Typed `get_cell_at`, `get_cells_at`, `set_cell_at`, and `set_cells_at` APIs accept
+  validated `CellRef` values directly. CLI batch reads use the typed path, avoiding
+  address conversion and reparsing; JSON addresses are formatted without temporary
+  strings.
 - Invalid CLI addresses and values are reported as usage errors before opening
   a workbook; failed batch reads produce no partial output.
 - Relationship URI resolution rejects directory targets and unresolved empty
   path segments, preventing malformed targets from aliasing valid package parts.
 - ZIP patched-data entries stay opaque; reading, editing, and deleting obsolete
   patched records during compaction are refused.
+- Compaction recognizes obsolete Stored records whose payload contains header
+  and descriptor-like bytes, retaining neighboring active parts unchanged.
 - Worksheet numeric attributes and scalar values accept surrounding XML
   whitespace, including shared-formula indices, styles, and shared-string indices.
 - Shared-string and rich-text reads reject content hidden in unsupported XML

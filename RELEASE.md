@@ -54,17 +54,21 @@ UI or execute VBA.
 
 Local candidate verification on 2026-10-09 passed with Rust 1.99.0 on Linux:
 
-- Formatting, strict Clippy, all 130 tests, both documentation examples,
+- Formatting, strict Clippy, all 141 tests, both documentation examples,
   documentation with warnings denied, and release builds.
 - Offline packaging verified the extracted library and CLI build.
 - Python's independent JSON parser verified CLI sheet listing and batched cell
   inspection, including Unicode, multiline text, all scalar types, formula caches,
   styles, and duplicate input order.
 - LibreOffice export/edit/reopen checks for default and compact saves.
+- Typed cell reads and writes, patch checks including output-size limits,
+  command help, and range/compaction regressions are covered by the tests.
+- The benchmark verifies string and typed batches, reads, streaming saves,
+  compaction, and edits alongside 20,000 merged ranges before measuring.
 
 The local checks used source-path overrides for clean upstream checkouts of
-`quick-xml` 0.42.0, `flate2` 1.1.10, and `crc32fast` 1.5.2. Their published crate
-archives are not cached and the local registry download failed because
+`quick-xml` 0.42.0, `flate2` 1.1.10, and `crc32fast` 1.5.2. The local cache lacks
+the `quick-xml` archive and registry downloads failed because
 `static.crates.io` could not resolve. This verifies those source versions, but
 does not verify the downloaded registry artifacts. Rust 1.88.0 is not installed
 locally, and this workspace has no Git metadata.
@@ -72,10 +76,10 @@ The standard offline installation from the extracted package also needs those
 uncached registry archives. The CI package job checks installation and JSON
 inspection of the extracted crate using registry dependencies.
 
-The remote baseline commit `2033e1ec5dca206a235fa877e240441ade97672d` passed its
-[complete CI run](https://github.com/Cameron-Lyons/sheetpatch/actions/runs/37904888595),
+The prior candidate commit `baec0b17f234da07a6ac04ac2a53dca202a487df` passed its
+[complete CI run](https://github.com/Cameron-Lyons/sheetpatch/actions/runs/37906791252),
 including Linux/macOS/Windows, Rust 1.88.0, registry packaging and publishing dry
-run, and LibreOffice interoperability. That baseline predates the latest candidate
+run, extracted-package installation, and LibreOffice interoperability. That commit predates the latest candidate
 changes; require the complete CI matrix and registry checks for the final candidate
 commit before publication.
 

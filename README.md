@@ -21,7 +21,7 @@ sheetpatch = "1.0"
 For an unpublished checkout, use `sheetpatch = { path = "/path/to/sheetpatch" }`.
 
 ```rust,no_run
-use sheetpatch::{CellEdit, CellValue, Workbook};
+use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 fn main() -> sheetpatch::Result<()> {
     let mut book = Workbook::open("report.xlsm")?;
@@ -35,6 +35,10 @@ fn main() -> sheetpatch::Result<()> {
     book.set_cell("Summary", "D2", true)?;
     book.set_cell("Summary", "E2", CellValue::Blank)?;
 
+    // Typed addresses use one-based row and column numbers.
+    let target = CellRef::new(5, 3)?;
+    book.set_cell_at("Summary", target, 37.5)?;
+
     // A batch parses each affected worksheet once.
     book.set_cells("Summary", [("C3", 12.5), ("C4", 25.0)])?;
 
@@ -44,7 +48,7 @@ fn main() -> sheetpatch::Result<()> {
         CellEdit::new("Summary", "B4", "Approved")?,
     ])?;
 
-    let cell = book.get_cell("Summary", "C3")?;
+    let cell = book.get_cell_at("Summary", target)?;
     println!("{:?}", cell.value);
 
     book.save("report-edited.xlsm")?;
@@ -77,7 +81,10 @@ and `style_index`. `get_cells` reads multiple addresses with one worksheet parse
 preserving input order. Shared strings and rich text are decoded without changing
 the workbook; formula values are cached results. Shared-formula follower cells
 may contain empty stored formula text. `CellRef::new(row, column)` supports typed,
-one-based addresses and `CellEdit::at` accepts them directly.
+one-based addresses. `get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`,
+and `CellEdit::at` accept them directly, avoiding conversion through A1 strings.
+Typed batches preserve input order for reads and use the last value for duplicate
+edits, with the same transaction and value validation rules as A1 batches.
 
 `write_to` streams a workbook to any `std::io::Write` implementation. File saves
 use that same path, avoiding allocation of another complete ZIP. Worksheets are
@@ -103,7 +110,10 @@ cargo build --release --locked
 ./target/release/sheetpatch get --json report.xlsm Summary B2 C2 D2
 ./target/release/sheetpatch patch report.xlsm edited.xlsm edits.tsv
 ./target/release/sheetpatch patch report.xlsm edited.xlsm - < edits.tsv
+./target/release/sheetpatch patch --check report.xlsm edits.tsv
+./target/release/sheetpatch patch --check report.xlsm - < edits.tsv
 ./target/release/sheetpatch compact edited.xlsm compact.xlsm
+./target/release/sheetpatch help patch
 ```
 
 `get` accepts one or more addresses and prints each current scalar value in input
@@ -123,10 +133,21 @@ use UTF-8; BOM and CRLF files are supported. Empty lines and tab-free lines
 beginning with `#` are ignored. Literal multiline values use the Rust API. Invalid rows report their
 line number and leave the destination unchanged.
 
+`patch --check` validates the complete transaction and output generation,
+including worksheet names, formula protection, merged ranges, value metadata,
+and ZIP size limits, without saving. It reports the number of input edit rows,
+including duplicates.
+The same patch can then be applied with `patch INPUT OUTPUT PATCH.tsv`. Check mode
+accepts a file or standard input and returns the same validation errors as an
+actual edit. Generated ZIP bytes are streamed to a sink; no complete output
+archive is allocated or written to disk. An empty patch succeeds for a supported workbook.
+
 `--help` (`-h`) and `--version` (`-V`) exit successfully. Invalid command syntax,
 addresses or values, patch syntax, or non-Unicode text arguments exit with code 2; workbook and I/O
 errors exit with code 1. Native filesystem paths are accepted even when they
 cannot be represented as Unicode. Output handles a closed pipe without a panic.
+`help COMMAND` and `COMMAND --help` (`-h`) show focused command instructions;
+`help` shows the full command list.
 
 Each `set` invocation starts from its input workbook. To accumulate CLI edits,
 use the previous output as the next input, or use the same input and output path.
@@ -232,7 +253,10 @@ checks Cargo dependencies and GitHub Actions weekly.
 ## Performance
 
 Batch edits parse each affected worksheet once and apply all XML changes in one
-pass. Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
+pass. Formula and merged-range guards use direct membership checks for small
+collections of edits or ranges. Larger batches exclude ranges outside the edited
+cells' bounding rectangle before allocating a sweep index.
+Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
 scans. ZIP physical order is cached for repeated saves, and worksheet parsing
 borrows names and attribute values from the original XML. Direct children use
 ranges in the parse index, avoiding an allocation for each parent. Edits that

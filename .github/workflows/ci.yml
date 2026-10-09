@@ -110,6 +110,13 @@ jobs:
           assert cells[0]["value"] == "Original text" and cells[0]["style_index"] == 1
           assert cells[1]["value"] == 25 and cells[1]["formula"] == "B1*2"
           assert cells[2]["type"] == "blank" and cells[2]["value"] is None
+          checked = subprocess.run(
+              [str(binary), "patch", "--check", str(fixture), "-"],
+              input="Data\tA1\ttext\tValidated through installed CLI\n",
+              text=True, capture_output=True, check=True,
+          )
+          assert checked.stdout == "Validated 1 patch row.\n" and not checked.stderr
+          assert "--check" in subprocess.check_output([str(binary), "help", "patch"], text=True)
           PY
 
   interoperability:
