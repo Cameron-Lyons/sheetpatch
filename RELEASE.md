@@ -19,6 +19,7 @@ cargo test --locked --all-targets --all-features
 cargo test --locked --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 cargo build --locked --release --all-targets --all-features
+SHEETPATCH_BENCH_SAMPLES=1 cargo bench --locked --bench editing
 cargo package --locked
 cargo publish --locked --dry-run
 ```
@@ -51,20 +52,44 @@ UI or execute VBA.
 
 ## Publication
 
-Local candidate verification on 2026-10-08 passed with Rust 1.99.0 on Linux:
+Local candidate verification on 2026-10-09 passed with Rust 1.99.0 on Linux:
 
-- Formatting, strict Clippy, all 102 tests, both documentation examples,
+- Formatting, strict Clippy, all 141 tests, both documentation examples,
   documentation with warnings denied, and release builds.
-- Offline packaging and the complete test suite in the extracted crate.
-- Installation from the extracted crate, version output, and a fixture read.
-- LibreOffice export/edit/reopen checks for default and compact saves, plus
-  independent reopens of edits to a workbook with URI-escaped worksheet names.
+- Offline packaging verified the extracted library and CLI build.
+- Python's independent JSON parser verified CLI sheet listing and batched cell
+  inspection, including Unicode, multiline text, all scalar types, formula caches,
+  styles, and duplicate input order.
+- LibreOffice export/edit/reopen checks for default and compact saves.
+- Typed cell reads and writes, patch checks including output-size limits,
+  command help, and range/compaction regressions are covered by the tests.
+- The benchmark verifies string and typed batches, reads, streaming saves,
+  compaction, and edits alongside 20,000 merged ranges before measuring.
 
-These results cover the local candidate. Git metadata and remote CI results are
-unavailable in this workspace. Rust 1.88.0 is not installed, and its download and
-the online publishing dry run failed because network hostnames could not resolve.
-Before publication, require the configured Windows/macOS/MSRV CI jobs and the
-online dry run to pass for the final candidate commit.
+The local checks used source-path overrides for clean upstream checkouts of
+`quick-xml` 0.42.0, `flate2` 1.1.10, and `crc32fast` 1.5.2. The local cache lacks
+the `quick-xml` archive and registry downloads failed because
+`static.crates.io` could not resolve. This verifies those source versions, but
+does not verify the downloaded registry artifacts. Rust 1.88.0 is not installed
+locally, and this workspace has no Git metadata.
+The standard offline installation from the extracted package also needs those
+uncached registry archives. The CI package job checks installation and JSON
+inspection of the extracted crate using registry dependencies.
+
+The prior candidate commit `baec0b17f234da07a6ac04ac2a53dca202a487df` passed its
+[complete CI run](https://github.com/Cameron-Lyons/sheetpatch/actions/runs/37906791252),
+including Linux/macOS/Windows, Rust 1.88.0, registry packaging and publishing dry
+run, extracted-package installation, and LibreOffice interoperability. That commit predates the latest candidate
+changes; require the complete CI matrix and registry checks for the final candidate
+commit before publication.
+
+A manual review of the [RustSec package index](https://rustsec.org/packages/)
+on 2026-10-09 found no applicable advisories for the eight dependencies in the
+candidate Cargo.lock. The two listed `quick-xml` advisories
+([RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html) and
+[RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html)) are
+patched in versions 0.41.0 and later; the candidate uses 0.42.0. Repeat the review
+if dependencies change or publication occurs later.
 
 1. Confirm Cargo.toml and Cargo.lock both contain `1.0.0`, and update the changelog
    from release candidate to the actual release date.
