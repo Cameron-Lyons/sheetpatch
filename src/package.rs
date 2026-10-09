@@ -491,8 +491,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                     return Err(Error::Xml("XML nesting exceeds 256 levels".into()));
                 }
                 let name = e.name();
-                let name =
-                    std::str::from_utf8(name.as_ref()).map_err(|e| Error::Xml(e.to_string()))?;
+                let name = name.as_ref();
                 if !valid_qname(name) || name.starts_with("xmlns:") {
                     return Err(Error::Xml("invalid XML element name".into()));
                 }
@@ -503,27 +502,21 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 let mut keys = BTreeSet::new();
                 for attr in e.attributes() {
                     let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
-                    let name = std::str::from_utf8(attr.key.as_ref())
-                        .map_err(|e| Error::Xml(e.to_string()))?;
+                    let name = attr.key.as_ref();
                     if !valid_qname(name) {
                         return Err(Error::Xml("invalid XML attribute name".into()));
                     }
-                    if attr.value.contains(&b'<') {
+                    if attr.value.contains('<') {
                         return Err(Error::Xml("literal '<' in XML attribute value".into()));
                     }
                     let (resolved, local) = reader.resolver().resolve_attribute(attr.key);
                     let namespace = namespace(resolved)?;
-                    let local = std::str::from_utf8(local.as_ref())
-                        .map_err(|e| Error::Xml(e.to_string()))?
-                        .to_owned();
+                    let local = local.as_ref().to_owned();
                     if !keys.insert((namespace.clone(), local.clone())) {
                         return Err(Error::Xml("duplicate XML attribute".into()));
                     }
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )?
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
                         .into_owned();
                     if !value.chars().all(crate::xml::valid_char) {
                         return Err(Error::Xml("invalid XML attribute character".into()));
@@ -536,9 +529,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 }
                 let node = Node {
                     namespace: ns,
-                    local: std::str::from_utf8(e.local_name().as_ref())
-                        .map_err(|e| Error::Xml(e.to_string()))?
-                        .to_owned(),
+                    local: e.local_name().as_ref().to_owned(),
                     attributes,
                     parent: stack.last().copied(),
                 };
@@ -565,12 +556,10 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 ));
             }
             Event::Text(e) => {
-                if e.as_ref().windows(3).any(|s| s == b"]]>") {
+                if e.as_ref().contains("]]>") {
                     return Err(Error::Xml("CDATA terminator in XML text".into()));
                 }
-                if stack.is_empty()
-                    && !crate::xml::whitespace(std::str::from_utf8(e.as_ref()).unwrap())
-                {
+                if stack.is_empty() && !crate::xml::whitespace(e.as_ref()) {
                     return Err(Error::Xml("text outside XML root".into()));
                 }
             }
@@ -581,8 +570,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 if stack.is_empty() {
                     return Err(Error::Xml("content outside XML root".into()));
                 }
-                let reference =
-                    std::str::from_utf8(e.as_ref()).map_err(|e| Error::Xml(e.to_string()))?;
+                let reference = e.as_ref();
                 let spelling = format!("&{reference};");
                 let value = quick_xml::escape::unescape(&spelling)
                     .map_err(|e| Error::Xml(e.to_string()))?;
@@ -591,8 +579,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                 }
             }
             Event::PI(e) => {
-                let target =
-                    std::str::from_utf8(e.target()).map_err(|e| Error::Xml(e.to_string()))?;
+                let target = e.target();
                 if !crate::xml::valid_name(target) || target.eq_ignore_ascii_case("xml") {
                     return Err(Error::Xml(
                         "invalid XML processing-instruction target".into(),
