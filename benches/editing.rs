@@ -11,7 +11,7 @@ use std::{
 };
 
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
-use sheetpatch::{CellValue, Workbook};
+use sheetpatch::{CellRef, CellValue, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
@@ -46,6 +46,10 @@ fn worksheet(cells: usize, values: &BTreeMap<usize, i32>) -> Vec<u8> {
 
 fn fixture(cells: usize) -> Vec<u8> {
     let sheet = worksheet(cells, &BTreeMap::new());
+    fixture_with_sheet(&sheet)
+}
+
+fn fixture_with_sheet(sheet: &[u8]) -> Vec<u8> {
     let workbook = format!(
         "<workbook xmlns=\"{MAIN_NS}\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Data\" sheetId=\"1\" r:id=\"r1\"/></sheets></workbook>"
     );
@@ -64,7 +68,7 @@ fn fixture(cells: usize) -> Vec<u8> {
         ("_rels/.rels", b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='root' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
         ("xl/workbook.xml", workbook.as_bytes()),
         ("xl/_rels/workbook.xml.rels", b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='s1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles' Target='styles.xml'/></Relationships>"),
-        (SHEET_PATH, &sheet),
+        (SHEET_PATH, sheet),
         ("xl/styles.xml", b"<styleSheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><fonts count='1'><font/></fonts><fills count='2'><fill><patternFill patternType='none'/></fill><fill><patternFill patternType='gray125'/></fill></fills><borders count='1'><border/></borders><cellStyleXfs count='1'><xf/></cellStyleXfs><cellXfs count='1'><xf xfId='0'/></cellXfs></styleSheet>"),
         ("customXml/item1.xml", b"<opaque xmlns='urn:vendor' flag='keep'>unfamiliar XML</opaque>"),
         ("vendor/opaque.bin", &payload),
@@ -261,6 +265,73 @@ fn bulk(input: &[u8], edits: &[(String, CellValue)]) -> Workbook {
     book
 }
 
+fn bulk_at(input: &[u8], edits: &[(CellRef, CellValue)]) -> Workbook {
+    let mut book = Workbook::from_bytes(input.to_vec()).unwrap();
+    book.set_cells_at(
+        "Data",
+        edits.iter().map(|(cell, value)| (*cell, value.clone())),
+    )
+    .unwrap();
+    book
+}
+
+fn guarded_worksheet(cells: usize, values: &BTreeMap<usize, i32>) -> Vec<u8> {
+    let mut merges = format!("<mergeCells count=\"{cells}\">");
+    for row in 1..=cells {
+        write!(merges, "<mergeCell ref=\"A{row}:D{row}\"/>").unwrap();
+    }
+    merges.push_str("</mergeCells>");
+    String::from_utf8(worksheet(cells, values))
+        .unwrap()
+        .replace("r=\"A", "r=\"E")
+        .replace("ref=\"A1:A", "ref=\"E1:E")
+        .replace("</sheetData>", &format!("</sheetData>{merges}"))
+        .into_bytes()
+}
+
+fn guarded_batches(samples: usize) {
+    let cells = 20_000;
+    let input = fixture_with_sheet(&guarded_worksheet(cells, &BTreeMap::new()));
+    for count in [1, 500] {
+        let rows: Vec<_> = if count == 1 {
+            vec![10_000]
+        } else {
+            (0..count).map(|index| 1 + index * cells / count).collect()
+        };
+        let edits: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, &row)| {
+                (
+                    CellRef::new(row as u32, 5).unwrap(),
+                    CellValue::Number(-((index + 1) as f64)),
+                )
+            })
+            .collect();
+        let values = rows
+            .iter()
+            .enumerate()
+            .map(|(index, &row)| (row, -((index + 1) as i32)))
+            .collect();
+        let mut edited = bulk_at(&input, &edits);
+        let output = edited.to_bytes().unwrap();
+        verify_output(&input, &output, &guarded_worksheet(cells, &values));
+        assert!(
+            edited
+                .set_cell_at("Data", CellRef::new(10_000, 3).unwrap(), 42)
+                .is_err()
+        );
+        assert_eq!(edited.to_bytes().unwrap(), output);
+        report(
+            "guarded_bulk_at",
+            cells,
+            count,
+            samples,
+            measure(samples, || bulk_at(&input, &edits)),
+        );
+    }
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         println!("Run cargo bench --bench editing for release-profile measurements.");
@@ -271,10 +342,17 @@ fn main() {
     for &(cells, count) in CASES {
         let input = fixture(cells);
         let edits = updates(cells, count);
+        let typed_edits: Vec<_> = edits
+            .iter()
+            .map(|(address, value)| (address.parse::<CellRef>().unwrap(), value.clone()))
+            .collect();
         let expected = expected(cells, count);
         let sequential = sequential(&input, &edits);
         let batched = bulk(&input, &edits);
         let output = batched.to_bytes().unwrap();
+        let typed = bulk_at(&input, &typed_edits);
+        verify_output(&input, &typed.to_bytes().unwrap(), &expected);
+        assert_eq!(typed.to_bytes().unwrap(), output);
         verify_output(&input, &sequential.to_bytes().unwrap(), &expected);
         verify_output(&input, &output, &expected);
         let mut streamed = Vec::new();
@@ -284,6 +362,10 @@ fn main() {
         verify_output(&input, &compact, &expected);
         let addresses: Vec<_> = edits.iter().map(|(address, _)| address.as_str()).collect();
         let values = batched.get_cells("Data", &addresses).unwrap();
+        let typed_values = typed
+            .get_cells_at("Data", typed_edits.iter().map(|(cell, _)| *cell))
+            .unwrap();
+        assert_eq!(typed_values, values);
         for (cell, (_, expected_value)) in values.iter().zip(&edits) {
             assert_eq!(&cell.value, expected_value);
         }
@@ -318,6 +400,24 @@ fn main() {
             count,
             samples,
             measure(samples, || batched.get_cells("Data", &addresses).unwrap()),
+        );
+        report(
+            "bulk_at",
+            cells,
+            count,
+            samples,
+            measure(samples, || bulk_at(&input, &typed_edits)),
+        );
+        report(
+            "get_cells_at",
+            cells,
+            count,
+            samples,
+            measure(samples, || {
+                typed
+                    .get_cells_at("Data", typed_edits.iter().map(|(cell, _)| *cell))
+                    .unwrap()
+            }),
         );
         report(
             "unchanged_bulk",
@@ -391,4 +491,5 @@ fn main() {
             compacted.len()
         );
     }
+    guarded_batches(samples);
 }

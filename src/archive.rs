@@ -402,6 +402,11 @@ impl Archive {
             .get(name)
             .map(|&index| &self.entries[index])
             .ok_or_else(|| invalid(format!("ZIP member is missing: {name}")))?;
+        if entry.flags & 0x20 != 0 {
+            return Err(Error::Unsupported(format!(
+                "patched ZIP member data in {name}"
+            )));
+        }
         if entry.size as usize > MAX_READ {
             return Err(Error::Unsupported(format!(
                 "ZIP member {name} exceeds the 64 MiB read limit"
@@ -565,7 +570,13 @@ impl Archive {
                     "ZIP member {name} exceeds the 64 MiB read limit"
                 )));
             }
-            let method = self.entries[index].method;
+            let entry = &self.entries[index];
+            if entry.flags & 0x20 != 0 {
+                return Err(Error::Unsupported(format!(
+                    "patched ZIP member data in {name}"
+                )));
+            }
+            let method = entry.method;
             if !matches!(method, 0 | 8) {
                 return Err(Error::Unsupported(format!(
                     "ZIP compression method {method} in {name}"
@@ -692,7 +703,7 @@ impl Archive {
         }
         let flags = u16_at(bytes, start + 6)?;
         let method = u16_at(bytes, start + 8)?;
-        if flags & (1 | 0x40 | 0x2000) != 0 || !matches!(method, 0 | 8) {
+        if flags & (1 | 0x20 | 0x40 | 0x2000) != 0 || !matches!(method, 0 | 8) {
             return Err(unsupported());
         }
         let local_crc = u32_at(bytes, start + 14)?;
@@ -768,8 +779,8 @@ impl Archive {
     }
 
     // Stored streams carry no end marker. Index descriptors immediately before
-    // local signatures or the central directory in a single pass; their size
-    // fields identify the possible payload start. The index avoids scanning
+    // recognizable local headers or the central directory in a single pass.
+    // Their size fields identify the possible payload start. The index avoids scanning
     // the rest of the archive separately for every obsolete streaming member.
     fn stored_descriptors(&self) -> StoredDescriptors {
         let mut descriptors = HashMap::new();
@@ -800,6 +811,12 @@ impl Archive {
                 let Some(data_start) = data_end.checked_sub(size as usize) else {
                     continue;
                 };
+                // A signature inside stored payload is not a record boundary.
+                // Only index descriptors whose following header could be an
+                // active member or an obsolete member compaction understands.
+                if boundary != self.central_start && !self.recognizable_local_header(boundary) {
+                    continue;
+                }
                 let descriptor = StoredDescriptor {
                     data_end,
                     end: boundary,
@@ -817,6 +834,38 @@ impl Archive {
             }
         }
         descriptors
+    }
+
+    fn recognizable_local_header(&self, start: usize) -> bool {
+        let check = || -> Option<bool> {
+            let name_start = start.checked_add(30)?;
+            if name_start > self.central_start {
+                return Some(false);
+            }
+            let name_length = u16_at(&self.original, start + 26).ok()? as usize;
+            let extra_length = u16_at(&self.original, start + 28).ok()? as usize;
+            let name_end = name_start.checked_add(name_length)?;
+            let data_start = name_end.checked_add(extra_length)?;
+            if data_start > self.central_start {
+                return Some(false);
+            }
+            let name = std::str::from_utf8(&self.original[name_start..name_end]).ok()?;
+            let entry = &self.entries[*self.index.get(name)?];
+            if entry.local_record.start == start {
+                // Archive::new already validated this active record, including
+                // opaque compression methods retained without decoding.
+                return Some(true);
+            }
+            let flags = u16_at(&self.original, start + 6).ok()?;
+            let method = u16_at(&self.original, start + 8).ok()?;
+            Some(
+                flags & (1 | 0x20 | 0x40 | 0x2000) == 0
+                    && matches!(method, 0 | 8)
+                    && method == entry.method
+                    && check_extra(&self.original[name_end..data_start]).is_ok(),
+            )
+        };
+        check().unwrap_or(false)
     }
 
     fn stored_orphan_end(
@@ -1352,6 +1401,54 @@ mod tests {
     }
 
     #[test]
+    fn patched_zip_members_remain_opaque_and_cannot_be_read_or_replaced() {
+        let mut patched = fixture(false);
+        let archive = Archive::new(patched.clone()).unwrap();
+        let central = archive.entries[0].central.start;
+        set_u16(&mut patched, 6, 0x20);
+        set_u16(&mut patched, central + 8, 0x20);
+        let original = combine(patched, decorate_fixture(b"keep.xml", false));
+        let archive = Archive::new(original.clone()).unwrap();
+        assert!(matches!(
+            archive.read("part.xml"),
+            Err(Error::Unsupported(message)) if message.contains("patched")
+        ));
+        assert_eq!(archive.read("keep.xml").unwrap(), b"<part/>");
+        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+        let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
+        let mut output = Vec::new();
+        assert!(matches!(
+            archive.write_to(&changes, &mut output),
+            Err(Error::Unsupported(message)) if message.contains("patched")
+        ));
+        assert!(output.is_empty());
+        let changes = BTreeMap::from([("keep.xml".into(), b"replacement".to_vec())]);
+        let output = archive.write(&changes).unwrap();
+        let reopened = Archive::new(output).unwrap();
+        assert_eq!(reopened.read("keep.xml").unwrap(), b"replacement");
+        let before = &archive.entries[archive.index["part.xml"]];
+        let after = &reopened.entries[reopened.index["part.xml"]];
+        assert_eq!(
+            reopened.original[after.local_record.clone()],
+            archive.original[before.local_record.clone()]
+        );
+    }
+
+    #[test]
+    fn compaction_never_discards_obsolete_patched_zip_members() {
+        let archive = Archive::new(fixture(false)).unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
+        let mut original = append(&archive, &changes);
+        set_u16(&mut original, 6, 0x20);
+        let archive = Archive::new(original.clone()).unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
+        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+        let mut output = Vec::new();
+        assert!(archive.compact_to(&BTreeMap::new(), &mut output).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn compaction_keeps_clean_archives_and_all_descriptor_forms_byte_identical() {
         let mut unsigned = fixture(true);
         let signed_offset = 30 + b"part.xml".len() + b"<part/>".len();
@@ -1495,6 +1592,51 @@ mod tests {
         for (name, expected) in changes {
             assert_eq!(compacted.read(&name).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn stored_orphan_payload_signatures_do_not_create_false_descriptor_ambiguity() {
+        let archive = Archive::new(fixture(true)).unwrap();
+        let entry = &archive.entries[0];
+        let mut payload = b"prefix".to_vec();
+        // These bytes mimic a descriptor pointing to the real payload start,
+        // but the following signature belongs to payload, not a local header.
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&6u32.to_le_bytes());
+        payload.extend_from_slice(&6u32.to_le_bytes());
+        payload.extend_from_slice(&LOCAL.to_le_bytes());
+        payload.extend_from_slice(b"ordinary payload after the signature");
+        let checksum = crc32(&payload);
+        let mut bytes = archive.original[entry.local_header.clone()].to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let central_start = bytes.len();
+        let mut central = archive.original[entry.central.clone()].to_vec();
+        set_u32(&mut central, 16, checksum);
+        set_u32(&mut central, 20, payload.len() as u32);
+        set_u32(&mut central, 24, payload.len() as u32);
+        bytes.extend_from_slice(&central);
+        let mut ending = archive.original[archive.end..].to_vec();
+        set_u32(&mut ending, 16, central_start as u32);
+        bytes.extend_from_slice(&ending);
+        let archive = Archive::new(combine(bytes, decorate_fixture(b"keep.xml", true))).unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), payload);
+        let opaque_record = archive.original[archive.entries[1].local_record.clone()].to_vec();
+        let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
+        let archive = Archive::new(append(&archive, &changes)).unwrap();
+        let mut compacted = Vec::new();
+        archive
+            .compact_to(&BTreeMap::new(), &mut compacted)
+            .unwrap();
+        let archive = Archive::new(compacted).unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
+        assert_eq!(
+            archive.original[archive.entries[1].local_record.clone()],
+            opaque_record
+        );
     }
 
     #[test]

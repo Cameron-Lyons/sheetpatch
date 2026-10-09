@@ -243,7 +243,19 @@ impl Workbook {
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        let cell = address.parse()?;
+        self.set_cell_at(sheet, address.parse()?, value)
+    }
+
+    /// Set a scalar value using an already validated, one-based cell address.
+    ///
+    /// The value and worksheet restrictions are checked before applying changes,
+    /// just as with [`Self::set_cell`]. No A1 string conversion is needed.
+    pub fn set_cell_at(
+        &mut self,
+        sheet: &str,
+        cell: CellRef,
+        value: impl Into<CellValue>,
+    ) -> Result<()> {
         let value = value.into();
         value.validate()?;
         let index = self.sheet_index(sheet)?;
@@ -260,9 +272,36 @@ impl Workbook {
         V: Into<CellValue>,
     {
         let index = self.sheet_index(sheet)?;
+        self.set_cells_in_sheet(
+            index,
+            cells
+                .into_iter()
+                .map(|(address, value)| address.as_ref().parse().map(|cell| (cell, value))),
+        )
+    }
+
+    /// Apply a batch using typed addresses, parsing the worksheet once.
+    ///
+    /// Duplicate addresses use the last value, but every value is validated.
+    /// The entire batch commits only after every edit succeeds. An empty batch
+    /// still requires an existing worksheet. No A1 string conversions are needed.
+    pub fn set_cells_at<I, V>(&mut self, sheet: &str, cells: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (CellRef, V)>,
+        V: Into<CellValue>,
+    {
+        let index = self.sheet_index(sheet)?;
+        self.set_cells_in_sheet(index, cells.into_iter().map(Ok))
+    }
+
+    fn set_cells_in_sheet<I, V>(&mut self, index: usize, cells: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<(CellRef, V)>>,
+        V: Into<CellValue>,
+    {
         let mut values = BTreeMap::new();
-        for (address, value) in cells {
-            let cell = address.as_ref().parse()?;
+        for cell in cells {
+            let (cell, value) = cell?;
             let value = value.into();
             value.validate()?;
             values.insert(cell, value);
@@ -328,7 +367,19 @@ impl Workbook {
     /// Read a cell's current value, cached formula result, and style index.
     /// Missing cells return a blank value without modifying the workbook.
     pub fn get_cell(&self, sheet: &str, address: &str) -> Result<CellContent> {
-        Ok(self.get_cells(sheet, [address])?.remove(0))
+        let index = self.sheet_index(sheet)?;
+        Ok(self
+            .read_cells_in_sheet(index, &[address.parse()?])?
+            .remove(0))
+    }
+
+    /// Read a cell using an already validated, one-based address.
+    ///
+    /// Returns the current scalar value, cached formula result, and style index,
+    /// just as with [`Self::get_cell`]. Missing cells return a blank value.
+    pub fn get_cell_at(&self, sheet: &str, cell: CellRef) -> Result<CellContent> {
+        let index = self.sheet_index(sheet)?;
+        Ok(self.read_cells_in_sheet(index, &[cell])?.remove(0))
     }
 
     /// Read many cells with one worksheet parse, retaining input order.
@@ -342,6 +393,25 @@ impl Workbook {
             .into_iter()
             .map(|address| address.as_ref().parse())
             .collect::<Result<Vec<CellRef>>>()?;
+        self.read_cells_in_sheet(index, &cells)
+    }
+
+    /// Read a batch using typed addresses, parsing the worksheet once.
+    ///
+    /// Input order and duplicates are retained; missing cells return blanks.
+    /// An empty batch still requires an existing worksheet. No A1 string
+    /// conversions are needed.
+    pub fn get_cells_at(
+        &self,
+        sheet: &str,
+        cells: impl IntoIterator<Item = CellRef>,
+    ) -> Result<Vec<CellContent>> {
+        let index = self.sheet_index(sheet)?;
+        let cells: Vec<CellRef> = cells.into_iter().collect();
+        self.read_cells_in_sheet(index, &cells)
+    }
+
+    fn read_cells_in_sheet(&self, index: usize, cells: &[CellRef]) -> Result<Vec<CellContent>> {
         if cells.is_empty() {
             return Ok(Vec::new());
         }
@@ -351,7 +421,7 @@ impl Workbook {
             .map(Vec::as_slice)
             .map(Ok)
             .unwrap_or_else(|| self.original_sheet(index))?;
-        read_cells(xml, &cells, || self.shared_strings())
+        read_cells(xml, cells, || self.shared_strings())
     }
 
     /// Whether any package parts have pending edits.
@@ -682,14 +752,30 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
             .map(|(p, _)| p.split('/').collect())
             .unwrap_or_default()
     };
-    for part in target.split('/') {
+    // Empty URI segments are significant: removing them changes both direct
+    // lookup and which segment a following '..' removes. Only the leading '/'
+    // denotes the package root. Retain a terminal directory separator after
+    // removing '.' or '..', so it cannot alias a file part.
+    let mut segments = target
+        .strip_prefix('/')
+        .unwrap_or(&target)
+        .split('/')
+        .peekable();
+    while let Some(part) = segments.next() {
         match part {
-            "" | "." => (),
+            "." => {
+                if segments.peek().is_none() {
+                    parts.push("");
+                }
+            }
             ".." => {
                 if parts.pop().is_none() {
                     return Err(Error::InvalidWorkbook(
                         "relationship target escapes package root".into(),
                     ));
+                }
+                if segments.peek().is_none() {
+                    parts.push("");
                 }
             }
             value => parts.push(value),
@@ -698,6 +784,11 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
     if parts.is_empty() {
         return Err(Error::InvalidWorkbook(
             "relationship target names no part".into(),
+        ));
+    }
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidWorkbook(
+            "relationship target contains an empty part-name segment".into(),
         ));
     }
     Ok(parts.join("/"))
@@ -823,6 +914,72 @@ mod tests {
             "",
         ] {
             assert!(resolve_target("books/main.xml", target).is_err());
+        }
+    }
+
+    #[test]
+    fn relationship_resolution_preserves_empty_segments_and_directory_targets() {
+        for target in [
+            "tabs//sheet.xml",
+            "tabs/sheet.xml/",
+            "tabs/sheet.xml/.",
+            "tabs/sheet.xml/child/..",
+            ".",
+            "..",
+        ] {
+            assert!(
+                resolve_target("books/main.xml", target).is_err(),
+                "{target}"
+            );
+        }
+        // An empty segment removed by a following '..' does not remove its
+        // preceding named segment. RFC URI resolution differs from collapsing
+        // every consecutive slash before resolving traversal.
+        assert_eq!(
+            resolve_target("books/main.xml", "tabs//../sheet.xml").unwrap(),
+            "books/tabs/sheet.xml"
+        );
+    }
+
+    #[test]
+    fn workbook_discovery_does_not_alias_invalid_relationship_paths() {
+        let archive =
+            Archive::new(include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec()).unwrap();
+        for (part, target, invalid_targets) in [
+            (
+                "_rels/.rels",
+                "xl/workbook.xml",
+                [
+                    "xl//workbook.xml",
+                    "xl/workbook.xml/",
+                    "xl/workbook.xml/.",
+                    "xl/workbook.xml/child/..",
+                ],
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                "worksheets/sheet1.xml",
+                [
+                    "worksheets//sheet1.xml",
+                    "worksheets/sheet1.xml/",
+                    "worksheets/sheet1.xml/.",
+                    "worksheets/sheet1.xml/child/..",
+                ],
+            ),
+        ] {
+            let xml = String::from_utf8(archive.read(part).unwrap()).unwrap();
+            assert!(xml.contains(target));
+            for invalid_target in invalid_targets {
+                let changes = BTreeMap::from([(
+                    part.to_owned(),
+                    xml.replace(target, invalid_target).into_bytes(),
+                )]);
+                let bytes = archive.write(&changes).unwrap();
+                assert!(
+                    Workbook::from_bytes(bytes).is_err(),
+                    "{part}: {invalid_target}"
+                );
+            }
         }
     }
     #[test]

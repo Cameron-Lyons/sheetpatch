@@ -12,8 +12,9 @@ use quick_xml::{
 };
 
 use crate::xml::{
-    excel_text, namespace as decoded_namespace, valid_char as valid_xml_char, valid_name,
-    valid_qname, validate_declaration, validate_namespaces, whitespace as xml_whitespace,
+    excel_text, namespace as decoded_namespace, trim_whitespace as trim_xml_whitespace,
+    valid_char as valid_xml_char, valid_name, valid_qname, validate_declaration,
+    validate_namespaces, whitespace as xml_whitespace,
 };
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 
@@ -544,10 +545,13 @@ fn patched_cell<'a>(
         let old = &elements[child];
         match value {
             CellValue::Number(number) if kind == "n" && old.is(namespace, "v") => {
-                element_text(xml, old)?.trim().parse::<f64>().ok() == Some(*number)
+                trim_xml_whitespace(&element_text(xml, old)?)
+                    .parse::<f64>()
+                    .ok()
+                    == Some(*number)
             }
             CellValue::Bool(boolean) if kind == "b" && old.is(namespace, "v") => {
-                match element_text(xml, old)?.trim() {
+                match trim_xml_whitespace(&element_text(xml, old)?) {
                     "1" | "true" => *boolean,
                     "0" | "false" => !*boolean,
                     _ => false,
@@ -746,10 +750,10 @@ impl<'a> WorksheetIndex<'a> {
             if !row.is(namespace, "row") {
                 continue;
             }
-            let row_number = row
+            let row_reference = row
                 .attr("r")
-                .ok_or_else(|| unsupported("rows without explicit row numbers"))?
-                .value
+                .ok_or_else(|| unsupported("rows without explicit row numbers"))?;
+            let row_number = trim_xml_whitespace(&row_reference.value)
                 .parse::<u32>()
                 .map_err(|_| unsupported("invalid row number"))?;
             if row_number <= previous_row || row_number > 1_048_576 {
@@ -791,10 +795,10 @@ impl<'a> WorksheetIndex<'a> {
                     }
                     match formula.attr("t").map(|attribute| attribute.value.as_ref()) {
                         Some("shared") => {
-                            let index = formula
+                            let index_reference = formula
                                 .attr("si")
-                                .ok_or_else(|| unsupported("shared formula without an index"))?
-                                .value
+                                .ok_or_else(|| unsupported("shared formula without an index"))?;
+                            let index = trim_xml_whitespace(&index_reference.value)
                                 .parse::<u32>()
                                 .map_err(|_| unsupported("invalid shared formula index"))?;
                             let has_range = shared.entry(index).or_insert(false);
@@ -947,7 +951,49 @@ fn validate_ranges(
     ranges: &[Range],
     merged: bool,
 ) -> Result<()> {
-    let mut events = Vec::with_capacity(ranges.len() * if merged { 4 } else { 2 });
+    if cells.is_empty() || ranges.is_empty() {
+        return Ok(());
+    }
+    let violation = |cell: CellRef| {
+        unsupported(if merged {
+            format!("{cell} is not the anchor of its merged range")
+        } else {
+            format!("{cell} belongs to a formula range")
+        })
+    };
+    // With either dimension small, direct membership checks cost less than
+    // sorting events and allocating a column index. Large batches still use
+    // the sweep so their work does not grow as cells times ranges.
+    if cells.len() <= 8 || ranges.len() <= 8 || cells.len().saturating_mul(ranges.len()) <= 256 {
+        for &cell in cells.keys() {
+            if ranges
+                .iter()
+                .any(|range| range.contains(cell) && (!merged || cell != range.first))
+            {
+                return Err(violation(cell));
+            }
+        }
+        return Ok(());
+    }
+    let first_row = cells.first_key_value().unwrap().0.row;
+    let last_row = cells.last_key_value().unwrap().0.row;
+    let (first_column, last_column) = cells.keys().fold((u16::MAX, 0), |(first, last), cell| {
+        (first.min(cell.column), last.max(cell.column))
+    });
+    // A rectangle outside the edited envelope cannot contain a requested
+    // cell. Count relevant ranges before reserving event storage, so unrelated
+    // worksheet ranges add no memory overhead to a batch.
+    let relevant_ranges = ranges.iter().filter(|range| {
+        range.first.row <= last_row
+            && range.last.row >= first_row
+            && range.first.column <= last_column
+            && range.last.column >= first_column
+    });
+    let relevant_count = relevant_ranges.clone().count();
+    if relevant_count == 0 {
+        return Ok(());
+    }
+    let mut events = Vec::with_capacity(relevant_count * if merged { 4 } else { 2 });
     let mut add_range = |first_row, last_row, first_column, last_column| {
         if first_row <= last_row && first_column <= last_column {
             events.push(GuardEvent {
@@ -964,7 +1010,7 @@ fn validate_ranges(
             });
         }
     };
-    for range in ranges {
+    for range in relevant_ranges {
         if merged {
             // The anchor remains editable; the rest of its rectangle does not.
             add_range(
@@ -1016,11 +1062,7 @@ fn validate_ranges(
             index &= index - 1;
         }
         if count > 0 {
-            return Err(unsupported(if merged {
-                format!("{cell} is not the anchor of its merged range")
-            } else {
-                format!("{cell} belongs to a formula range")
-            }));
+            return Err(violation(cell));
         }
     }
     Ok(())
@@ -1278,6 +1320,24 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
 }
 
 fn rich_text(xml: &[u8], elements: &[Element], index: usize, namespace: &str) -> Result<String> {
+    // Ignoring text hidden in compatibility branches or other containers would
+    // return an incomplete scalar value. Phonetic text is a known, separate
+    // annotation and remains excluded from the displayed text.
+    for element in &elements[elements[index].children_start..elements[index].children_end] {
+        let known_container = element.is(namespace, "r") || element.is(namespace, "rPh");
+        let known_text = element.is(namespace, "t");
+        if (known_container && element.parent != Some(index))
+            || (known_text
+                && !element.parent.is_some_and(|parent| {
+                    parent == index
+                        || ((elements[parent].is(namespace, "r")
+                            || elements[parent].is(namespace, "rPh"))
+                            && elements[parent].parent == Some(index))
+                }))
+        {
+            return Err(unsupported("rich text inside an unsupported XML container"));
+        }
+    }
     let mut text = String::new();
     for child in elements[index].children(elements) {
         let element = &elements[child];
@@ -1301,6 +1361,12 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     let namespace = root.namespace.as_deref().unwrap_or_default();
     if root.local_name() != "sst" || !matches!(namespace, TRANSITIONAL | STRICT) {
         return Err(unsupported("expected an OOXML shared-string table"));
+    }
+    if elements
+        .iter()
+        .any(|element| element.is(namespace, "si") && element.parent != Some(0))
+    {
+        return Err(unsupported("shared string outside the shared-string table"));
     }
     root.children(&elements)
         .filter(|&index| elements[index].is(namespace, "si"))
@@ -1327,8 +1393,7 @@ fn cell_content<'a>(
     let style_index = cell
         .attr("s")
         .map(|attribute| {
-            attribute
-                .value
+            trim_xml_whitespace(&attribute.value)
                 .parse::<u32>()
                 .map_err(|_| unsupported("invalid cell style index"))
         })
@@ -1362,10 +1427,9 @@ fn cell_content<'a>(
             }
             let text = element_text(xml, payload)?;
             match kind {
-                "n" if text.trim().is_empty() => CellValue::Blank,
+                "n" if trim_xml_whitespace(&text).is_empty() => CellValue::Blank,
                 "n" => {
-                    let number = text
-                        .trim()
+                    let number = trim_xml_whitespace(&text)
                         .parse::<f64>()
                         .map_err(|_| unsupported("invalid numeric cell value"))?;
                     if !number.is_finite() {
@@ -1373,7 +1437,7 @@ fn cell_content<'a>(
                     }
                     CellValue::Number(number)
                 }
-                "b" => CellValue::Bool(match text.trim() {
+                "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
                     "0" | "false" => false,
                     "1" | "true" => true,
                     _ => return Err(unsupported("invalid boolean cell value")),
@@ -1381,8 +1445,7 @@ fn cell_content<'a>(
                 "str" => CellValue::Text(excel_text(&text)?),
                 "e" => CellValue::Error(excel_text(&text)?),
                 "s" => {
-                    let position = text
-                        .trim()
+                    let position = trim_xml_whitespace(&text)
                         .parse::<usize>()
                         .map_err(|_| unsupported("invalid shared-string index"))?;
                     let strings = shared_strings()?;
@@ -1660,6 +1723,31 @@ mod tests {
                 edit(&invalid, "C1", 2.0.into()),
                 Err(Error::Unsupported(_))
             ));
+        }
+    }
+
+    #[test]
+    fn numeric_attributes_collapse_xml_whitespace_without_rewriting_it() {
+        let input = sheet(
+            "<sheetData><row r=' &#9;1&#13;&#10; '><c r='A1'><f t='shared' si=' 1 ' ref='A1:B1'>1</f><v>1</v></c><c r='B1'><f t='shared' si='&#9;01&#10;'/><v>1</v></c><c r='C1' s=' &#9;3&#13; '><v> 7 </v></c></row></sheetData>",
+        );
+        let content = read_cell(input.as_bytes(), "C1".parse().unwrap(), None).unwrap();
+        assert_eq!(content.value, CellValue::Number(7.0));
+        assert_eq!(content.style_index, Some(3));
+        assert_eq!(
+            edit(&input, "C1", 8.0.into()).unwrap(),
+            input.replace("<v> 7 </v>", "<v>8</v>")
+        );
+        for address in ["A1", "B1"] {
+            assert!(edit(&input, address, 2.0.into()).is_err());
+        }
+        for invalid in ["1 2", "\u{a0}1\u{a0}"] {
+            let bad_row = input.replace(" &#9;1&#13;&#10; ", invalid);
+            assert!(edit(&bad_row, "C1", 8.0.into()).is_err());
+            let bad_index = input.replace("si=' 1 '", &format!("si='{invalid}'"));
+            assert!(edit(&bad_index, "C1", 8.0.into()).is_err());
+            let bad_style = input.replace("s=' &#9;3&#13; '", &format!("s='{invalid}'"));
+            assert!(read_cell(bad_style.as_bytes(), "C1".parse().unwrap(), None).is_err());
         }
     }
 
@@ -2143,12 +2231,61 @@ mod tests {
     }
 
     #[test]
+    fn hidden_shared_strings_cannot_shift_visible_string_indices() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        for namespace in [TRANSITIONAL, STRICT] {
+            let table = format!(
+                "<sst xmlns='{namespace}' xmlns:mc='{mc}' xmlns:x='urn:custom'><mc:AlternateContent><mc:Choice Requires='x'><si><t>first</t></si></mc:Choice><mc:Fallback><si><t>first fallback</t></si></mc:Fallback></mc:AlternateContent><si><t>second</t></si></sst>"
+            );
+            assert!(matches!(
+                read_shared_strings(table.as_bytes()),
+                Err(Error::Unsupported(_))
+            ));
+            let foreign = format!(
+                "<sst xmlns='{namespace}' xmlns:x='urn:custom'><x:si><x:t>extension</x:t></x:si><si><t>first</t></si><si><t>second</t></si></sst>"
+            );
+            assert_eq!(
+                read_shared_strings(foreign.as_bytes()).unwrap(),
+                ["first", "second"]
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_rich_text_cannot_produce_a_partial_scalar_read() {
+        for payload in [
+            "<t>visible</t><x:alternate><t>hidden</t></x:alternate>",
+            "<t>visible</t><x:alternate><r><t>hidden</t></r></x:alternate>",
+            "<r><t>visible</t><x:alternate><t>hidden</t></x:alternate></r>",
+            "<t>visible</t><rPh sb='0' eb='1'><x:alternate><t>hidden</t></x:alternate></rPh>",
+        ] {
+            let inline = sheet(&format!(
+                "<sheetData><row r='1'><c r='A1' t='inlineStr'><is>{payload}</is></c></row></sheetData>"
+            ));
+            assert!(matches!(
+                read_cell(inline.as_bytes(), "A1".parse().unwrap(), None),
+                Err(Error::Unsupported(_))
+            ));
+            let table = format!(
+                "<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:custom'><si>{payload}</si></sst>"
+            );
+            assert!(matches!(
+                read_shared_strings(table.as_bytes()),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_invalid_read_values_and_missing_shared_strings() {
         for (kind, payload) in [
             ("n", "NaN"),
             ("n", "infinity"),
+            ("n", "\u{a0}1\u{a0}"),
             ("b", "2"),
+            ("b", "\u{a0}true\u{a0}"),
             ("s", "-1"),
+            ("s", "\u{a0}0\u{a0}"),
             ("d", "2026-01-01"),
         ] {
             let input = sheet(&format!(
@@ -2221,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn range_sweep_matches_rectangle_membership_with_overlapping_ranges() {
+    fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
         let mut seed = 17u32;
         let mut next = || {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -2258,6 +2395,13 @@ mod tests {
                         .is_err(),
                         blocked
                     );
+                    // The same target in a large batch exercises the event
+                    // sweep. Other cells lie past every generated rectangle.
+                    let mut batch: BTreeMap<_, _> = (40..=70)
+                        .map(|row| (CellRef { row, column: 1 }, CellValue::Blank))
+                        .collect();
+                    batch.insert(cell, CellValue::Blank);
+                    assert_eq!(validate_ranges(&batch, &ranges, merged).is_err(), blocked);
                 }
             }
         }
@@ -2287,5 +2431,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() {
+        let mut ranges = vec![
+            Range {
+                first: "AF1".parse().unwrap(),
+                last: "AG30".parse().unwrap(),
+            };
+            40
+        ];
+        ranges.push(Range {
+            first: "B15".parse().unwrap(),
+            last: "F15".parse().unwrap(),
+        });
+        let mut cells: BTreeMap<_, _> = (1..=10)
+            .chain([30])
+            .map(|row| (CellRef::new(row, 26).unwrap(), CellValue::Blank))
+            .collect();
+        cells.insert("C15".parse().unwrap(), CellValue::Blank);
+        for merged in [false, true] {
+            let error = validate_ranges(&cells, &ranges, merged).unwrap_err();
+            assert!(error.to_string().contains("C15"));
+        }
+        cells.remove(&"C15".parse().unwrap());
+        cells.insert("B15".parse().unwrap(), CellValue::Blank);
+        assert!(validate_ranges(&cells, &ranges, true).is_ok());
+        assert!(validate_ranges(&cells, &ranges, false).is_err());
+        ranges.push(Range {
+            first: "A15".parse().unwrap(),
+            last: "D15".parse().unwrap(),
+        });
+        let error = validate_ranges(&cells, &ranges, true).unwrap_err();
+        assert!(error.to_string().contains("B15"));
     }
 }

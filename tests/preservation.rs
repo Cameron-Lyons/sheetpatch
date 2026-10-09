@@ -1102,6 +1102,63 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
 }
 
 #[test]
+fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
+    const XML_LIMIT: usize = 64 * 1024 * 1024;
+    let mut worksheet = format!(
+        "<worksheet xmlns='{MAIN_NS}' xmlns:x='urn:vendor'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData><x:padding>"
+    )
+    .into_bytes();
+    let ending = b"</x:padding></worksheet>";
+    worksheet.resize(XML_LIMIT - 1000 - ending.len(), b'x');
+    worksheet.extend_from_slice(ending);
+    let original = fixture(std::str::from_utf8(&worksheet).unwrap());
+    drop(worksheet);
+    assert_eq!(
+        Workbook::from_bytes(original.clone())
+            .unwrap()
+            .get_cell("Data & Notes", "A1")
+            .unwrap()
+            .value,
+        CellValue::Number(7.0)
+    );
+
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsm");
+    let output = directory.0.join("output.xlsm");
+    let patch = directory.0.join("patch.tsv");
+    fs::write(&input, &original).unwrap();
+    fs::write(&output, b"keep destination unchanged").unwrap();
+    fs::write(
+        &patch,
+        format!("Data & Notes\tA1\ttext\t{}\n", "a".repeat(32_700)),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_sheetpatch");
+    let checked = Command::new(binary)
+        .args(["patch", "--check"])
+        .arg(&input)
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(checked.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("64 MiB read limit"));
+    let applied = Command::new(binary)
+        .arg("patch")
+        .arg(&input)
+        .arg(&output)
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert_eq!(applied.status.code(), Some(1));
+    assert!(applied.stdout.is_empty());
+    assert_eq!(applied.stderr, checked.stderr);
+    assert_eq!(fs::read(&input).unwrap(), original);
+    assert_eq!(fs::read(&output).unwrap(), b"keep destination unchanged");
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 3);
+}
+
+#[test]
 fn cli_patch_get_and_compact_support_atomic_batch_workflows() {
     let directory = TempDir::new();
     let input = directory.0.join("input.xlsm");
