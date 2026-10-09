@@ -7,7 +7,7 @@ use std::{
 };
 
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
-use sheetpatch::{CellValue, Workbook};
+use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const WORKSHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -32,7 +32,7 @@ fn fixture_at(
         r#"<workbook xmlns="{MAIN_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data &amp; Notes" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029"/></workbook>"#
     );
     let workbook_rels = format!(
-        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{sheet_target}"/></Relationships>"#
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{sheet_target}"/><Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="/xl/sharedStrings.xml"/></Relationships>"#
     );
     let (parent, file) = workbook_path.rsplit_once('/').unwrap();
     let workbook_rels_path = format!("{parent}/_rels/{file}.rels");
@@ -150,6 +150,7 @@ struct ArchiveEntry {
     uncompressed_size: usize,
     compressed_start: usize,
     compressed_size: usize,
+    local_bytes: Vec<u8>,
     central_bytes: Vec<u8>,
 }
 
@@ -178,6 +179,7 @@ fn archive_entries(bytes: &[u8]) -> Vec<ArchiveEntry> {
             uncompressed_size: u32_at(bytes, offset + 24) as usize,
             compressed_start: data_start,
             compressed_size: u32_at(bytes, offset + 20) as usize,
+            local_bytes: bytes[local..data_start + u32_at(bytes, offset + 20) as usize].to_vec(),
             central_bytes: bytes[offset..offset + entry_len].to_vec(),
         });
         offset += entry_len;
@@ -268,11 +270,45 @@ fn assert_untouched_parts(original: &[u8], updated: &[u8]) {
             .find(|updated| updated.name == entry.name)
             .unwrap();
         assert_eq!(
-            updated_entry.central_bytes, entry.central_bytes,
+            updated_entry.local_bytes, entry.local_bytes,
+            "changed local record in {}",
+            entry.name
+        );
+        let mut original_metadata = entry.central_bytes;
+        let mut updated_metadata = updated_entry.central_bytes;
+        // Local offsets necessarily move when an earlier worksheet changes size.
+        // Every other central-directory byte must remain identical.
+        original_metadata[42..46].fill(0);
+        updated_metadata[42..46].fill(0);
+        assert_eq!(
+            updated_metadata, original_metadata,
             "changed metadata in {}",
             entry.name
         );
     }
+}
+
+fn assert_contiguous_local_records(bytes: &[u8]) {
+    let mut ranges: Vec<_> = archive_entries(bytes)
+        .into_iter()
+        .map(|entry| {
+            (
+                u32_at(&entry.central_bytes, 42) as usize,
+                entry.compressed_start + entry.compressed_size,
+            )
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        assert_eq!(start, cursor, "unexpected unused bytes between ZIP records");
+        cursor = end;
+    }
+    let end = bytes
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .unwrap();
+    assert_eq!(cursor, u32_at(bytes, end + 16) as usize);
 }
 
 #[test]
@@ -518,6 +554,13 @@ fn signed_packages_can_be_read_but_cannot_be_edited() {
         .collect();
     let signed = archive(&borrowed);
     let mut workbook = Workbook::from_bytes(signed.clone()).unwrap();
+    workbook
+        .set_cells("Data & Notes", std::iter::empty::<(&str, i32)>())
+        .unwrap();
+    workbook
+        .apply_edits(std::iter::empty::<CellEdit>())
+        .unwrap();
+    assert!(!workbook.has_changes());
     assert!(workbook.set_cell("Data & Notes", "A1", 3).is_err());
     assert_eq!(workbook.to_bytes().unwrap(), signed);
 }
@@ -606,6 +649,102 @@ fn cli_lists_sheets_and_can_atomically_replace_the_input() {
 }
 
 #[test]
+fn cli_help_version_and_usage_have_stable_exit_codes() {
+    for flag in ["--help", "-h"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(result.stderr.is_empty());
+        assert!(
+            String::from_utf8(result.stdout)
+                .unwrap()
+                .contains("sheetpatch patch")
+        );
+    }
+    for flag in ["--version", "-V"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(result.stderr.is_empty());
+        assert_eq!(
+            result.stdout,
+            format!("sheetpatch {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+    }
+    let result = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("unknown-command")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8(result.stderr).unwrap().contains("Usage:"));
+}
+
+// macOS rejects invalid UTF-8 filenames, so exercise native byte paths on Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_accepts_non_unicode_paths() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let directory = TempDir::new();
+    let input = directory
+        .0
+        .join(OsString::from_vec(b"input-\xff.xlsx".to_vec()));
+    let output = directory
+        .0
+        .join(OsString::from_vec(b"output-\xfe.xlsx".to_vec()));
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    let edited = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("set")
+        .arg(&input)
+        .arg(&output)
+        .args(["Data & Notes", "C1", "number", "123"])
+        .output()
+        .unwrap();
+    assert!(edited.status.success(), "{:?}", edited.stderr);
+    assert_eq!(
+        Workbook::open(&output)
+            .unwrap()
+            .get_cell("Data & Notes", "C1")
+            .unwrap()
+            .value,
+        CellValue::Number(123.0)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_rejects_non_unicode_text_without_modifying_output() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    fs::write(&output, b"existing output").unwrap();
+    let before = fs::read(&output).unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+        .arg("set")
+        .arg(&input)
+        .arg(&output)
+        .args(["Data & Notes", "C1", "text"])
+        .arg(OsString::from_vec(vec![0xff]))
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .unwrap()
+            .contains("must be valid Unicode")
+    );
+    assert_eq!(fs::read(&output).unwrap(), before);
+}
+
+#[test]
 fn failed_cli_edits_leave_existing_output_unchanged() {
     let directory = TempDir::new();
     let input = directory.0.join("input.xlsx");
@@ -633,6 +772,43 @@ fn failed_cli_edits_leave_existing_output_unchanged() {
 }
 
 #[test]
+fn cli_rejects_non_utf8_patch_rows_with_the_line_number_and_usage_exit_code() {
+    use std::process::Stdio;
+
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    let patch = directory.0.join("edits.tsv");
+    let invalid = b"Data & Notes\tA1\ttext\tvalid edit\nData & Notes\tC1\ttext\t\xff\n";
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    fs::write(&output, b"existing output").unwrap();
+    fs::write(&patch, invalid).unwrap();
+
+    for from_stdin in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sheetpatch"));
+        command.arg("patch").arg(&input).arg(&output);
+        let result = if from_stdin {
+            let mut child = command
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(invalid).unwrap();
+            child.wait_with_output().unwrap()
+        } else {
+            command.arg(&patch).output().unwrap()
+        };
+        assert_eq!(result.status.code(), Some(2));
+        let message = String::from_utf8(result.stderr).unwrap();
+        assert!(message.contains("Patch line 2:"), "{message}");
+        assert!(message.contains("UTF-8"), "{message}");
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+    }
+}
+
+#[test]
 fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
     let directory = TempDir::new();
     let input = directory.0.join("repeated.xlsm");
@@ -644,6 +820,7 @@ fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
         workbook.save(&input).unwrap();
         let updated = fs::read(&input).unwrap();
         assert_untouched_parts(&original, &updated);
+        assert_contiguous_local_records(&updated);
         let reopened = Workbook::from_bytes(updated.clone()).unwrap();
         assert_eq!(reopened.to_bytes().unwrap(), updated);
     }
@@ -668,4 +845,324 @@ fn failed_atomic_rename_keeps_existing_destination_and_removes_temporary_files()
         b"existing destination content"
     );
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+fn replace_parts(original: &[u8], replacements: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut owned: Vec<(String, Vec<u8>)> = archive_entries(original)
+        .into_iter()
+        .map(|entry| {
+            let bytes = replacements
+                .iter()
+                .find(|(name, _)| *name == entry.name)
+                .map_or_else(
+                    || payload(original, &entry.name),
+                    |(_, bytes)| bytes.to_vec(),
+                );
+            (entry.name, bytes)
+        })
+        .collect();
+    for &(name, bytes) in replacements {
+        if !owned.iter().any(|(existing, _)| existing == name) {
+            owned.push((name.to_owned(), bytes.to_vec()));
+        }
+    }
+    archive(
+        &owned
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn batch_edits_are_ordered_transactional_and_preserve_opaque_parts() {
+    let original = fixture(WORKSHEET);
+    let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
+    workbook
+        .set_cells(
+            "Data & Notes",
+            [
+                ("E3", CellValue::from("third row")),
+                ("B2", CellValue::Number(12.5)),
+                ("A1", CellValue::from("first update")),
+                ("D3", CellValue::Bool(false)),
+                ("D1", CellValue::Error("#N/A".into())),
+                ("A1", CellValue::from("last wins")),
+            ],
+        )
+        .unwrap();
+    assert!(workbook.has_changes());
+    let contents = workbook
+        .get_cells("Data & Notes", ["E3", "A1", "B2", "D3", "D1", "Z99", "A1"])
+        .unwrap();
+    assert_eq!(
+        contents.iter().map(|cell| &cell.value).collect::<Vec<_>>(),
+        vec![
+            &CellValue::from("third row"),
+            &CellValue::from("last wins"),
+            &CellValue::Number(12.5),
+            &CellValue::Bool(false),
+            &CellValue::Error("#N/A".into()),
+            &CellValue::Blank,
+            &CellValue::from("last wins"),
+        ]
+    );
+    assert_eq!(contents[1].style_index, Some(3));
+    let output = workbook.to_bytes().unwrap();
+    assert_untouched_parts(&original, &output);
+    assert!(
+        worksheet_xml(&output).contains(
+            "<extLst><ext uri=\"urn:vendor\"><x:cellFeature flag=\"true\"/></ext></extLst>"
+        )
+    );
+    let before = workbook.to_bytes().unwrap();
+    assert!(
+        workbook
+            .set_cells("Data & Notes", [("A1", 3), ("A0", 4)])
+            .is_err()
+    );
+    assert_eq!(workbook.to_bytes().unwrap(), before);
+    workbook.reset_changes();
+    assert!(!workbook.has_changes());
+    assert_eq!(workbook.to_bytes().unwrap(), original);
+}
+
+fn add_other_sheet(original: &[u8], other: &str) -> Vec<u8> {
+    let workbook_xml = String::from_utf8(payload(original, "xl/workbook.xml"))
+        .unwrap()
+        .replace(
+            "</sheets>",
+            "<sheet name=\"Other\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
+        );
+    let rels = String::from_utf8(payload(original, "xl/_rels/workbook.xml.rels")).unwrap().replace("</Relationships>", "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/other.xml\"/></Relationships>");
+    replace_parts(
+        original,
+        &[
+            ("xl/workbook.xml", workbook_xml.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/worksheets/other.xml", other.as_bytes()),
+        ],
+    )
+}
+
+#[test]
+fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
+    let other = format!(
+        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>"
+    );
+    let original = add_other_sheet(&fixture(WORKSHEET), &other);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    book.set_cells(
+        "Data & Notes",
+        [
+            ("C1", CellValue::Number(99.0)),
+            ("A2", CellValue::Bool(true)),
+            ("Z99", CellValue::Blank),
+        ],
+    )
+    .unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+
+    book.set_cell("Data & Notes", "C1", 101).unwrap();
+    let pending = book.to_bytes().unwrap();
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::new("Other", "A1", 7).unwrap(),
+    ])
+    .unwrap();
+    assert!(book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), pending);
+
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::new("Other", "A1", 8).unwrap(),
+    ])
+    .unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data & Notes", "C1").unwrap().value,
+        CellValue::Number(101.0)
+    );
+    assert_eq!(
+        reopened.get_cell("Other", "A1").unwrap().value,
+        CellValue::Number(8.0)
+    );
+
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "C1", 99).unwrap(),
+        CellEdit::new("Other", "A1", 7).unwrap(),
+    ])
+    .unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+}
+
+#[test]
+fn multi_sheet_transaction_rolls_back_every_sheet_on_failure() {
+    let other = format!(
+        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"
+    );
+    let bytes = add_other_sheet(&fixture(WORKSHEET), &other);
+    let mut book = Workbook::from_bytes(bytes).unwrap();
+    book.set_cell("Data & Notes", "A2", false).unwrap();
+    let before = book.to_bytes().unwrap();
+    let edits = vec![
+        CellEdit::new("Data & Notes", "A1", "pending").unwrap(),
+        CellEdit::new("Other", "A1", 8).unwrap(),
+    ];
+    assert!(book.apply_edits(edits).is_err());
+    assert_eq!(book.to_bytes().unwrap(), before);
+    book.apply_edits([
+        CellEdit::new("Data & Notes", "A1", "committed").unwrap(),
+        CellEdit::at("Other", CellRef::new(2, 2).unwrap(), 9).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        book.get_cell("Data & Notes", "A1").unwrap().value,
+        CellValue::from("committed")
+    );
+    assert_eq!(
+        book.get_cell("Other", "B2").unwrap().value,
+        CellValue::Number(9.0)
+    );
+    let formula = book.get_cell("Other", "A1").unwrap();
+    assert_eq!(formula.formula.as_deref(), Some("1+1"));
+    assert_eq!(formula.value, CellValue::Number(2.0));
+}
+
+#[test]
+fn inspect_shared_strings_styles_and_pending_values_without_changes() {
+    let bytes = fixture(WORKSHEET);
+    let mut book = Workbook::from_bytes(bytes.clone()).unwrap();
+    let cell = book.get_cell("Data & Notes", "A1").unwrap();
+    assert_eq!(cell.value, CellValue::from("Old text"));
+    assert_eq!(cell.style_index, Some(3));
+    assert_eq!(
+        book.get_cell("Data & Notes", "B1").unwrap().value,
+        CellValue::from("Unchanged & literal")
+    );
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), bytes);
+    book.set_cell("Data & Notes", "A1", "new").unwrap();
+    assert_eq!(
+        book.get_cell("Data & Notes", "A1").unwrap().value,
+        CellValue::from("new")
+    );
+    book.reset_changes();
+    assert_eq!(
+        book.get_cell("Data & Notes", "A1").unwrap().value,
+        CellValue::from("Old text")
+    );
+    let broken = replace_parts(&bytes, &[("xl/sharedStrings.xml", b"<malformed>")]);
+    let book = Workbook::from_bytes(broken).unwrap();
+    assert_eq!(
+        book.get_cell("Data & Notes", "C1").unwrap().value,
+        CellValue::Number(99.0)
+    );
+    assert!(book.get_cell("Data & Notes", "A1").is_err());
+}
+
+#[test]
+fn streaming_output_and_compaction_preserve_active_payloads() {
+    let original = fixture(WORKSHEET);
+    let mut current = original.clone();
+    for index in 0..4 {
+        let mut book = Workbook::from_bytes(current).unwrap();
+        book.set_cell("Data & Notes", "A1", format!("iteration {index}"))
+            .unwrap();
+        let mut streamed = Vec::new();
+        book.write_to(&mut streamed).unwrap();
+        assert_eq!(streamed, book.to_bytes().unwrap());
+        current = streamed;
+        assert_contiguous_local_records(&current);
+    }
+    let book = Workbook::from_bytes(current.clone()).unwrap();
+    let compact = book.to_bytes_compact().unwrap();
+    assert_eq!(compact, current);
+    let reopened = Workbook::from_bytes(compact.clone()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data & Notes", "A1").unwrap().value,
+        CellValue::from("iteration 3")
+    );
+    for entry in archive_entries(&original) {
+        if entry.name != "xl/worksheets/sheet1.xml" {
+            assert_eq!(
+                payload(&compact, &entry.name),
+                payload(&original, &entry.name)
+            );
+            assert_eq!(
+                compressed_payload(&compact, &entry.name),
+                compressed_payload(&original, &entry.name)
+            );
+        }
+    }
+    assert_eq!(archive_comment(&original), archive_comment(&compact));
+    assert_eq!(reopened.to_bytes_compact().unwrap(), compact);
+}
+
+#[test]
+fn cli_patch_get_and_compact_support_atomic_batch_workflows() {
+    let directory = TempDir::new();
+    let input = directory.0.join("input.xlsm");
+    let output = directory.0.join("output.xlsm");
+    let patch = directory.0.join("patch.tsv");
+    fs::write(&input, fixture(WORKSHEET)).unwrap();
+    fs::write(&patch, "Data & Notes\tA1\ttext\tfirst\nData & Notes\tD3\tnumber\t12.5\nData & Notes\tE3\terror\t#N/A\n").unwrap();
+    let binary = env!("CARGO_BIN_EXE_sheetpatch");
+    let patched = Command::new(binary)
+        .arg("patch")
+        .arg(&input)
+        .arg(&output)
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert!(
+        patched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&patched.stderr)
+    );
+    let inspected = Command::new(binary)
+        .arg("get")
+        .arg(&output)
+        .args(["Data & Notes", "D3"])
+        .output()
+        .unwrap();
+    assert!(inspected.status.success());
+    assert_eq!(inspected.stdout, b"12.5\n");
+    let before = fs::read(&output).unwrap();
+    fs::write(
+        &patch,
+        "Data & Notes\tA1\ttext\tshould not save\nData & Notes\tD3\tnumber\tnot a number\n",
+    )
+    .unwrap();
+    let rejected = Command::new(binary)
+        .arg("patch")
+        .arg(&output)
+        .arg(&output)
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    assert_eq!(fs::read(&output).unwrap(), before);
+    let compacted = Command::new(binary)
+        .arg("compact")
+        .arg(&output)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        compacted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compacted.stderr)
+    );
+    assert_eq!(fs::read(&output).unwrap(), before);
+    assert_eq!(
+        Workbook::open(&output)
+            .unwrap()
+            .get_cell("Data & Notes", "A1")
+            .unwrap()
+            .value,
+        CellValue::from("first")
+    );
 }

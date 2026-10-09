@@ -9,9 +9,20 @@ pub struct CellRef {
 }
 
 impl CellRef {
+    /// Construct an address from one-based row and column numbers.
+    pub fn new(row: u32, column: u16) -> Result<Self> {
+        if !(1..=1_048_576).contains(&row) || !(1..=16_384).contains(&column) {
+            return Err(Error::InvalidCellReference(format!(
+                "row {row}, column {column}"
+            )));
+        }
+        Ok(Self { row, column })
+    }
+    /// Return the one-based row number.
     pub fn row(self) -> u32 {
         self.row
     }
+    /// Return the one-based column number.
     pub fn column(self) -> u16 {
         self.column
     }
@@ -23,6 +34,9 @@ impl FromStr for CellRef {
     fn from_str(address: &str) -> Result<Self> {
         let invalid = || Error::InvalidCellReference(address.to_owned());
         let bytes = address.as_bytes();
+        if !(2..=10).contains(&bytes.len()) {
+            return Err(invalid());
+        }
         let split = bytes
             .iter()
             .position(|b| !b.is_ascii_alphabetic())
@@ -72,9 +86,14 @@ impl fmt::Display for CellRef {
 /// Text is stored inline, so the workbook's shared-string table stays untouched.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellValue {
+    /// Text, written as an inline string without creating a formula.
     Text(String),
+    /// A finite numeric value. Existing number formats determine its display.
     Number(f64),
+    /// A boolean value.
     Bool(bool),
+    /// An Excel error value, such as `#DIV/0!` or `#N/A`.
+    Error(String),
     /// Remove the value, retaining the cell's formatting and unknown content.
     Blank,
 }
@@ -82,13 +101,99 @@ pub enum CellValue {
 impl CellValue {
     pub(crate) fn validate(&self) -> Result<()> {
         match self {
-            Self::Number(n) if !n.is_finite() => Err(Error::InvalidValue("numbers must be finite".into())),
-            Self::Text(s) if s.encode_utf16().count() > 32_767 => Err(Error::InvalidValue("text exceeds Excel's 32,767 UTF-16 code unit limit".into())),
-            Self::Text(s) if s.chars().any(|c| !matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')) => {
-                Err(Error::InvalidValue("text contains a character forbidden by XML 1.0".into()))
+            Self::Number(n) if !n.is_finite() => {
+                Err(Error::InvalidValue("numbers must be finite".into()))
+            }
+            Self::Text(s) if s.len() > 32_767 && s.encode_utf16().take(32_768).count() > 32_767 => {
+                Err(Error::InvalidValue(
+                    "text exceeds Excel's 32,767 UTF-16 code unit limit".into(),
+                ))
+            }
+            Self::Text(s) if !s.chars().all(crate::xml::valid_char) => Err(Error::InvalidValue(
+                "text contains a character forbidden by XML 1.0".into(),
+            )),
+            Self::Error(s)
+                if s.len() > 64
+                    || !s.starts_with('#')
+                    || s.len() < 2
+                    || !s.bytes().all(|c| {
+                        c.is_ascii_uppercase() || c.is_ascii_digit() || b"#/!?._".contains(&c)
+                    }) =>
+            {
+                Err(Error::InvalidValue(
+                    "error values must be an Excel error token such as #N/A".into(),
+                ))
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// A cell's scalar value, optional formula text, and existing style index.
+/// Formula values are cached results; no calculation is performed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellContent {
+    /// The scalar value, or a formula's stored cached result.
+    pub value: CellValue,
+    /// Stored formula text, without a leading equals sign.
+    ///
+    /// Shared-formula followers can contain empty formula text; formulas are
+    /// neither expanded nor calculated.
+    pub formula: Option<String>,
+    /// The existing cell style index, when explicitly present.
+    pub style_index: Option<u32>,
+}
+
+/// One validated edit, usable in a transaction spanning multiple worksheets.
+#[derive(Clone, Debug)]
+pub struct CellEdit {
+    pub(crate) sheet: String,
+    pub(crate) cell: CellRef,
+    pub(crate) value: CellValue,
+}
+
+impl CellEdit {
+    /// Construct an edit from a sheet name, an A1 address, and a value.
+    ///
+    /// The address and value are validated immediately. The sheet's existence
+    /// and its formula or merged-cell restrictions are checked when applied.
+    pub fn new(
+        sheet: impl Into<String>,
+        address: &str,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        Self::at(sheet, address.parse()?, value)
+    }
+
+    /// Construct an edit from a sheet name, a typed address, and a value.
+    ///
+    /// The value is validated immediately; worksheet restrictions are checked
+    /// when the edit is applied to a workbook.
+    pub fn at(
+        sheet: impl Into<String>,
+        cell: CellRef,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        let value = value.into();
+        value.validate()?;
+        Ok(Self {
+            sheet: sheet.into(),
+            cell,
+            value,
+        })
+    }
+
+    /// Return the target sheet name.
+    pub fn sheet(&self) -> &str {
+        &self.sheet
+    }
+    /// Return the target cell address.
+    pub fn cell(&self) -> CellRef {
+        self.cell
+    }
+    /// Return the validated value to write.
+    pub fn value(&self) -> &CellValue {
+        &self.value
     }
 }
 
@@ -150,8 +255,40 @@ mod tests {
             CellValue::Number(f64::INFINITY),
             CellValue::from("a\0b"),
             CellValue::from("a".repeat(32_768)),
+            CellValue::Error("not-an-error".into()),
+            CellValue::Error("#BAD\nTOKEN".into()),
         ] {
             assert!(value.validate().is_err());
         }
+    }
+
+    #[test]
+    fn text_limit_counts_utf16_units_instead_of_utf8_bytes() {
+        for text in [
+            "a".repeat(32_767),
+            "é".repeat(32_767),
+            format!("{}a", "😀".repeat(16_383)),
+        ] {
+            assert!(CellValue::Text(text).validate().is_ok());
+        }
+        for text in ["é".repeat(32_768), "😀".repeat(16_384)] {
+            assert!(CellValue::Text(text).validate().is_err());
+        }
+    }
+
+    #[test]
+    fn typed_addresses_and_edits_validate_before_mutation() {
+        assert_eq!(
+            CellRef::new(1_048_576, 16_384).unwrap().to_string(),
+            "XFD1048576"
+        );
+        for (row, column) in [(0, 1), (1, 0), (1_048_577, 1), (1, 16_385)] {
+            assert!(CellRef::new(row, column).is_err());
+        }
+        assert!(CellEdit::new("Data", "A1", f64::NAN).is_err());
+        let edit = CellEdit::at("Data", CellRef::new(2, 3).unwrap(), 7).unwrap();
+        assert_eq!(edit.sheet(), "Data");
+        assert_eq!(edit.cell().to_string(), "C2");
+        assert_eq!(edit.value(), &CellValue::Number(7.0));
     }
 }
