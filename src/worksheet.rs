@@ -186,8 +186,8 @@ fn attribute_spans(
         // XML normalizes literal attribute whitespace before expanding entity
         // references; referenced whitespace keeps its actual value.
         let value = XmlAttribute {
-            key: QName(name.as_bytes()),
-            value: Cow::Borrowed(raw),
+            key: QName(name),
+            value: Cow::Borrowed(std::str::from_utf8(raw).map_err(|e| xml_error(e.to_string()))?),
         }
         .normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
         if !value.chars().all(valid_xml_char) {
@@ -210,7 +210,7 @@ fn attribute_spans(
 // spelling once and share it rather than allocating a URI per element.
 fn cached_namespace(
     result: ResolveResult<'_>,
-    cache: &mut HashMap<Vec<u8>, Rc<str>>,
+    cache: &mut HashMap<String, Rc<str>>,
 ) -> Result<Option<Rc<str>>> {
     match result {
         ResolveResult::Unbound => Ok(None),
@@ -219,7 +219,7 @@ fn cached_namespace(
                 Rc::clone(value)
             } else {
                 let value: Rc<str> = decoded_namespace(ResolveResult::Bound(namespace))?.into();
-                cache.insert(namespace.as_ref().to_vec(), Rc::clone(&value));
+                cache.insert(namespace.as_ref().to_owned(), Rc::clone(&value));
                 value
             };
             Ok((!value.is_empty()).then_some(value))
@@ -280,8 +280,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element<'_>>> {
                 let mut expanded = HashSet::new();
                 for attribute in tag.attributes() {
                     let attribute = attribute.map_err(|e| xml_error(e.to_string()))?;
-                    let attribute_name = std::str::from_utf8(attribute.key.as_ref())
-                        .map_err(|e| xml_error(e.to_string()))?;
+                    let attribute_name = attribute.key.as_ref();
                     if !valid_qname(attribute_name) {
                         return Err(xml_error("invalid XML attribute name"));
                     }
@@ -332,8 +331,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element<'_>>> {
                 elements[index].children_end = elements.len();
             }
             Event::Text(text) => {
-                let raw =
-                    std::str::from_utf8(text.as_ref()).map_err(|e| xml_error(e.to_string()))?;
+                let raw = text.as_ref();
                 if raw.contains("]]>") {
                     return Err(xml_error("CDATA terminator in ordinary XML text"));
                 }
@@ -345,8 +343,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element<'_>>> {
                 if stack.is_empty() {
                     return Err(xml_error("entity reference outside the XML root"));
                 }
-                let name = std::str::from_utf8(reference.as_ref())
-                    .map_err(|e| xml_error(e.to_string()))?;
+                let name = reference.as_ref();
                 decoded(&format!("&{name};"))?;
             }
             Event::CData(_) if stack.is_empty() => {
@@ -358,8 +355,7 @@ fn parse(xml: &[u8]) -> Result<Vec<Element<'_>>> {
                 }
             }
             Event::PI(instruction) => {
-                let target = std::str::from_utf8(instruction.target())
-                    .map_err(|e| xml_error(e.to_string()))?;
+                let target = instruction.target();
                 if !valid_name(target) || target.eq_ignore_ascii_case("xml") {
                     return Err(xml_error("invalid XML processing instruction target"));
                 }
@@ -1261,22 +1257,13 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Text(value) => {
-                text.push_str(
-                    &value
-                        .xml10_content()
-                        .map_err(|e| xml_error(e.to_string()))?,
-                );
+                text.push_str(&value.xml10_content());
             }
             Event::CData(value) => {
-                text.push_str(
-                    &value
-                        .xml10_content()
-                        .map_err(|e| xml_error(e.to_string()))?,
-                );
+                text.push_str(&value.xml10_content());
             }
             Event::GeneralRef(reference) => {
-                let name = std::str::from_utf8(reference.as_ref())
-                    .map_err(|e| xml_error(e.to_string()))?;
+                let name = reference.as_ref();
                 text.push_str(&decoded(&format!("&{name};"))?);
             }
             Event::Comment(_) | Event::PI(_) => {}

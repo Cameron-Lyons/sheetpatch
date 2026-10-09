@@ -51,7 +51,7 @@ pub(crate) fn whitespace(text: &str) -> bool {
 }
 
 pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
-    let raw = start.as_ref();
+    let raw = start.as_ref().as_bytes();
     let name_length = start.name().as_ref().len();
     let mut quote = None;
     for position in name_length..raw.len() {
@@ -81,15 +81,15 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
 pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
     const XML: &str = "http://www.w3.org/XML/1998/namespace";
     const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
-    if start.name().as_ref().starts_with(b"xmlns:") {
+    if start.name().as_ref().starts_with("xmlns:") {
         return Err(Error::Xml("xmlns cannot be an element prefix".into()));
     }
     for attribute in start.attributes() {
         let attribute = attribute.map_err(|e| Error::Xml(e.to_string()))?;
         let name = attribute.key.as_ref();
-        let prefix = if name == b"xmlns" {
+        let prefix = if name == "xmlns" {
             None
-        } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
             Some(prefix)
         } else {
             continue;
@@ -98,10 +98,10 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
         if !value.chars().all(valid_char) {
             return Err(Error::Xml("invalid XML namespace character".into()));
         }
-        if prefix == Some(b"xmlns".as_slice())
+        if prefix == Some("xmlns")
             || value == XMLNS
-            || (value == XML && prefix != Some(b"xml".as_slice()))
-            || (prefix == Some(b"xml".as_slice()) && value != XML)
+            || (value == XML && prefix != Some("xml"))
+            || (prefix == Some("xml") && value != XML)
         {
             return Err(Error::Xml("invalid reserved XML namespace binding".into()));
         }
@@ -115,8 +115,7 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
 }
 
 pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
-    let content =
-        std::str::from_utf8(declaration.as_ref()).map_err(|e| Error::Xml(e.to_string()))?;
+    let content = declaration.as_ref();
     let start = BytesStart::from_content(content, 3);
     validate_attribute_spacing(&start)?;
     let mut version_seen = false;
@@ -125,21 +124,21 @@ pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
     for (index, attribute) in start.attributes().enumerate() {
         let attribute = attribute.map_err(|e| Error::Xml(e.to_string()))?;
         match attribute.key.as_ref() {
-            b"version" if index == 0 => {
+            "version" if index == 0 => {
                 version_seen = true;
-                if attribute.value.as_ref() != b"1.0" {
+                if attribute.value.as_ref() != "1.0" {
                     return Err(Error::Unsupported("only XML 1.0 is supported".into()));
                 }
             }
-            b"encoding" if version_seen && !encoding_seen && !standalone_seen => {
+            "encoding" if version_seen && !encoding_seen && !standalone_seen => {
                 encoding_seen = true;
-                if !attribute.value.eq_ignore_ascii_case(b"UTF-8") {
+                if !attribute.value.eq_ignore_ascii_case("UTF-8") {
                     return Err(Error::Unsupported("only UTF-8 XML is supported".into()));
                 }
             }
-            b"standalone" if version_seen && !standalone_seen => {
+            "standalone" if version_seen && !standalone_seen => {
                 standalone_seen = true;
-                if !matches!(attribute.value.as_ref(), b"yes" | b"no") {
+                if !matches!(attribute.value.as_ref(), "yes" | "no") {
                     return Err(Error::Xml("invalid XML standalone declaration".into()));
                 }
             }
@@ -158,7 +157,7 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
     match result {
         ResolveResult::Bound(ns) => {
             let attribute = Attribute {
-                key: QName(b"xmlns"),
+                key: QName("xmlns"),
                 value: Cow::Borrowed(ns.as_ref()),
             };
             let value = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
@@ -168,10 +167,9 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
             Ok(value.into_owned())
         }
         ResolveResult::Unbound => Ok(String::new()),
-        ResolveResult::Unknown(prefix) => Err(Error::Xml(format!(
-            "unbound namespace prefix {}",
-            String::from_utf8_lossy(&prefix)
-        ))),
+        ResolveResult::Unknown(prefix) => {
+            Err(Error::Xml(format!("unbound namespace prefix {prefix}")))
+        }
     }
 }
 
