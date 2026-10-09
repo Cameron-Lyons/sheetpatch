@@ -93,18 +93,30 @@ From a checkout, use `cargo install --path . --locked` or build as shown below.
 cargo build --release --locked
 ./target/release/sheetpatch --version
 ./target/release/sheetpatch list report.xlsm
+./target/release/sheetpatch list --json report.xlsm
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary B2 text 'Revised total'
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary C2 number 42.5
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary D2 bool true
 ./target/release/sheetpatch set report.xlsm edited.xlsm Summary E2 blank
 ./target/release/sheetpatch get report.xlsm Summary B2
+./target/release/sheetpatch get report.xlsm Summary B2 C2 D2
+./target/release/sheetpatch get --json report.xlsm Summary B2 C2 D2
 ./target/release/sheetpatch patch report.xlsm edited.xlsm edits.tsv
 ./target/release/sheetpatch patch report.xlsm edited.xlsm - < edits.tsv
 ./target/release/sheetpatch compact edited.xlsm compact.xlsm
 ```
 
-`get` prints the current scalar value, or an empty line for a blank cell. A patch
-file contains tab-separated `sheet`, `cell`, `type`, and `value` fields, one edit
+`get` accepts one or more addresses and prints each current scalar value in input
+order, or an empty line for a blank cell. The worksheet is parsed once; all reads
+must succeed before any values are printed. Text can include embedded newlines
+or tabs. Use `get --json` for unambiguous machine-readable output: a JSON array of
+objects with `sheet`, normalized A1 `cell`, `type`, `value`, `formula`, and
+`style_index` fields. Types are `text`, `number`, `bool`, `error`, and `blank`;
+blank values and absent formula/style fields use `null`. Formula values are
+stored caches, and shared-formula followers may have an empty formula string.
+`list --json` returns a JSON array of worksheet `name` and package `path` objects.
+
+A patch file contains tab-separated `sheet`, `cell`, `type`, and `value` fields, one edit
 per line. Types are `text`, `number`, `bool`, `error`, and `blank`; `blank` may omit
 its value. Text keeps trailing whitespace and additional tabs. Patch files must
 use UTF-8; BOM and CRLF files are supported. Empty lines and tab-free lines
@@ -112,7 +124,7 @@ beginning with `#` are ignored. Literal multiline values use the Rust API. Inval
 line number and leave the destination unchanged.
 
 `--help` (`-h`) and `--version` (`-V`) exit successfully. Invalid command syntax,
-patch syntax, or non-Unicode text arguments exit with code 2; workbook and I/O
+addresses or values, patch syntax, or non-Unicode text arguments exit with code 2; workbook and I/O
 errors exit with code 1. Native filesystem paths are accepted even when they
 cannot be represented as Unicode. Output handles a closed pipe without a panic.
 
@@ -164,7 +176,8 @@ in cached results. The original workbook's calculation settings are retained.
   and transitional SpreadsheetML and namespace-prefixed worksheets.
 - ZIP32 archives; accessed XML parts must use Stored or Deflate compression,
   be UTF-8 XML 1.0, and be at most 64 MiB. Other untouched compression methods
-  are retained without decoding. Workbooks are held in memory.
+  are retained without decoding. ZIP patched-data entries can only be preserved
+  untouched. Workbooks are held in memory.
 - Explicit, sorted row and cell coordinates. Ambiguous or malformed worksheet
   layouts return an error before applying changes.
 - Formula cells and shared, array, or data-table formula ranges are protected
@@ -180,6 +193,8 @@ in cached results. The original workbook's calculation settings are retained.
   bypassing these protections.
 - Unfamiliar XML inside a value payload is protected against replacement;
   unfamiliar cell attributes and sibling elements are preserved.
+- String reads refuse hidden text or shared-string entries in unsupported XML
+  containers, preventing partial values or shifted shared-string indices.
 - Legacy `.xls`, binary `.xlsb`, encrypted workbooks, ZIP64, multi-disk ZIP,
   and XML DTDs are unsupported. Digitally signed OOXML packages can be opened
   and copied unchanged, but editing is refused to avoid invalidating signatures.
@@ -188,9 +203,9 @@ in cached results. The original workbook's calculation settings are retained.
 
 Three direct dependencies; XML parsing and compression disable default features:
 
-- [`quick-xml`](https://docs.rs/quick-xml/0.41.0/quick_xml/): namespace-aware parsing.
-- [`flate2`](https://docs.rs/flate2/1.1.9/flate2/): pure Rust Deflate compression.
-- [`crc32fast`](https://docs.rs/crc32fast/1.5.0/crc32fast/): optimized ZIP checksums.
+- [`quick-xml`](https://docs.rs/quick-xml/0.42.0/quick_xml/): namespace-aware parsing.
+- [`flate2`](https://docs.rs/flate2/1.1.10/flate2/): pure Rust Deflate compression.
+- [`crc32fast`](https://docs.rs/crc32fast/1.5.2/crc32fast/): optimized ZIP checksums.
 
 There are no additional Rust CLI or test dependencies. ZIP records are handled
 in the crate so untouched records can remain unchanged.
@@ -207,8 +222,9 @@ cargo package --locked
 
 GitHub CI checks formatting, Clippy, and documentation with warnings treated as
 errors. Tests run on Linux, macOS, and Windows with stable Rust, and on Linux with
-the minimum supported Rust 1.88.0. Release builds and a clean package build must
-also pass. An independent LibreOffice export/edit/reopen check runs on Linux.
+the minimum supported Rust 1.88.0. Release builds, a clean package build, and
+installation and inspection of that extracted package must also pass.
+An independent LibreOffice export/edit/reopen check runs on Linux.
 The aggregate `CI` check requires every job to succeed. Actions are
 pinned to full commit hashes, workflow permissions are read-only, and Dependabot
 checks Cargo dependencies and GitHub Actions weekly.

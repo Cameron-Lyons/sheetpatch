@@ -12,8 +12,9 @@ use quick_xml::{
 };
 
 use crate::xml::{
-    excel_text, namespace as decoded_namespace, valid_char as valid_xml_char, valid_name,
-    valid_qname, validate_declaration, validate_namespaces, whitespace as xml_whitespace,
+    excel_text, namespace as decoded_namespace, trim_whitespace as trim_xml_whitespace,
+    valid_char as valid_xml_char, valid_name, valid_qname, validate_declaration,
+    validate_namespaces, whitespace as xml_whitespace,
 };
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 
@@ -544,10 +545,13 @@ fn patched_cell<'a>(
         let old = &elements[child];
         match value {
             CellValue::Number(number) if kind == "n" && old.is(namespace, "v") => {
-                element_text(xml, old)?.trim().parse::<f64>().ok() == Some(*number)
+                trim_xml_whitespace(&element_text(xml, old)?)
+                    .parse::<f64>()
+                    .ok()
+                    == Some(*number)
             }
             CellValue::Bool(boolean) if kind == "b" && old.is(namespace, "v") => {
-                match element_text(xml, old)?.trim() {
+                match trim_xml_whitespace(&element_text(xml, old)?) {
                     "1" | "true" => *boolean,
                     "0" | "false" => !*boolean,
                     _ => false,
@@ -746,10 +750,10 @@ impl<'a> WorksheetIndex<'a> {
             if !row.is(namespace, "row") {
                 continue;
             }
-            let row_number = row
+            let row_reference = row
                 .attr("r")
-                .ok_or_else(|| unsupported("rows without explicit row numbers"))?
-                .value
+                .ok_or_else(|| unsupported("rows without explicit row numbers"))?;
+            let row_number = trim_xml_whitespace(&row_reference.value)
                 .parse::<u32>()
                 .map_err(|_| unsupported("invalid row number"))?;
             if row_number <= previous_row || row_number > 1_048_576 {
@@ -791,10 +795,10 @@ impl<'a> WorksheetIndex<'a> {
                     }
                     match formula.attr("t").map(|attribute| attribute.value.as_ref()) {
                         Some("shared") => {
-                            let index = formula
+                            let index_reference = formula
                                 .attr("si")
-                                .ok_or_else(|| unsupported("shared formula without an index"))?
-                                .value
+                                .ok_or_else(|| unsupported("shared formula without an index"))?;
+                            let index = trim_xml_whitespace(&index_reference.value)
                                 .parse::<u32>()
                                 .map_err(|_| unsupported("invalid shared formula index"))?;
                             let has_range = shared.entry(index).or_insert(false);
@@ -1278,6 +1282,24 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
 }
 
 fn rich_text(xml: &[u8], elements: &[Element], index: usize, namespace: &str) -> Result<String> {
+    // Ignoring text hidden in compatibility branches or other containers would
+    // return an incomplete scalar value. Phonetic text is a known, separate
+    // annotation and remains excluded from the displayed text.
+    for element in &elements[elements[index].children_start..elements[index].children_end] {
+        let known_container = element.is(namespace, "r") || element.is(namespace, "rPh");
+        let known_text = element.is(namespace, "t");
+        if (known_container && element.parent != Some(index))
+            || (known_text
+                && !element.parent.is_some_and(|parent| {
+                    parent == index
+                        || ((elements[parent].is(namespace, "r")
+                            || elements[parent].is(namespace, "rPh"))
+                            && elements[parent].parent == Some(index))
+                }))
+        {
+            return Err(unsupported("rich text inside an unsupported XML container"));
+        }
+    }
     let mut text = String::new();
     for child in elements[index].children(elements) {
         let element = &elements[child];
@@ -1301,6 +1323,12 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     let namespace = root.namespace.as_deref().unwrap_or_default();
     if root.local_name() != "sst" || !matches!(namespace, TRANSITIONAL | STRICT) {
         return Err(unsupported("expected an OOXML shared-string table"));
+    }
+    if elements
+        .iter()
+        .any(|element| element.is(namespace, "si") && element.parent != Some(0))
+    {
+        return Err(unsupported("shared string outside the shared-string table"));
     }
     root.children(&elements)
         .filter(|&index| elements[index].is(namespace, "si"))
@@ -1327,8 +1355,7 @@ fn cell_content<'a>(
     let style_index = cell
         .attr("s")
         .map(|attribute| {
-            attribute
-                .value
+            trim_xml_whitespace(&attribute.value)
                 .parse::<u32>()
                 .map_err(|_| unsupported("invalid cell style index"))
         })
@@ -1362,10 +1389,9 @@ fn cell_content<'a>(
             }
             let text = element_text(xml, payload)?;
             match kind {
-                "n" if text.trim().is_empty() => CellValue::Blank,
+                "n" if trim_xml_whitespace(&text).is_empty() => CellValue::Blank,
                 "n" => {
-                    let number = text
-                        .trim()
+                    let number = trim_xml_whitespace(&text)
                         .parse::<f64>()
                         .map_err(|_| unsupported("invalid numeric cell value"))?;
                     if !number.is_finite() {
@@ -1373,7 +1399,7 @@ fn cell_content<'a>(
                     }
                     CellValue::Number(number)
                 }
-                "b" => CellValue::Bool(match text.trim() {
+                "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
                     "0" | "false" => false,
                     "1" | "true" => true,
                     _ => return Err(unsupported("invalid boolean cell value")),
@@ -1381,8 +1407,7 @@ fn cell_content<'a>(
                 "str" => CellValue::Text(excel_text(&text)?),
                 "e" => CellValue::Error(excel_text(&text)?),
                 "s" => {
-                    let position = text
-                        .trim()
+                    let position = trim_xml_whitespace(&text)
                         .parse::<usize>()
                         .map_err(|_| unsupported("invalid shared-string index"))?;
                     let strings = shared_strings()?;
@@ -1660,6 +1685,31 @@ mod tests {
                 edit(&invalid, "C1", 2.0.into()),
                 Err(Error::Unsupported(_))
             ));
+        }
+    }
+
+    #[test]
+    fn numeric_attributes_collapse_xml_whitespace_without_rewriting_it() {
+        let input = sheet(
+            "<sheetData><row r=' &#9;1&#13;&#10; '><c r='A1'><f t='shared' si=' 1 ' ref='A1:B1'>1</f><v>1</v></c><c r='B1'><f t='shared' si='&#9;01&#10;'/><v>1</v></c><c r='C1' s=' &#9;3&#13; '><v> 7 </v></c></row></sheetData>",
+        );
+        let content = read_cell(input.as_bytes(), "C1".parse().unwrap(), None).unwrap();
+        assert_eq!(content.value, CellValue::Number(7.0));
+        assert_eq!(content.style_index, Some(3));
+        assert_eq!(
+            edit(&input, "C1", 8.0.into()).unwrap(),
+            input.replace("<v> 7 </v>", "<v>8</v>")
+        );
+        for address in ["A1", "B1"] {
+            assert!(edit(&input, address, 2.0.into()).is_err());
+        }
+        for invalid in ["1 2", "\u{a0}1\u{a0}"] {
+            let bad_row = input.replace(" &#9;1&#13;&#10; ", invalid);
+            assert!(edit(&bad_row, "C1", 8.0.into()).is_err());
+            let bad_index = input.replace("si=' 1 '", &format!("si='{invalid}'"));
+            assert!(edit(&bad_index, "C1", 8.0.into()).is_err());
+            let bad_style = input.replace("s=' &#9;3&#13; '", &format!("s='{invalid}'"));
+            assert!(read_cell(bad_style.as_bytes(), "C1".parse().unwrap(), None).is_err());
         }
     }
 
@@ -2143,12 +2193,61 @@ mod tests {
     }
 
     #[test]
+    fn hidden_shared_strings_cannot_shift_visible_string_indices() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        for namespace in [TRANSITIONAL, STRICT] {
+            let table = format!(
+                "<sst xmlns='{namespace}' xmlns:mc='{mc}' xmlns:x='urn:custom'><mc:AlternateContent><mc:Choice Requires='x'><si><t>first</t></si></mc:Choice><mc:Fallback><si><t>first fallback</t></si></mc:Fallback></mc:AlternateContent><si><t>second</t></si></sst>"
+            );
+            assert!(matches!(
+                read_shared_strings(table.as_bytes()),
+                Err(Error::Unsupported(_))
+            ));
+            let foreign = format!(
+                "<sst xmlns='{namespace}' xmlns:x='urn:custom'><x:si><x:t>extension</x:t></x:si><si><t>first</t></si><si><t>second</t></si></sst>"
+            );
+            assert_eq!(
+                read_shared_strings(foreign.as_bytes()).unwrap(),
+                ["first", "second"]
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_rich_text_cannot_produce_a_partial_scalar_read() {
+        for payload in [
+            "<t>visible</t><x:alternate><t>hidden</t></x:alternate>",
+            "<t>visible</t><x:alternate><r><t>hidden</t></r></x:alternate>",
+            "<r><t>visible</t><x:alternate><t>hidden</t></x:alternate></r>",
+            "<t>visible</t><rPh sb='0' eb='1'><x:alternate><t>hidden</t></x:alternate></rPh>",
+        ] {
+            let inline = sheet(&format!(
+                "<sheetData><row r='1'><c r='A1' t='inlineStr'><is>{payload}</is></c></row></sheetData>"
+            ));
+            assert!(matches!(
+                read_cell(inline.as_bytes(), "A1".parse().unwrap(), None),
+                Err(Error::Unsupported(_))
+            ));
+            let table = format!(
+                "<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:custom'><si>{payload}</si></sst>"
+            );
+            assert!(matches!(
+                read_shared_strings(table.as_bytes()),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_invalid_read_values_and_missing_shared_strings() {
         for (kind, payload) in [
             ("n", "NaN"),
             ("n", "infinity"),
+            ("n", "\u{a0}1\u{a0}"),
             ("b", "2"),
+            ("b", "\u{a0}true\u{a0}"),
             ("s", "-1"),
+            ("s", "\u{a0}0\u{a0}"),
             ("d", "2026-01-01"),
         ] {
             let input = sheet(&format!(

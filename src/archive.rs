@@ -402,6 +402,11 @@ impl Archive {
             .get(name)
             .map(|&index| &self.entries[index])
             .ok_or_else(|| invalid(format!("ZIP member is missing: {name}")))?;
+        if entry.flags & 0x20 != 0 {
+            return Err(Error::Unsupported(format!(
+                "patched ZIP member data in {name}"
+            )));
+        }
         if entry.size as usize > MAX_READ {
             return Err(Error::Unsupported(format!(
                 "ZIP member {name} exceeds the 64 MiB read limit"
@@ -565,7 +570,13 @@ impl Archive {
                     "ZIP member {name} exceeds the 64 MiB read limit"
                 )));
             }
-            let method = self.entries[index].method;
+            let entry = &self.entries[index];
+            if entry.flags & 0x20 != 0 {
+                return Err(Error::Unsupported(format!(
+                    "patched ZIP member data in {name}"
+                )));
+            }
+            let method = entry.method;
             if !matches!(method, 0 | 8) {
                 return Err(Error::Unsupported(format!(
                     "ZIP compression method {method} in {name}"
@@ -692,7 +703,7 @@ impl Archive {
         }
         let flags = u16_at(bytes, start + 6)?;
         let method = u16_at(bytes, start + 8)?;
-        if flags & (1 | 0x40 | 0x2000) != 0 || !matches!(method, 0 | 8) {
+        if flags & (1 | 0x20 | 0x40 | 0x2000) != 0 || !matches!(method, 0 | 8) {
             return Err(unsupported());
         }
         let local_crc = u32_at(bytes, start + 14)?;
@@ -1349,6 +1360,54 @@ mod tests {
             assert!(archive.compact_to(&changes, &mut output).is_err());
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn patched_zip_members_remain_opaque_and_cannot_be_read_or_replaced() {
+        let mut patched = fixture(false);
+        let archive = Archive::new(patched.clone()).unwrap();
+        let central = archive.entries[0].central.start;
+        set_u16(&mut patched, 6, 0x20);
+        set_u16(&mut patched, central + 8, 0x20);
+        let original = combine(patched, decorate_fixture(b"keep.xml", false));
+        let archive = Archive::new(original.clone()).unwrap();
+        assert!(matches!(
+            archive.read("part.xml"),
+            Err(Error::Unsupported(message)) if message.contains("patched")
+        ));
+        assert_eq!(archive.read("keep.xml").unwrap(), b"<part/>");
+        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+        let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
+        let mut output = Vec::new();
+        assert!(matches!(
+            archive.write_to(&changes, &mut output),
+            Err(Error::Unsupported(message)) if message.contains("patched")
+        ));
+        assert!(output.is_empty());
+        let changes = BTreeMap::from([("keep.xml".into(), b"replacement".to_vec())]);
+        let output = archive.write(&changes).unwrap();
+        let reopened = Archive::new(output).unwrap();
+        assert_eq!(reopened.read("keep.xml").unwrap(), b"replacement");
+        let before = &archive.entries[archive.index["part.xml"]];
+        let after = &reopened.entries[reopened.index["part.xml"]];
+        assert_eq!(
+            reopened.original[after.local_record.clone()],
+            archive.original[before.local_record.clone()]
+        );
+    }
+
+    #[test]
+    fn compaction_never_discards_obsolete_patched_zip_members() {
+        let archive = Archive::new(fixture(false)).unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
+        let mut original = append(&archive, &changes);
+        set_u16(&mut original, 6, 0x20);
+        let archive = Archive::new(original.clone()).unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
+        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+        let mut output = Vec::new();
+        assert!(archive.compact_to(&BTreeMap::new(), &mut output).is_err());
+        assert!(output.is_empty());
     }
 
     #[test]

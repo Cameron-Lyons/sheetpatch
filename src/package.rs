@@ -682,14 +682,30 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
             .map(|(p, _)| p.split('/').collect())
             .unwrap_or_default()
     };
-    for part in target.split('/') {
+    // Empty URI segments are significant: removing them changes both direct
+    // lookup and which segment a following '..' removes. Only the leading '/'
+    // denotes the package root. Retain a terminal directory separator after
+    // removing '.' or '..', so it cannot alias a file part.
+    let mut segments = target
+        .strip_prefix('/')
+        .unwrap_or(&target)
+        .split('/')
+        .peekable();
+    while let Some(part) = segments.next() {
         match part {
-            "" | "." => (),
+            "." => {
+                if segments.peek().is_none() {
+                    parts.push("");
+                }
+            }
             ".." => {
                 if parts.pop().is_none() {
                     return Err(Error::InvalidWorkbook(
                         "relationship target escapes package root".into(),
                     ));
+                }
+                if segments.peek().is_none() {
+                    parts.push("");
                 }
             }
             value => parts.push(value),
@@ -698,6 +714,11 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
     if parts.is_empty() {
         return Err(Error::InvalidWorkbook(
             "relationship target names no part".into(),
+        ));
+    }
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidWorkbook(
+            "relationship target contains an empty part-name segment".into(),
         ));
     }
     Ok(parts.join("/"))
@@ -823,6 +844,72 @@ mod tests {
             "",
         ] {
             assert!(resolve_target("books/main.xml", target).is_err());
+        }
+    }
+
+    #[test]
+    fn relationship_resolution_preserves_empty_segments_and_directory_targets() {
+        for target in [
+            "tabs//sheet.xml",
+            "tabs/sheet.xml/",
+            "tabs/sheet.xml/.",
+            "tabs/sheet.xml/child/..",
+            ".",
+            "..",
+        ] {
+            assert!(
+                resolve_target("books/main.xml", target).is_err(),
+                "{target}"
+            );
+        }
+        // An empty segment removed by a following '..' does not remove its
+        // preceding named segment. RFC URI resolution differs from collapsing
+        // every consecutive slash before resolving traversal.
+        assert_eq!(
+            resolve_target("books/main.xml", "tabs//../sheet.xml").unwrap(),
+            "books/tabs/sheet.xml"
+        );
+    }
+
+    #[test]
+    fn workbook_discovery_does_not_alias_invalid_relationship_paths() {
+        let archive =
+            Archive::new(include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec()).unwrap();
+        for (part, target, invalid_targets) in [
+            (
+                "_rels/.rels",
+                "xl/workbook.xml",
+                [
+                    "xl//workbook.xml",
+                    "xl/workbook.xml/",
+                    "xl/workbook.xml/.",
+                    "xl/workbook.xml/child/..",
+                ],
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                "worksheets/sheet1.xml",
+                [
+                    "worksheets//sheet1.xml",
+                    "worksheets/sheet1.xml/",
+                    "worksheets/sheet1.xml/.",
+                    "worksheets/sheet1.xml/child/..",
+                ],
+            ),
+        ] {
+            let xml = String::from_utf8(archive.read(part).unwrap()).unwrap();
+            assert!(xml.contains(target));
+            for invalid_target in invalid_targets {
+                let changes = BTreeMap::from([(
+                    part.to_owned(),
+                    xml.replace(target, invalid_target).into_bytes(),
+                )]);
+                let bytes = archive.write(&changes).unwrap();
+                assert!(
+                    Workbook::from_bytes(bytes).is_err(),
+                    "{part}: {invalid_target}"
+                );
+            }
         }
     }
     #[test]

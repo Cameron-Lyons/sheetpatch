@@ -88,6 +88,29 @@ jobs:
             cargo test --locked --all-targets --all-features --manifest-path "$manifest"
             cargo test --locked --doc --all-features --manifest-path "$manifest"
           done
+      - name: Install and inspect extracted release package
+        run: |
+          for manifest in target/package/sheetpatch-*/Cargo.toml; do
+            cargo install --locked --path "${manifest%/Cargo.toml}" --root "$RUNNER_TEMP/sheetpatch-install"
+          done
+          "$RUNNER_TEMP/sheetpatch-install/bin/sheetpatch" --version
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          binary = Path(os.environ["RUNNER_TEMP"]) / "sheetpatch-install/bin/sheetpatch"
+          fixture = Path("tests/fixtures/libreoffice.xlsx")
+          def read(*arguments):
+              return json.loads(subprocess.check_output([str(binary), *map(str, arguments)]))
+          sheets = read("list", "--json", fixture)
+          assert [sheet["name"] for sheet in sheets] == ["Data", "Notes"]
+          cells = read("get", "--json", fixture, "Data", "a1", "D1", "XFD1048576")
+          assert [cell["cell"] for cell in cells] == ["A1", "D1", "XFD1048576"]
+          assert cells[0]["value"] == "Original text" and cells[0]["style_index"] == 1
+          assert cells[1]["value"] == 25 and cells[1]["formula"] == "B1*2"
+          assert cells[2]["type"] == "blank" and cells[2]["value"] is None
+          PY
 
   interoperability:
     name: LibreOffice interoperability
@@ -97,7 +120,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
       - name: Install independent spreadsheet application

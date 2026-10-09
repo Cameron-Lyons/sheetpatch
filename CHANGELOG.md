@@ -14,6 +14,19 @@ workbooks. See README.md for the preservation contract and supported scope.
   Explicit compaction can remove obsolete records from 0.2 append saves.
 - CLI commands for listing sheets, reading cells, setting values, TSV patches,
   and compaction, plus `--help` and `--version`.
+- CLI reads accept multiple cells with one worksheet parse and preserve input
+  order. `get --json` includes scalar types, values, stored formulas, and styles;
+  `list --json` exposes worksheet names and package paths for scripts.
+- Invalid CLI addresses and values are reported as usage errors before opening
+  a workbook; failed batch reads produce no partial output.
+- Relationship URI resolution rejects directory targets and unresolved empty
+  path segments, preventing malformed targets from aliasing valid package parts.
+- ZIP patched-data entries stay opaque; reading, editing, and deleting obsolete
+  patched records during compaction are refused.
+- Worksheet numeric attributes and scalar values accept surrounding XML
+  whitespace, including shared-formula indices, styles, and shared-string indices.
+- Shared-string and rich-text reads reject content hidden in unsupported XML
+  containers, preventing shifted indices and incomplete text values.
 - Atomic saves preserve private destination permissions before writing temporary
   contents and support long destination filenames. On Unix, temporary replacements
   use restricted permissions at creation, closing the window before chmod.

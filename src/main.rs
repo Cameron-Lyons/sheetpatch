@@ -8,9 +8,9 @@ use std::{
     process::ExitCode,
 };
 
-use sheetpatch::{CellEdit, CellValue, Workbook};
+use sheetpatch::{CellContent, CellEdit, CellRef, CellValue, Workbook};
 
-const USAGE: &str = "Usage:\n  sheetpatch list INPUT\n  sheetpatch get INPUT SHEET CELL\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch --help\n  sheetpatch --version\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints the stored value; formula results are cached and are not recalculated.";
+const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch --help\n  sheetpatch --version\n\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin. Empty lines are ignored.\nLines starting with # without tabs are comments.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\n--json returns an array: list includes names and paths; get includes types, values, formulas and styles.";
 
 #[derive(Debug)]
 enum Failure {
@@ -99,6 +99,79 @@ fn text_arg(args: &[OsString], index: usize) -> Result<&str, Failure> {
         .ok_or_else(|| Failure::Usage(format!("Argument {index} must be valid Unicode text.")))
 }
 
+fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    let mut start = 0;
+    for (index, ch) in value.char_indices() {
+        let escape = match ch {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            '\u{08}' => "\\b",
+            '\u{0c}' => "\\f",
+            '\u{00}'..='\u{1f}' => "",
+            _ => continue,
+        };
+        output.write_all(&value.as_bytes()[start..index])?;
+        if escape.is_empty() {
+            write!(output, "\\u{:04x}", ch as u32)?;
+        } else {
+            output.write_all(escape.as_bytes())?;
+        }
+        start = index + ch.len_utf8();
+    }
+    output.write_all(&value.as_bytes()[start..])?;
+    output.write_all(b"\"")
+}
+
+fn write_scalar(output: &mut impl Write, value: &CellValue) -> io::Result<()> {
+    match value {
+        CellValue::Text(value) | CellValue::Error(value) => writeln!(output, "{value}"),
+        CellValue::Number(value) => writeln!(output, "{value}"),
+        CellValue::Bool(value) => writeln!(output, "{value}"),
+        CellValue::Blank => writeln!(output),
+    }
+}
+
+fn write_json_cell(
+    output: &mut impl Write,
+    sheet: &str,
+    cell: CellRef,
+    content: &CellContent,
+) -> io::Result<()> {
+    output.write_all(b"{\"sheet\":")?;
+    write_json_string(output, sheet)?;
+    output.write_all(b",\"cell\":")?;
+    write_json_string(output, &cell.to_string())?;
+    let kind = match content.value {
+        CellValue::Text(_) => "text",
+        CellValue::Number(_) => "number",
+        CellValue::Bool(_) => "bool",
+        CellValue::Error(_) => "error",
+        CellValue::Blank => "blank",
+    };
+    write!(output, ",\"type\":\"{kind}\",\"value\":")?;
+    match &content.value {
+        CellValue::Text(value) | CellValue::Error(value) => write_json_string(output, value)?,
+        CellValue::Number(value) => write!(output, "{value}")?,
+        CellValue::Bool(value) => write!(output, "{value}")?,
+        CellValue::Blank => output.write_all(b"null")?,
+    }
+    output.write_all(b",\"formula\":")?;
+    match &content.formula {
+        Some(formula) => write_json_string(output, formula)?,
+        None => output.write_all(b"null")?,
+    }
+    output.write_all(b",\"style_index\":")?;
+    match content.style_index {
+        Some(style) => write!(output, "{style}")?,
+        None => output.write_all(b"null")?,
+    }
+    output.write_all(b"}")
+}
+
 fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
     match args.get(1).and_then(|arg| arg.to_str()) {
         Some("--help" | "-h") if args.len() == 2 => {
@@ -109,22 +182,68 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
             writeln!(output, "sheetpatch {}", env!("CARGO_PKG_VERSION"))?;
             Ok(())
         }
-        Some("list") if args.len() == 3 => {
-            let workbook = Workbook::open(&args[2])?;
-            for sheet in workbook.sheets() {
-                writeln!(output, "{}", sheet.name())?;
+        Some("list") => {
+            let json = args.get(2).is_some_and(|arg| arg == "--json");
+            let input_index = if json { 3 } else { 2 };
+            if args.len() != input_index + 1 {
+                return Err(Failure::Usage("list requires one input workbook.".into()));
+            }
+            let workbook = Workbook::open(&args[input_index])?;
+            if json {
+                output.write_all(b"[")?;
+            }
+            for (index, sheet) in workbook.sheets().iter().enumerate() {
+                if json {
+                    if index != 0 {
+                        output.write_all(b",")?;
+                    }
+                    output.write_all(b"{\"name\":")?;
+                    write_json_string(&mut output, sheet.name())?;
+                    output.write_all(b",\"path\":")?;
+                    write_json_string(&mut output, sheet.path())?;
+                    output.write_all(b"}")?;
+                } else {
+                    writeln!(output, "{}", sheet.name())?;
+                }
+            }
+            if json {
+                output.write_all(b"]\n")?;
             }
             Ok(())
         }
-        Some("get") if args.len() == 5 => {
-            let sheet = text_arg(args, 3)?;
-            let cell = text_arg(args, 4)?;
-            let workbook = Workbook::open(&args[2])?;
-            match workbook.get_cell(sheet, cell)?.value {
-                CellValue::Text(value) | CellValue::Error(value) => writeln!(output, "{value}")?,
-                CellValue::Number(value) => writeln!(output, "{value}")?,
-                CellValue::Bool(value) => writeln!(output, "{value}")?,
-                CellValue::Blank => writeln!(output)?,
+        Some("get") => {
+            let json = args.get(2).is_some_and(|arg| arg == "--json");
+            let input_index = if json { 3 } else { 2 };
+            if args.len() < input_index + 3 {
+                return Err(Failure::Usage(
+                    "get requires an input workbook, a sheet, and at least one cell.".into(),
+                ));
+            }
+            let sheet = text_arg(args, input_index + 1)?;
+            let cells = (input_index + 2..args.len())
+                .map(|index| {
+                    text_arg(args, index)?
+                        .parse::<CellRef>()
+                        .map_err(|error| Failure::Usage(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let workbook = Workbook::open(&args[input_index])?;
+            let contents = workbook.get_cells(sheet, cells.iter().map(ToString::to_string))?;
+            if json {
+                output.write_all(b"[")?;
+            }
+            for (index, (cell, content)) in cells.iter().zip(&contents).enumerate() {
+                if json {
+                    if index != 0 {
+                        output.write_all(b",")?;
+                    }
+                    write_json_cell(&mut output, sheet, *cell, content)?;
+                } else {
+                    write_scalar(&mut output, &content.value)?;
+                }
+            }
+            if json {
+                output.write_all(b"]\n")?;
             }
             Ok(())
         }
@@ -136,8 +255,10 @@ fn run(args: &[OsString], mut output: impl Write) -> Result<(), Failure> {
             .map_err(Failure::Usage)?;
             let sheet = text_arg(args, 4)?;
             let cell = text_arg(args, 5)?;
+            let edit = CellEdit::new(sheet, cell, value)
+                .map_err(|error| Failure::Usage(error.to_string()))?;
             let mut workbook = Workbook::open(&args[2])?;
-            workbook.set_cell(sheet, cell, value)?;
+            workbook.apply_edits([edit])?;
             workbook.save(&args[3])?;
             Ok(())
         }
@@ -200,6 +321,10 @@ mod tests {
         for (args, text_indexes) in [
             (vec!["sheetpatch", "get", "", "Data", "A1"], 3..5),
             (
+                vec!["sheetpatch", "get", "--json", "", "Data", "A1", "B2"],
+                4..7,
+            ),
+            (
                 vec!["sheetpatch", "set", "", "", "Data", "A1", "text", "value"],
                 4..8,
             ),
@@ -216,6 +341,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn json_strings_escape_all_controls_and_keep_unicode() {
+        let input = format!("Café 😀\"\\{}", (0..32).map(char::from).collect::<String>());
+        let mut output = Vec::new();
+        write_json_string(&mut output, &input).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "\"Café 😀\\\"\\\\",
+                "\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007",
+                "\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f",
+                "\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017",
+                "\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\""
+            )
+        );
     }
 
     #[test]

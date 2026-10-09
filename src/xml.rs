@@ -50,6 +50,12 @@ pub(crate) fn whitespace(text: &str) -> bool {
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
+// Schema numeric values collapse XML whitespace, rather than Rust's broader
+// Unicode whitespace set. Internal whitespace remains invalid for a number.
+pub(crate) fn trim_whitespace(text: &str) -> &str {
+    text.trim_matches([' ', '\t', '\r', '\n'])
+}
+
 pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
     let raw = start.as_ref().as_bytes();
     let name_length = start.name().as_ref().len();
@@ -272,8 +278,10 @@ mod tests {
     #[test]
     fn xml_space_is_limited_to_the_four_defined_characters() {
         assert!(whitespace(" \t\r\n"));
+        assert_eq!(trim_whitespace(" \t\r\n17\n\t "), "17");
         for text in ["\u{a0}", "\u{2000}", "\u{85}", "text"] {
             assert!(!whitespace(text));
+            assert_eq!(trim_whitespace(text), text);
         }
     }
 
