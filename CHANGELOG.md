@@ -25,6 +25,17 @@ workbooks. See README.md for the preservation contract and supported scope.
   validated `CellRef` values directly. CLI batch reads use the typed path, avoiding
   address conversion and reparsing; JSON addresses are formatted without temporary
   strings.
+- `prepare_sheet` returns a read-only `WorksheetView` for repeated reads using
+  one validated worksheet index. Index retention is limited to the view's lifetime;
+  ordinary reads retain their existing memory behavior.
+- Worksheet parsing, indexing, protection checks, value decoding, and patch
+  planning have separate internal modules. Attributes and row cells use compact
+  shared buffers, namespaces use canonical identifiers, and edits apply absolute
+  spans without rebuilding each cell.
+- Per-sheet state groups original and pending XML. ZIP writers resolve borrowed
+  replacements to entry indexes once and share normal/compact record emission.
+- Benchmarks cover prepared and ordinary reads, wide rows, large cell extensions,
+  shared strings, insertions, and multi-sheet transactions, with workload filters.
 - Invalid CLI addresses and values are reported as usage errors before opening
   a workbook; failed batch reads produce no partial output.
 - Relationship URI resolution rejects directory targets and unresolved empty

@@ -86,6 +86,23 @@ and `CellEdit::at` accept them directly, avoiding conversion through A1 strings.
 Typed batches preserve input order for reads and use the last value for duplicate
 edits, with the same transaction and value validation rules as A1 batches.
 
+For repeated reads from one worksheet, `prepare_sheet` returns a `WorksheetView`
+that parses and validates the worksheet once:
+
+```rust,no_run
+let book = sheetpatch::Workbook::open("report.xlsx")?;
+let sheet = book.prepare_sheet("Summary")?;
+let total = sheet.get_cell("C2")?;
+let details = sheet.get_cells(["C3", "C4", "C3"])?;
+# Ok::<(), sheetpatch::Error>(())
+```
+
+The view includes pending edits, preserves read order and duplicates, and loads
+shared strings only when requested values need them. It borrows the workbook;
+drop it before making edits. Dropping the view releases the parsed index.
+Ordinary reads retain cached decompressed XML but release their index after
+each call. Both workbooks and prepared views can be shared across threads.
+
 `write_to` streams a workbook to any `std::io::Write` implementation. File saves
 use that same path, avoiding allocation of another complete ZIP. Worksheets are
 decompressed lazily and cached; shared strings are loaded only when a requested
@@ -259,12 +276,25 @@ cells' bounding rectangle before allocating a sweep index.
 Indexed ZIP/sheet lookup and cached decompression avoid repeated archive
 scans. ZIP physical order is cached for repeated saves, and worksheet parsing
 borrows names and attribute values from the original XML. Direct children use
-ranges in the parse index, avoiding an allocation for each parent. Edits that
+ranges in the parse index, and attributes and row cells use shared buffers,
+avoiding an allocation for each parent, attribute list, or row's cells. Normalized
+namespace URIs use compact identifiers. One patch plan applies payload and
+attribute changes directly to worksheet spans;
+unchanged cell extensions are copied only into the final output. Edits that
 leave a worksheet unchanged retain its current XML without copying it.
 Shared-string reads load the table on demand during the same worksheet parse.
+Prepared worksheet views reuse a validated index across reads, with retention
+controlled by the view's lifetime.
 Streaming saves borrow ZIP metadata and hold one replacement compressed part at
 a time, in addition to the input archive, cached original XML, and pending
-worksheet XML.
+worksheet XML. Changed parts resolve to archive entry indexes once per save;
+normal and compact saves use the same record emitter with their respective
+gap-preservation rules.
+
+The internal worksheet pipeline separates XML spans, worksheet structure,
+protection checks, patch planning, and value decoding. Package discovery is
+separate from workbook state, and each sheet's original and pending XML share
+one state record. Transactions stage all replacements before committing them.
 
 Run the dependency-free benchmark with:
 
@@ -274,7 +304,20 @@ SHEETPATCH_BENCH_SAMPLES=3 cargo bench --locked --bench editing
 
 The harness independently checks expected worksheet XML and untouched compressed
 ZIP parts before measuring, and compares sequential edits, batching, streaming,
-compaction, batch reads, and unchanged batches. Initial 0.2 measurements used one
+compaction, batch reads, prepared reads, and unchanged batches. It also exercises
+wide rows, unfamiliar cell extensions, shared strings, new-row insertion, and
+multiple worksheets. Use `SHEETPATCH_BENCH_CASES` to select comma-separated cases
+(`narrow_10000`, `narrow_50000`, `guarded`, `wide`, `opaque`, `shared_strings`,
+`insertion`, `multisheet`) and `SHEETPATCH_BENCH_OPERATIONS` to select exact
+operation names printed by the harness. For example:
+
+```sh
+SHEETPATCH_BENCH_CASES=narrow_50000 \
+SHEETPATCH_BENCH_OPERATIONS=bulk_at,get_cells_at,prepared_single_reads \
+SHEETPATCH_BENCH_SAMPLES=5 cargo bench --locked --bench editing
+```
+
+Initial 0.2 measurements used one
 release-mode sample per synthetic workload on an Intel Core Ultra 5 325, Linux
 x86_64, Rust 1.99.0:
 
