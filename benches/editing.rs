@@ -1,6 +1,13 @@
 //! Reproducible benchmarks without a benchmarking dependency.
 //! Run `SHEETPATCH_BENCH_SAMPLES=3 cargo bench --bench editing`.
-//! Samples include workbook loading and edits, but exclude fixture construction.
+//! Cold reads and edits include workbook loading; warm reads and saves reuse a book.
+//! Prepared lookups exclude view construction; `prepare_and_read` includes it.
+//! All timings exclude fixture construction.
+//! Filter comma-separated case names with `SHEETPATCH_BENCH_CASES` and operation
+//! names with `SHEETPATCH_BENCH_OPERATIONS`; unset filters run every workload.
+//! Example: `SHEETPATCH_BENCH_CASES=wide SHEETPATCH_BENCH_OPERATIONS=wide_bulk_at`.
+//! Run one filtered operation under `/usr/bin/time -v` to compare process peak RSS;
+//! this includes fixture construction and correctness checks as well as samples.
 
 use std::{
     collections::BTreeMap,
@@ -11,11 +18,62 @@ use std::{
 };
 
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
-use sheetpatch::{CellRef, CellValue, Workbook};
+use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 const CASES: &[(usize, usize)] = &[(10_000, 100), (50_000, 500)];
+const CASE_NAMES: &[&str] = &[
+    "narrow_10000",
+    "narrow_50000",
+    "guarded",
+    "wide",
+    "opaque",
+    "shared_strings",
+    "insertion",
+    "multisheet",
+];
+const OPERATIONS: &[&str] = &[
+    "sequential",
+    "bulk",
+    "get_cells",
+    "bulk_at",
+    "get_cells_at",
+    "unchanged_bulk",
+    "to_bytes",
+    "write_to_sink",
+    "compact_to_bytes",
+    "compact_to_sink",
+    "guarded_bulk_at",
+    "cold_single_read",
+    "warm_single_reads",
+    "prepared_single_reads",
+    "prepare_and_read",
+    "wide_bulk_at",
+    "opaque_bulk_at",
+    "opaque_unchanged",
+    "shared_cold_reads",
+    "shared_warm_reads",
+    "shared_prepared_reads",
+    "insert_bulk_at",
+    "multisheet_apply",
+];
+
+fn selected(variable: &str, name: &str) -> bool {
+    std::env::var(variable).is_ok_and(|filter| filter.split(',').any(|item| item.trim() == name))
+        || std::env::var_os(variable).is_none()
+}
+
+fn validate_filter(variable: &str, names: &[&str]) {
+    if let Ok(filter) = std::env::var(variable) {
+        for item in filter.split(',') {
+            assert!(
+                names.contains(&item.trim()),
+                "unknown {variable} value {item:?}; choose from {names:?}"
+            );
+        }
+    }
+}
 
 fn updates(cells: usize, count: usize) -> Vec<(String, CellValue)> {
     (0..count)
@@ -151,6 +209,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 struct Entry<'a> {
+    local: &'a [u8],
     compressed: &'a [u8],
     central_prefix: &'a [u8],
     central_suffix: &'a [u8],
@@ -172,6 +231,7 @@ fn entries(bytes: &[u8]) -> BTreeMap<String, Entry<'_>> {
         entries.insert(
             name,
             Entry {
+                local: &bytes[local..start + size],
                 compressed: &bytes[start..start + size],
                 central_prefix: &bytes[offset..offset + 42],
                 central_suffix: &bytes[offset + 46..offset + central_size],
@@ -183,17 +243,24 @@ fn entries(bytes: &[u8]) -> BTreeMap<String, Entry<'_>> {
 }
 
 fn verify_output(input: &[u8], output: &[u8], expected: &[u8]) {
+    verify_parts(input, output, &[(SHEET_PATH, expected)]);
+}
+
+fn verify_parts(input: &[u8], output: &[u8], expected: &[(&str, &[u8])]) {
     let originals = entries(input);
     let replacements = entries(output);
     assert_eq!(originals.len(), replacements.len());
-    let mut decoded = Vec::new();
-    DeflateDecoder::new(replacements[SHEET_PATH].compressed)
-        .read_to_end(&mut decoded)
-        .unwrap();
-    assert_eq!(decoded, expected, "effective worksheet XML must match");
+    for &(path, xml) in expected {
+        let mut decoded = Vec::new();
+        DeflateDecoder::new(replacements[path].compressed)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, xml, "effective worksheet XML must match: {path}");
+    }
     for (name, original) in originals {
-        if name != SHEET_PATH {
+        if !expected.iter().any(|&(path, _)| path == name) {
             let replacement = &replacements[&name];
+            assert_eq!(original.local, replacement.local, "{name}");
             assert_eq!(original.compressed, replacement.compressed, "{name}");
             assert_eq!(
                 original.central_prefix, replacement.central_prefix,
@@ -224,7 +291,10 @@ fn sequential(input: &[u8], edits: &[(String, CellValue)]) -> Workbook {
     book
 }
 
-fn measure<T>(samples: usize, mut operation: impl FnMut() -> T) -> Duration {
+fn measure<T>(samples: usize, label: &str, mut operation: impl FnMut() -> T) -> Option<Duration> {
+    if !selected("SHEETPATCH_BENCH_OPERATIONS", label) {
+        return None;
+    }
     let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
@@ -233,7 +303,7 @@ fn measure<T>(samples: usize, mut operation: impl FnMut() -> T) -> Duration {
         drop(result);
     }
     times.sort_unstable();
-    times[times.len() / 2]
+    Some(times[times.len() / 2])
 }
 
 fn samples() -> usize {
@@ -248,8 +318,10 @@ fn samples() -> usize {
         .unwrap_or(3)
 }
 
-fn report(label: &str, cells: usize, count: usize, samples: usize, elapsed: Duration) {
-    println!("{label},{cells},{count},{samples},{}", elapsed.as_micros());
+fn report(label: &str, cells: usize, count: usize, samples: usize, elapsed: Option<Duration>) {
+    if let Some(elapsed) = elapsed {
+        println!("{label},{cells},{count},{samples},{}", elapsed.as_micros());
+    }
 }
 
 // New APIs begin here; the helpers above also run against the original baseline.
@@ -327,7 +399,408 @@ fn guarded_batches(samples: usize) {
             cells,
             count,
             samples,
-            measure(samples, || bulk_at(&input, &edits)),
+            measure(samples, "guarded_bulk_at", || bulk_at(&input, &edits)),
+        );
+    }
+}
+
+fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> Vec<u8> {
+    let base = fixture_with_sheet(sheets[0].1);
+    let mut parts: BTreeMap<String, Vec<u8>> = entries(&base)
+        .into_iter()
+        .map(|(name, entry)| {
+            let mut bytes = Vec::new();
+            DeflateDecoder::new(entry.compressed)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            (name, bytes)
+        })
+        .collect();
+    let office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let mut workbook = format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{office}'><sheets>");
+    let mut relationships = String::from(
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
+    );
+    let mut additional_types = String::new();
+    for (index, &(name, xml)) in sheets.iter().enumerate() {
+        let number = index + 1;
+        write!(
+            workbook,
+            "<sheet name='{name}' sheetId='{number}' r:id='r{number}'/>"
+        )
+        .unwrap();
+        write!(relationships, "<Relationship Id='r{number}' Type='{office}/worksheet' Target='worksheets/sheet{number}.xml'/>").unwrap();
+        if index > 0 {
+            write!(additional_types, "<Override PartName='/xl/worksheets/sheet{number}.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/>").unwrap();
+        }
+        parts.insert(format!("xl/worksheets/sheet{number}.xml"), xml.to_vec());
+    }
+    if let Some(strings) = shared_strings {
+        write!(
+            relationships,
+            "<Relationship Id='strings' Type='{office}/sharedStrings' Target='sharedStrings.xml'/>"
+        )
+        .unwrap();
+        additional_types.push_str("<Override PartName='/xl/sharedStrings.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'/>");
+        parts.insert("xl/sharedStrings.xml".into(), strings.to_vec());
+    }
+    write!(
+        relationships,
+        "<Relationship Id='styles' Type='{office}/styles' Target='styles.xml'/></Relationships>"
+    )
+    .unwrap();
+    workbook.push_str("</sheets></workbook>");
+    parts.insert("xl/workbook.xml".into(), workbook.into_bytes());
+    parts.insert(
+        "xl/_rels/workbook.xml.rels".into(),
+        relationships.into_bytes(),
+    );
+    let types = String::from_utf8(parts.remove("[Content_Types].xml").unwrap()).unwrap();
+    parts.insert(
+        "[Content_Types].xml".into(),
+        types
+            .replace("</Types>", &format!("{additional_types}</Types>"))
+            .into_bytes(),
+    );
+    let borrowed: Vec<_> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    zip(&borrowed)
+}
+
+fn wide_worksheet(rows: u32, columns: u16, values: &BTreeMap<CellRef, i32>) -> Vec<u8> {
+    let last = CellRef::new(rows, columns).unwrap();
+    let mut xml = format!("<worksheet xmlns='{MAIN_NS}'><dimension ref='A1:{last}'/><sheetData>");
+    for row in 1..=rows {
+        write!(xml, "<row r='{row}'>").unwrap();
+        for column in 1..=columns {
+            let cell = CellRef::new(row, column).unwrap();
+            let value = values
+                .get(&cell)
+                .copied()
+                .unwrap_or(((row - 1) * u32::from(columns) + u32::from(column)) as i32);
+            write!(xml, "<c r='{cell}' s='0'><v>{value}</v></c>").unwrap();
+        }
+        xml.push_str("</row>");
+    }
+    xml.push_str("</sheetData></worksheet>");
+    xml.into_bytes()
+}
+
+fn numeric_case(
+    samples: usize,
+    label: &str,
+    sheet: &[u8],
+    expected: &[u8],
+    cells: usize,
+    edits: &[(CellRef, CellValue)],
+) -> Workbook {
+    let input = fixture_with_sheet(sheet);
+    let book = bulk_at(&input, edits);
+    verify_output(&input, &book.to_bytes().unwrap(), expected);
+    let reads = book
+        .get_cells_at("Data", edits.iter().map(|(cell, _)| *cell))
+        .unwrap();
+    for (read, (_, value)) in reads.iter().zip(edits) {
+        assert_eq!(&read.value, value);
+    }
+    report(
+        label,
+        cells,
+        edits.len(),
+        samples,
+        measure(samples, label, || bulk_at(&input, edits)),
+    );
+    book
+}
+
+fn repeated_reads(
+    samples: usize,
+    input: &[u8],
+    book: &Workbook,
+    edits: &[(CellRef, CellValue)],
+    cells: usize,
+) {
+    let queries: Vec<_> = edits.iter().take(16).map(|(cell, _)| *cell).collect();
+    let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
+    let read_one_at_a_time = || {
+        queries
+            .iter()
+            .map(|&cell| book.get_cell_at("Data", cell).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read_one_at_a_time(), expected);
+    report(
+        "cold_single_read",
+        cells,
+        1,
+        samples,
+        measure(samples, "cold_single_read", || {
+            Workbook::from_bytes(input.to_vec())
+                .unwrap()
+                .get_cell_at("Data", queries[0])
+                .unwrap()
+        }),
+    );
+    report(
+        "warm_single_reads",
+        cells,
+        queries.len(),
+        samples,
+        measure(samples, "warm_single_reads", read_one_at_a_time),
+    );
+    prepared_reads(samples, book, &queries, cells);
+}
+
+// Keep the new API benchmarks together so the common workloads can also run
+// against an older checkout with a small view adapter for baseline comparison.
+fn prepared_reads(samples: usize, book: &Workbook, queries: &[CellRef], cells: usize) {
+    if selected("SHEETPATCH_BENCH_OPERATIONS", "prepared_single_reads") {
+        let view = book.prepare_sheet("Data").unwrap();
+        let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
+        let read = || {
+            queries
+                .iter()
+                .map(|&cell| view.get_cell_at(cell).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(), expected);
+        report(
+            "prepared_single_reads",
+            cells,
+            queries.len(),
+            samples,
+            measure(samples, "prepared_single_reads", read),
+        );
+    }
+    report(
+        "prepare_and_read",
+        cells,
+        1,
+        samples,
+        measure(samples, "prepare_and_read", || {
+            book.prepare_sheet("Data")
+                .unwrap()
+                .get_cell_at(queries[0])
+                .unwrap()
+        }),
+    );
+}
+
+fn shared_string_reads(samples: usize) {
+    let cells = 2_000;
+    let count = 64;
+    let mut sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData>");
+    let mut strings = format!("<sst xmlns='{MAIN_NS}'>");
+    for index in 0..128 {
+        write!(
+            strings,
+            "<si><r><t>Shared {index} </t></r><r><t>☕ _x005F_x0041_</t></r></si>"
+        )
+        .unwrap();
+    }
+    strings.push_str("</sst>");
+    for row in 1..=cells {
+        write!(
+            sheet,
+            "<row r='{row}'><c r='A{row}' t='s'><v>{}</v></c></row>",
+            (row - 1) % 128
+        )
+        .unwrap();
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let input = expanded_fixture(&[("Data", sheet.as_bytes())], Some(strings.as_bytes()));
+    let queries: Vec<_> = (0..count)
+        .map(|index| CellRef::new(1 + (index * cells / count) as u32, 1).unwrap())
+        .collect();
+    let book = Workbook::from_bytes(input.clone()).unwrap();
+    let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
+    for (content, cell) in expected.iter().zip(&queries) {
+        assert_eq!(
+            content.value,
+            CellValue::from(format!("Shared {} ☕ _x0041_", (cell.row() - 1) % 128))
+        );
+    }
+    assert_eq!(book.to_bytes().unwrap(), input);
+    report(
+        "shared_cold_reads",
+        cells,
+        count,
+        samples,
+        measure(samples, "shared_cold_reads", || {
+            Workbook::from_bytes(input.clone())
+                .unwrap()
+                .get_cells_at("Data", queries.iter().copied())
+                .unwrap()
+        }),
+    );
+    report(
+        "shared_warm_reads",
+        cells,
+        count,
+        samples,
+        measure(samples, "shared_warm_reads", || {
+            book.get_cells_at("Data", queries.iter().copied()).unwrap()
+        }),
+    );
+    if selected("SHEETPATCH_BENCH_OPERATIONS", "shared_prepared_reads") {
+        let view = book.prepare_sheet("Data").unwrap();
+        assert_eq!(
+            view.get_cells_at(queries.iter().copied()).unwrap(),
+            expected
+        );
+        report(
+            "shared_prepared_reads",
+            cells,
+            count,
+            samples,
+            measure(samples, "shared_prepared_reads", || {
+                view.get_cells_at(queries.iter().copied()).unwrap()
+            }),
+        );
+    }
+}
+
+fn extra_workloads(samples: usize) {
+    if selected("SHEETPATCH_BENCH_CASES", "wide") {
+        let rows = 200;
+        let columns = 100;
+        let values: BTreeMap<_, _> = (0..100)
+            .map(|index| {
+                (
+                    CellRef::new(
+                        1 + index * rows / 100,
+                        1 + (index * 37 % u32::from(columns)) as u16,
+                    )
+                    .unwrap(),
+                    -((index + 1) as i32),
+                )
+            })
+            .collect();
+        let edits: Vec<_> = values
+            .iter()
+            .map(|(&cell, &value)| (cell, CellValue::from(value)))
+            .collect();
+        numeric_case(
+            samples,
+            "wide_bulk_at",
+            &wide_worksheet(rows, columns, &BTreeMap::new()),
+            &wide_worksheet(rows, columns, &values),
+            rows as usize * usize::from(columns),
+            &edits,
+        );
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "opaque") {
+        let cells = 1_000;
+        let count = 20;
+        let mut extension = String::from("<extLst><ext uri='urn:bench'><v:tree>");
+        for index in 0..32 {
+            write!(extension, "<v:branch n='{index}'><v:leaf a='opaque'>unfamiliar cell extension payload</v:leaf></v:branch>").unwrap();
+        }
+        extension.push_str("</v:tree></ext></extLst>");
+        let with_extensions = |values| {
+            String::from_utf8(worksheet(cells, values))
+                .unwrap()
+                .replace("</c>", &format!("{extension}</c>"))
+                .into_bytes()
+        };
+        let edits: Vec<_> = updates(cells, count)
+            .into_iter()
+            .map(|(cell, value)| (cell.parse().unwrap(), value))
+            .collect();
+        let values = (0..count)
+            .map(|index| (1 + index * cells / count, -((index + 1) as i32)))
+            .collect();
+        let mut book = numeric_case(
+            samples,
+            "opaque_bulk_at",
+            &with_extensions(&BTreeMap::new()),
+            &with_extensions(&values),
+            cells,
+            &edits,
+        );
+        let before = book.to_bytes().unwrap();
+        report(
+            "opaque_unchanged",
+            cells,
+            count,
+            samples,
+            measure(samples, "opaque_unchanged", || {
+                book.set_cells_at("Data", edits.iter().cloned()).unwrap()
+            }),
+        );
+        assert_eq!(book.to_bytes().unwrap(), before);
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "shared_strings") {
+        shared_string_reads(samples);
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "insertion") {
+        let sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let mut rows = String::from("<sheetData>");
+        let mut edits = Vec::new();
+        for row in 1..=500 {
+            write!(rows, "<row r=\"{row}\">").unwrap();
+            for column in 1..=2 {
+                let cell = CellRef::new(row, column).unwrap();
+                let value = row as i32 * i32::from(column);
+                write!(rows, "<c r=\"{cell}\"><v>{value}</v></c>").unwrap();
+                edits.push((cell, CellValue::from(value)));
+            }
+            rows.push_str("</row>");
+        }
+        rows.push_str("</sheetData>");
+        numeric_case(
+            samples,
+            "insert_bulk_at",
+            sheet.as_bytes(),
+            sheet.replace("<sheetData/>", &rows).as_bytes(),
+            0,
+            &edits,
+        );
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "multisheet") {
+        let cells = 2_000;
+        let count = 32;
+        let sheet = worksheet(cells, &BTreeMap::new());
+        let names = ["Data", "Other1", "Other2", "Other3"];
+        let sheets: Vec<_> = names.iter().map(|&name| (name, sheet.as_slice())).collect();
+        let input = expanded_fixture(&sheets, None);
+        let edits: Vec<_> = names
+            .iter()
+            .flat_map(|&name| {
+                updates(cells, count)
+                    .into_iter()
+                    .map(move |(cell, value)| CellEdit::new(name, &cell, value).unwrap())
+            })
+            .collect();
+        let run = || {
+            let mut book = Workbook::from_bytes(input.clone()).unwrap();
+            book.apply_edits(edits.clone()).unwrap();
+            book
+        };
+        let book = run();
+        let expected = expected(cells, count);
+        let paths: Vec<_> = (1..=names.len())
+            .map(|number| format!("xl/worksheets/sheet{number}.xml"))
+            .collect();
+        let parts: Vec<_> = paths
+            .iter()
+            .map(|path| (path.as_str(), expected.as_slice()))
+            .collect();
+        verify_parts(&input, &book.to_bytes().unwrap(), &parts);
+        for name in names {
+            assert_eq!(
+                book.get_cell(name, "A1").unwrap().value,
+                CellValue::Number(-1.0)
+            );
+        }
+        report(
+            "multisheet_apply",
+            cells * names.len(),
+            edits.len(),
+            samples,
+            measure(samples, "multisheet_apply", run),
         );
     }
 }
@@ -337,9 +810,14 @@ fn main() {
         println!("Run cargo bench --bench editing for release-profile measurements.");
         return;
     }
+    validate_filter("SHEETPATCH_BENCH_CASES", CASE_NAMES);
+    validate_filter("SHEETPATCH_BENCH_OPERATIONS", OPERATIONS);
     let samples = samples();
     println!("operation,cells,edits,samples,median_us");
     for &(cells, count) in CASES {
+        if !selected("SHEETPATCH_BENCH_CASES", &format!("narrow_{cells}")) {
+            continue;
+        }
         let input = fixture(cells);
         let edits = updates(cells, count);
         let typed_edits: Vec<_> = edits
@@ -347,13 +825,18 @@ fn main() {
             .map(|(address, value)| (address.parse::<CellRef>().unwrap(), value.clone()))
             .collect();
         let expected = expected(cells, count);
-        let sequential = sequential(&input, &edits);
         let batched = bulk(&input, &edits);
         let output = batched.to_bytes().unwrap();
         let typed = bulk_at(&input, &typed_edits);
         verify_output(&input, &typed.to_bytes().unwrap(), &expected);
         assert_eq!(typed.to_bytes().unwrap(), output);
-        verify_output(&input, &sequential.to_bytes().unwrap(), &expected);
+        if selected("SHEETPATCH_BENCH_OPERATIONS", "sequential") {
+            verify_output(
+                &input,
+                &sequential(&input, &edits).to_bytes().unwrap(),
+                &expected,
+            );
+        }
         verify_output(&input, &output, &expected);
         let mut streamed = Vec::new();
         batched.write_to(&mut streamed).unwrap();
@@ -369,6 +852,7 @@ fn main() {
         for (cell, (_, expected_value)) in values.iter().zip(&edits) {
             assert_eq!(&cell.value, expected_value);
         }
+        repeated_reads(samples, &input, &batched, &typed_edits, cells);
         let mut unchanged = bulk(&input, &edits);
         unchanged
             .set_cells(
@@ -385,35 +869,37 @@ fn main() {
             cells,
             count,
             samples,
-            measure(samples, || self::sequential(&input, &edits)),
+            measure(samples, "sequential", || self::sequential(&input, &edits)),
         );
         report(
             "bulk",
             cells,
             count,
             samples,
-            measure(samples, || bulk(&input, &edits)),
+            measure(samples, "bulk", || bulk(&input, &edits)),
         );
         report(
             "get_cells",
             cells,
             count,
             samples,
-            measure(samples, || batched.get_cells("Data", &addresses).unwrap()),
+            measure(samples, "get_cells", || {
+                batched.get_cells("Data", &addresses).unwrap()
+            }),
         );
         report(
             "bulk_at",
             cells,
             count,
             samples,
-            measure(samples, || bulk_at(&input, &typed_edits)),
+            measure(samples, "bulk_at", || bulk_at(&input, &typed_edits)),
         );
         report(
             "get_cells_at",
             cells,
             count,
             samples,
-            measure(samples, || {
+            measure(samples, "get_cells_at", || {
                 typed
                     .get_cells_at("Data", typed_edits.iter().map(|(cell, _)| *cell))
                     .unwrap()
@@ -424,7 +910,7 @@ fn main() {
             cells,
             count,
             samples,
-            measure(samples, || {
+            measure(samples, "unchanged_bulk", || {
                 unchanged
                     .set_cells(
                         "Data",
@@ -441,28 +927,34 @@ fn main() {
             cells,
             count,
             samples,
-            measure(samples, || batched.to_bytes().unwrap()),
+            measure(samples, "to_bytes", || batched.to_bytes().unwrap()),
         );
         report(
             "write_to_sink",
             cells,
             count,
             samples,
-            measure(samples, || batched.write_to(io::sink()).unwrap()),
+            measure(samples, "write_to_sink", || {
+                batched.write_to(io::sink()).unwrap()
+            }),
         );
         report(
             "compact_to_bytes",
             cells,
             count,
             samples,
-            measure(samples, || batched.to_bytes_compact().unwrap()),
+            measure(samples, "compact_to_bytes", || {
+                batched.to_bytes_compact().unwrap()
+            }),
         );
         report(
             "compact_to_sink",
             cells,
             count,
             samples,
-            measure(samples, || batched.write_compact_to(io::sink()).unwrap()),
+            measure(samples, "compact_to_sink", || {
+                batched.write_compact_to(io::sink()).unwrap()
+            }),
         );
         println!(
             "sizes,{cells},{count},input={},edited={},compact={}",
@@ -491,5 +983,8 @@ fn main() {
             compacted.len()
         );
     }
-    guarded_batches(samples);
+    if selected("SHEETPATCH_BENCH_CASES", "guarded") {
+        guarded_batches(samples);
+    }
+    extra_workloads(samples);
 }

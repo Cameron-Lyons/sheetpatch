@@ -22,6 +22,26 @@ const DESCRIPTOR: u32 = 0x0807_4b50;
 const ZIP64_LOCATOR: u32 = 0x0706_4b50;
 const MAX_READ: usize = 64 * 1024 * 1024;
 
+pub(crate) trait PartChanges {
+    // Names are unique; iteration order is also the validation error order.
+    fn parts(&self) -> impl Iterator<Item = (&str, &[u8])>;
+
+    fn is_empty(&self) -> bool {
+        self.parts().next().is_none()
+    }
+}
+
+impl PartChanges for BTreeMap<String, Vec<u8>> {
+    fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+    }
+
+    fn is_empty(&self) -> bool {
+        BTreeMap::is_empty(self)
+    }
+}
+
 pub(crate) struct Entry {
     pub(crate) name: String,
     flags: u16,
@@ -58,6 +78,18 @@ struct Replacement {
     crc: u32,
     compressed_size: u32,
     size: u32,
+}
+
+struct ChangePlan<'a> {
+    // Keep only changed entry indexes and borrowed payloads, ordered by their
+    // physical local-record positions for a single merge during emission.
+    data: Vec<(usize, &'a [u8])>,
+}
+
+#[derive(Clone, Copy)]
+enum RecordPolicy {
+    PreserveGaps,
+    Compact,
 }
 
 // `None` means more than one structurally plausible descriptor points to that
@@ -445,7 +477,7 @@ impl Archive {
         Ok(output)
     }
 
-    pub(crate) fn write(&self, changes: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>> {
+    pub(crate) fn write(&self, changes: &impl PartChanges) -> Result<Vec<u8>> {
         let mut output = Vec::with_capacity(self.original.len());
         self.write_to(changes, &mut output)?;
         Ok(output)
@@ -457,30 +489,46 @@ impl Archive {
     /// time. As with `Write::write_all`, a writer error may leave partial output.
     pub(crate) fn write_to<W: Write>(
         &self,
-        changes: &BTreeMap<String, Vec<u8>>,
+        changes: &impl PartChanges,
         writer: &mut W,
     ) -> Result<()> {
         if changes.is_empty() {
             writer.write_all(&self.original)?;
             return Ok(());
         }
-        self.validate_changes(changes)?;
+        let plan = self.validate_changes(changes)?;
+        self.emit_records(&plan, writer, RecordPolicy::PreserveGaps)
+    }
+
+    fn emit_records<W: Write>(
+        &self,
+        plan: &ChangePlan<'_>,
+        writer: &mut W,
+        policy: RecordPolicy,
+    ) -> Result<()> {
+        let (order, preserve_gaps) = match policy {
+            RecordPolicy::PreserveGaps => (self.local_order.as_slice(), true),
+            RecordPolicy::Compact => (self.compaction_order()?, false),
+        };
         let mut position = 0;
         let mut original_position = 0;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = vec![0; self.entries.len()];
-        for &index in &self.local_order {
+        let mut pending = plan.data.iter().peekable();
+        for &index in order {
             let entry = &self.entries[index];
             // Prefixes, gaps and any obsolete records from older versions are
             // opaque here. Preserve them; only explicit compaction removes
             // obsolete records after proving their boundaries and checksums.
-            emit(
-                writer,
-                &mut position,
-                &self.original[original_position..entry.local_record.start],
-            )?;
+            if preserve_gaps {
+                emit(
+                    writer,
+                    &mut position,
+                    &self.original[original_position..entry.local_record.start],
+                )?;
+            }
             offsets[index] = zip32(position, "ZIP local-record offset")?;
-            if let Some(data) = changes.get(&entry.name) {
+            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
                 replacements[index] =
                     Some(self.emit_replacement(entry, data, writer, &mut position)?);
             } else {
@@ -492,32 +540,33 @@ impl Archive {
             }
             original_position = entry.local_record.end;
         }
-        emit(
-            writer,
-            &mut position,
-            &self.original[original_position..self.central_start],
-        )?;
+        if preserve_gaps {
+            emit(
+                writer,
+                &mut position,
+                &self.original[original_position..self.central_start],
+            )?;
+        }
         self.emit_directory(writer, &mut position, &offsets, &replacements)
     }
 
     /// Reproduce pre-1.0 append saves to exercise migration and compaction.
     #[cfg(test)]
-    fn append_to<W: Write>(
-        &self,
-        changes: &BTreeMap<String, Vec<u8>>,
-        writer: &mut W,
-    ) -> Result<()> {
+    fn append_to<W: Write>(&self, changes: &impl PartChanges, writer: &mut W) -> Result<()> {
         if changes.is_empty() {
             writer.write_all(&self.original)?;
             return Ok(());
         }
-        self.validate_changes(changes)?;
+        let mut plan = self.validate_changes(changes)?;
+        // Legacy appends emit replacements in central-directory order.
+        plan.data.sort_unstable_by_key(|change| change.0);
         let mut position = 0;
         emit(writer, &mut position, &self.original[..self.central_start])?;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = Vec::with_capacity(self.entries.len());
+        let mut pending = plan.data.iter().peekable();
         for (index, entry) in self.entries.iter().enumerate() {
-            if let Some(data) = changes.get(&entry.name) {
+            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
                 offsets.push(zip32(position, "ZIP local-record offset")?);
                 replacements[index] =
                     Some(self.emit_replacement(entry, data, writer, &mut position)?);
@@ -533,33 +582,19 @@ impl Archive {
     /// silently discarded by compaction.
     pub(crate) fn compact_to<W: Write>(
         &self,
-        changes: &BTreeMap<String, Vec<u8>>,
+        changes: &impl PartChanges,
         writer: &mut W,
     ) -> Result<()> {
-        self.validate_changes(changes)?;
-        let order = self.compaction_order()?;
-        let mut position = 0;
-        let mut replacements = vec![None; self.entries.len()];
-        let mut offsets = vec![0; self.entries.len()];
-        for &index in order {
-            let entry = &self.entries[index];
-            offsets[index] = zip32(position, "ZIP local-record offset")?;
-            if let Some(data) = changes.get(&entry.name) {
-                replacements[index] =
-                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
-            } else {
-                emit(
-                    writer,
-                    &mut position,
-                    &self.original[entry.local_record.clone()],
-                )?;
-            }
-        }
-        self.emit_directory(writer, &mut position, &offsets, &replacements)
+        let plan = self.validate_changes(changes)?;
+        self.emit_records(&plan, writer, RecordPolicy::Compact)
     }
 
-    fn validate_changes(&self, changes: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-        for (name, data) in changes {
+    fn validate_changes<'a>(&self, changes: &'a impl PartChanges) -> Result<ChangePlan<'a>> {
+        let parts = changes.parts();
+        let mut plan = ChangePlan {
+            data: Vec::with_capacity(parts.size_hint().0),
+        };
+        for (name, data) in parts {
             let Some(&index) = self.index.get(name) else {
                 return Err(invalid(format!(
                     "cannot replace missing ZIP member: {name}"
@@ -582,8 +617,11 @@ impl Archive {
                     "ZIP compression method {method} in {name}"
                 )));
             }
+            plan.data.push((index, data));
         }
-        Ok(())
+        plan.data
+            .sort_unstable_by_key(|&(index, _)| self.entries[index].local_record.start);
+        Ok(plan)
     }
 
     fn emit_replacement<W: Write>(
@@ -1334,6 +1372,122 @@ mod tests {
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
         bytes
+    }
+
+    #[test]
+    fn many_replacements_follow_local_order_and_retain_central_order_and_metadata() {
+        let archive = Archive::new(combine_members((0..96).map(|index| {
+            let name: [u8; 8] = format!("part{index:04}").into_bytes().try_into().unwrap();
+            decorate_fixture(&name, index % 3 != 0)
+        })))
+        .unwrap();
+        let mut reordered = archive.original[..archive.central_start].to_vec();
+        for entry in archive.entries.iter().rev() {
+            reordered.extend_from_slice(&archive.original[entry.central.clone()]);
+        }
+        reordered.extend_from_slice(&archive.original[archive.end..]);
+        let archive = Archive::new(reordered).unwrap();
+        let changes: BTreeMap<_, _> = (0..96)
+            .step_by(3)
+            .map(|index| {
+                (
+                    format!("part{index:04}"),
+                    format!("replacement {index} {}", "x".repeat(index)).into_bytes(),
+                )
+            })
+            .collect();
+        let obsolete = Archive::new(append(&archive, &changes)).unwrap();
+        for (archive, has_obsolete_records) in [(&archive, false), (&obsolete, true)] {
+            let preserved = archive.write(&changes).unwrap();
+            let mut compacted = Vec::new();
+            archive.compact_to(&changes, &mut compacted).unwrap();
+            if has_obsolete_records {
+                assert!(compacted.len() < preserved.len());
+            } else {
+                assert_eq!(compacted, preserved);
+            }
+            for output in [preserved, compacted] {
+                let reopened = Archive::new(output).unwrap();
+                assert_eq!(
+                    reopened
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.name)
+                        .collect::<Vec<_>>(),
+                    archive
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.name)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    reopened
+                        .local_order
+                        .iter()
+                        .map(|&index| &reopened.entries[index].name)
+                        .collect::<Vec<_>>(),
+                    archive
+                        .local_order
+                        .iter()
+                        .map(|&index| &archive.entries[index].name)
+                        .collect::<Vec<_>>()
+                );
+                for before in &archive.entries {
+                    let after = &reopened.entries[reopened.index[&before.name]];
+                    if let Some(data) = changes.get(&before.name) {
+                        assert_eq!(reopened.read(&before.name).unwrap(), *data);
+                    } else {
+                        assert_eq!(
+                            reopened.original[after.local_record.clone()],
+                            archive.original[before.local_record.clone()]
+                        );
+                        let before = &archive.original[before.central.clone()];
+                        let after = &reopened.original[after.central.clone()];
+                        assert_eq!(after[..42], before[..42]);
+                        assert_eq!(after[46..], before[46..]);
+                    }
+                }
+                assert!(reopened.original.ends_with(b"comment"));
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_changes_keep_validation_order_and_fail_before_output() {
+        struct BorrowedChanges<'a>(&'a [(&'a str, &'a [u8])]);
+
+        impl PartChanges for BorrowedChanges<'_> {
+            fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
+                self.0.iter().copied()
+            }
+        }
+
+        let original = fixture(false);
+        let archive = Archive::new(original.clone()).unwrap();
+        let empty = BorrowedChanges(&[]);
+        assert_eq!(archive.write(&empty).unwrap(), original);
+        let valid = BorrowedChanges(&[("part.xml", b"borrowed replacement")]);
+        assert_eq!(
+            Archive::new(archive.write(&valid).unwrap())
+                .unwrap()
+                .read("part.xml")
+                .unwrap(),
+            b"borrowed replacement"
+        );
+        let invalid = BorrowedChanges(&[("z-missing.xml", b""), ("a-missing.xml", b"")]);
+        for compact in [false, true] {
+            let mut output = Vec::new();
+            let result = if compact {
+                archive.compact_to(&invalid, &mut output)
+            } else {
+                archive.write_to(&invalid, &mut output)
+            };
+            assert!(matches!(
+                result,
+                Err(Error::InvalidWorkbook(message)) if message.ends_with("z-missing.xml")
+            ));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
