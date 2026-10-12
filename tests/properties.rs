@@ -464,8 +464,13 @@ impl SheetModel {
     }
 
     fn protected(&self, cell: CellRef) -> bool {
+        self.guarded(cell) || self.opaque_cells.contains(&cell)
+    }
+
+    /// Formula cells, cells in formula ranges, and merged followers: the
+    /// guards checked for a whole batch before any cell is patched.
+    fn guarded(&self, cell: CellRef) -> bool {
         self.formula_cells.contains(&cell)
-            || self.opaque_cells.contains(&cell)
             || self.formula_ranges.iter().any(|range| range.contains(cell))
             || self
                 .merges
@@ -1550,15 +1555,22 @@ enum Outcome {
     Applied,
     InvalidValue,
     SheetNotFound,
+    /// A protected cell, refused with its worksheet and address.
+    Protected,
+    /// A value payload with unfamiliar markup, which no edit may discard.
     Refused,
 }
 
-fn outcome_of(result: &sheetpatch::Result<()>) -> Option<Outcome> {
+/// The outcome of a result, and for a protected cell, its worksheet and cell.
+fn outcome_of(result: &sheetpatch::Result<()>) -> Option<(Outcome, Option<(&str, CellRef)>)> {
     match result {
-        Ok(()) => Some(Outcome::Applied),
-        Err(Error::InvalidValue(_)) => Some(Outcome::InvalidValue),
-        Err(Error::SheetNotFound(_)) => Some(Outcome::SheetNotFound),
-        Err(Error::Unsupported(_)) => Some(Outcome::Refused),
+        Ok(()) => Some((Outcome::Applied, None)),
+        Err(Error::InvalidValue(_)) => Some((Outcome::InvalidValue, None)),
+        Err(Error::SheetNotFound(_)) => Some((Outcome::SheetNotFound, None)),
+        Err(Error::ProtectedCell { sheet, cell, .. }) => {
+            Some((Outcome::Protected, Some((sheet.as_str(), *cell))))
+        }
+        Err(Error::Unsupported(_)) => Some((Outcome::Refused, None)),
         Err(_) => None,
     }
 }
@@ -1576,14 +1588,58 @@ fn expected_outcome(sheets: &[SheetModel], batch: &Batch) -> Outcome {
     if missing {
         return Outcome::SheetNotFound;
     }
-    if batch
-        .net()
-        .iter()
-        .any(|(&(sheet, cell), value)| !sheets[sheet].accepts(cell, value))
-    {
-        return Outcome::Refused;
+    refusal(sheets, batch).map_or(Outcome::Applied, |(outcome, _)| outcome)
+}
+
+/// The first refused edit of a batch with valid input, and its outcome.
+/// Worksheets are patched in workbook order. Within one, the formula and
+/// merged-range guards cover the whole batch before any cell is patched; the
+/// cells are then patched in row-major order, where unfamiliar payload markup
+/// and changed values with metadata are refused.
+fn refusal(sheets: &[SheetModel], batch: &Batch) -> Option<(Outcome, (usize, CellRef))> {
+    let net = batch.net();
+    for (index, sheet) in sheets.iter().enumerate() {
+        let edits = || {
+            net.iter()
+                .filter(move |((edited, _), _)| *edited == index)
+                .map(|(&(_, cell), value)| (cell, value))
+        };
+        // Formula cells are checked first, then formula ranges, then merged
+        // ranges, each in row-major order.
+        let first = |guard: &dyn Fn(CellRef) -> bool| {
+            edits().map(|(cell, _)| cell).find(|&cell| guard(cell))
+        };
+        let guarded = first(&|cell| sheet.formula_cells.contains(&cell))
+            .or_else(|| {
+                first(&|cell| {
+                    sheet
+                        .formula_ranges
+                        .iter()
+                        .any(|range| range.contains(cell))
+                })
+            })
+            .or_else(|| {
+                first(&|cell| {
+                    sheet
+                        .merges
+                        .iter()
+                        .any(|range| range.contains(cell) && cell != range.first())
+                })
+            });
+        if let Some(cell) = guarded {
+            debug_assert!(sheet.guarded(cell));
+            return Some((Outcome::Protected, (index, cell)));
+        }
+        if let Some((cell, _)) = edits().find(|&(cell, value)| !sheet.accepts(cell, value)) {
+            let outcome = if sheet.opaque_cells.contains(&cell) {
+                Outcome::Refused
+            } else {
+                Outcome::Protected
+            };
+            return Some((outcome, (index, cell)));
+        }
     }
-    Outcome::Applied
+    None
 }
 
 fn apply_batch(
@@ -2114,9 +2170,13 @@ fn assert_refused(case: Case, book: &mut Workbook, sheets: &[SheetModel], batch:
         .filter(|&(&(sheet, cell), value)| !sheets[sheet].accepts(cell, value))
         .map(|(&(sheet, cell), _)| format!("{}!{cell}", sheets[sheet].name))
         .collect();
+    // A protected cell is reported with its own worksheet and address.
+    let expected_cell = refusal(sheets, batch)
+        .filter(|_| expected == Outcome::Protected)
+        .map(|(_, (sheet, cell))| (sheets[sheet].name.as_str(), cell));
     assert_eq!(
         outcome_of(&result),
-        Some(expected),
+        Some((expected, expected_cell)),
         "{case}: {result:?}; protected cells {protected:?} in {}",
         brief(batch)
     );

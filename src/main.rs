@@ -10,7 +10,7 @@ use std::{
     process::ExitCode,
 };
 
-use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, SheetVisibility, Workbook};
+use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Workbook};
 
 const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch cells [--json] INPUT SHEET [RANGE]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nOptions go right after the command. Write a file whose name starts with - as ./NAME.\nUse - as INPUT to read the workbook from stdin, or as OUTPUT to write it to stdout when stdout is not a terminal.\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin; INPUT and PATCH.tsv cannot both be -. Use LF or CRLF line endings.\nEmpty lines are ignored. Lines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\nA get CELL may be a range such as A1:C3, read row by row; one get reads at most 1048576 cells.\ncells prints CELL<TAB>TYPE<TAB>VALUE for each cell holding a value or formula, optionally within RANGE.\n--json returns an array: list includes names, paths and visibility; get and cells include types, values, formulas and styles.\nOn a terminal, plain list, get and cells output shows control characters as \\u{..} escapes; --json is exact.";
 
@@ -490,23 +490,17 @@ fn require_sheet(workbook: &Workbook, sheet: &str) -> Result<(), Failure> {
     }
 }
 
-/// Find the patch line behind a refused edit. The library names the refused
-/// cell at the start of its message as `worksheet "NAME": CELL`, built with
-/// the same formatting as here; the last line that targets that worksheet and
-/// cell supplied the value that was applied.
-fn refused_line(rows: &[(usize, CellEdit)], error: &sheetpatch::Error) -> Option<usize> {
-    let (sheetpatch::Error::Unsupported(message)
-    | sheetpatch::Error::Xml(message)
-    | sheetpatch::Error::InvalidWorkbook(message)) = error
-    else {
+/// Find the patch line behind an edit refused for a protected cell: the last
+/// line that targets that worksheet and cell, which supplied the value that
+/// was applied.
+fn protected_line(rows: &[(usize, CellEdit)], error: &sheetpatch::Error) -> Option<usize> {
+    let sheetpatch::Error::ProtectedCell { sheet, cell, .. } = error else {
         return None;
     };
-    let message = message.strip_prefix("worksheet ")?;
-    rows.iter().rev().find_map(|(line, edit)| {
-        let rest = message.strip_prefix(&format!("{:?}: {}", edit.sheet(), edit.cell()))?;
-        // The address must end here, so that A1 does not match A10.
-        rest.starts_with([' ', ':']).then_some(*line)
-    })
+    rows.iter()
+        .rev()
+        .find(|(_, edit)| edit.sheet() == sheet && edit.cell() == *cell)
+        .map(|&(line, _)| line)
 }
 
 /// Read patch rows with their one-based line numbers. `origin` names the
@@ -704,17 +698,6 @@ fn value_type(value: &CellValue) -> &'static str {
     }
 }
 
-fn visibility_name(visibility: SheetVisibility) -> &'static str {
-    match visibility {
-        SheetVisibility::Visible => "visible",
-        SheetVisibility::Hidden => "hidden",
-        SheetVisibility::VeryHidden => "veryHidden",
-        // The CLI ships with the library, so a state added later gets its
-        // own name here; the enumeration is open only to other crates.
-        _ => "unknown",
-    }
-}
-
 fn write_json_cell(
     output: &mut impl Write,
     sheet: &str,
@@ -775,7 +758,7 @@ fn cmd_list(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resu
             write_json_string(output, sheet.name())?;
             output.write_all(b",\"path\":")?;
             write_json_string(output, sheet.path())?;
-            let visibility = visibility_name(sheet.visibility());
+            let visibility = sheet.visibility().as_str();
             write!(output, ",\"visibility\":\"{visibility}\"}}")
         })?;
     } else {
@@ -846,7 +829,7 @@ fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     let view = workbook.prepare_sheet(sheet)?;
     // Filter the worksheet's own cells; a large range is never expanded.
     let cells: Vec<CellRef> = view
-        .cell_refs()
+        .cells()
         .filter(|&cell| range.is_none_or(|range| range.contains(cell)))
         .collect();
     let contents = view.get_cells_at(cells.iter().copied())?;
@@ -949,7 +932,7 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     // The rows are kept to name the line of a refused edit.
     workbook
         .apply_edits(rows.iter().map(|(_, edit)| edit.clone()))
-        .map_err(|error| match refused_line(&rows, &error) {
+        .map_err(|error| match protected_line(&rows, &error) {
             Some(line_number) => Failure::Context(format!("Patch line {line_number}"), error),
             None => Failure::Workbook(error),
         })?;
@@ -1377,48 +1360,45 @@ mod tests {
     }
 
     #[test]
-    fn refused_edits_name_the_last_patch_line_for_their_cell() {
-        let rows = read_patch(
-            "Data\tA1\ttext\tfirst\nData\tA10\tnumber\t1\nData\tA1\ttext\tlast\nOther \"Data\"\tB2\tblank\n"
-                .as_bytes(),
-            "test",
-        )
-        .unwrap();
-        let line = |error| refused_line(&rows, &error);
-        let unsupported = |message: &str| sheetpatch::Error::Unsupported(message.into());
+    fn refused_edits_name_the_last_patch_line_for_their_protected_cell() {
+        // D1 of the fixture's Data worksheet holds a formula.
+        let mut workbook =
+            Workbook::from_bytes(include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec())
+                .unwrap();
+        let protected = workbook.set_cell("Data", "D1", 1).unwrap_err();
+        assert!(
+            matches!(
+                &protected,
+                sheetpatch::Error::ProtectedCell { sheet, cell, .. }
+                    if sheet == "Data" && cell.to_string() == "D1"
+            ),
+            "{protected:?}"
+        );
+        let line = |patch: &str| {
+            protected_line(&read_patch(patch.as_bytes(), "test").unwrap(), &protected)
+        };
+        // The last line for the worksheet and cell supplied the applied value.
         assert_eq!(
-            line(unsupported("worksheet \"Data\": A1 contains a formula")),
+            line(
+                "Data\tD1\ttext\tfirst\nData\tD10\tnumber\t1\nData\td1\ttext\tlast\nOther\tD1\tblank\n"
+            ),
             Some(3)
         );
-        assert_eq!(
-            line(unsupported("worksheet \"Data\": A10 contains a formula")),
-            Some(2)
-        );
-        assert_eq!(
-            line(sheetpatch::Error::Xml(
-                "worksheet \"Data\": A1: cell has multiple value payloads".into()
-            )),
-            Some(3)
-        );
-        assert_eq!(
-            line(sheetpatch::Error::InvalidWorkbook(
-                "worksheet \"Other \\\"Data\\\"\": B2: invalid".into()
-            )),
-            Some(4)
-        );
+        // D10 and the same cell on another worksheet are other targets.
+        assert_eq!(line("Other\tD1\tblank\nData\tD10\tnumber\t1\n"), None);
+        // Only protected-cell refusals have a line, even when another error's
+        // message names a cell that a line targets.
+        let rows = read_patch("Data\tA1\ttext\tx\n".as_bytes(), "test").unwrap();
         for error in [
-            // Cells and worksheets that no line targets, and messages naming none.
-            unsupported("worksheet \"Data\": A100 contains a formula"),
-            unsupported("worksheet \"Data\": B2 contains a formula"),
-            unsupported("worksheet \"Other\": B2 contains a formula"),
-            unsupported("worksheet \"Other \\\"Data\\\"\": B20 contains a formula"),
-            unsupported("worksheet \"Data\": overlapping XML edits"),
-            unsupported("A1 contains a formula"),
-            unsupported("editing a digitally signed OOXML package would invalidate its signature"),
+            sheetpatch::Error::Unsupported("worksheet \"Data\": A1 contains a formula".into()),
+            sheetpatch::Error::Xml(
+                "worksheet \"Data\": A1: cell has multiple value payloads".into(),
+            ),
+            sheetpatch::Error::InvalidWorkbook("worksheet \"Data\": A1: invalid".into()),
             sheetpatch::Error::InvalidValue("worksheet \"Data\": A1 is invalid".into()),
             sheetpatch::Error::SheetNotFound("Data".into()),
         ] {
-            assert_eq!(line(error), None);
+            assert_eq!(protected_line(&rows, &error), None, "{error}");
         }
     }
 

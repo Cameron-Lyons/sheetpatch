@@ -73,33 +73,72 @@ fn time(text: &str) -> Option<f64> {
     Some((((hours * 60 + minutes) * 60) as f64 + seconds) / 86_400.0)
 }
 
+/// Why an ISO 8601 cell value has no Excel serial.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum DateError {
+    /// Not a valid date, date-time, or time in a supported form.
+    Invalid,
+    /// A valid value with a time-zone offset other than `Z`, which would
+    /// need a local time zone to convert.
+    TimeZoneOffset,
+    /// A valid date before the workbook's date system starts.
+    BeforeEpoch,
+}
+
+// Splits a `+HH:MM` or `-HH:MM` time-zone offset from the end of a value.
+fn offset(text: &str) -> Option<&str> {
+    let split = text.len().checked_sub(6)?;
+    let (value, offset) = (text.get(..split)?, text.get(split..)?);
+    let bytes = offset.as_bytes();
+    (matches!(bytes[0], b'+' | b'-')
+        && bytes[3] == b':'
+        && digits(offset, 1..3).is_some_and(|hours| hours <= 14)
+        && digits(offset, 4..6).is_some_and(|minutes| minutes <= 59)
+        && !value.is_empty())
+    .then_some(value)
+}
+
 /// Converts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS[.fraction]]` or a time-only
 /// `HH:MM[:SS[.fraction]]`, each optionally ending in `Z`, to an Excel serial.
 ///
-/// Other UTC offsets and forms, and dates before the workbook's epoch, return
-/// `None`. The 1900 date system counts Excel's nonexistent 1900-02-29 as serial
-/// 60, so serials from 1900-03-01 onward are one day greater than elapsed days.
-pub(super) fn excel_serial(text: &str, date1904: bool) -> Option<f64> {
-    let text = text.strip_suffix('Z').unwrap_or(text);
-    let (days, fraction) = match text.split_once('T') {
-        Some((day, clock)) => (Some(date(day)?), time(clock)?),
-        None if text.len() == 10 && text.as_bytes()[4] == b'-' => (Some(date(text)?), 0.0),
-        None => (None, time(text)?),
+/// Other forms are invalid. A value that would be valid but for a time-zone
+/// offset other than `Z`, or a date before the workbook's epoch, is reported
+/// separately. The 1900 date system counts Excel's nonexistent 1900-02-29 as
+/// serial 60, so serials from 1900-03-01 onward are one day greater than
+/// elapsed days; Excel's day zero, 1899-12-31, is serial 0, and holds times
+/// without a date. A time before midnight never reaches the next day's serial.
+pub(super) fn excel_serial(text: &str, date1904: bool) -> Result<f64, DateError> {
+    let (text, zoned) = match text.strip_suffix('Z') {
+        Some(text) => (text, false),
+        None => offset(text).map_or((text, false), |text| (text, true)),
     };
-    let serial = match days {
-        None => 0,
-        Some(days) if date1904 => {
-            let serial = days - days_from_civil(1904, 1, 1);
-            if serial < 0 {
-                return None;
-            }
-            serial
+    let parsed = match text.split_once('T') {
+        Some((day, clock)) => date(day).map(Some).zip(time(clock)),
+        None if text.len() == 10 && text.as_bytes()[4] == b'-' => {
+            date(text).map(|days| (Some(days), 0.0))
         }
+        None => time(text).map(|fraction| (None, fraction)),
+    };
+    let (days, fraction) = parsed.ok_or(DateError::Invalid)?;
+    if zoned {
+        return Err(DateError::TimeZoneOffset);
+    }
+    let serial = match days {
+        // A time without a date is a fraction of serial 0 in either system.
+        None => 0,
+        Some(days) if date1904 => match days - days_from_civil(1904, 1, 1) {
+            ..0 => return Err(DateError::BeforeEpoch),
+            serial => serial,
+        },
+        // Excel's day zero, 1899-12-31, is serial 0.
         Some(days) => match days - days_from_civil(1899, 12, 30) {
-            ..=1 => return None,
-            serial @ 2..=60 => serial - 1,
+            ..=0 => return Err(DateError::BeforeEpoch),
+            serial @ 1..=60 => serial - 1,
             serial => serial,
         },
     };
-    Some(serial as f64 + fraction)
+    // Neither rounding to the serial's precision nor a fraction of a second
+    // that rounds up to 60 may carry a time before midnight into the next day.
+    let next_day = (serial + 1) as f64;
+    Ok((serial as f64 + fraction).min(next_day.next_down()))
 }

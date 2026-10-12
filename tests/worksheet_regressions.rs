@@ -172,7 +172,8 @@ fn leading_byte_order_marks_are_ordinary_cell_text() {
     // U+FEFF is not XML whitespace, so the value is not a number.
     assert!(matches!(
         book.get_cell("Data", "G1"),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidWorkbook(message))
+            if message == "worksheet \"Data\": G1: invalid numeric cell value"
     ));
 
     // Removing the invisible character is a real edit, not a no-op.
@@ -509,6 +510,9 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         ("9999-12-31T23:59:59", 2_958_465.0 + 86_399.0 / 86_400.0),
         ("12:00", 0.5),
         ("06:00:00Z", 0.25),
+        // Excel's day zero holds times without a date.
+        ("1899-12-31", 0.0),
+        ("1899-12-31T12:00:00", 0.5),
     ];
     let body: String = cells
         .iter()
@@ -528,32 +532,43 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
             "{text}"
         );
     }
-    for invalid in [
-        "1899-12-31",
-        "2024-01-15T00:00:00+01:00",
-        "2023-02-29",
-        "2024-13-01",
-        "2024-01-15T24:00",
-        "2024-01-15T00:60",
-        "2024-01-15T00:00:60",
-        "2024-01-15T00:00:00.",
-        "24-01-15",
-        "2024-1-15",
-        "noon",
-        "",
+    // Valid values outside the supported forms are unsupported; malformed
+    // values make the workbook invalid. Either can be replaced.
+    for (text, unsupported) in [
+        ("1899-12-30", true),
+        ("1899-12-30T23:59:59", true),
+        ("2024-01-15T00:00:00+01:00", true),
+        ("2024-01-15-05:00", true),
+        ("2023-02-29", false),
+        ("2024-13-01", false),
+        ("2024-01-15T24:00", false),
+        ("2024-01-15T00:60", false),
+        ("2024-01-15T00:00:60", false),
+        ("2024-01-15T00:00:00.", false),
+        ("24-01-15", false),
+        ("2024-1-15", false),
+        ("noon", false),
+        ("", false),
     ] {
-        let mut book = workbook(&row(&format!("<c r='A1' t='d'><v>{invalid}</v></c>")), None);
-        assert!(
-            matches!(book.get_cell("Data", "A1"), Err(Error::Unsupported(_))),
-            "{invalid}"
-        );
+        let mut book = workbook(&row(&format!("<c r='A1' t='d'><v>{text}</v></c>")), None);
+        let error = book.get_cell("Data", "A1").unwrap_err();
+        let expected = if unsupported {
+            matches!(&error, Error::Unsupported(message) if message.starts_with("worksheet \"Data\": A1: ISO 8601 date cell value "))
+        } else {
+            matches!(&error, Error::InvalidWorkbook(message) if message == "worksheet \"Data\": A1: invalid ISO 8601 date cell value")
+        };
+        assert!(expected, "{text}: {error:?}");
         book.set_cell("Data", "A1", 1).unwrap();
         assert_eq!(value(&book, "A1"), CellValue::Number(1.0));
     }
-    // Writing the same serial over a date cell still stores a number.
+    // Writing the serial a date cell reads as leaves it unchanged; another
+    // number replaces the date.
     book.set_cell("Data", "A1", 45_306.0).unwrap();
+    book.set_cell("Data", "A12", 0.5).unwrap();
+    assert!(!book.has_changes());
+    book.set_cell("Data", "A1", 45_307.0).unwrap();
     assert!(book.has_changes());
-    assert!(sheet_xml(&book).contains("<c r='A1'><v>45306</v></c>"));
+    assert!(sheet_xml(&book).contains("<c r='A1'><v>45307</v></c>"));
 }
 
 #[test]
@@ -568,8 +583,12 @@ fn edit_refusals_name_the_cell() {
         )),
         None,
     );
+    let error = book.set_cell("Data", "A1", 5).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "protected cell: worksheet \"Data\": A1 has value metadata (a linked or rich data type)"
+    );
     for (address, message) in [
-        ("A1", "A1: cell value has associated metadata"),
         ("B1", "B1: unfamiliar XML inside the cell value payload"),
         ("C1", "C1: cell has multiple value payloads"),
         (

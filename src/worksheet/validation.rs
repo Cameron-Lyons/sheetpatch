@@ -1,6 +1,6 @@
 use super::index::Range;
 use super::parse::{Attribute, Element, NamespaceId};
-use super::unsupported;
+use super::{protected, protection, unsupported};
 use crate::{CellRef, CellValue, Result};
 use std::collections::BTreeMap;
 
@@ -91,11 +91,12 @@ pub(super) fn validate_ranges(
         return Ok(());
     }
     let violation = |cell: CellRef| {
-        unsupported(if merged {
-            format!("{cell} is not the anchor of its merged range")
+        let reason = if merged {
+            protection::MERGED
         } else {
-            format!("{cell} belongs to a formula range")
-        })
+            protection::FORMULA_RANGE
+        };
+        protected(cell, reason)
     };
     // With either dimension small, direct membership checks cost less than
     // sorting events and allocating a column index. Large batches still use

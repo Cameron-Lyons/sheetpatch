@@ -75,15 +75,32 @@ fn book(parts: &BTreeMap<String, String>) -> Workbook {
     Workbook::from_bytes(archive(parts)).unwrap()
 }
 
-fn refusal(cell: &str) -> String {
-    format!("worksheet \"Data\": {cell} {REFUSAL}")
+fn assert_refused_in(sheet_name: &str, result: sheetpatch::Result<()>, address: &str) {
+    match result {
+        Err(
+            ref error @ Error::ProtectedCell {
+                ref sheet,
+                cell,
+                ref reason,
+                ..
+            },
+        ) => {
+            assert_eq!(
+                (sheet.as_str(), cell.to_string().as_str()),
+                (sheet_name, address)
+            );
+            assert_eq!(reason, REFUSAL);
+            assert_eq!(
+                error.to_string(),
+                format!("protected cell: worksheet \"{sheet_name}\": {address} {REFUSAL}")
+            );
+        }
+        other => panic!("expected {address} to be refused, got {other:?}"),
+    }
 }
 
 fn assert_refused(result: sheetpatch::Result<()>, cell: &str) {
-    match result {
-        Err(Error::Unsupported(message)) => assert_eq!(message, refusal(cell)),
-        other => panic!("expected {cell} to be refused, got {other:?}"),
-    }
+    assert_refused_in("Data", result, cell);
 }
 
 #[test]
@@ -203,15 +220,51 @@ fn sheets_without_tables_are_unaffected() {
         CellValue::from("Total")
     );
     book.set_cell("Notes", "B5", "free").unwrap();
-    assert!(matches!(
-        book.set_cell("Notes", "A1", "Total"),
-        Err(Error::Unsupported(message)) if message == format!("worksheet \"Notes\": A1 {REFUSAL}")
-    ));
+    assert_refused_in("Notes", book.set_cell("Notes", "A1", "Total"), "A1");
+}
+
+#[test]
+fn rewriting_a_date_header_with_its_serial_is_a_no_op() {
+    for (properties, serial, other) in [
+        ("", 45_306, 43_844),
+        ("<workbookPr date1904='1'/>", 43_844, 45_306),
+    ] {
+        let mut parts = parts("ref='A1:B3'");
+        let data = parts["xl/worksheets/sheet1.xml"].replace(
+            "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+            "<c r='B1' t='d' s='2'><v>2024-01-15</v></c>",
+        );
+        parts.insert("xl/worksheets/sheet1.xml".into(), data);
+        let workbook =
+            parts["xl/workbook.xml"].replace("<sheets>", &format!("{properties}<sheets>"));
+        parts.insert("xl/workbook.xml".into(), workbook);
+        let original = archive(&parts);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(
+            book.get_cell("Data", "B1").unwrap().value,
+            CellValue::from(serial)
+        );
+        // The serial the date reads as is its current value.
+        book.set_cell("Data", "B1", serial).unwrap();
+        assert!(!book.has_changes());
+        book.set_cells("Data", [("B1", serial), ("B2", 8)]).unwrap();
+        book.set_cell("Data", "B2", 5).unwrap();
+        assert!(!book.has_changes());
+        assert_eq!(book.to_bytes().unwrap(), original);
+        // Any other number would change the header.
+        assert_refused(book.set_cell("Data", "B1", other), "B1");
+        assert_refused(
+            book.apply_edits([CellEdit::new("Data", "B1", serial + 1).unwrap()]),
+            "B1",
+        );
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
 }
 
 #[test]
 fn malformed_tables_of_an_edited_sheet_are_invalid() {
-    let invalid = |change: &dyn Fn(&mut BTreeMap<String, String>)| {
+    // Errors name the part at fault, not the worksheet being edited.
+    let invalid = |change: &dyn Fn(&mut BTreeMap<String, String>), part: &str| {
         let mut parts = parts("ref='A1:B3'");
         change(&mut parts);
         let mut book = book(&parts);
@@ -223,7 +276,11 @@ fn malformed_tables_of_an_edited_sheet_are_invalid() {
         book.set_cell("Notes", "A1", 2).unwrap();
         match book.set_cell("Data", "B2", 7) {
             Err(Error::InvalidWorkbook(message)) => {
-                assert!(message.starts_with("worksheet \"Data\": "), "{message}");
+                assert!(
+                    message.starts_with(&format!("part {part:?}: ")),
+                    "{message}"
+                );
+                assert!(!message.contains("worksheet \""), "{message}");
                 message
             }
             other => panic!("expected an invalid table, got {other:?}"),
@@ -238,34 +295,105 @@ fn malformed_tables_of_an_edited_sheet_are_invalid() {
         "ref='A1:B3' headerRowCount='4'",
     ] {
         let attributes = attributes.to_owned();
-        let message = invalid(&move |parts| {
-            let table = parts[TABLE_PATH].replace("displayName='Table1' ref='A1:B3'", "");
-            let table = table.replacen(" id='1'", &format!(" id='1' {attributes}"), 1);
-            parts.insert(TABLE_PATH.into(), table);
-        });
-        assert!(message.contains(TABLE_PATH), "{message}");
-    }
-    let message = invalid(&|parts| {
-        let table = parts[TABLE_PATH]
-            .replace("<table ", "<other ")
-            .replace("</table>", "</other>");
-        parts.insert(TABLE_PATH.into(), table);
-    });
-    assert!(message.contains(TABLE_PATH), "{message}");
-    let message = invalid(&|parts| {
-        parts.remove(TABLE_PATH);
-    });
-    assert!(message.contains(TABLE_PATH), "{message}");
-    invalid(&|parts| {
-        let rels = parts[SHEET_RELS].replace(
-            "Target='../tables/table1.xml'",
-            "Target='../tables/table1.xml' TargetMode='External'",
+        let message = invalid(
+            &move |parts| {
+                let table = parts[TABLE_PATH].replace("displayName='Table1' ref='A1:B3'", "");
+                let table = table.replacen(" id='1'", &format!(" id='1' {attributes}"), 1);
+                parts.insert(TABLE_PATH.into(), table);
+            },
+            TABLE_PATH,
         );
-        parts.insert(SHEET_RELS.into(), rels);
-    });
-    invalid(&|parts| {
-        let rels =
-            parts[SHEET_RELS].replace("Target='../tables/table1.xml'", "Target='../../../x.xml'");
-        parts.insert(SHEET_RELS.into(), rels);
-    });
+        assert!(message.contains(": table "), "{message}");
+    }
+    let message = invalid(
+        &|parts| {
+            let table = parts[TABLE_PATH]
+                .replace("<table ", "<other ")
+                .replace("</table>", "</other>");
+            parts.insert(TABLE_PATH.into(), table);
+        },
+        TABLE_PATH,
+    );
+    assert!(
+        message.ends_with("expected a SpreadsheetML table"),
+        "{message}"
+    );
+    // A missing target, an external target, and a target outside the
+    // package are the relationships part's errors.
+    let message = invalid(
+        &|parts| {
+            parts.remove(TABLE_PATH);
+        },
+        SHEET_RELS,
+    );
+    assert!(
+        message.ends_with(&format!("missing table part {TABLE_PATH}")),
+        "{message}"
+    );
+    invalid(
+        &|parts| {
+            let rels = parts[SHEET_RELS].replace(
+                "Target='../tables/table1.xml'",
+                "Target='../tables/table1.xml' TargetMode='External'",
+            );
+            parts.insert(SHEET_RELS.into(), rels);
+        },
+        SHEET_RELS,
+    );
+    invalid(
+        &|parts| {
+            let rels = parts[SHEET_RELS]
+                .replace("Target='../tables/table1.xml'", "Target='../../../x.xml'");
+            parts.insert(SHEET_RELS.into(), rels);
+        },
+        SHEET_RELS,
+    );
+    invalid(
+        &|parts| {
+            let rels = parts[SHEET_RELS].replace("<Relationships ", "<Other ");
+            let rels = rels.replace("</Relationships>", "</Other>");
+            parts.insert(SHEET_RELS.into(), rels);
+        },
+        SHEET_RELS,
+    );
+}
+
+#[test]
+fn unreadable_table_parts_name_the_part_with_their_own_variant() {
+    for (part, damage, expected) in [
+        (TABLE_PATH, "truncated", Error::Xml(String::new())),
+        (SHEET_RELS, "truncated", Error::Xml(String::new())),
+        (TABLE_PATH, "doctype", Error::Unsupported(String::new())),
+        (SHEET_RELS, "doctype", Error::Unsupported(String::new())),
+    ] {
+        let mut parts = parts("ref='A1:B3'");
+        let xml = &parts[part];
+        let damaged = match damage {
+            "truncated" => xml[..xml.len() / 2].to_owned(),
+            _ => format!("<!DOCTYPE x>{xml}"),
+        };
+        parts.insert(part.into(), damaged);
+        let mut book = book(&parts);
+        let error = book.set_cell("Data", "B2", 7).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected),
+            "{part} {damage}: {error:?}"
+        );
+        let message = match &error {
+            Error::Xml(message) | Error::Unsupported(message) => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            message.starts_with(&format!("part {part:?}: ")),
+            "{message}"
+        );
+        assert!(!message.contains("worksheet \""), "{message}");
+        assert!(!book.has_changes());
+        // The worksheet itself stays readable.
+        assert_eq!(
+            book.get_cell("Data", "B2").unwrap().value,
+            CellValue::Number(5.0)
+        );
+    }
 }

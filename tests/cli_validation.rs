@@ -131,7 +131,7 @@ fn refused_edits_report_the_last_patch_line_for_their_cell() {
             assert_eq!(
                 String::from_utf8(result.stderr).unwrap(),
                 format!(
-                    "sheetpatch: Patch line {line}: unsupported: worksheet \"Data\": D1 contains a formula\n"
+                    "sheetpatch: Patch line {line}: protected cell: worksheet \"Data\": D1 contains a formula\n"
                 )
             );
         }
@@ -151,7 +151,7 @@ fn refused_edits_report_the_last_patch_line_for_their_cell() {
     assert_eq!(result.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
-        "sheetpatch: unsupported: worksheet \"Data\": D1 contains a formula\n"
+        "sheetpatch: protected cell: worksheet \"Data\": D1 contains a formula\n"
     );
     assert!(!output.exists());
 }

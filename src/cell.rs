@@ -16,6 +16,8 @@ impl CellRef {
 
     /// Construct an address from one-based row and column numbers.
     ///
+    /// # Errors
+    ///
     /// Returns [`Error::InvalidCellReference`] unless the row is within
     /// `1..=`[`Self::MAX_ROW`] and the column is within `1..=`[`Self::MAX_COLUMN`].
     pub fn new(row: u32, column: u16) -> Result<Self> {
@@ -39,6 +41,13 @@ impl CellRef {
 impl FromStr for CellRef {
     type Err = Error;
 
+    /// Parse an A1 address such as `"B2"`; column letters may be lowercase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCellReference`], holding the input, for `$`
+    /// markers, ranges, sheet prefixes, surrounding whitespace, and addresses
+    /// outside Excel's grid.
     fn from_str(address: &str) -> Result<Self> {
         let invalid = || Error::InvalidCellReference(address.to_owned());
         let bytes = address.as_bytes();
@@ -70,8 +79,12 @@ impl FromStr for CellRef {
     }
 }
 
-impl fmt::Display for CellRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl CellRef {
+    // The longest address, `XFD1048576`.
+    const MAX_LEN: usize = 10;
+
+    // Writes the A1 address to the start of `buffer`, returning its length.
+    fn encode(self, buffer: &mut [u8]) -> usize {
         let mut column = self.column;
         let mut letters = [0u8; 3];
         let mut start = letters.len();
@@ -81,12 +94,44 @@ impl fmt::Display for CellRef {
             letters[start] = b'A' + (column % 26) as u8;
             column /= 26;
         }
-        write!(
-            f,
-            "{}{}",
-            std::str::from_utf8(&letters[start..]).unwrap(),
-            self.row
-        )
+        let mut digits = [0u8; 7];
+        let mut first_digit = digits.len();
+        let mut row = self.row;
+        while row != 0 {
+            first_digit -= 1;
+            digits[first_digit] = b'0' + (row % 10) as u8;
+            row /= 10;
+        }
+        let letters = &letters[start..];
+        let digits = &digits[first_digit..];
+        buffer[..letters.len()].copy_from_slice(letters);
+        buffer[letters.len()..letters.len() + digits.len()].copy_from_slice(digits);
+        letters.len() + digits.len()
+    }
+}
+
+// Formats an ASCII address built on the stack, honoring width, fill, and
+// alignment like a string.
+fn pad_ascii(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    f.pad(std::str::from_utf8(bytes).map_err(|_| fmt::Error)?)
+}
+
+impl fmt::Display for CellRef {
+    /// Format as an A1 address, such as `"XFD1048576"`. Width, fill, and
+    /// alignment are honored as for a string.
+    ///
+    /// ```
+    /// use sheetpatch::CellRef;
+    ///
+    /// let cell = CellRef::new(2, 28)?;
+    /// assert_eq!(cell.to_string(), "AB2");
+    /// assert_eq!(format!("[{cell:>5}]"), "[  AB2]");
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buffer = [0u8; Self::MAX_LEN];
+        let len = self.encode(&mut buffer);
+        pad_ascii(f, &buffer[..len])
     }
 }
 
@@ -110,7 +155,8 @@ impl fmt::Display for CellRef {
 /// # Ok::<(), sheetpatch::Error>(())
 /// ```
 ///
-/// Reading and writing a block with a workbook:
+/// Reading and writing a block with a workbook. A range is itself an iterable
+/// of its cells, in the same order as [`CellRange::cells`]:
 ///
 /// ```no_run
 /// use sheetpatch::{CellRange, Workbook};
@@ -119,11 +165,16 @@ impl fmt::Display for CellRef {
 /// let range: CellRange = "B2:D3".parse()?;
 /// let values = [1, 2, 3, 4, 5, 6];
 /// book.set_cells_at("Data", range.cells().zip(values))?;
-/// let cells = book.get_cells_at("Data", range.cells())?;
+/// let cells = book.get_cells_at("Data", range)?;
 /// assert_eq!(cells.len(), 6);
 /// # Ok::<(), sheetpatch::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Ranges are ordered by their top-left cell and then by their bottom-right
+/// cell, each compared in row-major order like [`CellRef`]: row first, then
+/// column. This makes ranges usable as sorted map keys; it is not a
+/// containment or size order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CellRange {
     first: CellRef,
     last: CellRef,
@@ -198,10 +249,13 @@ impl FromStr for CellRange {
 
     /// Parse `"A1:C3"` (corners in either order) or a single cell such as `"B2"`.
     ///
-    /// Each corner follows [`CellRef`]'s rules: lowercase letters are accepted,
-    /// while `$` markers, whole rows or columns such as `"A:C"`, sheet prefixes
-    /// and surrounding whitespace are rejected with
-    /// [`Error::InvalidCellReference`].
+    /// Each corner follows [`CellRef`]'s rules: lowercase letters are accepted.
+    ///
+    /// # Errors
+    ///
+    /// `$` markers, whole rows or columns such as `"A:C"`, sheet prefixes and
+    /// surrounding whitespace are rejected with
+    /// [`Error::InvalidCellReference`], which holds the whole input.
     fn from_str(range: &str) -> Result<Self> {
         let invalid = |_: Error| Error::InvalidCellReference(range.to_owned());
         match range.split_once(':') {
@@ -216,13 +270,37 @@ impl FromStr for CellRange {
 
 impl fmt::Display for CellRange {
     /// Format as `"A1:C3"`, or as a single address such as `"B2"` when the
-    /// range holds one cell.
+    /// range holds one cell. Width, fill, and alignment are honored as for a
+    /// string.
+    ///
+    /// ```
+    /// use sheetpatch::CellRange;
+    ///
+    /// let range: CellRange = "C3:A1".parse()?;
+    /// assert_eq!(format!("[{range:-^9}]"), "[--A1:C3--]");
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.first == self.last {
-            write!(f, "{}", self.first)
-        } else {
-            write!(f, "{}:{}", self.first, self.last)
+        let mut buffer = [0u8; 2 * CellRef::MAX_LEN + 1];
+        let mut len = self.first.encode(&mut buffer);
+        if self.first != self.last {
+            buffer[len] = b':';
+            len += 1;
+            len += self.last.encode(&mut buffer[len..]);
         }
+        pad_ascii(f, &buffer[..len])
+    }
+}
+
+/// Iterates over the range's cells in row-major order, like
+/// [`CellRange::cells`], so a range can be passed directly to the batch
+/// methods that take cells.
+impl IntoIterator for CellRange {
+    type Item = CellRef;
+    type IntoIter = CellRangeIter;
+
+    fn into_iter(self) -> CellRangeIter {
+        self.cells()
     }
 }
 
@@ -233,6 +311,7 @@ impl fmt::Display for CellRange {
 /// does not implement [`ExactSizeIterator`], because a whole worksheet holds
 /// more cells than a 32-bit `usize` can count.
 #[derive(Clone, Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct CellRangeIter {
     range: CellRange,
     next: Option<CellRef>,
@@ -292,6 +371,14 @@ impl FusedIterator for CellRangeIter {}
 /// `TryFrom` instead, which rejects values that `f64` cannot hold exactly.
 /// There is deliberately no `f32` conversion: `0.1f32` would widen to
 /// `0.10000000149011612`.
+///
+/// Unlike most of this crate's enums, `CellValue` is exhaustive, so a `match`
+/// on it needs no fallback arm. Its variants are the closed set of scalar
+/// value types a SpreadsheetML cell can store (shared and inline strings and
+/// formula strings all read as text, and ISO 8601 dates read as numbers), so
+/// none is expected to be added. Other information that reads may report in
+/// future, such as more cell metadata, belongs on [`CellContent`], which is
+/// `#[non_exhaustive]`.
 ///
 /// ```
 /// use sheetpatch::CellValue;
@@ -398,7 +485,13 @@ impl CellEdit {
     /// Construct an edit from a sheet name, an A1 address, and a value.
     ///
     /// The address and value are validated immediately. The sheet's existence
-    /// and its formula or merged-cell restrictions are checked when applied.
+    /// and its [edit restrictions](crate::Workbook#edit-restrictions) are
+    /// checked when the edit is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCellReference`] for an invalid address, and
+    /// otherwise [`Error::InvalidValue`] for a value no cell can hold.
     pub fn new(
         sheet: impl Into<String>,
         address: &str,
@@ -409,8 +502,15 @@ impl CellEdit {
 
     /// Construct an edit from a sheet name, a typed address, and a value.
     ///
-    /// The value is validated immediately; worksheet restrictions are checked
-    /// when the edit is applied to a workbook.
+    /// The value is validated immediately; the sheet's existence and its
+    /// [edit restrictions](crate::Workbook#edit-restrictions) are checked when
+    /// the edit is applied to a workbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] for a non-finite number, text longer
+    /// than Excel's 32,767 UTF-16 code units, or an error value that is not
+    /// one of Excel's error codes.
     pub fn at(
         sheet: impl Into<String>,
         cell: CellRef,
@@ -496,7 +596,12 @@ impl fmt::Display for CellValue {
     /// Text and error tokens are written verbatim, numbers use `f64`'s
     /// `Display` (shortest round-trip digits, never an exponent), booleans are
     /// `true` or `false`, and a blank is an empty string. Number formats are
-    /// not applied. Width, alignment and precision flags are honored.
+    /// not applied.
+    ///
+    /// Width, fill, and alignment are honored for every value. Precision
+    /// applies only to numbers, as decimal places: other values are never
+    /// truncated, so formatting a column of mixed values with `{:.2}` keeps
+    /// every text value whole.
     ///
     /// ```
     /// use sheetpatch::CellValue;
@@ -504,17 +609,49 @@ impl fmt::Display for CellValue {
     /// assert_eq!(CellValue::from(42).to_string(), "42");
     /// assert_eq!(CellValue::from(0.1 + 0.2).to_string(), "0.30000000000000004");
     /// assert_eq!(format!("{:.2}", CellValue::from(2.0 / 3.0)), "0.67");
+    /// assert_eq!(format!("{:.2}", CellValue::from("text")), "text");
+    /// assert_eq!(format!("[{:>6.1}]", CellValue::from(true)), "[  true]");
     /// assert_eq!(CellValue::Error("#N/A".into()).to_string(), "#N/A");
     /// assert_eq!(CellValue::Blank.to_string(), "");
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Text(text) | Self::Error(text) => f.pad(text),
+            Self::Text(text) | Self::Error(text) => pad_whole(f, text),
             Self::Number(number) => fmt::Display::fmt(number, f),
-            Self::Bool(value) => fmt::Display::fmt(value, f),
-            Self::Blank => f.pad(""),
+            Self::Bool(true) => pad_whole(f, "true"),
+            Self::Bool(false) => pad_whole(f, "false"),
+            Self::Blank => pad_whole(f, ""),
         }
     }
+}
+
+// Pads `text` to the formatter's width with its fill and alignment (left by
+// default, as for strings), but ignores precision, which `Formatter::pad`
+// would apply by truncating the text.
+fn pad_whole(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    if f.precision().is_none() {
+        return f.pad(text);
+    }
+    let padding = f
+        .width()
+        .map_or(0, |width| width.saturating_sub(text.chars().count()));
+    if padding == 0 {
+        return f.write_str(text);
+    }
+    let (before, after) = match f.align() {
+        Some(fmt::Alignment::Right) => (padding, 0),
+        Some(fmt::Alignment::Center) => (padding / 2, padding.div_ceil(2)),
+        Some(fmt::Alignment::Left) | None => (0, padding),
+    };
+    let fill = f.fill();
+    for _ in 0..before {
+        fmt::Write::write_char(f, fill)?;
+    }
+    f.write_str(text)?;
+    for _ in 0..after {
+        fmt::Write::write_char(f, fill)?;
+    }
+    Ok(())
 }
 
 impl From<&str> for CellValue {

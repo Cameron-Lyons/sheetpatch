@@ -1,6 +1,6 @@
 use super::parse::{Attribute, Element, NamespaceId, XmlDocument, parse};
 use super::validation::validate_ranges;
-use super::{at_cell, unique, unsupported};
+use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
 use crate::{CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -432,7 +432,7 @@ impl<'a> WorksheetIndex<'a> {
         }
         for &cell in cells.keys() {
             if self.formula_cells.contains(&cell) {
-                return Err(unsupported(format!("{cell} contains a formula")));
+                return Err(protected(cell, protection::FORMULA));
             }
         }
         validate_ranges(cells, &self.formula_ranges, false)?;
