@@ -308,3 +308,73 @@ impl Drop for TempDir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+const DATA_DESCRIPTOR: u32 = 0x0807_4b50;
+const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+
+/// Rewrites a contiguous archive with local records in directory order, such
+/// as [`write_zip`] output, the way a streaming writer records sizes. Entries
+/// for which `descriptor(name)` returns `Some(signed)` set general-purpose flag
+/// bit 3, zero the CRC-32 and sizes in their local header, and follow their
+/// compressed bytes with a data descriptor, with its optional signature when
+/// `signed`. Other entries and the end record's comment are copied unchanged.
+pub fn with_data_descriptors(archive: &[u8], descriptor: impl Fn(&str) -> Option<bool>) -> Vec<u8> {
+    let end = end_of_central_directory(archive);
+    let mut output = Vec::with_capacity(archive.len() + 16 * u16_at(archive, end + 10));
+    let mut central = Vec::new();
+    let mut cursor = 0;
+    for entry in zip_entries(archive) {
+        assert_eq!(
+            entry.local_offset, cursor,
+            "local records must be contiguous and in directory order"
+        );
+        cursor += entry.local.len();
+        let offset = zip32(output.len());
+        let header_len = entry.local.len() - entry.compressed.len();
+        let mut header = entry.local[..header_len].to_vec();
+        let mut record = entry.central.to_vec();
+        let signed = descriptor(&entry.name);
+        if signed.is_some() {
+            let flags = u16_at(&header, 6) as u16 | FLAG_DATA_DESCRIPTOR;
+            header[6..8].copy_from_slice(&flags.to_le_bytes());
+            record[8..10].copy_from_slice(&flags.to_le_bytes());
+            // CRC-32, compressed size, and uncompressed size follow the data.
+            header[14..26].fill(0);
+        }
+        output.extend_from_slice(&header);
+        output.extend_from_slice(entry.compressed);
+        if let Some(signed) = signed {
+            if signed {
+                put_u32(&mut output, DATA_DESCRIPTOR);
+            }
+            output.extend_from_slice(&entry.central[16..28]);
+        }
+        record[42..46].copy_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(&record);
+    }
+    assert_eq!(
+        cursor,
+        central_directory_offset(archive),
+        "unexpected ZIP gap"
+    );
+    let central_offset = zip32(output.len());
+    output.extend_from_slice(&central);
+    let mut end_record = archive[end..].to_vec();
+    end_record[12..16].copy_from_slice(&zip32(central.len()).to_le_bytes());
+    end_record[16..20].copy_from_slice(&central_offset.to_le_bytes());
+    output.extend_from_slice(&end_record);
+    output
+}
+
+/// Length of the data descriptor following `entry`'s compressed bytes in
+/// `bytes`: 16 with its signature, 12 without, or 0 when flag bit 3 is clear.
+pub fn data_descriptor_len(bytes: &[u8], entry: &ZipEntry<'_>) -> usize {
+    if u16_at(entry.central, 8) as u16 & FLAG_DATA_DESCRIPTOR == 0 {
+        return 0;
+    }
+    if u32_at(bytes, entry.local_offset + entry.local.len()) == DATA_DESCRIPTOR {
+        16
+    } else {
+        12
+    }
+}
