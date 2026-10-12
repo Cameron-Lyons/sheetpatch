@@ -12,4 +12,4 @@ mod xml;
 
 pub use cell::{CellContent, CellEdit, CellRange, CellRangeIter, CellRef, CellValue};
 pub use error::{Error, Result};
-pub use package::{Sheet, Workbook, WorksheetView};
+pub use package::{Sheet, SheetVisibility, Workbook, WorksheetView};

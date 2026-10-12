@@ -136,9 +136,13 @@ fn reopened(book: &Workbook) -> Workbook {
     Workbook::from_bytes(book.to_bytes().unwrap()).unwrap()
 }
 
+// Worksheet-level refusals name the worksheet, then the cell or row.
 fn unsupported_message(result: sheetpatch::Result<()>) -> String {
     match result {
-        Err(Error::Unsupported(message)) => message,
+        Err(Error::Unsupported(message)) => message
+            .strip_prefix("worksheet \"Data\": ")
+            .unwrap_or_else(|| panic!("expected the worksheet's name: {message}"))
+            .to_owned(),
         other => panic!("expected an unsupported edit, got {other:?}"),
     }
 }
