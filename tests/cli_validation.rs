@@ -230,19 +230,28 @@ fn carriage_returns_inside_rows_are_rejected_with_their_line() {
                 path.to_str().unwrap(),
             ],
         ] {
+            // Only a `-` PATCH reads standard input; piping input to a command
+            // that exits without reading it would race with a broken pipe.
+            let reads_stdin = args.last() == Some(&"-");
             let mut child = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
                 .args(&args)
-                .stdin(Stdio::piped())
+                .stdin(if reads_stdin {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(patch.as_bytes())
-                .unwrap();
+            if reads_stdin {
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(patch.as_bytes())
+                    .unwrap();
+            }
             let result = child.wait_with_output().unwrap();
             assert_eq!(result.status.code(), Some(2));
             assert!(result.stdout.is_empty());
