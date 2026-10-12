@@ -403,6 +403,11 @@ impl Workbook {
     /// and a pipe or device once that much has been read. On Unix, a regular
     /// file's permission bits and group apply to new destinations of
     /// [`Self::save`] and [`Self::save_compact`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the file cannot be opened or read, and
+    /// otherwise fails like [`Self::from_bytes`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = fs::File::open(path)?;
         let metadata = file.metadata()?;
@@ -439,6 +444,12 @@ impl Workbook {
     /// [`Self::save_compact`] are created with the default permissions, as
     /// for [`Self::from_bytes`].
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when reading fails, [`Error::Unsupported`] for
+    /// input beyond the size limit, and otherwise fails like
+    /// [`Self::from_bytes`].
+    ///
     /// ```no_run
     /// use sheetpatch::Workbook;
     /// let book = Workbook::from_reader(std::io::stdin().lock())?;
@@ -451,6 +462,15 @@ impl Workbook {
 
     /// Open an in-memory workbook, retaining its original archive bytes.
     /// Worksheet XML and shared strings are parsed lazily when first accessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for packages outside the supported scope,
+    /// such as legacy `.xls` and password-encrypted (OLE compound) files,
+    /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, and encrypted
+    /// ZIP entries. Returns [`Error::InvalidWorkbook`] or [`Error::Xml`] for a
+    /// damaged or ambiguous archive or package metadata. Worksheet XML is
+    /// checked when a worksheet is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::new(bytes)?;
         let discovery::PackageMetadata {
@@ -986,6 +1006,13 @@ impl Workbook {
     /// process may assign it, and otherwise no group access. Setuid, setgid
     /// and sticky bits are never applied; writing the contents would clear
     /// setuid and setgid anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] of kind [`std::io::ErrorKind::InvalidInput`] for
+    /// the destinations described above, and [`Error::Io`] when creating,
+    /// writing, syncing, or renaming the temporary file fails. Otherwise fails
+    /// like [`Self::to_bytes`].
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_to(writer)
@@ -996,6 +1023,10 @@ impl Workbook {
     /// present in the input. Opaque ZIP prefixes or gaps cause an error.
     /// Saving does not clear pending edits or replace the retained original.
     /// Destinations and permissions are handled as described for [`Self::save`].
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::save`] and [`Self::write_compact_to`].
     pub fn save_compact(&self, path: impl AsRef<Path>) -> Result<()> {
         crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_compact_to(writer)
