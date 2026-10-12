@@ -323,30 +323,42 @@ pub enum CellValue {
 
 impl CellValue {
     pub(crate) fn validate(&self) -> Result<()> {
+        // Excel stores error cells as one of a fixed set of codes. Other
+        // spellings, even plausible typos such as `#DIV/0`, display as a
+        // different error. Reads stay lenient for codes added in the future.
+        const ERROR_VALUES: [&str; 17] = [
+            "#NULL!",
+            "#DIV/0!",
+            "#VALUE!",
+            "#REF!",
+            "#NAME?",
+            "#NUM!",
+            "#N/A",
+            "#GETTING_DATA",
+            "#SPILL!",
+            "#CALC!",
+            "#FIELD!",
+            "#BLOCKED!",
+            "#CONNECT!",
+            "#BUSY!",
+            "#UNKNOWN!",
+            "#PYTHON!",
+            "#EXTERNAL!",
+        ];
         match self {
             Self::Number(n) if !n.is_finite() => {
                 Err(Error::InvalidValue("numbers must be finite".into()))
             }
+            // Characters XML 1.0 forbids are written as Excel `_xHHHH_` escapes,
+            // so any text a cell can hold, including text read back, is valid.
             Self::Text(s) if s.len() > 32_767 && s.encode_utf16().take(32_768).count() > 32_767 => {
                 Err(Error::InvalidValue(
                     "text exceeds Excel's 32,767 UTF-16 code unit limit".into(),
                 ))
             }
-            Self::Text(s) if !s.chars().all(crate::xml::valid_char) => Err(Error::InvalidValue(
-                "text contains a character forbidden by XML 1.0".into(),
+            Self::Error(s) if !ERROR_VALUES.contains(&s.as_str()) => Err(Error::InvalidValue(
+                "error values must be an Excel error code such as #N/A or #DIV/0!".into(),
             )),
-            Self::Error(s)
-                if s.len() > 64
-                    || !s.starts_with('#')
-                    || s.len() < 2
-                    || !s.bytes().all(|c| {
-                        c.is_ascii_uppercase() || c.is_ascii_digit() || b"#/!?._".contains(&c)
-                    }) =>
-            {
-                Err(Error::InvalidValue(
-                    "error values must be an Excel error token such as #N/A".into(),
-                ))
-            }
             _ => Ok(()),
         }
     }
@@ -646,12 +658,52 @@ mod tests {
         for value in [
             CellValue::Number(f64::NAN),
             CellValue::Number(f64::INFINITY),
-            CellValue::from("a\0b"),
             CellValue::from("a".repeat(32_768)),
             CellValue::Error("not-an-error".into()),
             CellValue::Error("#BAD\nTOKEN".into()),
         ] {
-            assert!(value.validate().is_err());
+            assert!(value.validate().is_err(), "{value:?}");
+        }
+        for error in [
+            "#FOO", "##", "#1", "#DIV/0", "#N/A!", "#na", "#n/a", "#NA", "#", "", " #N/A", "#N/A ",
+            "#REF!\0",
+        ] {
+            assert!(
+                matches!(
+                    CellValue::Error(error.into()).validate(),
+                    Err(Error::InvalidValue(message)) if message.contains("#N/A")
+                ),
+                "{error:?}"
+            );
+        }
+        for error in [
+            "#NULL!",
+            "#DIV/0!",
+            "#VALUE!",
+            "#REF!",
+            "#NAME?",
+            "#NUM!",
+            "#N/A",
+            "#GETTING_DATA",
+            "#SPILL!",
+            "#CALC!",
+            "#FIELD!",
+            "#BLOCKED!",
+            "#CONNECT!",
+            "#BUSY!",
+            "#UNKNOWN!",
+            "#PYTHON!",
+            "#EXTERNAL!",
+        ] {
+            assert!(CellValue::Error(error.into()).validate().is_ok(), "{error}");
+        }
+        // Characters that XML 1.0 forbids are stored as `_xHHHH_` escapes.
+        for text in [
+            "a\0b",
+            "\u{1}\u{8}\u{b}\u{c}\u{e}\u{1f}",
+            "\u{fffe}\u{ffff}",
+        ] {
+            assert!(CellValue::from(text).validate().is_ok(), "{text:?}");
         }
     }
 

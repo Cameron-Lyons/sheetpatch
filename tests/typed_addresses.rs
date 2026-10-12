@@ -79,7 +79,7 @@ fn typed_batches_validate_overwritten_values_and_roll_back_on_formula_protection
     ));
     assert_eq!(book.to_bytes().unwrap(), pending);
     assert!(matches!(
-        book.set_cell_at("Data", a1, "invalid\0text"),
+        book.set_cell_at("Data", a1, "a".repeat(32_768)),
         Err(Error::InvalidValue(_))
     ));
     assert_eq!(book.to_bytes().unwrap(), pending);

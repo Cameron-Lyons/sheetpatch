@@ -6,6 +6,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
+mod date;
 mod index;
 mod parse;
 mod patch;
@@ -30,27 +31,36 @@ impl<'xml> PreparedWorksheet<'xml> {
         })
     }
 
+    /// Reads cells in request order. Shared strings are loaded at most once,
+    /// only for a requested `t="s"` cell. `date1904` selects the workbook's
+    /// date system for ISO 8601 (`t="d"`) cells, which read as Excel serials.
     pub(crate) fn read_cells<'strings>(
         &self,
         cells: &[CellRef],
         shared_strings: impl FnMut() -> Result<&'strings [String]>,
+        date1904: bool,
     ) -> Result<Vec<CellContent>> {
-        read::read_cells(self.xml, &self.index, cells, shared_strings)
+        read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
     }
 
-    pub(crate) fn patch_cells(
+    /// Patches cells against the original byte spans. Shared strings are
+    /// loaded at most once, only to recognize rewriting a `t="s"` cell's
+    /// current text; a failed load is treated as a changed value.
+    pub(crate) fn patch_cells<'strings>(
         &self,
         cells: &BTreeMap<CellRef, CellValue>,
+        shared_strings: impl FnMut() -> Result<&'strings [String]>,
     ) -> Result<Cow<'xml, [u8]>> {
         // Scalar values are validated before constructing the index, keeping
         // value errors ahead of worksheet parsing errors.
-        patch::patch_cells(self.xml, &self.index, cells)
+        patch::patch_cells(self.xml, &self.index, cells, shared_strings)
     }
 }
 
-pub(crate) fn patch_cells<'xml>(
+pub(crate) fn patch_cells<'xml, 'strings>(
     xml: &'xml [u8],
     cells: &BTreeMap<CellRef, CellValue>,
+    shared_strings: impl FnMut() -> Result<&'strings [String]>,
 ) -> Result<Cow<'xml, [u8]>> {
     if cells.is_empty() {
         return Ok(Cow::Borrowed(xml));
@@ -60,18 +70,19 @@ pub(crate) fn patch_cells<'xml>(
         value.validate()?;
     }
     let worksheet = PreparedWorksheet::parse(xml)?;
-    worksheet.patch_cells(cells)
+    worksheet.patch_cells(cells, shared_strings)
 }
 
 pub(crate) fn read_cells<'strings>(
     xml: &[u8],
     cells: &[CellRef],
     shared_strings: impl FnMut() -> Result<&'strings [String]>,
+    date1904: bool,
 ) -> Result<Vec<CellContent>> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }
-    PreparedWorksheet::parse(xml)?.read_cells(cells, shared_strings)
+    PreparedWorksheet::parse(xml)?.read_cells(cells, shared_strings, date1904)
 }
 
 type RowCells = (u32, usize, std::ops::Range<usize>);
@@ -81,6 +92,15 @@ fn xml_error(message: impl Into<String>) -> Error {
 }
 fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
+}
+
+// Names the cell an edit refusal concerns, retaining the error's variant.
+fn at_cell(cell: CellRef, error: Error) -> Error {
+    match error {
+        Error::Unsupported(message) => unsupported(format!("{cell}: {message}")),
+        Error::Xml(message) => xml_error(format!("{cell}: {message}")),
+        error => error,
+    }
 }
 
 fn unique<T>(mut items: impl Iterator<Item = T>, message: &'static str) -> Result<Option<T>> {
@@ -101,14 +121,20 @@ fn decoded(input: &str) -> Result<String> {
 
 #[cfg(test)]
 fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
-    patch_cells(xml, &BTreeMap::from([(cell, value.clone())])).map(Cow::into_owned)
+    patch_cells(xml, &BTreeMap::from([(cell, value.clone())]), || {
+        Err(Error::SharedStringsUnavailable)
+    })
+    .map(Cow::into_owned)
 }
 
 #[cfg(test)]
 fn read_cell(xml: &[u8], cell: CellRef, shared_strings: Option<&[String]>) -> Result<CellContent> {
-    read_cells(xml, &[cell], || {
-        shared_strings.ok_or(Error::SharedStringsUnavailable)
-    })
+    read_cells(
+        xml,
+        &[cell],
+        || shared_strings.ok_or(Error::SharedStringsUnavailable),
+        false,
+    )
     .map(|mut cells| cells.remove(0))
 }
 

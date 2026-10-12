@@ -191,7 +191,7 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
     let mut declaration_seen = false;
     loop {
         let event_start = reader.buffer_position();
-        let event = reader.read_event()?;
+        let event = reader.read_event().map_err(Error::xml)?;
         let is_empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(e) | Event::Empty(e) => {
@@ -227,7 +227,8 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                         return Err(Error::Xml("duplicate XML attribute".into()));
                     }
                     let value = attr
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map_err(Error::xml)?
                         .into_owned();
                     if !value.chars().all(crate::xml::valid_char) {
                         return Err(Error::Xml("invalid XML attribute character".into()));

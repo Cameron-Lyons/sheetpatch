@@ -58,8 +58,10 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<quick_xml::Error> for Error {
-    fn from(value: quick_xml::Error) -> Self {
-        Self::Xml(value.to_string())
+impl Error {
+    // quick-xml is a pre-1.0 dependency, so its error type is converted only
+    // inside the crate rather than through a public `From` implementation.
+    pub(crate) fn xml(error: quick_xml::Error) -> Self {
+        Self::Xml(error.to_string())
     }
 }

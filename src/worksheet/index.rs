@@ -1,6 +1,6 @@
 use super::parse::{Attribute, Element, NamespaceId, parse};
 use super::validation::validate_ranges;
-use super::{RowCells, unique, unsupported};
+use super::{RowCells, at_cell, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
 use crate::{CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -59,6 +59,51 @@ pub(super) fn reference_range(reference: &str) -> Result<Range> {
     Ok(Range { first, last })
 }
 
+// Column default styles as sorted, nonoverlapping `(min, max, style)` intervals.
+// Malformed or ambiguous definitions are reported only when a new cell needs
+// its column's style, so reads and edits of existing cells are unaffected.
+type ColumnStyles = std::result::Result<Vec<(u32, u32, u32)>, &'static str>;
+
+fn column_styles<'a>(
+    elements: &[Element<'a>],
+    attributes: &[Attribute<'a>],
+    namespace: NamespaceId,
+) -> ColumnStyles {
+    let number = |column: &Element, name, default| {
+        column
+            .attr(attributes, name)
+            .map_or(Ok(default), |attribute| {
+                trim_xml_whitespace(&attribute.value)
+                    .parse::<u32>()
+                    .map_err(|_| "invalid column definition")
+            })
+    };
+    let mut columns = Vec::new();
+    for index in elements[0].children(elements) {
+        let definitions = &elements[index];
+        if !definitions.is(namespace, "cols") {
+            continue;
+        }
+        for index in definitions.children(elements) {
+            let column = &elements[index];
+            if !column.is(namespace, "col") {
+                continue;
+            }
+            let first = number(column, "min", 0)?;
+            let last = number(column, "max", 0)?;
+            if first == 0 || first > last {
+                return Err("invalid column definition");
+            }
+            columns.push((first, last, number(column, "style", 0)?));
+        }
+    }
+    columns.sort_unstable();
+    if columns.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+        return Err("overlapping column definitions");
+    }
+    Ok(columns)
+}
+
 // A worksheet's structure is indexed once. Byte spans remain relative to the
 // original document, so unrelated whitespace, prefixes and markup never move.
 pub(super) struct WorksheetIndex<'a> {
@@ -71,7 +116,10 @@ pub(super) struct WorksheetIndex<'a> {
     pub(super) formula_cells: HashSet<CellRef>,
     pub(super) formula_ranges: Vec<Range>,
     pub(super) merged_ranges: Vec<Range>,
-    pub(super) incomplete_formula_group: bool,
+    /// The first formula cell whose shared, array, or data-table group lacks a
+    /// reference range, leaving the protected cells unknown.
+    pub(super) incomplete_formula_group: Option<CellRef>,
+    column_styles: ColumnStyles,
 }
 
 impl<'a> WorksheetIndex<'a> {
@@ -100,10 +148,12 @@ impl<'a> WorksheetIndex<'a> {
         let mut rows = Vec::new();
         let mut cells = Vec::new();
         let mut previous_row = 0;
-        let mut shared: HashMap<u32, bool> = HashMap::new();
+        // Each shared-formula index maps to its first cell and whether any
+        // member of the group carries the group's reference range.
+        let mut shared: HashMap<u32, (CellRef, bool)> = HashMap::new();
         let mut formula_cells = HashSet::new();
         let mut formula_ranges = Vec::new();
-        let mut incomplete_formula_group = false;
+        let mut incomplete_formula_group = None;
         for index in elements[data_index].children(&elements) {
             let row = &elements[index];
             if !row.is(namespace, "row") {
@@ -116,7 +166,9 @@ impl<'a> WorksheetIndex<'a> {
                 .parse::<u32>()
                 .map_err(|_| unsupported("invalid row number"))?;
             if row_number <= previous_row || row_number > 1_048_576 {
-                return Err(unsupported("duplicate, unsorted, or invalid row numbers"));
+                return Err(unsupported(format!(
+                    "row {row_number}: duplicate, unsorted, or invalid row numbers"
+                )));
             }
             previous_row = row_number;
             let cells_start = cells.len();
@@ -128,14 +180,22 @@ impl<'a> WorksheetIndex<'a> {
                 }
                 let address: CellRef = existing
                     .attr(&attributes, "r")
-                    .ok_or_else(|| unsupported("cells without explicit references"))?
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "row {row_number}: cells without explicit references"
+                        ))
+                    })?
                     .value
                     .parse()
-                    .map_err(|_| unsupported("invalid cell reference in worksheet"))?;
+                    .map_err(|_| {
+                        unsupported(format!(
+                            "row {row_number}: invalid cell reference in worksheet"
+                        ))
+                    })?;
                 if address.row != row_number || address.column <= previous_column {
-                    return Err(unsupported(
-                        "duplicate, unsorted, or inconsistent cell references",
-                    ));
+                    return Err(unsupported(format!(
+                        "{address}: duplicate, unsorted, or inconsistent cell references"
+                    )));
                 }
                 previous_column = address.column;
                 cells.push((address, index));
@@ -148,7 +208,8 @@ impl<'a> WorksheetIndex<'a> {
                     let range = formula
                         .attr(&attributes, "ref")
                         .map(|attribute| reference_range(&attribute.value))
-                        .transpose()?;
+                        .transpose()
+                        .map_err(|error| at_cell(address, error))?;
                     if let Some(range) = range {
                         formula_ranges.push(range);
                     }
@@ -157,17 +218,22 @@ impl<'a> WorksheetIndex<'a> {
                         .map(|attribute| attribute.value.as_ref())
                     {
                         Some("shared") => {
-                            let index_reference = formula
-                                .attr(&attributes, "si")
-                                .ok_or_else(|| unsupported("shared formula without an index"))?;
+                            let index_reference =
+                                formula.attr(&attributes, "si").ok_or_else(|| {
+                                    unsupported(format!(
+                                        "{address}: shared formula without an index"
+                                    ))
+                                })?;
                             let index = trim_xml_whitespace(&index_reference.value)
                                 .parse::<u32>()
-                                .map_err(|_| unsupported("invalid shared formula index"))?;
-                            let has_range = shared.entry(index).or_insert(false);
-                            *has_range |= range.is_some();
+                                .map_err(|_| {
+                                    unsupported(format!("{address}: invalid shared formula index"))
+                                })?;
+                            let group = shared.entry(index).or_insert((address, false));
+                            group.1 |= range.is_some();
                         }
                         Some("array" | "dataTable") if range.is_none() => {
-                            incomplete_formula_group = true;
+                            incomplete_formula_group.get_or_insert(address);
                         }
                         _ => {}
                     }
@@ -175,7 +241,13 @@ impl<'a> WorksheetIndex<'a> {
             }
             rows.push((row_number, index, cells_start..cells.len()));
         }
-        incomplete_formula_group |= shared.values().any(|has_range| !has_range);
+        incomplete_formula_group = shared
+            .values()
+            .filter(|&&(_, has_range)| !has_range)
+            .map(|&(first, _)| first)
+            .chain(incomplete_formula_group)
+            .min();
+        let mut column_styles = column_styles(&elements, &attributes, namespace);
         let mut merged_ranges = Vec::new();
         for index in root.children(&elements) {
             let merges = &elements[index];
@@ -232,6 +304,18 @@ impl<'a> WorksheetIndex<'a> {
             {
                 return Err(unsupported("merged range outside mergeCells"));
             }
+            // Hidden column definitions leave a new cell's default style unknown.
+            if element.namespace == namespace
+                && match element.local_name() {
+                    "cols" => element.parent != Some(0),
+                    "col" => !element.parent.is_some_and(|parent| {
+                        elements[parent].is(namespace, "cols") && elements[parent].parent == Some(0)
+                    }),
+                    _ => false,
+                }
+            {
+                column_styles = Err("column definitions inside an unsupported XML container");
+            }
         }
         Ok(Self {
             elements,
@@ -244,7 +328,23 @@ impl<'a> WorksheetIndex<'a> {
             formula_ranges,
             merged_ranges,
             incomplete_formula_group,
+            column_styles,
         })
+    }
+
+    // The column's default style for a new cell, or `None` for style zero.
+    pub(super) fn column_style(&self, cell: CellRef) -> Result<Option<u32>> {
+        let columns = self
+            .column_styles
+            .as_ref()
+            .map_err(|&message| unsupported(format!("{cell}: {message}")))?;
+        let column = u32::from(cell.column);
+        let position = columns.partition_point(|&(first, _, _)| first <= column);
+        Ok(position
+            .checked_sub(1)
+            .map(|position| columns[position])
+            .filter(|&(_, last, style)| column <= last && style != 0)
+            .map(|(_, _, style)| style))
     }
 
     pub(super) fn cell(&self, address: CellRef) -> Option<usize> {
@@ -260,8 +360,11 @@ impl<'a> WorksheetIndex<'a> {
     }
 
     pub(super) fn validate_edits(&self, cells: &BTreeMap<CellRef, CellValue>) -> Result<()> {
-        if self.incomplete_formula_group {
-            return Err(unsupported("formula group without a reference range"));
+        // Without the group's range, any edited cell could be a hidden member.
+        if let Some(cell) = self.incomplete_formula_group {
+            return Err(unsupported(format!(
+                "{cell} belongs to a formula group without a reference range"
+            )));
         }
         for &cell in cells.keys() {
             if self.formula_cells.contains(&cell) {

@@ -359,7 +359,7 @@ fn invalid_values_and_addresses_fail_without_modifying_the_archive() {
     }
     assert!(
         workbook
-            .set_cell("Data & Notes", "A1", "invalid\0text")
+            .set_cell("Data & Notes", "A1", "a".repeat(32_768))
             .is_err()
     );
     assert_eq!(workbook.to_bytes().unwrap(), original);

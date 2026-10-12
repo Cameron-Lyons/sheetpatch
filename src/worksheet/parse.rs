@@ -1,9 +1,9 @@
 use super::{STRICT, TRANSITIONAL, decoded, decoded_namespace, unsupported, xml_error};
-use crate::Result;
 use crate::xml::{
     valid_char as valid_xml_char, valid_name, valid_qname, validate_declaration,
     validate_namespaces, whitespace as xml_whitespace,
 };
+use crate::{Error, Result};
 use quick_xml::{
     events::{Event, attributes::Attribute as XmlAttribute},
     name::{QName, ResolveResult},
@@ -227,7 +227,8 @@ fn attribute_spans<'xml>(
             key: QName(name),
             value: Cow::Borrowed(std::str::from_utf8(raw).map_err(|e| xml_error(e.to_string()))?),
         }
-        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+        .map_err(Error::xml)?;
         if !value.chars().all(valid_xml_char) {
             return Err(xml_error("invalid XML character reference"));
         }
@@ -274,7 +275,11 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
         0
     };
     // quick-xml strips a BOM without including it in buffer_position(). Keep
-    // offsets relative to the original input explicitly.
+    // offsets relative to the original input explicitly. After the first BOM,
+    // U+FEFF is text before the root; the reader would strip it too.
+    if xml[bom..].starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(xml_error("text outside the XML root"));
+    }
     let mut reader = NsReader::from_reader(&xml[bom..]);
     reader.config_mut().check_comments = true;
     let mut elements: Vec<Element> = Vec::new();
@@ -285,7 +290,7 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
     let mut declaration_seen = false;
     loop {
         let start = reader.buffer_position() as usize + bom;
-        let event = reader.read_event()?;
+        let event = reader.read_event().map_err(Error::xml)?;
         let end = reader.buffer_position() as usize + bom;
         match event {
             Event::Start(ref tag) | Event::Empty(ref tag) => {
