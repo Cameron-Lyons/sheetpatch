@@ -84,9 +84,12 @@ fn indexes_direct_children_across_nested_extensions_and_empty_elements() {
         .map(|address| address.parse().unwrap())
         .collect();
     assert_eq!(
-        read_cells(input.as_bytes(), &addresses, || {
-            panic!("inline strings should not load shared strings")
-        })
+        read_cells(
+            input.as_bytes(),
+            &addresses,
+            || panic!("inline strings should not load shared strings"),
+            false
+        )
         .unwrap()
         .into_iter()
         .map(|cell| cell.value)
@@ -121,9 +124,12 @@ fn indexes_direct_children_across_nested_extensions_and_empty_elements() {
         );
     assert_eq!(changed, expected);
     assert_eq!(
-        read_cells(changed.as_bytes(), &addresses, || {
-            panic!("inline strings should not load shared strings")
-        })
+        read_cells(
+            changed.as_bytes(),
+            &addresses,
+            || panic!("inline strings should not load shared strings"),
+            false
+        )
         .unwrap()
         .into_iter()
         .map(|cell| cell.value)
@@ -363,6 +369,7 @@ fn generated_elements_use_the_context_prefix_after_default_namespace_rebinding()
             "C2".parse().unwrap(),
         ],
         || Err(Error::SharedStringsUnavailable),
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -424,6 +431,389 @@ fn escapes_excel_tokens_and_carriage_returns() {
         text_escaped("_x0041_\r&_Xabcd_"),
         "_x005F_x0041_&#13;&amp;_x005F_Xabcd_"
     );
+    assert_eq!(
+        text_escaped("<\0\u{b}_x000B\u{b}\u{ffff}>"),
+        "&lt;_x0000__x000B__x005F_x000B_x000B__xFFFF_&gt;"
+    );
+}
+
+#[test]
+fn xml_forbidden_text_round_trips_and_rewriting_it_is_a_no_op() {
+    let text = "\0a\u{1}_x0001\u{1f}_x0041_\u{fffe}\r\n\u{ffff}";
+    let changed = edit(&sheet("<sheetData/>"), "A1", text.into()).unwrap();
+    assert!(changed.contains(
+        "<t xml:space=\"preserve\">_x0000_a_x0001__x005F_x0001_x001F__x005F_x0041__xFFFE_&#13;\n_xFFFF_</t>"
+    ));
+    assert_eq!(
+        read_cell(changed.as_bytes(), "A1".parse().unwrap(), None)
+            .unwrap()
+            .value,
+        CellValue::from(text)
+    );
+    assert_eq!(edit(&changed, "A1", text.into()).unwrap(), changed);
+    let typed = changed
+        .replace(
+            "<c r=\"A1\" t=\"inlineStr\"><is><t xml:space=\"preserve\">",
+            "<c r=\"A1\" t=\"str\"><v>",
+        )
+        .replace("</t></is>", "</v>");
+    assert_eq!(edit(&typed, "A1", text.into()).unwrap(), typed);
+}
+
+#[test]
+fn leading_byte_order_marks_are_text_for_reads_and_unchanged_value_checks() {
+    let input = sheet(
+        "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><t>\u{feff}Name</t></is></c><c r='B1'><v>\u{feff}5</v></c><c r='C1' t='str'><v>\u{feff}\u{feff}x</v></c></row></sheetData>",
+    );
+    assert_eq!(
+        read_cell(input.as_bytes(), "C1".parse().unwrap(), None)
+            .unwrap()
+            .value,
+        CellValue::from("\u{feff}\u{feff}x")
+    );
+    assert!(matches!(
+        read_cell(input.as_bytes(), "B1".parse().unwrap(), None),
+        Err(Error::Unsupported(_))
+    ));
+    // Values that differ only by a leading U+FEFF are real edits.
+    for (address, value, old, new) in [
+        (
+            "A1",
+            CellValue::from("Name"),
+            "<is><t>\u{feff}Name</t></is>",
+            "<is><t xml:space=\"preserve\">Name</t></is>",
+        ),
+        ("B1", CellValue::Number(5.0), "<v>\u{feff}5</v>", "<v>5</v>"),
+        (
+            "C1",
+            CellValue::from("\u{feff}x"),
+            "t='str'><v>\u{feff}\u{feff}x</v>",
+            "t='inlineStr'><is><t xml:space=\"preserve\">\u{feff}x</t></is>",
+        ),
+    ] {
+        let changed = edit(&input, address, value.clone()).unwrap();
+        assert_eq!(changed, input.replace(old, new), "{address}");
+        assert_eq!(edit(&changed, address, value).unwrap(), changed);
+    }
+    assert_eq!(edit(&input, "A1", "\u{feff}Name".into()).unwrap(), input);
+}
+
+#[test]
+fn incomplete_formula_groups_block_every_edit_and_name_the_formula_cell() {
+    for formula in [
+        "<f t='shared' si='0'/>",
+        "<f t='array'>1</f>",
+        "<f t='dataTable' r1='A1'/>",
+    ] {
+        let input = sheet(&format!(
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row><row r='2'><c r='B2'>{formula}<v>1</v></c></row></sheetData>"
+        ));
+        for address in ["A1", "Z9", "B2"] {
+            assert!(
+                matches!(
+                    edit(&input, address, 2.0.into()),
+                    Err(Error::Unsupported(message))
+                        if message == "B2 belongs to a formula group without a reference range"
+                ),
+                "{formula} {address}"
+            );
+        }
+        // Positive control: the same group with its range protects only it.
+        let complete = input
+            .replace("/>", " ref='B2:C3'/>")
+            .replace(">1</f>", " ref='B2:C3'>1</f>");
+        assert!(edit(&complete, "A1", 2.0.into()).is_ok(), "{complete}");
+        assert!(edit(&complete, "Z9", 2.0.into()).is_ok());
+        assert!(matches!(
+            edit(&complete, "C3", 2.0.into()),
+            Err(Error::Unsupported(message)) if message == "C3 belongs to a formula range"
+        ));
+    }
+    // A shared group is complete when any member carries its range, and an
+    // incomplete group is reported at its first cell.
+    let followers = sheet(
+        "<sheetData><row r='1'><c r='A1'><f t='shared' si='3'/><v>1</v></c><c r='B1'><f t='shared' si='3' ref='A1:B1'>1</f><v>1</v></c><c r='C1'><f t='shared' si='4'/><v>1</v></c><c r='D1'><f t='shared' si='4'/><v>1</v></c></row></sheetData>",
+    );
+    assert!(matches!(
+        edit(&followers, "E5", 2.0.into()),
+        Err(Error::Unsupported(message))
+            if message == "C1 belongs to a formula group without a reference range"
+    ));
+    let complete = followers.replace(
+        "<c r='C1'><f t='shared' si='4'/>",
+        "<c r='C1'><f t='shared' si='4' ref='C1:D1'>1</f>",
+    );
+    assert!(edit(&complete, "E5", 2.0.into()).is_ok());
+    for (cell, message) in [
+        (
+            "<c r='A1'><f t='shared'/></c>",
+            "A1: shared formula without an index",
+        ),
+        (
+            "<c r='A1'><f t='shared' si='x'/></c>",
+            "A1: invalid shared formula index",
+        ),
+        (
+            "<c r='A1'><f t='array' ref='B2:A1'/></c>",
+            "A1: invalid cell range \"B2:A1\"",
+        ),
+    ] {
+        let input = sheet(&format!("<sheetData><row r='1'>{cell}</row></sheetData>"));
+        assert!(
+            matches!(edit(&input, "C3", 2.0.into()), Err(Error::Unsupported(m)) if m == message),
+            "{cell}"
+        );
+    }
+}
+
+#[test]
+fn unsorted_or_duplicate_rows_and_cells_are_rejected_with_their_location() {
+    for (rows, message) in [
+        (
+            "<row r='2'/><row r='1'/>",
+            "row 1: duplicate, unsorted, or invalid row numbers",
+        ),
+        (
+            "<row r='1'/><row r='1'/>",
+            "row 1: duplicate, unsorted, or invalid row numbers",
+        ),
+        (
+            "<row r='1048577'/>",
+            "row 1048577: duplicate, unsorted, or invalid row numbers",
+        ),
+        (
+            "<row r='1'><c r='B1'/><c r='A1'/></row>",
+            "A1: duplicate, unsorted, or inconsistent cell references",
+        ),
+        (
+            "<row r='1'><c r='A2'/></row>",
+            "A2: duplicate, unsorted, or inconsistent cell references",
+        ),
+        (
+            "<row r='3'><c/></row>",
+            "row 3: cells without explicit references",
+        ),
+    ] {
+        let input = sheet(&format!("<sheetData>{rows}</sheetData>"));
+        for result in [
+            edit(&input, "C5", 2.0.into()).map(drop),
+            read_cell(input.as_bytes(), "C5".parse().unwrap(), None).map(drop),
+        ] {
+            assert!(
+                matches!(&result, Err(Error::Unsupported(m)) if m == message),
+                "{rows}: {result:?}"
+            );
+        }
+    }
+    // Positive control: sorted, distinct rows edit and read normally.
+    let input = sheet("<sheetData><row r='1'><c r='A1'/><c r='B1'/></row><row r='2'/></sheetData>");
+    let changed = edit(&input, "A2", 2.0.into()).unwrap();
+    assert_eq!(
+        read_cell(changed.as_bytes(), "A2".parse().unwrap(), None)
+            .unwrap()
+            .value,
+        CellValue::Number(2.0)
+    );
+}
+
+#[test]
+fn values_are_inserted_before_an_existing_cells_extension_list() {
+    for (cell, value, expected) in [
+        (
+            "<c r=\"A1\" s=\"2\"></c>",
+            CellValue::Number(5.0),
+            "<c r=\"A1\" s=\"2\"><v>5</v></c>",
+        ),
+        (
+            "<c r=\"A1\"><extLst><ext uri=\"u\"/></extLst></c>",
+            CellValue::Number(5.0),
+            "<c r=\"A1\"><v>5</v><extLst><ext uri=\"u\"/></extLst></c>",
+        ),
+        (
+            "<c r=\"A1\" t=\"n\"><x:before/><extLst/><x:after/></c>",
+            CellValue::from("text"),
+            "<c r=\"A1\" t=\"inlineStr\"><x:before/><is><t xml:space=\"preserve\">text</t></is><extLst/><x:after/></c>",
+        ),
+    ] {
+        let input = sheet(&format!("<sheetData><row r=\"1\">{cell}</row></sheetData>"));
+        let changed = edit(&input, "A1", value.clone()).unwrap();
+        assert_eq!(changed, input.replace(cell, expected));
+        assert_eq!(
+            read_cell(changed.as_bytes(), "A1".parse().unwrap(), None)
+                .unwrap()
+                .value,
+            value
+        );
+    }
+}
+
+#[test]
+fn only_xml_version_10_is_supported() {
+    let body = "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData>";
+    for version in ["1.1", "2.0"] {
+        let input = sheet(body).replace("version=\"1.0\"", &format!("version=\"{version}\""));
+        assert!(matches!(
+            edit(&input, "A1", 2.0.into()),
+            Err(Error::Unsupported(message)) if message == "only XML 1.0 is supported"
+        ));
+        assert!(matches!(
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), None),
+            Err(Error::Unsupported(message)) if message == "only XML 1.0 is supported"
+        ));
+    }
+    let input = sheet(body);
+    assert_eq!(
+        edit(&input, "A1", 2.0.into()).unwrap(),
+        input.replace("<v>1</v>", "<v>2</v>")
+    );
+}
+
+#[test]
+fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
+    let input = sheet(
+        "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c><c r='C1'><v>3</v></c></row></sheetData>",
+    );
+    let cells = |values: &[(&str, CellValue)]| -> BTreeMap<CellRef, CellValue> {
+        values
+            .iter()
+            .map(|(address, value)| (address.parse().unwrap(), value.clone()))
+            .collect()
+    };
+    let strings = ["first".to_owned(), "second".to_owned()];
+    let mut loads = 0;
+    let unchanged = patch_cells(
+        input.as_bytes(),
+        &cells(&[
+            ("A1", "first".into()),
+            ("B1", "second".into()),
+            ("C1", 3.0.into()),
+        ]),
+        || {
+            loads += 1;
+            Ok(&strings)
+        },
+    )
+    .unwrap();
+    assert!(matches!(unchanged, Cow::Borrowed(_)));
+    assert_eq!(loads, 1);
+    // Numbers, blanks, and text over other cells never need the table.
+    let changed = patch_cells(
+        input.as_bytes(),
+        &cells(&[
+            ("A1", 1.0.into()),
+            ("B1", CellValue::Blank),
+            ("C1", "x".into()),
+        ]),
+        || panic!("shared strings are not needed"),
+    )
+    .unwrap();
+    assert!(matches!(changed, Cow::Owned(_)));
+    // A failed load is attempted once and leaves each edit as a change.
+    let mut loads = 0;
+    let changed = patch_cells(
+        input.as_bytes(),
+        &cells(&[("A1", "first".into()), ("B1", "second".into())]),
+        || {
+            loads += 1;
+            Err(Error::SharedStringsUnavailable)
+        },
+    )
+    .unwrap();
+    assert_eq!(loads, 1);
+    assert_eq!(
+        changed.as_ref(),
+        edit(&input, "A1", "first".into())
+            .and_then(|one| edit(&one, "B1", "second".into()))
+            .unwrap()
+            .as_bytes()
+    );
+}
+
+#[test]
+fn new_cells_use_row_or_column_default_styles_with_the_context_prefix() {
+    let input = format!(
+        r#"<s:worksheet xmlns:s="{STRICT}"><s:cols><s:col min="1" max="2" style="5"/></s:cols><s:sheetData><s:row r="1" s="6" customFormat="1"><s:c r="C1"><s:v>1</s:v></s:c></s:row><s:row r="2" s="6"/></s:sheetData></s:worksheet>"#
+    );
+    let changed = batch(
+        &input,
+        &[
+            ("A1", 1.0.into()),
+            ("A2", "two".into()),
+            ("C2", 2.0.into()),
+            ("B3", true.into()),
+            ("C3", 3.0.into()),
+        ],
+    )
+    .unwrap();
+    assert!(changed.contains(r#"<s:c r="A1" s="6"><s:v>1</s:v></s:c><s:c r="C1">"#));
+    assert!(changed.contains(r#"<s:row r="2" s="6"><s:c r="A2" s="5" t="inlineStr">"#));
+    assert!(changed.contains(r#"<s:c r="C2"><s:v>2</s:v></s:c></s:row>"#));
+    assert!(changed.contains(
+        r#"<s:row r="3"><s:c r="B3" s="5" t="b"><s:v>1</s:v></s:c><s:c r="C3"><s:v>3</s:v></s:c></s:row>"#
+    ));
+    // Hidden column definitions make a new cell's style ambiguous.
+    let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    let hidden = sheet(&format!(
+        "<mc:AlternateContent xmlns:mc='{mc}'><mc:Choice Requires='x'><cols><col min='1' max='1' style='3'/></cols></mc:Choice></mc:AlternateContent><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData>"
+    ));
+    assert!(matches!(
+        edit(&hidden, "A2", 2.0.into()),
+        Err(Error::Unsupported(message))
+            if message == "A2: column definitions inside an unsupported XML container"
+    ));
+    assert!(edit(&hidden, "A1", 2.0.into()).is_ok());
+}
+
+#[test]
+fn iso_dates_convert_in_both_date_systems() {
+    use super::date::excel_serial;
+    for (text, serial_1900, serial_1904) in [
+        ("1900-01-01", Some(1.0), None),
+        ("1900-02-28", Some(59.0), None),
+        ("1900-03-01", Some(61.0), None),
+        ("1903-12-31", Some(1_461.0), None),
+        ("1904-01-01", Some(1_462.0), Some(0.0)),
+        ("1904-01-02T12:00", Some(1_463.5), Some(1.5)),
+        ("2024-01-15T00:00:00Z", Some(45_306.0), Some(43_844.0)),
+        ("2000-02-29", Some(36_585.0), Some(35_123.0)),
+        ("18:00:00.000", Some(0.75), Some(0.75)),
+        ("1899-12-31", None, None),
+        ("0000-01-01", None, None),
+        ("1900-02-29", None, None),
+        ("2024-01-15T00:00:00z", None, None),
+        ("2024-01-15T00:00:00-00:00", None, None),
+        ("2024-01-15 00:00:00", None, None),
+        ("2024-01-15T", None, None),
+        ("T00:00", None, None),
+        ("12:3\u{e9}", None, None),
+        ("2024-01-1\u{e9}", None, None),
+        ("12:00:5\u{e9}", None, None),
+        ("+2024-01-15", None, None),
+        ("12:00:00.+1", None, None),
+    ] {
+        assert_eq!(excel_serial(text, false), serial_1900, "{text}");
+        assert_eq!(excel_serial(text, true), serial_1904, "{text}");
+    }
+    let input = sheet(
+        "<sheetData><row r='1'><c r='A1' t='d' s='3'><v>2024-01-15</v></c></row></sheetData>",
+    );
+    for (date1904, serial) in [(false, 45_306.0), (true, 43_844.0)] {
+        let content = read_cells(
+            input.as_bytes(),
+            &["A1".parse().unwrap()],
+            || panic!("no strings"),
+            date1904,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(content.value, CellValue::Number(serial));
+        assert_eq!(content.style_index, Some(3));
+    }
+    // Writing over a date cell, even with its own serial, stores a number.
+    assert_eq!(
+        edit(&input, "A1", 45_306.0.into()).unwrap(),
+        input.replace(" t='d'", "").replace("2024-01-15", "45306")
+    );
 }
 
 #[test]
@@ -457,6 +847,12 @@ fn preserves_utf8_bom_and_rejects_non_utf8_encoding() {
     );
     let changed = edit(&input, "A1", CellValue::Number(2.0)).unwrap();
     assert_eq!(changed, input.replace("<v>1</v>", "<v>2</v>"));
+    // U+FEFF after the byte order mark is text before the root element.
+    let doubled = format!("\u{feff}{input}");
+    assert!(matches!(
+        edit(&doubled, "A1", CellValue::Number(2.0)),
+        Err(Error::Xml(message)) if message == "text outside the XML root"
+    ));
     let input = input.replace("version=\"1.0\"", "version=\"1.0\" encoding=\"UTF-16\"");
     assert!(edit(&input, "A1", CellValue::Number(2.0)).is_err());
 }
@@ -549,7 +945,13 @@ fn batch(xml: &str, changes: &[(&str, CellValue)]) -> Result<String> {
         .iter()
         .map(|(address, value)| (address.parse().unwrap(), value.clone()))
         .collect();
-    Ok(String::from_utf8(patch_cells(xml.as_bytes(), &cells)?.into_owned()).unwrap())
+    Ok(String::from_utf8(
+        patch_cells(xml.as_bytes(), &cells, || {
+            Err(Error::SharedStringsUnavailable)
+        })?
+        .into_owned(),
+    )
+    .unwrap())
 }
 
 #[test]
@@ -646,7 +1048,7 @@ fn reads_values_formulas_styles_and_preserves_requested_order() {
         .map(|address| address.parse().unwrap())
         .collect();
     let strings = ["first".into(), "second".into()];
-    let cells = read_cells(input.as_bytes(), &addresses, || Ok(&strings)).unwrap();
+    let cells = read_cells(input.as_bytes(), &addresses, || Ok(&strings), false).unwrap();
     assert_eq!(
         cells
             .iter()
@@ -675,9 +1077,12 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
     let input = sheet(
         r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row></sheetData>"#,
     );
-    let numeric = read_cells(input.as_bytes(), &["A1".parse().unwrap()], || {
-        panic!("reading a number should not access shared strings")
-    })
+    let numeric = read_cells(
+        input.as_bytes(),
+        &["A1".parse().unwrap()],
+        || panic!("reading a number should not access shared strings"),
+        false,
+    )
     .unwrap();
     assert_eq!(numeric[0].value, CellValue::Number(7.0));
 
@@ -694,6 +1099,7 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
             loads += 1;
             Ok(&strings)
         },
+        false,
     )
     .unwrap();
     assert_eq!(loads, 1);
@@ -787,7 +1193,9 @@ fn rejects_invalid_read_values_and_missing_shared_strings() {
         ("b", "\u{a0}true\u{a0}"),
         ("s", "-1"),
         ("s", "\u{a0}0\u{a0}"),
-        ("d", "2026-01-01"),
+        ("d", "2026-01-01T00:00:00+01:00"),
+        ("d", "2026-02-29"),
+        ("x", "1"),
     ] {
         let input = sheet(&format!(
             r#"<sheetData><row r="1"><c r="A1" t="{kind}"><v>{payload}</v></c></row></sheetData>"#
@@ -850,7 +1258,10 @@ fn no_op_patches_borrow_the_original_xml() {
         BTreeMap::from([("C1".parse().unwrap(), CellValue::Blank)]),
     ] {
         assert!(matches!(
-            patch_cells(input.as_bytes(), &changes).unwrap(),
+            patch_cells(input.as_bytes(), &changes, || Err(
+                Error::SharedStringsUnavailable
+            ))
+            .unwrap(),
             Cow::Borrowed(_)
         ));
     }

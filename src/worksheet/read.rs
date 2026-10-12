@@ -1,3 +1,4 @@
+use super::date::excel_serial;
 use super::index::WorksheetIndex;
 use super::parse::{Element, NamespaceId, parse};
 use super::{decoded, unique, unsupported};
@@ -14,10 +15,18 @@ pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     if element.empty {
         return Ok(String::new());
     }
-    let mut reader = quick_xml::Reader::from_reader(&xml[element.open_end..element.close_start]);
+    let mut content = &xml[element.open_end..element.close_start];
     let mut text = String::new();
+    // A new reader discards a leading UTF-8 byte order mark, which inside an
+    // element is the ordinary character U+FEFF. Consume each leading copy, so
+    // the reader never starts at one.
+    while let Some(rest) = content.strip_prefix("\u{feff}".as_bytes()) {
+        text.push('\u{feff}');
+        content = rest;
+    }
+    let mut reader = quick_xml::Reader::from_reader(content);
     loop {
-        match reader.read_event()? {
+        match reader.read_event().map_err(Error::xml)? {
             Event::Text(value) => {
                 text.push_str(&value.xml10_content());
             }
@@ -106,6 +115,7 @@ pub(super) fn cell_content<'a>(
     index: &WorksheetIndex,
     address: CellRef,
     shared_strings: &mut impl FnMut() -> Result<&'a [String]>,
+    date1904: bool,
 ) -> Result<CellContent> {
     let Some(cell_index) = index.cell(address) else {
         return Ok(CellContent {
@@ -172,6 +182,11 @@ pub(super) fn cell_content<'a>(
                 }),
                 "str" => CellValue::Text(excel_text(&text)?),
                 "e" => CellValue::Error(excel_text(&text)?),
+                // Dates read as the serial number Excel would store for them.
+                "d" => CellValue::Number(
+                    excel_serial(trim_xml_whitespace(&text), date1904)
+                        .ok_or_else(|| unsupported("unsupported ISO 8601 date cell value"))?,
+                ),
                 "s" => {
                     let position = trim_xml_whitespace(&text)
                         .parse::<usize>()
@@ -206,6 +221,7 @@ pub(super) fn read_cells<'a>(
     index: &WorksheetIndex,
     cells: &[CellRef],
     mut shared_strings: impl FnMut() -> Result<&'a [String]>,
+    date1904: bool,
 ) -> Result<Vec<CellContent>> {
     if cells.is_empty() {
         return Ok(Vec::new());
@@ -221,6 +237,6 @@ pub(super) fn read_cells<'a>(
     };
     cells
         .iter()
-        .map(|&cell| cell_content(xml, index, cell, &mut load_strings))
+        .map(|&cell| cell_content(xml, index, cell, &mut load_strings, date1904))
         .collect()
 }

@@ -135,7 +135,7 @@ impl WorksheetView<'_> {
 
     fn read_cells(&self, cells: &[CellRef]) -> Result<Vec<CellContent>> {
         self.worksheet
-            .read_cells(cells, || self.workbook.shared_strings())
+            .read_cells(cells, || self.workbook.shared_strings(), false)
     }
 }
 
@@ -291,7 +291,8 @@ impl Workbook {
         for (index, cells) in grouped {
             let original = self.original_sheet(index)?;
             let current = self.states[index].current.as_deref().unwrap_or(original);
-            let Cow::Owned(patched) = patch_cells(current, &cells)? else {
+            let Cow::Owned(patched) = patch_cells(current, &cells, || self.shared_strings())?
+            else {
                 continue;
             };
             let changed = (patched != original).then_some(patched);
@@ -360,7 +361,12 @@ impl Workbook {
         if cells.is_empty() {
             return Ok(Vec::new());
         }
-        read_cells(self.current_sheet(index)?, cells, || self.shared_strings())
+        read_cells(
+            self.current_sheet(index)?,
+            cells,
+            || self.shared_strings(),
+            false,
+        )
     }
 
     /// Prepare a worksheet for repeated reads using a single validated XML index.

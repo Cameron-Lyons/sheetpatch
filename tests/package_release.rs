@@ -281,7 +281,7 @@ fn duplicate_batch_addresses_validate_every_input_and_keep_pending_changes_on_fa
     for invalid in [
         CellValue::Number(f64::NAN),
         CellValue::Number(f64::INFINITY),
-        CellValue::Text("invalid\0text".into()),
+        CellValue::Text("a".repeat(32_768)),
     ] {
         assert!(
             workbook
