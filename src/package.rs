@@ -52,6 +52,9 @@ pub struct Workbook {
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
+    // Permissions of the file this workbook was opened from, used as the
+    // creation mode for new save destinations so a copy is not more permissive.
+    source_permissions: Option<fs::Permissions>,
 }
 
 #[derive(Default)]
@@ -142,8 +145,43 @@ impl WorksheetView<'_> {
 impl Workbook {
     /// Read a workbook file and discover worksheets through its relationships.
     /// Worksheet XML and shared strings are parsed lazily when first accessed.
+    ///
+    /// Input larger than the largest possible ZIP32 archive (about 8 GiB) is
+    /// rejected with [`Error::Unsupported`]: a regular file before it is read,
+    /// and a pipe or device once that much has been read. On Unix, the file's
+    /// permissions become the creation mode for new destinations of
+    /// [`Self::save`] and [`Self::save_compact`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_bytes(fs::read(path)?)
+        use std::io::{self, Read};
+
+        // The central directory's offset and size are each below u32::MAX, and
+        // only a 22-byte end record and a comment of at most 64 KiB follow it.
+        const MAX_LEN: u64 = 2 * u32::MAX as u64 + 22 + u16::MAX as u64;
+        let too_large =
+            || Error::Unsupported("input exceeds the largest possible ZIP32 archive".into());
+        let file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let mut bytes = Vec::new();
+        if metadata.is_file() {
+            if metadata.len() > MAX_LEN {
+                return Err(too_large());
+            }
+            // Fall back to an unsized read on targets where the length does
+            // not fit in memory; reading then reports the allocation failure.
+            if let Ok(len) = usize::try_from(metadata.len()) {
+                bytes
+                    .try_reserve_exact(len)
+                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            }
+        }
+        // Devices and pipes have no useful length; stop reading at the limit.
+        file.take(MAX_LEN + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_LEN {
+            return Err(too_large());
+        }
+        let mut workbook = Self::from_bytes(bytes)?;
+        workbook.source_permissions = Some(metadata.permissions());
+        Ok(workbook)
     }
 
     /// Open an in-memory workbook, retaining its original archive bytes.
@@ -170,6 +208,7 @@ impl Workbook {
             sheet_indexes,
             shared_strings_path,
             shared_strings: OnceLock::new(),
+            source_permissions: None,
         })
     }
 
@@ -485,14 +524,29 @@ impl Workbook {
     /// The original destination is retained if generation or writing fails.
     /// Using the input path as destination is supported.
     /// Saving does not clear pending edits or replace the retained original.
+    ///
+    /// The destination must name a file. An existing destination must resolve
+    /// to a regular file: directories, FIFOs, devices, and sockets are rejected
+    /// before output is generated. Both cases return an [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
+    /// replaced by the new file rather than written through.
+    /// An existing destination keeps its permissions; on Unix it also keeps its
+    /// group when the process may assign it, and otherwise loses group access.
+    /// On Unix, a new destination for a workbook read by [`Self::open`] is
+    /// created with the source file's permissions, restricted by the umask.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        crate::atomic::write(path.as_ref(), |writer| self.write_to(writer))
+        crate::atomic::write(path.as_ref(), self.source_permissions.as_ref(), |writer| {
+            self.write_to(writer)
+        })
     }
 
     /// Atomically save while removing recognizable obsolete ZIP records already
     /// present in the input. Opaque ZIP prefixes or gaps cause an error.
     /// Saving does not clear pending edits or replace the retained original.
+    /// Destinations and permissions are handled as described for [`Self::save`].
     pub fn save_compact(&self, path: impl AsRef<Path>) -> Result<()> {
-        crate::atomic::write(path.as_ref(), |writer| self.write_compact_to(writer))
+        crate::atomic::write(path.as_ref(), self.source_permissions.as_ref(), |writer| {
+            self.write_compact_to(writer)
+        })
     }
 }
