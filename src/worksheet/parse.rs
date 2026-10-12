@@ -1,17 +1,19 @@
 use super::{STRICT, TRANSITIONAL, decoded, decoded_namespace, unsupported, xml_error};
 use crate::xml::{
-    valid_char as valid_xml_char, valid_name, valid_qname, validate_declaration,
-    validate_namespaces, whitespace as xml_whitespace,
+    MAX_DEPTH, is_space, valid_char as valid_xml_char, valid_name, valid_qname,
+    validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
 };
 use crate::{Error, Result};
 use quick_xml::{
     events::{Event, attributes::Attribute as XmlAttribute},
-    name::{QName, ResolveResult},
+    name::{NamespaceResolver, QName, ResolveResult},
     reader::NsReader,
 };
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    hash::Hash,
+    ops::Range,
     sync::Arc,
 };
 
@@ -28,6 +30,9 @@ impl NamespaceId {
 }
 
 struct NamespacePool {
+    // Consecutive elements nearly always share a namespace, so the latest
+    // raw URI is compared before hashing it.
+    last: (String, NamespaceId),
     raw: HashMap<String, NamespaceId>,
     canonical: HashMap<Arc<str>, NamespaceId>,
     values: Vec<Arc<str>>,
@@ -36,6 +41,7 @@ struct NamespacePool {
 impl NamespacePool {
     fn new() -> Self {
         Self {
+            last: (String::new(), NamespaceId::NONE),
             raw: HashMap::new(),
             canonical: HashMap::new(),
             values: vec![Arc::from("")],
@@ -43,6 +49,20 @@ impl NamespacePool {
     }
 
     fn resolve(&mut self, result: ResolveResult<'_>) -> Result<NamespaceId> {
+        let ResolveResult::Bound(namespace) = result else {
+            return self.resolve_uncached(result);
+        };
+        if !self.last.0.is_empty() && namespace.as_ref() == self.last.0 {
+            return Ok(self.last.1);
+        }
+        let id = self.resolve_uncached(ResolveResult::Bound(namespace))?;
+        self.last.0.clear();
+        self.last.0.push_str(namespace.as_ref());
+        self.last.1 = id;
+        Ok(id)
+    }
+
+    fn resolve_uncached(&mut self, result: ResolveResult<'_>) -> Result<NamespaceId> {
         match result {
             ResolveResult::Unbound => Ok(NamespaceId::NONE),
             ResolveResult::Bound(namespace) => {
@@ -74,45 +94,102 @@ impl NamespacePool {
     }
 }
 
+// Records store byte offsets and arena indexes as u32, which keeps a large
+// part's index compact. `parse_with` refuses parts of u32::MAX bytes or more,
+// and every element or attribute spans several bytes, so all values fit below
+// the parent sentinel.
+const NO_PARENT: u32 = u32::MAX;
+
+fn compact(value: usize) -> u32 {
+    debug_assert!(value < NO_PARENT as usize);
+    value as u32
+}
+
 #[derive(Debug)]
 pub(super) struct Attribute<'a> {
     pub(super) name: &'a str,
     pub(super) value: Cow<'a, str>,
-    pub(super) start: usize,
-    pub(super) value_start: usize,
-    pub(super) value_end: usize,
-    pub(super) end: usize,
+    start: u32,
+    value_start: u32,
+    value_end: u32,
+}
+
+impl Attribute<'_> {
+    /// The start of the whitespace that separates the attribute from the
+    /// preceding name or attribute.
+    pub(super) fn start(&self) -> usize {
+        self.start as usize
+    }
+    pub(super) fn value_start(&self) -> usize {
+        self.value_start as usize
+    }
+    pub(super) fn value_end(&self) -> usize {
+        self.value_end as usize
+    }
+    /// The end of the attribute: the closing quote follows the value.
+    pub(super) fn end(&self) -> usize {
+        self.value_end as usize + 1
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct Element<'a> {
     pub(super) name: &'a str,
     pub(super) namespace: NamespaceId,
-    pub(super) parent: Option<usize>,
-    pub(super) children_start: usize,
-    pub(super) children_end: usize,
-    pub(super) attributes: std::ops::Range<usize>,
-    pub(super) start: usize,
-    pub(super) open_end: usize,
-    pub(super) close_start: usize,
-    pub(super) end: usize,
+    parent: u32,
+    children_start: u32,
+    children_end: u32,
+    attributes_start: u32,
+    attributes_end: u32,
+    start: u32,
+    open_end: u32,
+    close_start: u32,
+    end: u32,
     pub(super) empty: bool,
     pub(super) opaque_markup: bool,
 }
 
 impl<'xml> Element<'xml> {
+    pub(super) fn parent(&self) -> Option<usize> {
+        (self.parent != NO_PARENT).then_some(self.parent as usize)
+    }
+    /// The start of the opening tag.
+    pub(super) fn start(&self) -> usize {
+        self.start as usize
+    }
+    /// The end of the opening tag, which ends an empty element.
+    pub(super) fn open_end(&self) -> usize {
+        self.open_end as usize
+    }
+    /// The start of the closing tag, or `open_end` for an empty element.
+    pub(super) fn close_start(&self) -> usize {
+        self.close_start as usize
+    }
+    pub(super) fn end(&self) -> usize {
+        self.end as usize
+    }
+    /// Arena indexes of every descendant, in document order.
+    pub(super) fn descendants(&self) -> Range<usize> {
+        self.children_start as usize..self.children_end as usize
+    }
     pub(super) fn local_name(&self) -> &str {
         self.name.rsplit(':').next().unwrap()
     }
     pub(super) fn is(&self, namespace: NamespaceId, name: &str) -> bool {
         self.namespace == namespace && self.local_name() == name
     }
+    pub(super) fn attributes<'a>(
+        &self,
+        attributes: &'a [Attribute<'xml>],
+    ) -> &'a [Attribute<'xml>] {
+        &attributes[self.attributes_start as usize..self.attributes_end as usize]
+    }
     pub(super) fn attr<'a>(
         &self,
         attributes: &'a [Attribute<'xml>],
         name: &str,
     ) -> Option<&'a Attribute<'xml>> {
-        attributes[self.attributes.clone()]
+        self.attributes(attributes)
             .iter()
             .find(|attr| attr.name == name)
     }
@@ -129,8 +206,8 @@ impl<'xml> Element<'xml> {
     pub(super) fn children<'a>(&self, elements: &'a [Element<'xml>]) -> Children<'a, 'xml> {
         Children {
             elements,
-            next: self.children_start,
-            end: self.children_end,
+            next: self.children_start as usize,
+            end: self.children_end as usize,
         }
     }
 }
@@ -151,7 +228,7 @@ impl Iterator for Children<'_, '_> {
             return None;
         }
         let index = self.next;
-        self.next = self.elements[index].children_end;
+        self.next = self.elements[index].children_end as usize;
         Some(index)
     }
 }
@@ -166,84 +243,156 @@ fn arena_push<T>(arena: &mut Vec<T>, item: T) {
     arena.push(item);
 }
 
+// Scratch space for one tag's duplicate checks, reused across tags so that
+// ordinary tags allocate nothing.
+#[derive(Default)]
+struct AttributeChecks<'xml> {
+    // Expanded names of the tag's ordinary prefixed attributes so far.
+    expanded: Vec<(NamespaceId, &'xml str)>,
+    // Used only by tags with many attributes.
+    names: HashSet<&'xml str>,
+    expanded_names: HashSet<(NamespaceId, &'xml str)>,
+}
+
+// Short lists are scanned directly. Past this length a set keeps duplicate
+// detection linear in the attribute count, so hostile tags cannot make it
+// quadratic.
+const LINEAR_SCAN_LIMIT: usize = 16;
+
+// Whether `item` repeats any of `previous`, every earlier item of one tag.
+// `set` holds them all once the list has outgrown a linear scan.
+fn repeated<T: Copy + Eq + Hash>(
+    mut previous: impl ExactSizeIterator<Item = T>,
+    set: &mut HashSet<T>,
+    item: T,
+) -> bool {
+    match previous.len() {
+        length if length < LINEAR_SCAN_LIMIT => previous.any(|earlier| earlier == item),
+        LINEAR_SCAN_LIMIT => {
+            set.clear();
+            set.extend(previous);
+            !set.insert(item)
+        }
+        _ => !set.insert(item),
+    }
+}
+
+fn markup(source: &str, range: Range<usize>) -> Result<&str> {
+    source
+        .get(range)
+        .ok_or_else(|| xml_error("XML markup splits a UTF-8 character"))
+}
+
+// The only attribute scanner: it records spans and checks syntax, names,
+// exact and expanded-name duplicates, and namespace declarations in one pass
+// over the tag between the element name and `open_end`.
 fn attribute_spans<'xml>(
-    xml: &'xml [u8],
-    start: usize,
+    source: &'xml str,
+    mut position: usize,
     open_end: usize,
-    name_len: usize,
-    attributes: &mut Vec<Attribute<'xml>>,
-) -> Result<std::ops::Range<usize>> {
-    let mut position = start + 1 + name_len;
+    document: &mut XmlDocument<'xml>,
+    resolver: &NamespaceResolver,
+    checks: &mut AttributeChecks<'xml>,
+) -> Result<Range<usize>> {
+    let xml = source.as_bytes();
+    let attributes = &mut document.attributes;
     let attributes_start = attributes.len();
-    while position < open_end {
+    checks.expanded.clear();
+    loop {
         let whitespace_start = position;
-        while position < open_end && xml[position].is_ascii_whitespace() {
+        while position < open_end && is_space(xml[position]) {
             position += 1;
         }
-        if matches!(xml.get(position), Some(b'/' | b'>')) {
+        // Only the tag's own `>` or `/>` ends the list. A slash anywhere
+        // else is not a terminator.
+        if position + 1 == open_end || (position + 2 == open_end && xml[position] == b'/') {
             break;
         }
         if position == whitespace_start {
             return Err(xml_error("missing XML attribute separator"));
         }
         let name_start = position;
-        while position < open_end && !xml[position].is_ascii_whitespace() && xml[position] != b'=' {
+        while position < open_end && !is_space(xml[position]) && xml[position] != b'=' {
             position += 1;
         }
-        let name = std::str::from_utf8(&xml[name_start..position])
-            .map_err(|e| xml_error(e.to_string()))?;
-        while position < open_end && xml[position].is_ascii_whitespace() {
+        let name = markup(source, name_start..position)?;
+        if !valid_qname(name) {
+            return Err(xml_error("invalid XML attribute name"));
+        }
+        let earlier = attributes[attributes_start..]
+            .iter()
+            .map(|attribute| attribute.name);
+        if repeated(earlier, &mut checks.names, name) {
+            return Err(xml_error("duplicate XML attribute"));
+        }
+        while position < open_end && is_space(xml[position]) {
             position += 1;
         }
-        if xml.get(position) != Some(&b'=') {
+        if position >= open_end || xml[position] != b'=' {
             return Err(xml_error("invalid XML attribute"));
         }
         position += 1;
-        while position < open_end && xml[position].is_ascii_whitespace() {
+        while position < open_end && is_space(xml[position]) {
             position += 1;
         }
-        let quote = *xml
-            .get(position)
+        let quote = match xml[..open_end].get(position) {
+            Some(&quote @ (b'\'' | b'"')) => quote,
+            _ => return Err(xml_error("unquoted XML attribute")),
+        };
+        let value_start = position + 1;
+        let value_end = xml[value_start..open_end]
+            .iter()
+            .position(|&byte| byte == quote)
+            .map(|length| value_start + length)
             .ok_or_else(|| xml_error("unterminated XML attribute"))?;
-        if quote != b'\'' && quote != b'"' {
-            return Err(xml_error("unquoted XML attribute"));
-        }
-        position += 1;
-        let value_start = position;
-        while position < open_end && xml[position] != quote {
-            position += 1;
-        }
-        if position >= open_end {
-            return Err(xml_error("unterminated XML attribute"));
-        }
-        let value_end = position;
-        let raw = &xml[value_start..value_end];
-        if raw.contains(&b'<') {
+        let raw = markup(source, value_start..value_end)?;
+        if raw.contains('<') {
             return Err(xml_error("less-than sign in an XML attribute"));
         }
         // XML normalizes literal attribute whitespace before expanding entity
         // references; referenced whitespace keeps its actual value.
         let value = XmlAttribute {
             key: QName(name),
-            value: Cow::Borrowed(std::str::from_utf8(raw).map_err(|e| xml_error(e.to_string()))?),
+            value: Cow::Borrowed(raw),
         }
         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .map_err(Error::xml)?;
-        if !value.chars().all(valid_xml_char) {
+        // Literal characters were validated with the whole document; only
+        // normalization or expanded references can produce new ones.
+        if let Cow::Owned(value) = &value
+            && !value.chars().all(valid_xml_char)
+        {
             return Err(xml_error("invalid XML character reference"));
         }
-        position += 1;
+        if name == "xmlns" {
+            validate_namespace_binding(None, &value)?;
+        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+            validate_namespace_binding(Some(prefix), &value)?;
+        } else if name.contains(':') {
+            // Different prefixes bound to one namespace can still repeat an
+            // expanded name. Unprefixed attributes have no namespace.
+            let (namespace, local) = resolver.resolve_attribute(QName(name));
+            let expanded = (document.namespaces.resolve(namespace)?, local.into_inner());
+            if repeated(
+                checks.expanded.iter().copied(),
+                &mut checks.expanded_names,
+                expanded,
+            ) {
+                return Err(xml_error("duplicate expanded attribute name"));
+            }
+            checks.expanded.push(expanded);
+        }
         arena_push(
             attributes,
             Attribute {
                 name,
                 value,
-                start: whitespace_start,
-                value_start,
-                value_end,
-                end: position,
+                start: compact(whitespace_start),
+                value_start: compact(value_start),
+                value_end: compact(value_end),
             },
         );
+        position = value_end + 1;
     }
     Ok(attributes_start..attributes.len())
 }
@@ -251,21 +400,47 @@ fn attribute_spans<'xml>(
 pub(super) struct XmlDocument<'xml> {
     pub(super) elements: Vec<Element<'xml>>,
     pub(super) attributes: Vec<Attribute<'xml>>,
-    namespaces: Vec<Arc<str>>,
+    namespaces: NamespacePool,
 }
 
-impl XmlDocument<'_> {
+impl<'xml> XmlDocument<'xml> {
     pub(super) fn is_spreadsheet_namespace(&self, id: NamespaceId) -> bool {
         matches!(
-            self.namespaces[id.0 as usize].as_ref(),
+            self.namespaces.values[id.0 as usize].as_ref(),
             TRANSITIONAL | STRICT
         )
+    }
+
+    // Offers a completed child of the root to `release`, which may discard
+    // the child's subtree. The root is the only open element at that point.
+    fn complete_child(&mut self, index: usize, release: &mut impl FnMut(&Self, usize) -> bool) {
+        if release(self, index) {
+            let attributes = self.elements[index].attributes_start as usize;
+            self.elements.truncate(index);
+            self.attributes.truncate(attributes);
+        }
     }
 }
 
 pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
+    parse_with(xml, |_, _| false)
+}
+
+/// Parses with every well-formedness and namespace check, calling `release`
+/// as each child of the root element completes. When it returns true, that
+/// child's subtree leaves the arenas, so a caller that consumes the children
+/// one at a time needs memory only for the largest of them.
+pub(super) fn parse_with<'xml>(
+    xml: &'xml [u8],
+    mut release: impl FnMut(&XmlDocument<'xml>, usize) -> bool,
+) -> Result<XmlDocument<'xml>> {
+    // Pending worksheet XML is not size-limited until it is saved, so the
+    // compact records' offset range is enforced here.
+    if xml.len() >= NO_PARENT as usize {
+        return Err(unsupported("XML part exceeds the 4 GiB index limit"));
+    }
     let source =
-        std::str::from_utf8(xml).map_err(|e| xml_error(format!("worksheet must be UTF-8: {e}")))?;
+        std::str::from_utf8(xml).map_err(|e| xml_error(format!("XML must be UTF-8: {e}")))?;
     if !source.chars().all(valid_xml_char) {
         return Err(xml_error("invalid XML character"));
     }
@@ -282,9 +457,12 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
     }
     let mut reader = NsReader::from_reader(&xml[bom..]);
     reader.config_mut().check_comments = true;
-    let mut elements: Vec<Element> = Vec::new();
-    let mut attributes = Vec::new();
-    let mut namespaces = NamespacePool::new();
+    let mut document = XmlDocument {
+        elements: Vec::new(),
+        attributes: Vec::new(),
+        namespaces: NamespacePool::new(),
+    };
+    let mut checks = AttributeChecks::default();
     let mut stack = Vec::new();
     let mut root_seen = false;
     let mut declaration_seen = false;
@@ -294,10 +472,10 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
         let end = reader.buffer_position() as usize + bom;
         match event {
             Event::Start(ref tag) | Event::Empty(ref tag) => {
-                if stack.len() >= 256 {
-                    return Err(unsupported(
-                        "worksheet XML nesting deeper than 256 elements",
-                    ));
+                if stack.len() >= MAX_DEPTH {
+                    return Err(unsupported(format!(
+                        "XML nesting deeper than {MAX_DEPTH} elements"
+                    )));
                 }
                 if stack.is_empty() {
                     if root_seen {
@@ -305,73 +483,63 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
                     }
                     root_seen = true;
                 }
-                let name =
-                    std::str::from_utf8(&xml[start + 1..start + 1 + tag.name().as_ref().len()])
-                        .map_err(|e| xml_error(e.to_string()))?;
+                let name_end = start + 1 + tag.name().as_ref().len();
+                let name = markup(source, start + 1..name_end)?;
                 if !valid_qname(name) {
                     return Err(xml_error("invalid XML element name"));
                 }
-                validate_namespaces(tag)?;
-                let (namespace, _) = reader.resolver().resolve_element(tag.name());
-                let namespace = namespaces.resolve(namespace)?;
-                // Let quick-xml check attribute syntax and duplicate names, and
-                // independently reject duplicate expanded names/prefix errors.
-                let mut first_expanded = None;
-                let mut expanded = HashSet::new();
-                for attribute in tag.attributes() {
-                    let attribute = attribute.map_err(|e| xml_error(e.to_string()))?;
-                    let attribute_name = attribute.key.as_ref();
-                    if !valid_qname(attribute_name) {
-                        return Err(xml_error("invalid XML attribute name"));
-                    }
-                    let (ns, local) = reader.resolver().resolve_attribute(attribute.key);
-                    let ns = namespaces.resolve(ns)?;
-                    // Unprefixed names and namespace declarations are already
-                    // checked for exact duplicates by quick-xml. Only ordinary
-                    // prefixed attributes can alias another expanded name.
-                    if attribute_name.contains(':') && !attribute_name.starts_with("xmlns:") {
-                        let name = (ns, local.into_inner());
-                        if let Some(first) = &first_expanded {
-                            if first == &name || !expanded.insert(name) {
-                                return Err(xml_error("duplicate expanded attribute name"));
-                            }
-                        } else {
-                            first_expanded = Some(name);
-                        }
-                    }
+                // Namespace declarations are checked with the attributes.
+                if name.starts_with("xmlns:") {
+                    return Err(xml_error("xmlns cannot be an element prefix"));
                 }
-                let attributes = attribute_spans(xml, start, end, name.len(), &mut attributes)?;
+                let (namespace, _) = reader.resolver().resolve_element(tag.name());
+                let namespace = document.namespaces.resolve(namespace)?;
+                let attributes = attribute_spans(
+                    source,
+                    name_end,
+                    end,
+                    &mut document,
+                    reader.resolver(),
+                    &mut checks,
+                )?;
                 let empty = matches!(event, Event::Empty(_));
-                let parent = stack.last().copied();
-                let index = elements.len();
+                let index = document.elements.len();
                 arena_push(
-                    &mut elements,
+                    &mut document.elements,
                     Element {
                         name,
                         namespace,
-                        parent,
-                        children_start: index + 1,
-                        children_end: index + 1,
-                        attributes,
-                        start,
-                        open_end: end,
-                        close_start: end,
-                        end,
+                        parent: stack.last().map_or(NO_PARENT, |&parent| compact(parent)),
+                        children_start: compact(index + 1),
+                        children_end: compact(index + 1),
+                        attributes_start: compact(attributes.start),
+                        attributes_end: compact(attributes.end),
+                        start: compact(start),
+                        open_end: compact(end),
+                        close_start: compact(end),
+                        end: compact(end),
                         empty,
                         opaque_markup: false,
                     },
                 );
                 if !empty {
                     stack.push(index);
+                } else if stack.len() == 1 {
+                    document.complete_child(index, &mut release);
                 }
             }
             Event::End(_) => {
                 let index = stack
                     .pop()
                     .ok_or_else(|| xml_error("unmatched closing XML tag"))?;
-                elements[index].close_start = start;
-                elements[index].end = end;
-                elements[index].children_end = elements.len();
+                let children_end = compact(document.elements.len());
+                let element = &mut document.elements[index];
+                element.close_start = compact(start);
+                element.end = compact(end);
+                element.children_end = children_end;
+                if stack.len() == 1 {
+                    document.complete_child(index, &mut release);
+                }
             }
             Event::Text(text) => {
                 let raw = text.as_ref();
@@ -394,7 +562,7 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
             }
             Event::Comment(_) => {
                 if let Some(&index) = stack.last() {
-                    elements[index].opaque_markup = true;
+                    document.elements[index].opaque_markup = true;
                 }
             }
             Event::PI(instruction) => {
@@ -403,7 +571,7 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
                     return Err(xml_error("invalid XML processing instruction target"));
                 }
                 if let Some(&index) = stack.last() {
-                    elements[index].opaque_markup = true;
+                    document.elements[index].opaque_markup = true;
                 }
             }
             Event::DocType(_) => return Err(unsupported("XML document type declarations")),
@@ -421,9 +589,5 @@ pub(super) fn parse(xml: &[u8]) -> Result<XmlDocument<'_>> {
     if !stack.is_empty() || !root_seen {
         return Err(xml_error("incomplete XML document"));
     }
-    Ok(XmlDocument {
-        elements,
-        attributes,
-        namespaces: namespaces.values,
-    })
+    Ok(document)
 }

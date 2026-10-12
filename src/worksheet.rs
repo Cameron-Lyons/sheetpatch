@@ -48,20 +48,21 @@ impl<'xml> PreparedWorksheet<'xml> {
         read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
     }
 
-    /// Patches cells against the original byte spans. Shared strings are
-    /// loaded at most once, only to recognize rewriting a `t="s"` cell's
-    /// current text; a failed load is treated as a changed value.
+    /// Patches cells against the original byte spans; values must already be
+    /// validated. Shared strings are loaded at most once, only to recognize
+    /// rewriting a `t="s"` cell's current text; a failed load is treated as a
+    /// changed value. Returns the original XML, borrowed, when nothing changes.
     pub(crate) fn patch_cells<'strings>(
         &self,
         cells: &BTreeMap<CellRef, CellValue>,
         shared_strings: impl FnMut() -> Result<&'strings [String]>,
     ) -> Result<Cow<'xml, [u8]>> {
-        // Scalar values are validated before constructing the index, keeping
-        // value errors ahead of worksheet parsing errors.
         patch::patch_cells(self.xml, &self.index, cells, shared_strings)
     }
 }
 
+/// Parses and patches a worksheet. Every public edit path validates its values
+/// before reaching the worksheet, so they are not checked again here.
 pub(crate) fn patch_cells<'xml, 'strings>(
     xml: &'xml [u8],
     cells: &BTreeMap<CellRef, CellValue>,
@@ -70,10 +71,7 @@ pub(crate) fn patch_cells<'xml, 'strings>(
     if cells.is_empty() {
         return Ok(Cow::Borrowed(xml));
     }
-    // Values fail before XML parsing, preserving the established error order.
-    for value in cells.values() {
-        value.validate()?;
-    }
+    debug_assert!(cells.values().all(|value| value.validate().is_ok()));
     let worksheet = PreparedWorksheet::parse(xml)?;
     worksheet.patch_cells(cells, shared_strings)
 }
@@ -89,8 +87,6 @@ pub(crate) fn read_cells<'strings>(
     }
     PreparedWorksheet::parse(xml)?.read_cells(cells, shared_strings, date1904)
 }
-
-type RowCells = (u32, usize, std::ops::Range<usize>);
 
 fn xml_error(message: impl Into<String>) -> Error {
     Error::Xml(message.into())

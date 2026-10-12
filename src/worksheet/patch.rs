@@ -1,4 +1,4 @@
-use super::index::{WorksheetIndex, reference_range};
+use super::index::{RowEntry, WorksheetIndex, reference_range};
 use super::parse::{Attribute, Element};
 use super::read::{element_text, rich_text};
 use super::validation::validate_payload;
@@ -25,16 +25,18 @@ impl EditPlan {
         self.edits.push(edit);
     }
 
+    // Turns an empty element `<name/>` into `<name>contents</name>`.
     fn expand(&mut self, element: &Element, mut contents: Vec<u8>) {
+        let open_end = element.open_end();
         self.push(Edit {
-            start: element.open_end - 2,
-            end: element.open_end - 1,
+            start: open_end - 2,
+            end: open_end - 1,
             bytes: Vec::new(),
         });
         contents.extend_from_slice(format!("</{}>", element.name).as_bytes());
         self.push(Edit {
-            start: element.open_end,
-            end: element.open_end,
+            start: open_end,
+            end: open_end,
             bytes: contents,
         });
     }
@@ -81,21 +83,23 @@ fn attribute_edit(
     if let Some(attribute) = element.attr(attributes, name) {
         match value {
             Some(value) if value != attribute.value => Some(Edit {
-                start: attribute.value_start,
-                end: attribute.value_end,
+                start: attribute.value_start(),
+                end: attribute.value_end(),
                 bytes: value.as_bytes().to_vec(),
             }),
             None => Some(Edit {
-                start: attribute.start,
-                end: attribute.end,
+                start: attribute.start(),
+                end: attribute.end(),
                 bytes: Vec::new(),
             }),
             _ => None,
         }
     } else {
+        // Before the tag's closing `>` or `/>`.
+        let position = element.open_end() - if element.empty { 2 } else { 1 };
         value.map(|value| Edit {
-            start: element.open_end - if element.empty { 2 } else { 1 },
-            end: element.open_end - if element.empty { 2 } else { 1 },
+            start: position,
+            end: position,
             bytes: format!(" {name}=\"{value}\"").into_bytes(),
         })
     }
@@ -252,8 +256,8 @@ fn patched_cell<'s>(
     }
     if let Some(child) = value_child {
         edits.push(Edit {
-            start: elements[child].start,
-            end: elements[child].end,
+            start: elements[child].start(),
+            end: elements[child].end(),
             bytes: value_bytes,
         });
     } else if !value_bytes.is_empty() {
@@ -261,7 +265,7 @@ fn patched_cell<'s>(
             .children(elements)
             .map(|child| &elements[child])
             .find(|child| child.is(namespace, "extLst"))
-            .map_or(cell.close_start, |child| child.start);
+            .map_or(cell.close_start(), Element::start);
         edits.push(Edit {
             start: position,
             end: position,
@@ -288,7 +292,7 @@ fn spans_edit(
         };
         let first = first.parse::<u16>().map_err(|_| invalid())?;
         let last = last.parse::<u16>().map_err(|_| invalid())?;
-        if first == 0 || first > last || last > 16_384 {
+        if first == 0 || first > last || last > CellRef::MAX_COLUMN {
             return Err(invalid());
         }
         spans.push((first, last));
@@ -347,6 +351,160 @@ fn default_style(
     index.column_style(cell)
 }
 
+// One row's edits, in column order.
+type RowChanges<'a> = [(&'a CellRef, &'a CellValue)];
+
+// Patches an existing row's cells and inserts its new ones in column order.
+// Only a row with a changed cell gets wider spans or, when it was empty
+// (`<row/>`), an expansion holding all of its new cells.
+fn patch_existing_row<'s>(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    row: &RowEntry,
+    changes: &RowChanges,
+    edits: &mut EditPlan,
+    changed_cells: &mut Vec<CellRef>,
+    shared_strings: &mut impl FnMut() -> Option<&'s [String]>,
+) -> Result<()> {
+    let elements = &index.elements;
+    let element = &elements[row.element];
+    let existing_cells = &index.cells[row.cells.clone()];
+    let mut cell_position = 0;
+    let mut changed_columns = Vec::new();
+    let mut empty_row_cells = Vec::new();
+    // Trailing cells follow the last existing cell. Only an extension list
+    // after that cell comes later; one placed before or between cells must not
+    // move new cells ahead of existing ones.
+    let after_cells = existing_cells
+        .last()
+        .map_or(element.open_end(), |&(_, cell)| elements[cell].end());
+    let fallback = element
+        .children(elements)
+        .map(|child| &elements[child])
+        .find(|child| child.start() >= after_cells && child.is(index.namespace, "extLst"))
+        .map_or(element.close_start(), Element::start);
+    for &(&cell, value) in changes {
+        while cell_position < existing_cells.len()
+            && existing_cells[cell_position].0.column < cell.column
+        {
+            cell_position += 1;
+        }
+        let existing = existing_cells
+            .get(cell_position)
+            .filter(|&&(address, _)| address == cell);
+        if let Some(&(_, cell_index)) = existing {
+            if !patched_cell(xml, index, cell, cell_index, value, edits, shared_strings)? {
+                continue;
+            }
+        } else if matches!(value, CellValue::Blank) {
+            continue;
+        } else {
+            let bytes = new_cell(
+                element,
+                cell,
+                default_style(index, Some(element), cell)?,
+                value,
+            );
+            if element.empty {
+                empty_row_cells.extend(bytes);
+            } else {
+                let insertion = existing_cells
+                    .get(cell_position)
+                    .map_or(fallback, |&(_, next)| elements[next].start());
+                edits.push(Edit {
+                    start: insertion,
+                    end: insertion,
+                    bytes,
+                });
+            }
+        }
+        changed_cells.push(cell);
+        changed_columns.push(cell.column);
+    }
+    if changed_columns.is_empty() {
+        return Ok(());
+    }
+    let spans = spans_edit(
+        element,
+        row.number,
+        &index.attributes,
+        changed_columns.into_iter(),
+    )?;
+    if let Some(spans) = spans {
+        edits.push(spans);
+    }
+    if element.empty {
+        edits.expand(element, empty_row_cells);
+    }
+    Ok(())
+}
+
+// The markup of a new row holding a row number's non-blank values, or `None`
+// when every value is blank and the row is not needed.
+fn new_row(
+    index: &WorksheetIndex,
+    number: u32,
+    changes: &RowChanges,
+    changed_cells: &mut Vec<CellRef>,
+) -> Result<Option<Vec<u8>>> {
+    let data = &index.elements[index.data_index];
+    let mut cells = Vec::new();
+    for &(&cell, value) in changes {
+        if !matches!(value, CellValue::Blank) {
+            cells.extend(new_cell(
+                data,
+                cell,
+                default_style(index, None, cell)?,
+                value,
+            ));
+            changed_cells.push(cell);
+        }
+    }
+    if cells.is_empty() {
+        return Ok(None);
+    }
+    let row = data.qualified("row");
+    let mut bytes = format!("<{row} r=\"{number}\">").into_bytes();
+    bytes.extend(cells);
+    bytes.extend_from_slice(format!("</{row}>").as_bytes());
+    Ok(Some(bytes))
+}
+
+// Widens the worksheet's dimension to include every changed cell. A reference
+// that already covers them keeps its exact bytes.
+fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<Option<Edit>> {
+    if changed_cells.is_empty() {
+        return Ok(None);
+    }
+    let elements = &index.elements;
+    let dimension = unique(
+        elements[0]
+            .children(elements)
+            .map(|child| &elements[child])
+            .filter(|element| element.is(index.namespace, "dimension")),
+        "multiple worksheet dimensions",
+    )?;
+    let Some(dimension) = dimension else {
+        return Ok(None);
+    };
+    let reference = dimension
+        .attr(&index.attributes, "ref")
+        .ok_or_else(|| unsupported("dimension without a reference"))?;
+    let old = reference_range(&reference.value)?;
+    let range = changed_cells
+        .iter()
+        .fold(old, |range, &cell| range.including(cell));
+    if old.contains(range.first) && old.contains(range.last) {
+        return Ok(None);
+    }
+    Ok(attribute_edit(
+        dimension,
+        &index.attributes,
+        "ref",
+        Some(&range.reference()),
+    ))
+}
+
 pub(super) fn patch_cells<'a, 's>(
     xml: &'a [u8],
     index: &WorksheetIndex,
@@ -361,158 +519,59 @@ pub(super) fn patch_cells<'a, 's>(
     // text. Load it at most once; a failure leaves such edits as changes.
     let mut loaded_strings = None;
     let mut strings = || *loaded_strings.get_or_insert_with(|| shared_strings().ok());
-    let elements = &index.elements;
-    let attributes = &index.attributes;
-    let namespace = index.namespace;
-    let data = &elements[index.data_index];
+    let data = &index.elements[index.data_index];
     let mut edits = EditPlan::default();
     let mut changed_cells = Vec::new();
+    // New rows for an empty `<sheetData/>` share one expansion.
+    let mut empty_data_rows = Vec::new();
     let mut pending = cells.iter().peekable();
     let mut row_position = 0;
-    let mut empty_data_rows = Vec::new();
     while let Some(&(&address, _)) = pending.peek() {
-        let row_number = address.row;
-        while row_position < index.rows.len() && index.rows[row_position].0 < row_number {
-            row_position += 1;
-        }
-        let existing_row = index
+        let number = address.row;
+        // Rows and edits are both sorted, so one cursor finds each edited row
+        // or the row a new one precedes.
+        while index
             .rows
             .get(row_position)
-            .filter(|&&(number, _, _)| number == row_number);
-        let mut row_changes = Vec::new();
-        while pending
-            .peek()
-            .is_some_and(|(address, _)| address.row == row_number)
+            .is_some_and(|row| row.number < number)
         {
-            row_changes.push(pending.next().unwrap());
+            row_position += 1;
         }
-        if let Some((_, row_index, existing_cells)) = existing_row {
-            let row = &elements[*row_index];
-            let existing_cells = &index.cells[existing_cells.clone()];
-            let mut cell_position = 0;
-            let mut changed_columns = Vec::new();
-            let mut empty_row_cells = Vec::new();
-            // Trailing cells follow the last existing cell. Only an extension
-            // list after that cell comes later; one placed before or between
-            // cells must not move new cells ahead of existing ones.
-            let after_cells = existing_cells
-                .last()
-                .map_or(row.open_end, |&(_, index)| elements[index].end);
-            let fallback = row
-                .children(elements)
-                .map(|index| &elements[index])
-                .find(|child| child.start >= after_cells && child.is(namespace, "extLst"))
-                .map_or(row.close_start, |child| child.start);
-            for (&cell, value) in row_changes {
-                while cell_position < existing_cells.len()
-                    && existing_cells[cell_position].0.column < cell.column
-                {
-                    cell_position += 1;
-                }
-                let existing = existing_cells
-                    .get(cell_position)
-                    .filter(|&&(address, _)| address == cell);
-                if let Some(&(_, cell_index)) = existing {
-                    if !patched_cell(
-                        xml,
-                        index,
-                        cell,
-                        cell_index,
-                        value,
-                        &mut edits,
-                        &mut strings,
-                    )? {
-                        continue;
-                    }
-                } else if matches!(value, CellValue::Blank) {
-                    continue;
-                } else {
-                    let bytes = new_cell(row, cell, default_style(index, Some(row), cell)?, value);
-                    if row.empty {
-                        empty_row_cells.extend(bytes);
-                    } else {
-                        let insertion = existing_cells
-                            .get(cell_position)
-                            .map_or(fallback, |&(_, index)| elements[index].start);
-                        edits.push(Edit {
-                            start: insertion,
-                            end: insertion,
-                            bytes,
-                        });
-                    }
-                }
-                changed_cells.push(cell);
-                changed_columns.push(cell.column);
-            }
-            if !changed_columns.is_empty() {
-                let span = spans_edit(row, row_number, attributes, changed_columns.into_iter())?;
-                if let Some(span) = span {
-                    edits.push(span);
-                }
-                if row.empty {
-                    edits.expand(row, empty_row_cells);
-                }
-            }
-        } else {
-            let mut new_cells = Vec::new();
-            for (&cell, value) in row_changes {
-                if !matches!(value, CellValue::Blank) {
-                    new_cells.extend(new_cell(
-                        data,
-                        cell,
-                        default_style(index, None, cell)?,
-                        value,
-                    ));
-                    changed_cells.push(cell);
-                }
-            }
-            if !new_cells.is_empty() {
-                let row_name = data.qualified("row");
-                let mut bytes = format!("<{row_name} r=\"{row_number}\">").into_bytes();
-                bytes.extend(new_cells);
-                bytes.extend_from_slice(format!("</{row_name}>").as_bytes());
-                if data.empty {
-                    empty_data_rows.extend(bytes);
-                } else {
-                    let insertion = index
-                        .rows
-                        .get(row_position)
-                        .map_or(data.close_start, |&(_, index, _)| elements[index].start);
-                    edits.push(Edit {
-                        start: insertion,
-                        end: insertion,
-                        bytes,
-                    });
-                }
+        let mut changes = Vec::new();
+        while pending.peek().is_some_and(|(cell, _)| cell.row == number) {
+            changes.push(pending.next().unwrap());
+        }
+        let next_row = index.rows.get(row_position);
+        if let Some(row) = next_row.filter(|row| row.number == number) {
+            patch_existing_row(
+                xml,
+                index,
+                row,
+                &changes,
+                &mut edits,
+                &mut changed_cells,
+                &mut strings,
+            )?;
+        } else if let Some(bytes) = new_row(index, number, &changes, &mut changed_cells)? {
+            if data.empty {
+                empty_data_rows.extend(bytes);
+            } else {
+                let insertion = next_row.map_or(data.close_start(), |row| {
+                    index.elements[row.element].start()
+                });
+                edits.push(Edit {
+                    start: insertion,
+                    end: insertion,
+                    bytes,
+                });
             }
         }
     }
     if !empty_data_rows.is_empty() {
         edits.expand(data, empty_data_rows);
     }
-    if !changed_cells.is_empty() {
-        let dimension = unique(
-            elements[0]
-                .children(elements)
-                .map(|index| &elements[index])
-                .filter(|element| element.is(namespace, "dimension")),
-            "multiple worksheet dimensions",
-        )?;
-        if let Some(dimension) = dimension {
-            let reference = dimension
-                .attr(attributes, "ref")
-                .ok_or_else(|| unsupported("dimension without a reference"))?;
-            let old = reference_range(&reference.value)?;
-            let range = changed_cells
-                .iter()
-                .fold(old, |range, &cell| range.including(cell));
-            if (!old.contains(range.first) || !old.contains(range.last))
-                && let Some(edit) =
-                    attribute_edit(dimension, attributes, "ref", Some(&range.reference()))
-            {
-                edits.push(edit);
-            }
-        }
+    if let Some(edit) = dimension_edit(index, &changed_cells)? {
+        edits.push(edit);
     }
     edits.apply(xml)
 }
