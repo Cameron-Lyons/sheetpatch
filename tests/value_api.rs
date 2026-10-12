@@ -202,7 +202,21 @@ fn default_display_and_accessors_follow_each_variant() {
     assert_eq!(format!("{:<3}|", CellValue::Blank), "   |");
     assert_eq!(format!("{:^6}|", CellValue::from(true)), " true |");
     assert_eq!(format!("{:08.3}", CellValue::from(-1.5)), "-001.500");
-    assert_eq!(format!("{:.3}", CellValue::from("abcdef")), "abc");
+    // Precision applies only to numbers: other values are never truncated,
+    // but still honor width, fill, and alignment.
+    assert_eq!(format!("{:.3}", CellValue::from("abcdef")), "abcdef");
+    assert_eq!(format!("{:.1}", CellValue::from(true)), "true");
+    assert_eq!(
+        format!("{:.2}", CellValue::Error("#DIV/0!".into())),
+        "#DIV/0!"
+    );
+    assert_eq!(format!("{:*<8.2}|", CellValue::from("abc")), "abc*****|");
+    assert_eq!(format!("{:>7.0}|", CellValue::from(false)), "  false|");
+    assert_eq!(format!("{:-^9.1}|", CellValue::from("ab")), "---ab----|");
+    assert_eq!(format!("{:-^9.1}|", CellValue::Blank), "---------|");
+    assert_eq!(format!("{:2.1}|", CellValue::from("long")), "long|");
+    assert_eq!(format!("{:>6.1}|", CellValue::from("é😀")), "    é😀|");
+    assert_eq!(format!("{:>8.1}|", CellValue::from(2.25)), "     2.2|");
 
     assert_eq!(text.as_text(), Some("plain & <raw>"));
     assert_eq!(number.as_number(), Some(12.5));
@@ -447,4 +461,80 @@ fn ranges_drive_typed_block_reads_and_writes() {
         values(view.get_cells_at(range("G10:H10").cells()).unwrap()),
         [CellValue::Number(3.0), CellValue::Number(4.0)]
     );
+}
+
+#[test]
+fn addresses_and_ranges_format_like_strings() {
+    let corner = cell("XFD1048576");
+    assert_eq!(format!("[{corner:>12}]"), "[  XFD1048576]");
+    assert_eq!(format!("[{:<4}]", cell("B2")), "[B2  ]");
+    assert_eq!(format!("[{:*^6}]", cell("C3")), "[**C3**]");
+    assert_eq!(format!("[{:3}]", corner), "[XFD1048576]");
+    assert_eq!(format!("{:.1}", cell("AB12")), "A");
+
+    let widest = range("A1:XFD1048576");
+    assert_eq!(widest.to_string(), "A1:XFD1048576");
+    assert_eq!(format!("[{widest:>15}]"), "[  A1:XFD1048576]");
+    assert_eq!(
+        format!("[{:^25}]", range("AAA100000:XFD1048576")),
+        "[  AAA100000:XFD1048576   ]"
+    );
+    assert_eq!(format!("[{:-<5}]", range("b2")), "[B2---]");
+    // Every address and range formats like its own text.
+    for text in [
+        "A1",
+        "Z26",
+        "AZ52",
+        "ZZ702",
+        "AAA703",
+        "B2:C3",
+        "A1048576:XFD1",
+    ] {
+        let range = range(text);
+        assert_eq!(format!("{range:>30}"), format!("{:>30}", range.to_string()));
+        let first = range.first();
+        assert_eq!(format!("{first:^12}"), format!("{:^12}", first.to_string()));
+    }
+}
+
+#[test]
+fn ranges_iterate_directly_and_order_by_their_corners() {
+    let block = range("B2:C3");
+    let cells: Vec<CellRef> = block.into_iter().collect();
+    assert_eq!(cells, block.cells().collect::<Vec<_>>());
+    let mut visited = Vec::new();
+    for cell in range("A1:B1") {
+        visited.push(cell.to_string());
+    }
+    assert_eq!(visited, ["A1", "B1"]);
+
+    // A range passes directly to the methods that take cells.
+    let mut book = Workbook::from_bytes(FIXTURE.to_vec()).unwrap();
+    assert_eq!(
+        values(book.get_cells_at("Data", range("A1:C1")).unwrap()),
+        values(book.get_cells_at("Data", range("A1:C1").cells()).unwrap())
+    );
+    book.set_cells_at("Data", range("G9:H9").into_iter().zip([1, 2]))
+        .unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    assert_eq!(
+        values(view.get_cells_at(range("G9:H9")).unwrap()),
+        [CellValue::Number(1.0), CellValue::Number(2.0)]
+    );
+
+    // Ranges sort by their top-left cell, then their bottom-right cell, each
+    // in row-major order.
+    let mut ranges = ["B1:B9", "A2", "A1:C3", "A1", "A1:A2", "C1"].map(range);
+    ranges.sort();
+    assert_eq!(
+        ranges.map(|range| range.to_string()),
+        ["A1", "A1:A2", "A1:C3", "B1:B9", "C1", "A2"]
+    );
+    assert!(range("A1:A2") > range("A1:C1"));
+    assert_eq!(
+        range("C3:A1").cmp(&range("A1:C3")),
+        std::cmp::Ordering::Equal
+    );
+    let keys: std::collections::BTreeSet<CellRange> = ["B2", "A1:B2", "b2"].map(range).into();
+    assert_eq!(keys.len(), 2);
 }

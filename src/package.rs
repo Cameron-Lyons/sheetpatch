@@ -2,7 +2,9 @@ use crate::{
     CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result,
     archive::{self, Archive, PartChanges},
     atomic::SourcePermissions,
-    worksheet::{PreparedWorksheet, patch_cells, read_cells, read_shared_strings},
+    worksheet::{
+        PreparedWorksheet, ReadError, patch_cells, protection, read_cells, read_shared_strings,
+    },
 };
 use std::{borrow::Cow, collections::BTreeMap, fmt, fs, io::Write, path::Path, sync::OnceLock};
 
@@ -32,19 +34,42 @@ impl Sheet {
     }
 
     // Names this worksheet in an error raised while reading, preparing, or
-    // patching it, retaining the error's variant.
+    // patching it, retaining the error's variant. Every worksheet error passes
+    // through here, which is what gives a protected-cell refusal its sheet.
     fn context(&self, error: Error) -> Error {
-        let name = &self.name;
         match error {
-            Error::Xml(message) => Error::Xml(format!("worksheet {name:?}: {message}")),
-            Error::InvalidWorkbook(message) => {
-                Error::InvalidWorkbook(format!("worksheet {name:?}: {message}"))
-            }
-            Error::Unsupported(message) => {
-                Error::Unsupported(format!("worksheet {name:?}: {message}"))
-            }
-            error => error,
+            Error::ProtectedCell { cell, reason, .. } => Error::ProtectedCell {
+                sheet: self.name.clone(),
+                cell,
+                reason,
+            },
+            error => prefixed(error, format_args!("worksheet {:?}", self.name)),
         }
+    }
+
+    // Like `context`, but a failure to load the shared-string table already
+    // names that part and is not the worksheet's.
+    fn read_context(&self, error: ReadError) -> Error {
+        match error {
+            ReadError::Worksheet(error) => self.context(error),
+            ReadError::SharedStrings(error) => error,
+        }
+    }
+}
+
+// Names the package part an error concerns, such as the shared-string table
+// or a table part read while serving a worksheet operation, retaining the
+// error's variant. Such errors are never attributed to the worksheet.
+fn in_part(path: &str, error: Error) -> Error {
+    prefixed(error, format_args!("part {path:?}"))
+}
+
+fn prefixed(error: Error, prefix: fmt::Arguments<'_>) -> Error {
+    match error {
+        Error::Xml(message) => Error::Xml(format!("{prefix}: {message}")),
+        Error::InvalidWorkbook(message) => Error::InvalidWorkbook(format!("{prefix}: {message}")),
+        Error::Unsupported(message) => Error::Unsupported(format!("{prefix}: {message}")),
+        error => error,
     }
 }
 
@@ -65,6 +90,24 @@ pub enum SheetVisibility {
     VeryHidden,
 }
 
+impl SheetVisibility {
+    /// The state's SpreadsheetML spelling: `"visible"`, `"hidden"`, or
+    /// `"veryHidden"`, as in the CLI's `list --json` output.
+    ///
+    /// ```
+    /// use sheetpatch::SheetVisibility;
+    ///
+    /// assert_eq!(SheetVisibility::VeryHidden.as_str(), "veryHidden");
+    /// ```
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::VeryHidden => "veryHidden",
+        }
+    }
+}
+
 /// An existing OOXML workbook with pending surgical cell edits.
 ///
 /// Untouched ZIP entries retain their local headers, compressed bytes, extra
@@ -83,6 +126,60 @@ pub enum SheetVisibility {
 /// book.save("report-edited.xlsm")?;
 /// # Ok::<(), sheetpatch::Error>(())
 /// ```
+///
+/// # Edit restrictions
+///
+/// Edits change scalar cell values only. An edit that could leave the
+/// workbook inconsistent, or lose information the crate cannot carry over, is
+/// refused before anything changes: the error leaves every pending edit as it
+/// was, and a batch or transaction that contains a refused edit applies none
+/// of its edits.
+///
+/// These cells are protected. Edits to them return [`Error::ProtectedCell`],
+/// which names the worksheet, the cell, and the reason:
+///
+/// - **Formula cells.** A formula's stored value is a cached result, so no
+///   value is written over one, not even the current value.
+/// - **Cells in a formula range.** The `ref` range of a shared, array, or
+///   data-table formula is computed by that formula group, including cells
+///   that have no formula of their own.
+/// - **Merged cells other than the anchor.** Excel shows a merged range's
+///   top-left cell, which stays editable; the rest of the range is protected.
+/// - **Excel table header cells.** Excel requires a header cell's text to
+///   equal its table column's name, so a header may be rewritten with its
+///   current value but not changed. Table bodies stay editable.
+/// - **Cells with value metadata** (a `vm` attribute), such as linked data
+///   types and other rich values, whose metadata describes the current value.
+///   Writing the current value again is allowed.
+///
+/// These edits return [`Error::Unsupported`]:
+///
+/// - Any edit of a digitally signed package (see [`Self::is_signed`]), which
+///   would invalidate the signature.
+/// - Any edit of a worksheet with a shared, array, or data-table formula group
+///   that has no reference range, since any cell could belong to it.
+/// - Adding a cell whose default style cannot be determined, because its
+///   row's custom format or the worksheet's column definitions are malformed,
+///   overlapping, or inside an unsupported container. Existing cells stay
+///   editable.
+/// - Changing a cell in a row whose `spans` hint, or in a worksheet whose
+///   `dimension` reference, is malformed, since the edit may need to widen it.
+/// - Replacing a value whose payload holds markup the crate does not
+///   recognize, which the replacement would discard.
+///
+/// Values are validated before any worksheet is read: non-finite numbers,
+/// text longer than Excel's 32,767 UTF-16 code units, and error values that
+/// are not Excel error codes return [`Error::InvalidValue`].
+///
+/// # Errors while reading
+///
+/// Worksheets, the shared-string table, and the parts that define a
+/// worksheet's tables are parsed on first use, so a damaged or unsupported
+/// part is reported by the first read or edit that needs it, as
+/// [`Error::Xml`], [`Error::InvalidWorkbook`], or [`Error::Unsupported`].
+/// Messages about a worksheet name it, and messages about another part, such
+/// as a shared-string table that cannot be loaded, name that part's path in
+/// the archive instead.
 pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
@@ -158,7 +255,7 @@ impl fmt::Debug for WorksheetView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorksheetView")
             .field("sheet", self.sheet)
-            .field("cells", &self.worksheet.cell_refs().len())
+            .field("cells", &self.worksheet.cells().len())
             .finish_non_exhaustive()
     }
 }
@@ -179,17 +276,18 @@ impl WorksheetView<'_> {
     /// # let bytes = include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec();
     /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
     /// let sheet = book.prepare_sheet("Data")?;
-    /// let cells: Vec<_> = sheet.cell_refs().collect();
+    /// let cells: Vec<_> = sheet.cells().collect();
     /// let contents = sheet.get_cells_at(cells.iter().copied())?;
     /// for (cell, content) in cells.iter().zip(&contents) {
     ///     println!("{cell}: {}", content.value);
     /// }
     /// assert_eq!(cells[0].to_string(), "A1");
     /// assert_eq!(contents[3].formula.as_deref(), Some("B1*2"));
+    /// assert_eq!(sheet.cells().len(), cells.len());
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
-    pub fn cell_refs(&self) -> impl Iterator<Item = CellRef> + '_ {
-        self.worksheet.cell_refs()
+    pub fn cells(&self) -> impl ExactSizeIterator<Item = CellRef> + '_ {
+        self.worksheet.cells()
     }
 
     /// The smallest range containing every cell element, or `None` for a
@@ -209,7 +307,7 @@ impl WorksheetView<'_> {
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
     pub fn used_range(&self) -> Option<CellRange> {
-        let mut cells = self.worksheet.cell_refs();
+        let mut cells = self.worksheet.cells();
         let first = cells.next()?;
         // Rows are in order, but a later row can start further left.
         let (left, right, last_row) = cells.fold(
@@ -229,16 +327,34 @@ impl WorksheetView<'_> {
     }
 
     /// Read a cell without reparsing the worksheet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCellReference`] for an invalid address. A cell
+    /// whose stored value is malformed or unsupported, or a shared-string
+    /// table that cannot be loaded, returns [`Error::Xml`],
+    /// [`Error::InvalidWorkbook`], or [`Error::Unsupported`], as described in
+    /// [errors while reading](Workbook#errors-while-reading).
     pub fn get_cell(&self, address: &str) -> Result<CellContent> {
         self.get_cell_at(address.parse()?)
     }
 
     /// Read a cell using an already validated, one-based address.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::get_cell`], other than for the address.
     pub fn get_cell_at(&self, cell: CellRef) -> Result<CellContent> {
         Ok(self.read_cells(&[cell])?.remove(0))
     }
 
     /// Read multiple addresses, retaining input order and duplicate requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCellReference`] for the first invalid address,
+    /// before reading any cell, and otherwise fails like [`Self::get_cell`]
+    /// for the first cell that cannot be read.
     pub fn get_cells<I, S>(&self, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -248,6 +364,11 @@ impl WorksheetView<'_> {
     }
 
     /// Read typed addresses, retaining input order and duplicate requests.
+    /// A [`CellRange`] reads its cells in row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::get_cell`] for the first cell that cannot be read.
     pub fn get_cells_at(
         &self,
         cells: impl IntoIterator<Item = CellRef>,
@@ -262,7 +383,7 @@ impl WorksheetView<'_> {
                 || self.workbook.shared_strings(),
                 self.workbook.date1904,
             )
-            .map_err(|error| self.sheet.context(error))
+            .map_err(|error| self.sheet.read_context(error))
     }
 }
 
@@ -395,9 +516,19 @@ impl Workbook {
 
     /// Set a scalar cell value, inserting a cell/row if needed.
     ///
-    /// Formula cells and shared/array formula ranges are deliberately protected.
-    /// Text and numbers are validated before applying changes. Failed edits leave
-    /// this workbook unchanged.
+    /// The cell keeps its style and other attributes. Text and numbers are
+    /// validated before applying changes, and failed edits leave this
+    /// workbook's pending edits unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name,
+    /// [`Error::InvalidCellReference`] for an invalid address, and
+    /// [`Error::InvalidValue`] for a value no cell can hold. Edits that the
+    /// [edit restrictions](Self#edit-restrictions) refuse return
+    /// [`Error::ProtectedCell`] or [`Error::Unsupported`], and a worksheet
+    /// that cannot be read fails as described in
+    /// [errors while reading](Self#errors-while-reading).
     pub fn set_cell(
         &mut self,
         sheet: &str,
@@ -413,6 +544,10 @@ impl Workbook {
     ///
     /// The value and worksheet restrictions are checked before applying changes,
     /// just as with [`Self::set_cell`]. No A1 string conversion is needed.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::set_cell`], other than for the address.
     pub fn set_cell_at(
         &mut self,
         sheet: &str,
@@ -426,6 +561,13 @@ impl Workbook {
     /// Apply edits to a worksheet in one parse and one XML patch.
     /// Duplicate addresses use the last value; every input is validated.
     /// The entire batch is committed only after every edit succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] before reading the batch if no
+    /// worksheet has this name, then the first invalid address or value, and
+    /// otherwise fails like [`Self::set_cell`] for the first edit refused.
+    /// No edit of a failed batch is applied.
     pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -446,6 +588,12 @@ impl Workbook {
     /// Duplicate addresses use the last value, but every value is validated.
     /// The entire batch commits only after every edit succeeds. An empty batch
     /// still requires an existing worksheet. No A1 string conversions are needed.
+    /// A [`CellRange`]'s [`cells`](CellRange::cells) zipped with values writes
+    /// a block in row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::set_cells`], other than for addresses.
     pub fn set_cells_at<I, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (CellRef, V)>,
@@ -475,6 +623,12 @@ impl Workbook {
 
     /// Apply a transaction across worksheets. On any error, all pending cell
     /// values remain unchanged. Worksheets are decompressed lazily and cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] for the first edit that names no
+    /// worksheet, and otherwise fails like [`Self::set_cell`] for the first
+    /// edit refused. No edit of a failed transaction is applied.
     pub fn apply_edits(&mut self, edits: impl IntoIterator<Item = CellEdit>) -> Result<()> {
         let mut grouped: BTreeMap<usize, BTreeMap<CellRef, CellValue>> = BTreeMap::new();
         for edit in edits {
@@ -505,13 +659,15 @@ impl Workbook {
             let in_sheet = |error| self.sheets[index].context(error);
             let original = self.original_sheet(index).map_err(in_sheet)?;
             let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
+            // Shared strings only recognize rewriting a cell's current text,
+            // so a table that cannot be loaded leaves such an edit a change.
+            let shared_strings = || self.shared_strings().ok().flatten();
             let Cow::Owned(patched) =
-                patch_cells(current, &cells, || self.shared_strings()).map_err(in_sheet)?
+                patch_cells(current, &cells, shared_strings, self.date1904).map_err(in_sheet)?
             else {
                 continue;
             };
-            self.check_table_headers(index, current, &cells)
-                .map_err(in_sheet)?;
+            self.check_table_headers(index, current, &cells)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -529,13 +685,15 @@ impl Workbook {
 
     // Excel requires each table header cell's text to equal its table column's
     // name, and repairs or removes a table whose header differs. An edit may
-    // rewrite a header cell's current value, but not change it.
+    // rewrite a header cell's current value, as it reads, but not change it.
+    // Errors name the worksheet or the package part they concern.
     fn check_table_headers(
         &self,
         index: usize,
         xml: &[u8],
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
+        let sheet = &self.sheets[index];
         let headers = self.table_headers(index)?;
         let (header_cells, values): (Vec<CellRef>, Vec<&CellValue>) = cells
             .iter()
@@ -544,13 +702,15 @@ impl Workbook {
         if header_cells.is_empty() {
             return Ok(());
         }
-        let current = read_cells(xml, &header_cells, || self.shared_strings(), self.date1904)?;
-        for ((cell, value), current) in header_cells.iter().zip(values).zip(current) {
+        let current = read_cells(xml, &header_cells, || self.shared_strings(), self.date1904)
+            .map_err(|error| sheet.read_context(error))?;
+        for ((&cell, value), current) in header_cells.iter().zip(values).zip(current) {
             if current.value != *value {
-                return Err(Error::Unsupported(format!(
-                    "{cell} is an Excel table header cell; \
-                     editing it would desynchronize the table's column names"
-                )));
+                return Err(Error::ProtectedCell {
+                    sheet: sheet.name.clone(),
+                    cell,
+                    reason: protection::TABLE_HEADER.into(),
+                });
             }
         }
         Ok(())
@@ -558,6 +718,15 @@ impl Workbook {
 
     /// Read a cell's current value, cached formula result, and style index.
     /// Missing cells return a blank value without modifying the workbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name and
+    /// [`Error::InvalidCellReference`] for an invalid address. A worksheet
+    /// that cannot be parsed, a cell whose stored value is malformed or
+    /// unsupported, or a shared-string table that cannot be loaded returns
+    /// [`Error::Xml`], [`Error::InvalidWorkbook`], or [`Error::Unsupported`],
+    /// as described in [errors while reading](Self#errors-while-reading).
     pub fn get_cell(&self, sheet: &str, address: &str) -> Result<CellContent> {
         let index = self.sheet_index(sheet)?;
         Ok(self
@@ -569,12 +738,23 @@ impl Workbook {
     ///
     /// Returns the current scalar value, cached formula result, and style index,
     /// just as with [`Self::get_cell`]. Missing cells return a blank value.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::get_cell`], other than for the address.
     pub fn get_cell_at(&self, sheet: &str, cell: CellRef) -> Result<CellContent> {
         let index = self.sheet_index(sheet)?;
         Ok(self.read_cells_in_sheet(index, &[cell])?.remove(0))
     }
 
     /// Read many cells with one worksheet parse, retaining input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
+    /// [`Error::InvalidCellReference`] for the first invalid address, before
+    /// reading any cell, and otherwise fails like [`Self::get_cell`] for the
+    /// first cell that cannot be read.
     pub fn get_cells<I, S>(&self, sheet: &str, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -588,7 +768,14 @@ impl Workbook {
     ///
     /// Input order and duplicates are retained; missing cells return blanks.
     /// An empty batch still requires an existing worksheet. No A1 string
-    /// conversions are needed.
+    /// conversions are needed, and a [`CellRange`] reads its cells in
+    /// row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, and
+    /// otherwise fails like [`Self::get_cell`] for the first cell that cannot
+    /// be read.
     pub fn get_cells_at(
         &self,
         sheet: &str,
@@ -603,14 +790,15 @@ impl Workbook {
         if cells.is_empty() {
             return Ok(Vec::new());
         }
-        let in_sheet = |error| self.sheets[index].context(error);
+        let sheet = &self.sheets[index];
         read_cells(
-            self.current_sheet(index).map_err(in_sheet)?,
+            self.current_sheet(index)
+                .map_err(|error| sheet.context(error))?,
             cells,
             || self.shared_strings(),
             self.date1904,
         )
-        .map_err(in_sheet)
+        .map_err(|error| sheet.read_context(error))
     }
 
     /// Prepare a worksheet for repeated reads using a single validated XML index.
@@ -628,6 +816,12 @@ impl Workbook {
     /// }
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, and
+    /// [`Error::Xml`], [`Error::InvalidWorkbook`], or [`Error::Unsupported`]
+    /// for a worksheet that cannot be parsed and indexed.
     pub fn prepare_sheet(&self, sheet: &str) -> Result<WorksheetView<'_>> {
         let index = self.sheet_index(sheet)?;
         let sheet = &self.sheets[index];
@@ -688,6 +882,7 @@ impl Workbook {
         Ok(cache.get_or_init(|| xml))
     }
 
+    // Errors name the relationships or table part they concern.
     fn table_headers(&self, index: usize) -> Result<&[CellRange]> {
         let cache = &self.sheet_xml[index].table_headers;
         if let Some(headers) = cache.get() {
@@ -697,16 +892,21 @@ impl Workbook {
         Ok(cache.get_or_init(|| headers))
     }
 
-    fn shared_strings(&self) -> Result<&[String]> {
+    // The shared-string table, or `None` for a workbook without one. Errors
+    // name the table's part, rather than the worksheet that needed it.
+    fn shared_strings(&self) -> Result<Option<&[String]>> {
+        let Some(path) = &self.shared_strings_path else {
+            return Ok(None);
+        };
         if let Some(strings) = self.shared_strings.get() {
-            return Ok(strings);
+            return Ok(Some(strings));
         }
-        let path = self
-            .shared_strings_path
-            .as_ref()
-            .ok_or(Error::SharedStringsUnavailable)?;
-        let strings = read_shared_strings(&self.archive.read(path)?)?;
-        Ok(self.shared_strings.get_or_init(|| strings))
+        let strings = self
+            .archive
+            .read(path)
+            .and_then(|xml| read_shared_strings(&xml))
+            .map_err(|error| in_part(path, error))?;
+        Ok(Some(self.shared_strings.get_or_init(|| strings)))
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
@@ -714,6 +914,11 @@ impl Workbook {
     /// with contiguous local records stays contiguous; edited records do not
     /// accumulate as obsolete copies. Central-directory offsets may change.
     /// Without edits this returns the original bytes. Pending edits are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when an edited worksheet cannot be
+    /// written, for example because the output would exceed a ZIP32 limit.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.archive.write(&self.changed_parts())
     }
@@ -725,6 +930,11 @@ impl Workbook {
     /// returns, so buffered writers passed by value still report write errors.
     /// An error after output has started, such as a failing writer, may leave a
     /// partial archive; use `save` for atomic files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when writing or flushing fails, and otherwise
+    /// fails like [`Self::to_bytes`].
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.write_to(&self.changed_parts(), &mut writer)
     }
@@ -735,12 +945,23 @@ impl Workbook {
     /// is flushed before this returns. An error after output has started, such
     /// as a failing writer, may leave a partial archive; use `save_compact` for
     /// files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when writing or flushing fails, and
+    /// [`Error::Unsupported`] when the archive has an opaque prefix, gaps, or
+    /// unrecognized obsolete records, which compaction would discard.
+    /// Otherwise fails like [`Self::to_bytes`].
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changed_parts(), &mut writer)
     }
 
     /// Serialize a compact archive, removing obsolete ZIP records.
     /// Opaque ZIP prefixes or gaps cause an error. Pending edits are retained.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::write_compact_to`], other than with [`Error::Io`].
     pub fn to_bytes_compact(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.write_compact_to(&mut bytes)?;

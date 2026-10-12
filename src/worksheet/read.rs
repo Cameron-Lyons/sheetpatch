@@ -1,7 +1,7 @@
-use super::date::excel_serial;
+use super::date::{DateError, excel_serial};
 use super::index::WorksheetIndex;
 use super::parse::{Element, NamespaceId, XmlDocument, parse_with};
-use super::{at_cell, decoded, unique, unsupported, xml_error};
+use super::{ReadError, at_cell, decoded, invalid, unique, unsupported, xml_error};
 use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
@@ -192,36 +192,45 @@ fn stored_value(
         return Err(unsupported("non-inline cell has an inline payload"));
     }
     let text = element_text(xml, payload)?;
+    // Values that their cell type cannot hold make the workbook malformed;
+    // only valid ISO 8601 dates outside the supported forms are unsupported.
     let value = match kind {
         "n" if trim_xml_whitespace(&text).is_empty() => CellValue::Blank,
         "n" => {
             let number = trim_xml_whitespace(&text)
                 .parse::<f64>()
-                .map_err(|_| unsupported("invalid numeric cell value"))?;
+                .map_err(|_| invalid("invalid numeric cell value"))?;
             if !number.is_finite() {
-                return Err(unsupported("non-finite numeric cell value"));
+                return Err(invalid("non-finite numeric cell value"));
             }
             CellValue::Number(number)
         }
         "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
             "0" | "false" => false,
             "1" | "true" => true,
-            _ => return Err(unsupported("invalid boolean cell value")),
+            _ => return Err(invalid("invalid boolean cell value")),
         }),
         "str" => CellValue::Text(excel_text(&text)?),
         "e" => CellValue::Error(excel_text(&text)?),
         // Dates read as the serial number Excel would store for them.
-        "d" => CellValue::Number(
-            excel_serial(trim_xml_whitespace(&text), date1904)
-                .ok_or_else(|| unsupported("unsupported ISO 8601 date cell value"))?,
-        ),
+        "d" => CellValue::Number(excel_serial(trim_xml_whitespace(&text), date1904).map_err(
+            |error| match error {
+                DateError::Invalid => invalid("invalid ISO 8601 date cell value"),
+                DateError::TimeZoneOffset => {
+                    unsupported("ISO 8601 date cell value with a time-zone offset")
+                }
+                DateError::BeforeEpoch => unsupported(
+                    "ISO 8601 date cell value before the start of the workbook's date system",
+                ),
+            },
+        )?),
         "s" => {
             return trim_xml_whitespace(&text)
                 .parse::<usize>()
                 .map(StoredValue::SharedString)
-                .map_err(|_| unsupported("invalid shared-string index"));
+                .map_err(|_| invalid("invalid shared-string index"));
         }
-        _ => return Err(unsupported(format!("unsupported cell value type {kind:?}"))),
+        _ => return Err(invalid(format!("invalid cell value type {kind:?}"))),
     };
     Ok(StoredValue::Value(value))
 }
@@ -239,7 +248,7 @@ fn stored_cell(
         .map(|attribute| {
             trim_xml_whitespace(&attribute.value)
                 .parse::<u32>()
-                .map_err(|_| unsupported("invalid cell style index"))
+                .map_err(|_| invalid("invalid cell style index"))
         })
         .transpose()?;
     let formulas = cell
@@ -259,9 +268,9 @@ pub(super) fn cell_content<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
-    shared_strings: &mut impl FnMut() -> Result<&'a [String]>,
+    shared_strings: &mut impl FnMut() -> Result<Option<&'a [String]>>,
     date1904: bool,
-) -> Result<CellContent> {
+) -> std::result::Result<CellContent, ReadError> {
     let Some(cell_index) = index.cell(address) else {
         return Ok(CellContent {
             value: CellValue::Blank,
@@ -275,9 +284,17 @@ pub(super) fn cell_content<'a>(
     let value = match value {
         StoredValue::Value(value) => value,
         StoredValue::SharedString(position) => {
-            let strings = shared_strings()?;
+            // A table that exists but cannot be loaded concerns that part;
+            // a missing table or index is the cell's problem.
+            let strings = shared_strings()
+                .map_err(ReadError::SharedStrings)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{address}: shared-string cell, but the workbook has no shared-string table"
+                    ))
+                })?;
             let text = strings.get(position).ok_or_else(|| {
-                Error::InvalidWorkbook(format!(
+                invalid(format!(
                     "{address}: shared-string index {position} is out of bounds"
                 ))
             })?;
@@ -295,9 +312,9 @@ pub(super) fn read_cells<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     cells: &[CellRef],
-    mut shared_strings: impl FnMut() -> Result<&'a [String]>,
+    mut shared_strings: impl FnMut() -> Result<Option<&'a [String]>>,
     date1904: bool,
-) -> Result<Vec<CellContent>> {
+) -> std::result::Result<Vec<CellContent>, ReadError> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }

@@ -202,6 +202,16 @@ fn normalizes_literal_attribute_whitespace_before_character_references() {
     assert!(changed.contains("x:flag=\"a\r\nb\rc\nd\te&#13;f&#10;g&#9;h\""));
 }
 
+// A protected-cell refusal names its cell and reason; the workbook, which
+// knows the worksheet's name, fills in the sheet.
+fn protected_cell(result: Result<String>, address: &str, expected: &str) -> bool {
+    matches!(
+        result,
+        Err(Error::ProtectedCell { sheet, cell, reason, .. })
+            if sheet.is_empty() && cell.to_string() == address && reason == expected
+    )
+}
+
 #[test]
 fn rejects_formula_cells_and_formula_followers() {
     for kind in ["shared", "array", "dataTable"] {
@@ -209,8 +219,22 @@ fn rejects_formula_cells_and_formula_followers() {
         let input = sheet(&format!(
             r#"<sheetData><row r="1"><c r="A1"><f t="{kind}"{si} ref="A1:C2">1</f><v>1</v></c></row></sheetData>"#
         ));
-        assert!(edit(&input, "A1", CellValue::Blank).is_err());
-        assert!(edit(&input, "B2", CellValue::Number(8.0)).is_err());
+        assert!(protected_cell(
+            edit(&input, "A1", CellValue::Blank),
+            "A1",
+            "contains a formula"
+        ));
+        // Even the cell's current value is refused.
+        assert!(protected_cell(
+            edit(&input, "A1", CellValue::Number(1.0)),
+            "A1",
+            "contains a formula"
+        ));
+        assert!(protected_cell(
+            edit(&input, "B2", CellValue::Number(8.0)),
+            "B2",
+            "belongs to a formula range"
+        ));
         assert!(edit(&input, "D2", CellValue::Number(8.0)).is_ok());
     }
 }
@@ -273,7 +297,9 @@ fn metadata_for_an_existing_value_cannot_survive_a_value_change() {
     ] {
         assert!(matches!(
             edit(&input, "A1", value),
-            Err(Error::Unsupported(_))
+            Err(Error::ProtectedCell { cell, reason, .. })
+                if cell.to_string() == "A1"
+                    && reason == "has value metadata (a linked or rich data type)"
         ));
     }
     assert_eq!(
@@ -368,7 +394,7 @@ fn generated_elements_use_the_context_prefix_after_default_namespace_rebinding()
             "B1".parse().unwrap(),
             "C2".parse().unwrap(),
         ],
-        || Err(Error::SharedStringsUnavailable),
+        || Ok(None),
         false,
     )
     .unwrap();
@@ -473,7 +499,7 @@ fn leading_byte_order_marks_are_text_for_reads_and_unchanged_value_checks() {
     );
     assert!(matches!(
         read_cell(input.as_bytes(), "B1".parse().unwrap(), None),
-        Err(Error::Unsupported(_))
+        Err(Error::InvalidWorkbook(message)) if message == "B1: invalid numeric cell value"
     ));
     // Values that differ only by a leading U+FEFF are real edits.
     for (address, value, old, new) in [
@@ -526,7 +552,8 @@ fn incomplete_formula_groups_block_every_edit_and_name_the_formula_cell() {
         assert!(edit(&complete, "Z9", 2.0.into()).is_ok());
         assert!(matches!(
             edit(&complete, "C3", 2.0.into()),
-            Err(Error::Unsupported(message)) if message == "C3 belongs to a formula range"
+            Err(Error::ProtectedCell { sheet, cell, reason, .. })
+                if sheet.is_empty() && cell.to_string() == "C3" && reason == "belongs to a formula range"
         ));
     }
     // A shared group is complete when any member carries its range, and an
@@ -690,8 +717,9 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
         ]),
         || {
             loads += 1;
-            Ok(&strings)
+            Some(&strings)
         },
+        false,
     )
     .unwrap();
     assert!(matches!(unchanged, Cow::Borrowed(_)));
@@ -705,18 +733,21 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
             ("C1", "x".into()),
         ]),
         || panic!("shared strings are not needed"),
+        false,
     )
     .unwrap();
     assert!(matches!(changed, Cow::Owned(_)));
-    // A failed load is attempted once and leaves each edit as a change.
+    // A table that is absent or fails to load is attempted once and leaves
+    // each edit as a change.
     let mut loads = 0;
     let changed = patch_cells(
         input.as_bytes(),
         &cells(&[("A1", "first".into()), ("B1", "second".into())]),
         || {
             loads += 1;
-            Err(Error::SharedStringsUnavailable)
+            None
         },
+        false,
     )
     .unwrap();
     assert_eq!(loads, 1);
@@ -766,36 +797,83 @@ fn new_cells_use_row_or_column_default_styles_with_the_context_prefix() {
 
 #[test]
 fn iso_dates_convert_in_both_date_systems() {
+    use super::date::DateError::{BeforeEpoch, Invalid, TimeZoneOffset};
     use super::date::excel_serial;
     for (text, serial_1900, serial_1904) in [
-        ("1900-01-01", Some(1.0), None),
-        ("1900-02-28", Some(59.0), None),
-        ("1900-03-01", Some(61.0), None),
-        ("1903-12-31", Some(1_461.0), None),
-        ("1904-01-01", Some(1_462.0), Some(0.0)),
-        ("1904-01-02T12:00", Some(1_463.5), Some(1.5)),
-        ("2024-01-15T00:00:00Z", Some(45_306.0), Some(43_844.0)),
-        ("2000-02-29", Some(36_585.0), Some(35_123.0)),
-        ("18:00:00.000", Some(0.75), Some(0.75)),
-        ("1899-12-31", None, None),
-        ("0000-01-01", None, None),
-        ("1900-02-29", None, None),
-        ("2024-01-15T00:00:00z", None, None),
-        ("2024-01-15T00:00:00-00:00", None, None),
-        ("2024-01-15 00:00:00", None, None),
-        ("2024-01-15T", None, None),
-        ("T00:00", None, None),
-        ("12:3\u{e9}", None, None),
-        ("2024-01-1\u{e9}", None, None),
-        ("12:00:5\u{e9}", None, None),
-        ("+2024-01-15", None, None),
-        ("12:00:00.+1", None, None),
+        ("1900-01-01", Ok(1.0), Err(BeforeEpoch)),
+        ("1900-02-28", Ok(59.0), Err(BeforeEpoch)),
+        ("1900-03-01", Ok(61.0), Err(BeforeEpoch)),
+        ("1903-12-31", Ok(1_461.0), Err(BeforeEpoch)),
+        ("1904-01-01", Ok(1_462.0), Ok(0.0)),
+        ("1904-01-02T12:00", Ok(1_463.5), Ok(1.5)),
+        ("2024-01-15T00:00:00Z", Ok(45_306.0), Ok(43_844.0)),
+        ("2000-02-29", Ok(36_585.0), Ok(35_123.0)),
+        ("18:00:00.000", Ok(0.75), Ok(0.75)),
+        ("06:00Z", Ok(0.25), Ok(0.25)),
+        // Excel's day zero holds times without a date.
+        ("1899-12-31", Ok(0.0), Err(BeforeEpoch)),
+        ("1899-12-31T12:00:00", Ok(0.5), Err(BeforeEpoch)),
+        ("1899-12-30", Err(BeforeEpoch), Err(BeforeEpoch)),
+        ("1899-12-30T23:59", Err(BeforeEpoch), Err(BeforeEpoch)),
+        ("0000-01-01", Err(BeforeEpoch), Err(BeforeEpoch)),
+        // Valid values with an offset other than Z would need a time zone.
+        (
+            "2024-01-15T00:00:00-00:00",
+            Err(TimeZoneOffset),
+            Err(TimeZoneOffset),
+        ),
+        (
+            "2024-01-15T12:00:00.5+05:30",
+            Err(TimeZoneOffset),
+            Err(TimeZoneOffset),
+        ),
+        ("2024-01-15+01:00", Err(TimeZoneOffset), Err(TimeZoneOffset)),
+        ("12:00-03:00", Err(TimeZoneOffset), Err(TimeZoneOffset)),
+        (
+            "1899-12-30T00:00+01:00",
+            Err(TimeZoneOffset),
+            Err(TimeZoneOffset),
+        ),
+        // Malformed values, with or without an offset.
+        ("2024-02-30+01:00", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T12:00+5:00", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T12:00+15:00", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T12:00Z+01:00", Err(Invalid), Err(Invalid)),
+        ("+01:00", Err(Invalid), Err(Invalid)),
+        ("1900-02-29", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T00:00:00z", Err(Invalid), Err(Invalid)),
+        ("2024-01-15 00:00:00", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T", Err(Invalid), Err(Invalid)),
+        ("2024-01-15T24:00", Err(Invalid), Err(Invalid)),
+        ("T00:00", Err(Invalid), Err(Invalid)),
+        ("12:3\u{e9}", Err(Invalid), Err(Invalid)),
+        ("2024-01-1\u{e9}", Err(Invalid), Err(Invalid)),
+        ("12:00:5\u{e9}", Err(Invalid), Err(Invalid)),
+        ("\u{e9}12:00:00", Err(Invalid), Err(Invalid)),
+        ("+2024-01-15", Err(Invalid), Err(Invalid)),
+        ("12:00:00.+1", Err(Invalid), Err(Invalid)),
+        ("", Err(Invalid), Err(Invalid)),
     ] {
         assert_eq!(excel_serial(text, false), serial_1900, "{text}");
         assert_eq!(excel_serial(text, true), serial_1904, "{text}");
     }
+    // A time before midnight never rounds into the next day, even where the
+    // fraction of a second rounds up to 60 seconds or the day's serial leaves
+    // too little precision for it.
+    for (text, day) in [
+        ("23:59:59.9999999999999999", 0.0),
+        ("23:59:59.9999999999", 0.0),
+        ("1899-12-31T23:59:59.9999999999999999", 0.0),
+        ("2024-01-15T23:59:59.9999999999", 45_306.0),
+        ("2024-01-15T23:59:59.9999999999999999Z", 45_306.0),
+        ("9999-12-31T23:59:59.999999999", 2_958_465.0),
+    ] {
+        let serial = excel_serial(text, false).unwrap();
+        assert!(serial >= day && serial < day + 1.0, "{text}: {serial}");
+        assert!(serial > day + 0.9999, "{text}: {serial}");
+    }
     let input = sheet(
-        "<sheetData><row r='1'><c r='A1' t='d' s='3'><v>2024-01-15</v></c></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' t='d' s='3'><v>2024-01-15</v></c><c r='B1' t='d'><v>1899-12-31T12:00:00</v></c></row></sheetData>",
     );
     for (date1904, serial) in [(false, 45_306.0), (true, 43_844.0)] {
         let content = read_cells(
@@ -809,10 +887,35 @@ fn iso_dates_convert_in_both_date_systems() {
         assert_eq!(content.value, CellValue::Number(serial));
         assert_eq!(content.style_index, Some(3));
     }
-    // Writing over a date cell, even with its own serial, stores a number.
     assert_eq!(
-        edit(&input, "A1", 45_306.0.into()).unwrap(),
-        input.replace(" t='d'", "").replace("2024-01-15", "45306")
+        read_cell(input.as_bytes(), "B1".parse().unwrap(), None)
+            .unwrap()
+            .value,
+        CellValue::Number(0.5)
+    );
+    let date_cell = |date1904: bool, value: f64| {
+        patch_cells(
+            input.as_bytes(),
+            &BTreeMap::from([("A1".parse().unwrap(), value.into())]),
+            || panic!("no strings"),
+            date1904,
+        )
+        .unwrap()
+    };
+    // Rewriting a date cell's own serial, in the workbook's date system,
+    // leaves its exact XML.
+    assert!(matches!(date_cell(false, 45_306.0), Cow::Borrowed(_)));
+    assert!(matches!(date_cell(true, 43_844.0), Cow::Borrowed(_)));
+    // Any other number replaces the date with a plain number.
+    assert_eq!(
+        date_cell(true, 45_306.0).as_ref(),
+        input
+            .replace(" t='d' s='3'><v>2024-01-15", " s='3'><v>45306")
+            .as_bytes()
+    );
+    assert_eq!(
+        edit(&input, "A1", 45_307.0.into()).unwrap(),
+        input.replace(" t='d' s='3'><v>2024-01-15", " s='3'><v>45307")
     );
 }
 
@@ -834,8 +937,17 @@ fn merged_range_anchor_can_change_but_followers_cannot() {
         r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:C2"/></mergeCells>"#,
     );
     assert!(edit(&input, "A1", CellValue::Number(2.0)).is_ok());
-    assert!(edit(&input, "B2", CellValue::Number(2.0)).is_err());
-    assert!(edit(&input, "B2", CellValue::Blank).is_err());
+    for (address, value) in [
+        ("B2", CellValue::Number(2.0)),
+        ("B2", CellValue::Blank),
+        ("C1", CellValue::from("x")),
+    ] {
+        assert!(protected_cell(
+            edit(&input, address, value),
+            address,
+            "is merged into another cell's range"
+        ));
+    }
     assert!(edit(&input, "D2", CellValue::Number(2.0)).is_ok());
 }
 
@@ -945,13 +1057,10 @@ fn batch(xml: &str, changes: &[(&str, CellValue)]) -> Result<String> {
         .iter()
         .map(|(address, value)| (address.parse().unwrap(), value.clone()))
         .collect();
-    Ok(String::from_utf8(
-        patch_cells(xml.as_bytes(), &cells, || {
-            Err(Error::SharedStringsUnavailable)
-        })?
-        .into_owned(),
+    Ok(
+        String::from_utf8(patch_cells(xml.as_bytes(), &cells, || None, false)?.into_owned())
+            .unwrap(),
     )
-    .unwrap())
 }
 
 #[test]
@@ -1036,6 +1145,37 @@ fn batch_guards_include_all_edits_and_accept_merged_anchors() {
     assert!(batch(&input, &[("E3", 2.0.into()), ("A7", 8.0.into())]).is_ok());
     assert!(batch(&input, &[("XFD1048576", 8.0.into())]).is_err());
     assert!(batch(&input, &[("G2", 2.0.into()), ("H6", 8.0.into())]).is_ok());
+    // Large batches over many ranges use a sweep, which reports the same
+    // refusals as direct membership checks.
+    let merges: String = (0..20)
+        .map(|index| format!("<mergeCell ref='A{row}:B{row}'/>", row = 2 * index + 1))
+        .collect();
+    let formulas: String = (0..20)
+        .map(|index| {
+            let row = 2 * index + 1;
+            format!("<row r='{row}'><c r='D{row}'><f t='array' ref='D{row}:E{row}'>1</f><v>1</v></c></row>")
+        })
+        .collect();
+    let input = sheet(&format!(
+        "<sheetData>{formulas}</sheetData><mergeCells>{merges}</mergeCells>"
+    ));
+    for (extra, reason) in [
+        ("B5", "is merged into another cell's range"),
+        ("E7", "belongs to a formula range"),
+    ] {
+        let mut changes: Vec<(String, CellValue)> = (1..=40)
+            .map(|row| (format!("A{row}"), CellValue::from(row)))
+            .collect();
+        changes.push((extra.into(), 1.into()));
+        let changes: Vec<(&str, CellValue)> = changes
+            .iter()
+            .map(|(address, value)| (address.as_str(), value.clone()))
+            .collect();
+        assert!(
+            protected_cell(batch(&input, &changes), extra, reason),
+            "{extra}"
+        );
+    }
 }
 
 #[test]
@@ -1048,7 +1188,7 @@ fn reads_values_formulas_styles_and_preserves_requested_order() {
         .map(|address| address.parse().unwrap())
         .collect();
     let strings = ["first".into(), "second".into()];
-    let cells = read_cells(input.as_bytes(), &addresses, || Ok(&strings), false).unwrap();
+    let cells = read_cells(input.as_bytes(), &addresses, || Ok(Some(&strings)), false).unwrap();
     assert_eq!(
         cells
             .iter()
@@ -1097,7 +1237,7 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
         ],
         || {
             loads += 1;
-            Ok(&strings)
+            Ok(Some(&strings))
         },
         false,
     )
@@ -1205,7 +1345,8 @@ fn rejects_invalid_read_values_and_missing_shared_strings() {
     let input = sheet(r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>"#);
     assert!(matches!(
         read_cell(input.as_bytes(), "A1".parse().unwrap(), None),
-        Err(Error::SharedStringsUnavailable)
+        Err(Error::InvalidWorkbook(message))
+            if message == "A1: shared-string cell, but the workbook has no shared-string table"
     ));
     assert!(matches!(
         read_cell(input.as_bytes(), "A1".parse().unwrap(), Some(&[])),
@@ -1258,10 +1399,7 @@ fn no_op_patches_borrow_the_original_xml() {
         BTreeMap::from([("C1".parse().unwrap(), CellValue::Blank)]),
     ] {
         assert!(matches!(
-            patch_cells(input.as_bytes(), &changes, || Err(
-                Error::SharedStringsUnavailable
-            ))
-            .unwrap(),
+            patch_cells(input.as_bytes(), &changes, || None, false).unwrap(),
             Cow::Borrowed(_)
         ));
     }
@@ -1497,34 +1635,55 @@ fn xml_variants_follow_the_shared_policy() {
 
 #[test]
 fn read_errors_name_the_cell() {
+    // Malformed cell data makes the workbook invalid.
     for (kind, payload, message) in [
         ("n", "x", "B2: invalid numeric cell value"),
         ("n", "1e999", "B2: non-finite numeric cell value"),
         ("b", "2", "B2: invalid boolean cell value"),
-        (
-            "d",
-            "2026-02-29",
-            "B2: unsupported ISO 8601 date cell value",
-        ),
+        ("d", "2026-02-29", "B2: invalid ISO 8601 date cell value"),
         ("s", "-1", "B2: invalid shared-string index"),
-        ("q", "1", "B2: unsupported cell value type \"q\""),
+        ("s", "0x1", "B2: invalid shared-string index"),
+        ("q", "1", "B2: invalid cell value type \"q\""),
+        (
+            "inlinestr",
+            "1",
+            "B2: invalid cell value type \"inlinestr\"",
+        ),
     ] {
         let input = sheet(&format!(
             "<sheetData><row r='2'><c r='B2' t='{kind}'><v>{payload}</v></c></row></sheetData>"
         ));
+        let error = read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&[])).unwrap_err();
         assert!(
-            matches!(
-                read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&[])),
-                Err(Error::Unsupported(error)) if error == message
-            ),
-            "{message}"
+            matches!(&error, Error::InvalidWorkbook(error) if error == message),
+            "{message}: {error:?}"
         );
     }
     let input = sheet("<sheetData><row r='2'><c r='B2' s='x'/></row></sheetData>");
     assert!(matches!(
         read_cell(input.as_bytes(), "B2".parse().unwrap(), None),
-        Err(Error::Unsupported(error)) if error == "B2: invalid cell style index"
+        Err(Error::InvalidWorkbook(error)) if error == "B2: invalid cell style index"
     ));
+    // Valid ISO 8601 values outside the supported forms are unsupported.
+    for (payload, message) in [
+        (
+            "2026-01-01T00:00:00+01:00",
+            "B2: ISO 8601 date cell value with a time-zone offset",
+        ),
+        (
+            "1899-12-30",
+            "B2: ISO 8601 date cell value before the start of the workbook's date system",
+        ),
+    ] {
+        let input = sheet(&format!(
+            "<sheetData><row r='2'><c r='B2' t='d'><v>{payload}</v></c></row></sheetData>"
+        ));
+        let error = read_cell(input.as_bytes(), "B2".parse().unwrap(), None).unwrap_err();
+        assert!(
+            matches!(&error, Error::Unsupported(error) if error == message),
+            "{message}: {error:?}"
+        );
+    }
     let input =
         sheet("<sheetData><row r='2'><c r='B2' t='str'><v>_xD800_</v></c></row></sheetData>");
     assert!(matches!(
@@ -1543,7 +1702,23 @@ fn read_errors_name_the_cell() {
         || Err(Error::Xml("shared strings".into())),
         false,
     );
-    assert!(matches!(loaded, Err(Error::Xml(error)) if error == "shared strings"));
+    assert!(matches!(
+        loaded,
+        Err(ReadError::SharedStrings(Error::Xml(error))) if error == "shared strings"
+    ));
+    // A cell's own problems are the worksheet's, even when they concern the
+    // table: here, its absence.
+    let loaded = read_cells(
+        input.as_bytes(),
+        &["B2".parse().unwrap()],
+        || Ok(None),
+        false,
+    );
+    assert!(matches!(
+        loaded,
+        Err(ReadError::Worksheet(Error::InvalidWorkbook(error)))
+            if error == "B2: shared-string cell, but the workbook has no shared-string table"
+    ));
 }
 
 #[test]

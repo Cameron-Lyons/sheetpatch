@@ -347,7 +347,7 @@ fn refused_patch_edits_name_only_lines_for_the_refused_cell() {
         ],
     );
     let output = directory.join("out.xlsx");
-    let formula = "unsupported: worksheet \"Data\": A10 contains a formula";
+    let formula = "protected cell: worksheet \"Data\": A10 contains a formula";
     for (patch, expected) in [
         // A1 is a prefix of A10, but names a different cell.
         (
@@ -361,7 +361,7 @@ fn refused_patch_edits_name_only_lines_for_the_refused_cell() {
         ),
         (
             "Data\tA1\ttext\tx\nData\tc2\ttext\ty\n",
-            "Patch line 2: unsupported: worksheet \"Data\": C2 is not the anchor of its merged range"
+            "Patch line 2: protected cell: worksheet \"Data\": C2 is merged into another cell's range"
                 .to_owned(),
         ),
         // A refusal naming a cell that no line edits has no line.

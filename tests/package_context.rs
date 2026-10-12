@@ -1,5 +1,6 @@
-//! Worksheet-level errors name their worksheet, and every entry point reports
-//! the same mistake with the same error.
+//! Worksheet-level errors name their worksheet, errors in other parts read for
+//! a worksheet name those parts instead, and every entry point reports the
+//! same mistake with the same error.
 mod common;
 
 use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
@@ -68,6 +69,19 @@ fn message(error: &Error) -> &str {
     }
 }
 
+/// The worksheet, cell, and reason of a protected-cell refusal.
+fn protected(error: &Error) -> (&str, String, &str) {
+    match error {
+        Error::ProtectedCell {
+            sheet,
+            cell,
+            reason,
+            ..
+        } => (sheet, cell.to_string(), reason),
+        other => panic!("expected a protected-cell refusal, got {other:?}"),
+    }
+}
+
 #[test]
 fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
     let mut book = book(&[
@@ -86,11 +100,13 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
             CellEdit::new("Beta", "A1", 5).unwrap(),
         ])
         .unwrap_err();
-    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
-    assert_eq!(message(&error), "worksheet \"Beta\": A1 contains a formula");
+    assert_eq!(
+        protected(&error),
+        ("Beta", "A1".into(), "contains a formula")
+    );
     assert_eq!(
         error.to_string(),
-        "unsupported: worksheet \"Beta\": A1 contains a formula"
+        "protected cell: worksheet \"Beta\": A1 contains a formula"
     );
     assert!(!book.has_changes());
     assert_eq!(book.to_bytes().unwrap(), original);
@@ -102,10 +118,13 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         book.set_cells_at("Beta", [(CellRef::new(2, 2).unwrap(), 3)]),
     ] {
         let error = result.unwrap_err();
-        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
         assert_eq!(
-            message(&error),
-            "worksheet \"Beta\": B2: cell value has associated metadata"
+            protected(&error),
+            (
+                "Beta",
+                "B2".into(),
+                "has value metadata (a linked or rich data type)"
+            )
         );
     }
     // Workbook-level refusals and value errors carry no worksheet.
@@ -123,9 +142,10 @@ fn worksheet_names_are_debug_quoted() {
         worksheet("<sheetData><row r='1'><c r='A1'><f>1</f><v>1</v></c></row></sheetData>"),
     )]);
     let error = book.set_cell("Q\"1 & \\", "A1", 2).unwrap_err();
+    assert_eq!(protected(&error).0, "Q\"1 & \\");
     assert_eq!(
-        message(&error),
-        "worksheet \"Q\\\"1 & \\\\\": A1 contains a formula"
+        error.to_string(),
+        "protected cell: worksheet \"Q\\\"1 & \\\\\": A1 contains a formula"
     );
 }
 
@@ -153,7 +173,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         (
             "unreadable value",
             worksheet("<sheetData><row r='1'><c r='A1' t='b'><v>2</v></c></row></sheetData>"),
-            Error::Unsupported(String::new()),
+            Error::InvalidWorkbook(String::new()),
         ),
         (
             "not a worksheet",
@@ -384,4 +404,269 @@ fn discovery_names_duplicate_targets_and_misplaced_sheets_as_invalid() {
             "{sheets}: {error:?}"
         );
     }
+}
+
+/// A worksheet holding one cell of each protected kind, with its relationships
+/// to an Excel table on J1:K3 whose header row is J1:K1.
+fn guarded_parts() -> BTreeMap<String, Vec<u8>> {
+    let guarded = format!(
+        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData><row r='1'>\
+         <c r='A1'><f>1+1</f><v>2</v></c>\
+         <c r='B1'><f t='shared' si='0' ref='B1:C2'>1</f><v>1</v></c><c r='C1'><f t='shared' si='0'/><v>1</v></c>\
+         <c r='D1'><f t='array' ref='D1:D3'>1</f><v>1</v></c>\
+         <c r='E1'><f t='dataTable' ref='E1:E3' dt2D='0' dtr='0' r1='A1'/><v>1</v></c>\
+         <c r='F1'><v>1</v></c>\
+         <c r='H1' vm='1'><v>1</v></c>\
+         <c r='J1' t='inlineStr'><is><t>Name</t></is></c><c r='K1' t='inlineStr'><is><t>Size</t></is></c>\
+         </row></sheetData><mergeCells count='1'><mergeCell ref='F1:G2'/></mergeCells>\
+         <tableParts count='1'><tablePart r:id='t1'/></tableParts></worksheet>"
+    );
+    let mut parts = parts(&[("Alpha", worksheet(CELL)), ("Beta", guarded.into_bytes())]);
+    parts.insert(
+        "xl/worksheets/_rels/sheet2.xml.rels".into(),
+        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+    );
+    parts.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='J1:K3'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Size'/></tableColumns></table>").into_bytes(),
+    );
+    parts
+}
+
+#[test]
+fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
+    let original = archive(&guarded_parts());
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    for (address, value, reason) in [
+        ("A1", CellValue::from(2), "contains a formula"),
+        ("C1", CellValue::Blank, "contains a formula"),
+        ("C2", CellValue::from("x"), "belongs to a formula range"),
+        ("D3", CellValue::from(true), "belongs to a formula range"),
+        ("E2", CellValue::from(1), "belongs to a formula range"),
+        (
+            "G2",
+            CellValue::from(1),
+            "is merged into another cell's range",
+        ),
+        (
+            "J1",
+            CellValue::from("Label"),
+            "is an Excel table header cell; editing it would desynchronize the table's column names",
+        ),
+        (
+            "K1",
+            CellValue::Blank,
+            "is an Excel table header cell; editing it would desynchronize the table's column names",
+        ),
+        (
+            "H1",
+            CellValue::from(5),
+            "has value metadata (a linked or rich data type)",
+        ),
+    ] {
+        let cell: CellRef = address.parse().unwrap();
+        let alpha = CellEdit::new("Alpha", "B1", 1).unwrap();
+        let edit = CellEdit::at("Beta", cell, value.clone()).unwrap();
+        for (method, result) in [
+            ("set_cell", book.set_cell("Beta", address, value.clone())),
+            ("set_cell_at", book.set_cell_at("Beta", cell, value.clone())),
+            (
+                "set_cells",
+                book.set_cells(
+                    "Beta",
+                    [("F1", CellValue::from(3)), (address, value.clone())],
+                ),
+            ),
+            (
+                "set_cells_at",
+                book.set_cells_at("Beta", [(cell, value.clone())]),
+            ),
+            ("apply_edits", book.apply_edits([alpha, edit])),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(
+                protected(&error),
+                ("Beta", address.to_owned(), reason),
+                "{method} {address}"
+            );
+            // The worksheet is named once, by the variant's own message.
+            assert_eq!(
+                error.to_string(),
+                format!("protected cell: worksheet \"Beta\": {address} {reason}"),
+                "{method} {address}"
+            );
+            assert!(!book.has_changes(), "{method} {address}");
+        }
+    }
+    // Rewriting a header's or a value-metadata cell's current value is allowed,
+    // but H1 holds the number 1, not the text "1"; rewriting a formula's cached
+    // value is never allowed.
+    let error = book
+        .set_cells("Beta", [("J1", "Name"), ("H1", "1")])
+        .unwrap_err();
+    assert_eq!(protected(&error).1, "H1");
+    book.set_cells(
+        "Beta",
+        [("J1", CellValue::from("Name")), ("H1", CellValue::from(1))],
+    )
+    .unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(
+        protected(&book.set_cell("Beta", "A1", 2).unwrap_err()).2,
+        "contains a formula"
+    );
+    // Worksheet-level refusals stay unsupported and name the worksheet.
+    let incomplete = archive(&parts(&[(
+        "Beta",
+        worksheet(
+            "<sheetData><row r='1'><c r='A1'><f t='array'>1</f><v>1</v></c></row></sheetData>",
+        ),
+    )]));
+    let mut book = Workbook::from_bytes(incomplete).unwrap();
+    let error = book.set_cell("Beta", "Z9", 1).unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    assert_eq!(
+        message(&error),
+        "worksheet \"Beta\": A1 belongs to a formula group without a reference range"
+    );
+}
+
+/// A Data worksheet whose A1 is the shared string at index 0 and B1 a number,
+/// with the given shared-string part, or none.
+fn shared_string_book(table: Option<&[u8]>) -> Workbook {
+    let data = worksheet(
+        "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>2</v></c></row></sheetData>",
+    );
+    let mut parts = parts(&[("Data", data)]);
+    if let Some(table) = table {
+        let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+        parts.insert(
+            "xl/_rels/workbook.xml.rels".into(),
+            rels.replace(
+                "</Relationships>",
+                &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+            )
+            .into_bytes(),
+        );
+        parts.insert("xl/sharedStrings.xml".into(), table.to_vec());
+    }
+    Workbook::from_bytes(archive(&parts)).unwrap()
+}
+
+#[test]
+fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
+    let table = |body: &str| format!("<sst xmlns='{MAIN_NS}'>{body}</sst>").into_bytes();
+    let cases: [(&str, Vec<u8>, Error); 4] = [
+        (
+            "truncated",
+            format!("<sst xmlns='{MAIN_NS}'><si><t>a</t></si>").into_bytes(),
+            Error::Xml(String::new()),
+        ),
+        (
+            "undeclared entity",
+            table("<si><t>a&bogus;</t></si>"),
+            Error::Xml(String::new()),
+        ),
+        (
+            "string outside the table",
+            table("<x><si><t>a</t></si></x>"),
+            Error::Unsupported(String::new()),
+        ),
+        (
+            "wrong root",
+            format!("<worksheet xmlns='{MAIN_NS}'/>").into_bytes(),
+            Error::Unsupported(String::new()),
+        ),
+    ];
+    for (case, xml, expected) in cases {
+        let mut book = shared_string_book(Some(&xml));
+        let view = book.prepare_sheet("Data").unwrap();
+        let a1 = CellRef::new(1, 1).unwrap();
+        let errors = [
+            book.get_cell("Data", "A1").unwrap_err(),
+            book.get_cell_at("Data", a1).unwrap_err(),
+            book.get_cells("Data", ["B1", "A1"]).unwrap_err(),
+            book.get_cells_at("Data", [a1]).unwrap_err(),
+            view.get_cell("A1").unwrap_err(),
+            view.get_cells_at([a1]).unwrap_err(),
+        ];
+        for error in &errors {
+            assert_eq!(
+                discriminant(error),
+                discriminant(&expected),
+                "{case}: {error}"
+            );
+            let message = message(error);
+            assert!(
+                message.starts_with("part \"xl/sharedStrings.xml\": "),
+                "{case}: {message}"
+            );
+            assert!(!message.contains("worksheet"), "{case}: {message}");
+            assert_eq!(error.to_string(), errors[0].to_string(), "{case}");
+        }
+        // Cells that need no shared string stay readable.
+        assert_eq!(view.get_cell("B1").unwrap().value, CellValue::Number(2.0));
+        drop(view);
+        // An edit only compares against the table, so a damaged table leaves
+        // rewriting the cell a change rather than an error.
+        book.set_cell("Data", "A1", "a").unwrap();
+        assert!(book.has_changes(), "{case}");
+    }
+}
+
+#[test]
+fn table_headers_read_through_a_damaged_shared_string_table_name_that_part() {
+    let mut parts = guarded_parts();
+    let beta = String::from_utf8(parts["xl/worksheets/sheet2.xml"].clone()).unwrap();
+    parts.insert(
+        "xl/worksheets/sheet2.xml".into(),
+        beta.replace(
+            "<c r='J1' t='inlineStr'><is><t>Name</t></is></c>",
+            "<c r='J1' t='s'><v>0</v></c>",
+        )
+        .into_bytes(),
+    );
+    let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+    parts.insert(
+        "xl/_rels/workbook.xml.rels".into(),
+        rels.replace(
+            "</Relationships>",
+            &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+        )
+        .into_bytes(),
+    );
+    parts.insert(
+        "xl/sharedStrings.xml".into(),
+        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si>").into_bytes(),
+    );
+    let mut book = Workbook::from_bytes(archive(&parts)).unwrap();
+    let error = book.set_cell("Beta", "J1", "Other").unwrap_err();
+    assert!(
+        matches!(&error, Error::Xml(message) if message.starts_with("part \"xl/sharedStrings.xml\": ")),
+        "{error:?}"
+    );
+    assert!(!book.has_changes());
+}
+
+#[test]
+fn shared_string_cells_without_a_table_are_invalid_cells_of_their_worksheet() {
+    let book = shared_string_book(None);
+    let expected =
+        "worksheet \"Data\": A1: shared-string cell, but the workbook has no shared-string table";
+    for error in [
+        book.get_cell("Data", "A1").unwrap_err(),
+        book.prepare_sheet("Data")
+            .unwrap()
+            .get_cell("A1")
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message) if message == expected),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        book.get_cell("Data", "B1").unwrap().value,
+        CellValue::Number(2.0)
+    );
 }

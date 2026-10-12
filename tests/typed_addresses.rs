@@ -60,7 +60,7 @@ fn typed_batches_validate_overwritten_values_and_roll_back_on_formula_protection
     let pending = book.to_bytes().unwrap();
     assert!(matches!(
         book.set_cells_at("Data", [(b2, 10), (d1, 11)]),
-        Err(Error::Unsupported(_))
+        Err(Error::ProtectedCell { sheet, cell, .. }) if sheet == "Data" && cell == d1
     ));
     assert_eq!(book.to_bytes().unwrap(), pending);
     assert_eq!(

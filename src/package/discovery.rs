@@ -1,5 +1,5 @@
 //! Validated OOXML package discovery and relationship target resolution.
-use super::{Sheet, SheetVisibility};
+use super::{Sheet, SheetVisibility, in_part};
 use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
@@ -46,38 +46,56 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
 }
 
 /// The header rows of the Excel tables related to a worksheet part. Excel
-/// requires each header cell's text to equal its table column's name.
+/// requires each header cell's text to equal its table column's name. Errors
+/// name the relationships or table part they concern, not the worksheet.
 pub(super) fn table_headers(archive: &Archive, worksheet: &str) -> Result<Vec<CellRange>> {
     let rels_path = relationships_path(worksheet);
-    let Some(rels_path) = archive.part_name(&rels_path)? else {
+    let Some(rels_path) = archive
+        .part_name(&rels_path)
+        .map_err(|error| in_part(&rels_path, error))?
+    else {
         return Ok(Vec::new());
     };
+    let in_rels = |error| in_part(rels_path, error);
     let mut headers = Vec::new();
-    for relationship in relationships(&archive.read(rels_path)?)? {
+    let relationships = archive
+        .read(rels_path)
+        .and_then(|xml| relationships(&xml))
+        .map_err(in_rels)?;
+    for relationship in relationships {
         if !office_type(&relationship.kind, "table") {
             continue;
         }
         if relationship.external {
-            return Err(Error::InvalidWorkbook(format!(
+            return Err(in_rels(Error::InvalidWorkbook(format!(
                 "table relationship {} is external",
                 relationship.id
-            )));
+            ))));
         }
-        let path = resolve_part_target(archive, worksheet, &relationship.target)?;
+        let path =
+            resolve_part_target(archive, worksheet, &relationship.target).map_err(in_rels)?;
         if !archive.contains(&path) {
-            return Err(Error::InvalidWorkbook(format!("missing table part {path}")));
+            return Err(in_rels(Error::InvalidWorkbook(format!(
+                "missing table part {path}"
+            ))));
         }
-        headers.extend(table_header(&path, &archive.read(&path)?)?);
+        let header = archive
+            .read(&path)
+            .and_then(|xml| table_header(&xml))
+            .map_err(|error| in_part(&path, error))?;
+        headers.extend(header);
     }
     Ok(headers)
 }
 
-fn table_header(path: &str, xml: &[u8]) -> Result<Option<CellRange>> {
-    let invalid = |problem: &str| Error::InvalidWorkbook(format!("table part {path} {problem}"));
+fn table_header(xml: &[u8]) -> Result<Option<CellRange>> {
+    let invalid = |problem: &str| Error::InvalidWorkbook(format!("table {problem}"));
     let nodes = xml_nodes(xml, root_only)?;
     let table = &nodes[0];
     if table.local != "table" || !main_namespace(&table.namespace) {
-        return Err(invalid("is not a SpreadsheetML table"));
+        return Err(Error::InvalidWorkbook(
+            "expected a SpreadsheetML table".into(),
+        ));
     }
     let reference = table
         .attr("", "ref")

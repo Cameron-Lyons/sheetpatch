@@ -96,7 +96,8 @@ fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
             CellEdit::new("Other", "A1", 10).unwrap(),
             CellEdit::new("Data", "D1", 11).unwrap(),
         ]),
-        Err(Error::Unsupported(_))
+        Err(Error::ProtectedCell { sheet, cell, .. })
+            if sheet == "Data" && cell.to_string() == "D1"
     ));
     assert_eq!(book.to_bytes().unwrap(), pending);
     assert_eq!(

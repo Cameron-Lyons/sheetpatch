@@ -33,7 +33,7 @@ fn book(worksheet: &str) -> Workbook {
 fn addresses(book: &Workbook) -> Vec<String> {
     book.prepare_sheet("Data")
         .unwrap()
-        .cell_refs()
+        .cells()
         .map(|cell| cell.to_string())
         .collect()
 }
@@ -49,10 +49,10 @@ fn used_range(book: &Workbook) -> Option<String> {
 fn fixture_cells_are_enumerated_with_their_contents() {
     let book = Workbook::from_bytes(include_bytes!("fixtures/libreoffice.xlsx").to_vec()).unwrap();
     let view = book.prepare_sheet("Data").unwrap();
-    let cells: Vec<String> = view.cell_refs().map(|cell| cell.to_string()).collect();
+    let cells: Vec<String> = view.cells().map(|cell| cell.to_string()).collect();
     assert_eq!(cells, ["A1", "B1", "C1", "D1", "E1"]);
     assert_eq!(view.used_range(), Some("A1:E1".parse().unwrap()));
-    let contents = view.get_cells_at(view.cell_refs()).unwrap();
+    let contents = view.get_cells_at(view.cells()).unwrap();
     assert_eq!(contents[1].value, CellValue::Number(12.5));
     assert_eq!(contents[3].formula.as_deref(), Some("B1*2"));
     assert_eq!(contents[3].value, CellValue::Number(25.0));
@@ -91,7 +91,7 @@ fn sparse_and_style_only_cells_define_the_used_range_rather_than_the_dimension()
     assert_eq!(used_range(&book).as_deref(), Some("B3:F9"));
     let view = book.prepare_sheet("Data").unwrap();
     let values: Vec<CellValue> = view
-        .get_cells_at(view.cell_refs())
+        .get_cells_at(view.cells())
         .unwrap()
         .into_iter()
         .map(|content| content.value)
