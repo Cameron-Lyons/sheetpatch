@@ -1,10 +1,12 @@
 //! Option placement, argument counts, and error message formats of the CLI.
+mod common;
+
+use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 const FIXTURE: &str = concat!(
@@ -24,43 +26,28 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    /// A directory holding `in.xlsx` and a one-row `p.tsv`.
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sheetpatch-cli-args-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        fs::copy(FIXTURE, path.join("in.xlsx")).unwrap();
-        fs::write(path.join("p.tsv"), "Data\tA1\ttext\tPatched\n").unwrap();
-        Self(path)
-    }
-
-    fn names(&self) -> Vec<String> {
-        let mut names: Vec<_> = fs::read_dir(&self.0)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
-    }
+/// A temporary directory holding `in.xlsx` and a one-row `p.tsv`.
+fn workspace() -> TempDir {
+    let directory = TempDir::new();
+    fs::copy(FIXTURE, directory.join("in.xlsx")).unwrap();
+    fs::write(directory.join("p.tsv"), "Data\tA1\ttext\tPatched\n").unwrap();
+    directory
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// The sorted names of the files in `directory`.
+fn names(directory: &TempDir) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
 fn misplaced_options_are_usage_errors_and_never_become_files() {
-    let directory = TempDir::new();
-    let original = fs::read(directory.0.join("in.xlsx")).unwrap();
+    let directory = workspace();
+    let original = fs::read(directory.join("in.xlsx")).unwrap();
     for (args, slot, synopsis) in [
         (
             vec!["patch", "in.xlsx", "--check", "p.tsv"],
@@ -105,6 +92,27 @@ fn misplaced_options_are_usage_errors_and_never_become_files() {
             Some("sheetpatch get --json INPUT SHEET CELL [CELL ...]"),
         ),
         (
+            vec!["get", "in.xlsx", "Data", "A1:B2", "-h"],
+            None,
+            Some("sheetpatch get -h"),
+        ),
+        (
+            vec!["cells", "in.xlsx", "Data", "--json"],
+            None,
+            Some("sheetpatch cells --json INPUT SHEET [RANGE]"),
+        ),
+        (
+            vec!["cells", "in.xlsx", "Data", "A1:B2", "--json"],
+            None,
+            Some("sheetpatch cells --json INPUT SHEET [RANGE]"),
+        ),
+        (
+            vec!["cells", "--json", "in.xlsx", "Data", "--help"],
+            None,
+            Some("sheetpatch cells --help"),
+        ),
+        (vec!["cells", "--json", "-in.xlsx", "Data"], None, None),
+        (
             vec!["patch", "in.xlsx", "out.xlsx", "p.tsv", "--check"],
             None,
             Some("sheetpatch patch --check INPUT PATCH.tsv"),
@@ -117,7 +125,7 @@ fn misplaced_options_are_usage_errors_and_never_become_files() {
             None,
         ),
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         let message = stderr(&output);
@@ -137,14 +145,14 @@ fn misplaced_options_are_usage_errors_and_never_become_files() {
         if let Some(synopsis) = synopsis {
             assert!(message.contains(synopsis), "{message}");
         }
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"], "{args:?}");
-        assert_eq!(fs::read(directory.0.join("in.xlsx")).unwrap(), original);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"], "{args:?}");
+        assert_eq!(fs::read(directory.join("in.xlsx")).unwrap(), original);
     }
 }
 
 #[test]
 fn unknown_and_repeated_options_are_usage_errors() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for (args, expected) in [
         (
             vec!["get", "--bogus", "in.xlsx", "Data", "A1"],
@@ -167,6 +175,14 @@ fn unknown_and_repeated_options_are_usage_errors() {
             "option \"--json\" is repeated",
         ),
         (
+            vec!["cells", "--json", "--json", "in.xlsx", "Data"],
+            "option \"--json\" is repeated",
+        ),
+        (
+            vec!["cells", "--check", "in.xlsx", "Data"],
+            "unknown option \"--check\" for cells; it accepts --json, --help or -h",
+        ),
+        (
             vec!["patch", "--check", "--check", "in.xlsx", "p.tsv"],
             "option \"--check\" is repeated",
         ),
@@ -187,7 +203,7 @@ fn unknown_and_repeated_options_are_usage_errors() {
             "unexpected argument \"list\" after --help",
         ),
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());
         let message = stderr(&output);
@@ -196,13 +212,13 @@ fn unknown_and_repeated_options_are_usage_errors() {
             "{message}"
         );
         assert!(message.contains("\n\nUsage:\n"), "{message}");
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"]);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"]);
     }
 }
 
 #[test]
 fn wrong_argument_counts_print_the_expected_form_and_full_usage() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for (args, expected) in [
         (vec![], "missing command"),
         (vec!["list"], "sheetpatch list [--json] INPUT"),
@@ -213,6 +229,14 @@ fn wrong_argument_counts_print_the_expected_form_and_full_usage() {
         (
             vec!["get", "in.xlsx", "Data"],
             "sheetpatch get [--json] INPUT SHEET CELL [CELL ...]",
+        ),
+        (
+            vec!["cells", "in.xlsx"],
+            "sheetpatch cells [--json] INPUT SHEET [RANGE]",
+        ),
+        (
+            vec!["cells", "--json", "in.xlsx", "Data", "A1", "B2"],
+            "sheetpatch cells [--json] INPUT SHEET [RANGE]",
         ),
         (
             vec!["set", "in.xlsx", "out.xlsx", "Data", "A1"],
@@ -244,19 +268,19 @@ fn wrong_argument_counts_print_the_expected_form_and_full_usage() {
         ),
         (vec!["help", "Text"], "unknown command \"Text\" for help"),
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());
         let message = stderr(&output);
         assert!(message.contains(expected), "{message}");
         assert!(message.contains("\n\nUsage:\n"), "{message}");
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"]);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"]);
     }
 }
 
 #[test]
 fn data_errors_print_one_quoted_line_and_a_help_hint() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for (args, expected) in [
         (
             vec!["set", "in.xlsx", "out.xlsx", "Data", "A1", "number", "42 "],
@@ -282,49 +306,103 @@ fn data_errors_print_one_quoted_line_and_a_help_hint() {
             vec!["get", "--json", "in.xlsx", "Data", "-5"],
             "invalid cell reference \"-5\"\nRun 'sheetpatch help get' for details.",
         ),
+        (
+            vec!["get", "in.xlsx", "Data", "A1:"],
+            "invalid cell range \"A1:\"\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["get", "in.xlsx", "Data", "A1", "A:C"],
+            "invalid cell range \"A:C\"\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["get", "in.xlsx", "Data", "$A$1:B2"],
+            "invalid cell range \"$A$1:B2\"\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["get", "in.xlsx", "Data", "A1:B2:C3"],
+            "invalid cell range \"A1:B2:C3\"\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["get", "in.xlsx", "Data", "A1:XFE1"],
+            "invalid cell range \"A1:XFE1\"\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["cells", "in.xlsx", "Data", "B2:"],
+            "invalid cell range \"B2:\"\nRun 'sheetpatch help cells' for details.",
+        ),
+        (
+            vec!["cells", "--json", "in.xlsx", "Data", "A0"],
+            "invalid cell reference \"A0\"\nRun 'sheetpatch help cells' for details.",
+        ),
+        (
+            vec!["cells", "in.xlsx", "Data", "-5"],
+            "invalid cell reference \"-5\"\nRun 'sheetpatch help cells' for details.",
+        ),
+        // Ranges are counted before they are expanded, so whole-sheet
+        // requests fail at once.
+        (
+            vec!["get", "in.xlsx", "Data", "A1:XFD1048576"],
+            "too many cells: the CELL arguments name 17179869184 cells, but one get reads at most 1048576\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec!["get", "--json", "in.xlsx", "Data", "A1:XFD64", "B2"],
+            "too many cells: the CELL arguments name 1048577 cells, but one get reads at most 1048576\nRun 'sheetpatch help get' for details.",
+        ),
+        (
+            vec![
+                "get",
+                "in.xlsx",
+                "Data",
+                "A1:A1048576",
+                "a1048576:XFD1048576",
+            ],
+            "too many cells: the CELL arguments name 1064960 cells, but one get reads at most 1048576\nRun 'sheetpatch help get' for details.",
+        ),
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());
         assert_eq!(stderr(&output), format!("sheetpatch: {expected}\n"));
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"]);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"]);
     }
 }
 
 #[test]
 fn missing_sheets_are_quoted_so_invisible_characters_show() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for args in [
         vec!["get", "in.xlsx", "Data ", "A1"],
-        vec!["get", "--json", "in.xlsx", "Data ", "A1"],
+        vec!["get", "--json", "in.xlsx", "Data ", "A1:B2"],
+        vec!["cells", "in.xlsx", "Data "],
+        vec!["cells", "--json", "in.xlsx", "Data ", "A1:B2"],
         vec!["set", "in.xlsx", "out.xlsx", "Data ", "A1", "text", "x"],
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         assert!(output.stdout.is_empty());
         assert_eq!(
             stderr(&output),
             "sheetpatch: worksheet not found: \"Data \"\n"
         );
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"]);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"]);
     }
 }
 
 #[test]
 fn values_and_sheet_names_may_start_with_a_dash() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for (kind, value, expected) in [
         ("number", "-5", CellValue::Number(-5.0)),
         ("text", "--json", CellValue::Text("--json".into())),
         ("text", "-", CellValue::Text("-".into())),
     ] {
         let output = cli_in(
-            &directory.0,
+            directory.path(),
             &["set", "in.xlsx", "out.xlsx", "Data", "A1", kind, value],
         );
         assert!(output.status.success(), "{}", stderr(&output));
         assert_eq!(
-            Workbook::open(directory.0.join("out.xlsx"))
+            Workbook::open(directory.join("out.xlsx"))
                 .unwrap()
                 .get_cell("Data", "A1")
                 .unwrap()
@@ -333,7 +411,7 @@ fn values_and_sheet_names_may_start_with_a_dash() {
         );
     }
     // A sheet name is never taken for an option; this one does not exist.
-    let output = cli_in(&directory.0, &["get", "in.xlsx", "--json", "A1"]);
+    let output = cli_in(directory.path(), &["get", "in.xlsx", "--json", "A1"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
@@ -343,9 +421,9 @@ fn values_and_sheet_names_may_start_with_a_dash() {
 
 #[test]
 fn files_named_like_options_are_reached_with_a_relative_prefix() {
-    let directory = TempDir::new();
-    fs::copy(FIXTURE, directory.0.join("-in.xlsx")).unwrap();
-    let listed = cli_in(&directory.0, &["list", "./-in.xlsx"]);
+    let directory = workspace();
+    fs::copy(FIXTURE, directory.join("-in.xlsx")).unwrap();
+    let listed = cli_in(directory.path(), &["list", "./-in.xlsx"]);
     assert!(listed.status.success(), "{}", stderr(&listed));
     assert_eq!(listed.stdout, b"Data\nNotes\n");
     for args in [
@@ -353,16 +431,16 @@ fn files_named_like_options_are_reached_with_a_relative_prefix() {
         vec!["patch", "in.xlsx", "./--check", "p.tsv"],
         vec!["compact", "in.xlsx", "./-"],
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(output.stdout.is_empty());
     }
     assert_eq!(
-        directory.names(),
+        names(&directory),
         ["-", "--check", "--help", "-in.xlsx", "in.xlsx", "p.tsv"]
     );
     assert_eq!(
-        Workbook::open(directory.0.join("--check"))
+        Workbook::open(directory.join("--check"))
             .unwrap()
             .get_cell("Data", "A1")
             .unwrap()
@@ -373,19 +451,20 @@ fn files_named_like_options_are_reached_with_a_relative_prefix() {
 
 #[test]
 fn help_options_right_after_a_command_show_its_help() {
-    let directory = TempDir::new();
+    let directory = workspace();
     for (args, command) in [
         (vec!["get", "--json", "--help"], "get"),
+        (vec!["cells", "-h", "--json", "in.xlsx", "Data"], "cells"),
         (vec!["patch", "--check", "-h", "in.xlsx", "p.tsv"], "patch"),
         (vec!["compact", "--help", "in.xlsx", "out.xlsx"], "compact"),
     ] {
-        let output = cli_in(&directory.0, &args);
+        let output = cli_in(directory.path(), &args);
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(output.stderr.is_empty());
         assert_eq!(
             output.stdout,
-            cli_in(&directory.0, &["help", command]).stdout
+            cli_in(directory.path(), &["help", command]).stdout
         );
-        assert_eq!(directory.names(), ["in.xlsx", "p.tsv"]);
+        assert_eq!(names(&directory), ["in.xlsx", "p.tsv"]);
     }
 }

@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashSet,
     env,
     ffi::{OsStr, OsString},
     fmt,
@@ -11,18 +10,24 @@ use std::{
     process::ExitCode,
 };
 
-use sheetpatch::{CellContent, CellEdit, CellRef, CellValue, Sheet, Workbook};
+use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, SheetVisibility, Workbook};
 
-const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nOptions go right after the command. Write a file whose name starts with - as ./NAME.\nUse - as INPUT to read the workbook from stdin, or as OUTPUT to write it to stdout when stdout is not a terminal.\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin; INPUT and PATCH.tsv cannot both be -. Use LF or CRLF line endings.\nEmpty lines are ignored. Lines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\n--json returns an array: list includes names and paths; get includes types, values, formulas and styles.\nOn a terminal, plain list and get output shows control characters as \\u{..} escapes; --json is exact.";
+const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch cells [--json] INPUT SHEET [RANGE]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nOptions go right after the command. Write a file whose name starts with - as ./NAME.\nUse - as INPUT to read the workbook from stdin, or as OUTPUT to write it to stdout when stdout is not a terminal.\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin; INPUT and PATCH.tsv cannot both be -. Use LF or CRLF line endings.\nEmpty lines are ignored. Lines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\nA get CELL may be a range such as A1:C3, read row by row; one get reads at most 1048576 cells.\ncells prints CELL<TAB>TYPE<TAB>VALUE for each cell holding a value or formula, optionally within RANGE.\n--json returns an array: list includes names, paths and visibility; get and cells include types, values, formulas and styles.\nOn a terminal, plain list, get and cells output shows control characters as \\u{..} escapes; --json is exact.";
+
+/// The most cells one `get` reads, counting every cell of each range.
+const MAX_GET_CELLS: u64 = 1_048_576;
 
 fn command_help(command: &str) -> Option<&'static str> {
     match command {
         "help" => Some(USAGE),
         "list" => Some(
-            "Usage: sheetpatch list [--json] INPUT\n\nList editable worksheets in workbook order. --json includes each worksheet's name and package path. Use - as INPUT to read the workbook from standard input. On a terminal, control characters in names are shown as \\u{..} escapes; --json output is exact.",
+            "Usage: sheetpatch list [--json] INPUT\n\nList editable worksheets, including hidden ones, in workbook order. --json includes each worksheet's name, package path and visibility: visible, hidden or veryHidden. Use - as INPUT to read the workbook from standard input. On a terminal, control characters in names, including tabs and line feeds, are shown as \\u{..} escapes; --json output is exact.",
         ),
         "get" => Some(
-            "Usage: sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n\nRead A1 addresses in input order with one worksheet parse. Names are case-sensitive; addresses accept lowercase letters. Formula results are stored caches, without recalculation. --json includes normalized addresses, scalar types, values, formulas and style indices. Blank values use null in JSON and an empty line in plain output. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters as \\u{..} escapes; --json output is exact.",
+            "Usage: sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n\nRead A1 addresses in input order with one worksheet parse. A CELL may also be a range such as A1:C3, which is read row by row from its top-left cell; one get reads at most 1048576 cells. Names are case-sensitive; addresses accept lowercase letters. Formula results are stored caches, without recalculation. --json includes normalized addresses, scalar types, values, formulas and style indices. Blank values use null in JSON and an empty line in plain output. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes; --json output is exact.",
+        ),
+        "cells" => Some(
+            "Usage: sheetpatch cells [--json] INPUT SHEET [RANGE]\n\nList the cells of a worksheet that hold a value or a formula, row by row, with one worksheet parse. A RANGE such as A1:C3 or B2 limits the list to the cells within it. Cells holding only formatting are skipped. Plain output has one CELL<TAB>TYPE<TAB>VALUE line per cell, with the types text, number, bool, error or blank, and values printed as get prints them. Prefixing each line with the sheet name and a tab gives patch rows for values without line breaks. Formula results are stored caches, without recalculation. --json returns the same objects as get --json, including formulas and style indices, and is exact. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes.",
         ),
         "set" => Some(
             "Usage:\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n\nSet one scalar cell value and save atomically. Text stays text even when it starts with =. Numbers must be finite; booleans are true or false; error tokens include #N/A and #DIV/0!. Blank clears the value while retaining formatting. Formula cells and merged-range followers are protected. INPUT and OUTPUT may be the same path. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal.",
@@ -49,11 +54,14 @@ enum Failure {
     },
     /// A workbook could not be read, edited, or written.
     Workbook(sheetpatch::Error),
-    /// A workbook error, prefixed with the operation and path that failed.
+    /// A workbook error, prefixed with what failed: an operation and its path
+    /// or stream, or the patch line whose edit was refused.
     Context(String, sheetpatch::Error),
     /// A request names something the workbook does not contain.
     Rejected(String),
-    /// Writing to standard output failed.
+    /// Writing text to standard output failed. A workbook that cannot be
+    /// written to standard output is a `Context` failure instead, so a closed
+    /// pipe is never mistaken for a complete archive.
     Output(io::Error),
 }
 
@@ -112,6 +120,7 @@ impl From<io::Error> for Failure {
 enum Command {
     List,
     Get,
+    Cells,
     Set,
     Patch,
     Compact,
@@ -122,6 +131,7 @@ impl Command {
         match name {
             "list" => Some(Self::List),
             "get" => Some(Self::Get),
+            "cells" => Some(Self::Cells),
             "set" => Some(Self::Set),
             "patch" => Some(Self::Patch),
             "compact" => Some(Self::Compact),
@@ -133,6 +143,7 @@ impl Command {
         match self {
             Self::List => "list",
             Self::Get => "get",
+            Self::Cells => "cells",
             Self::Set => "set",
             Self::Patch => "patch",
             Self::Compact => "compact",
@@ -148,6 +159,7 @@ impl Command {
                 "--json",
                 "sheetpatch get --json INPUT SHEET CELL [CELL ...]",
             )),
+            Self::Cells => Some(("--json", "sheetpatch cells --json INPUT SHEET [RANGE]")),
             Self::Patch => Some(("--check", "sheetpatch patch --check INPUT PATCH.tsv")),
             Self::Set | Self::Compact => None,
         }
@@ -172,8 +184,10 @@ enum Slot {
     /// A file path, or `-` for a standard stream. Paths that look like options
     /// are rejected so a misplaced flag never becomes a file name.
     Path(&'static str),
-    /// A cell address. A trailing `Cell` slot repeats.
+    /// A cell address or range. A trailing `Cell` slot repeats.
     Cell,
+    /// A single optional cell range, which unlike `Cell` does not repeat.
+    Range,
     /// A sheet name, value type, or value, which may legitimately start with '-'.
     Text,
 }
@@ -250,7 +264,7 @@ impl<'a> CommandLine<'a> {
                 }
                 // An address never starts with '-'; name the misplaced option
                 // instead of reporting an invalid address.
-                Some(Slot::Cell) if self.command.synopsis_for(arg).is_some() => {
+                Some(Slot::Cell | Slot::Range) if self.command.synopsis_for(arg).is_some() => {
                     return Err(self.misplaced_option(arg, None));
                 }
                 None if is_option(arg) => return Err(self.misplaced_option(arg, None)),
@@ -398,8 +412,12 @@ impl<'a> Destination<'a> {
                     workbook.write_to(&mut *output)
                 };
                 // Archive generation reports I/O errors only from its writer.
+                // Unlike text, a truncated archive is unusable, so even a pipe
+                // closed by its reader is a failure.
                 written.map_err(|error| match error {
-                    sheetpatch::Error::Io(error) => Failure::Output(error),
+                    sheetpatch::Error::Io(_) => {
+                        Failure::Context("cannot write workbook to standard output".into(), error)
+                    }
                     error => Failure::Workbook(error),
                 })
             }
@@ -449,20 +467,46 @@ fn parse_cell(address: &str) -> Result<CellRef, String> {
         .map_err(|_| format!("invalid cell reference {address:?}"))
 }
 
+/// Parse a range such as `A1:C3`, or a single address such as `B2`.
+fn parse_range(command: &'static str, range: &str) -> Result<CellRange, Failure> {
+    range.parse().map_err(|_| {
+        let kind = if range.contains(':') {
+            "cell range"
+        } else {
+            "cell reference"
+        };
+        Failure::invalid(command, format!("invalid {kind} {range:?}"))
+    })
+}
+
 fn sheet_not_found(sheet: &str) -> String {
     format!("worksheet not found: {sheet:?}")
 }
 
 fn require_sheet(workbook: &Workbook, sheet: &str) -> Result<(), Failure> {
-    if workbook
-        .sheets()
-        .iter()
-        .any(|candidate| candidate.name() == sheet)
-    {
-        Ok(())
-    } else {
-        Err(Failure::Rejected(sheet_not_found(sheet)))
+    match workbook.sheet(sheet) {
+        Some(_) => Ok(()),
+        None => Err(Failure::Rejected(sheet_not_found(sheet))),
     }
+}
+
+/// Find the patch line behind a refused edit. The library names the refused
+/// cell at the start of its message as `worksheet "NAME": CELL`, built with
+/// the same formatting as here; the last line that targets that worksheet and
+/// cell supplied the value that was applied.
+fn refused_line(rows: &[(usize, CellEdit)], error: &sheetpatch::Error) -> Option<usize> {
+    let (sheetpatch::Error::Unsupported(message)
+    | sheetpatch::Error::Xml(message)
+    | sheetpatch::Error::InvalidWorkbook(message)) = error
+    else {
+        return None;
+    };
+    let message = message.strip_prefix("worksheet ")?;
+    rows.iter().rev().find_map(|(line, edit)| {
+        let rest = message.strip_prefix(&format!("{:?}: {}", edit.sheet(), edit.cell()))?;
+        // The address must end here, so that A1 does not match A10.
+        rest.starts_with([' ', ':']).then_some(*line)
+    })
 }
 
 /// Read patch rows with their one-based line numbers. `origin` names the
@@ -580,33 +624,94 @@ fn write_json_array<W: Write, T>(
     output.write_all(b"]\n")
 }
 
-/// Write one line of plain output. On a terminal, C0 controls other than tab
-/// and line feed, DEL, and C1 controls are shown as `\u{..}` escapes so text
-/// from a workbook cannot move the cursor, clear the screen, or retitle the
-/// window. Pipes and files receive the exact text.
-fn write_plain_line(output: &mut impl Write, text: &str, terminal: bool) -> io::Result<()> {
-    let mut start = 0;
-    if terminal {
-        for (index, ch) in text.char_indices() {
-            if ch.is_control() && !matches!(ch, '\t' | '\n') {
-                output.write_all(&text.as_bytes()[start..index])?;
-                write!(output, "\\u{{{:x}}}", ch as u32)?;
-                start = index + ch.len_utf8();
-            }
-        }
-    }
-    output.write_all(&text.as_bytes()[start..])?;
-    output.write_all(b"\n")
+/// The characters that plain output shows as `\u{..}` escapes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    /// Pipes and files receive the exact text.
+    Exact,
+    /// Cell values on a terminal: C0 controls other than tab and line feed,
+    /// DEL, and C1 controls, so text from a workbook cannot move the cursor,
+    /// clear the screen, or retitle the window.
+    Controls,
+    /// Names on a terminal, one per line: every control, including tab and
+    /// line feed, so one crafted name cannot look like two.
+    AllControls,
 }
 
-fn write_scalar(output: &mut impl Write, value: &CellValue, terminal: bool) -> io::Result<()> {
-    match value {
-        CellValue::Text(value) | CellValue::Error(value) => {
-            write_plain_line(output, value, terminal)
+impl Escape {
+    fn values(terminal: bool) -> Self {
+        if terminal {
+            Self::Controls
+        } else {
+            Self::Exact
         }
-        CellValue::Number(value) => writeln!(output, "{value}"),
-        CellValue::Bool(value) => writeln!(output, "{value}"),
-        CellValue::Blank => writeln!(output),
+    }
+
+    fn names(terminal: bool) -> Self {
+        if terminal {
+            Self::AllControls
+        } else {
+            Self::Exact
+        }
+    }
+
+    fn applies(self, ch: char) -> bool {
+        match self {
+            Self::Exact => false,
+            Self::Controls => ch.is_control() && !matches!(ch, '\t' | '\n'),
+            Self::AllControls => ch.is_control(),
+        }
+    }
+}
+
+/// Displays a value for plain output with the characters its `Escape` selects
+/// shown as `\u{..}` escapes.
+struct Escaped<T>(T, Escape);
+
+impl<T: fmt::Display> fmt::Display for Escaped<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Escaping<'a, 'b>(&'a mut fmt::Formatter<'b>, Escape);
+
+        impl fmt::Write for Escaping<'_, '_> {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                let mut start = 0;
+                for (index, ch) in text.char_indices() {
+                    if self.1.applies(ch) {
+                        self.0.write_str(&text[start..index])?;
+                        write!(self.0, "\\u{{{:x}}}", u32::from(ch))?;
+                        start = index + ch.len_utf8();
+                    }
+                }
+                self.0.write_str(&text[start..])
+            }
+        }
+
+        match self.1 {
+            Escape::Exact => fmt::Display::fmt(&self.0, f),
+            escape => fmt::Write::write_fmt(&mut Escaping(f, escape), format_args!("{}", self.0)),
+        }
+    }
+}
+
+/// The `TYPE` of a value, as patch rows and JSON output spell it.
+fn value_type(value: &CellValue) -> &'static str {
+    match value {
+        CellValue::Text(_) => "text",
+        CellValue::Number(_) => "number",
+        CellValue::Bool(_) => "bool",
+        CellValue::Error(_) => "error",
+        CellValue::Blank => "blank",
+    }
+}
+
+fn visibility_name(visibility: SheetVisibility) -> &'static str {
+    match visibility {
+        SheetVisibility::Visible => "visible",
+        SheetVisibility::Hidden => "hidden",
+        SheetVisibility::VeryHidden => "veryHidden",
+        // The CLI ships with the library, so a state added later gets its
+        // own name here; the enumeration is open only to other crates.
+        _ => "unknown",
     }
 }
 
@@ -619,19 +724,14 @@ fn write_json_cell(
     output.write_all(b"{\"sheet\":")?;
     write_json_string(output, sheet)?;
     write!(output, ",\"cell\":\"{cell}\"")?;
-    let kind = match content.value {
-        CellValue::Text(_) => "text",
-        CellValue::Number(_) => "number",
-        CellValue::Bool(_) => "bool",
-        CellValue::Error(_) => "error",
-        CellValue::Blank => "blank",
-    };
+    let kind = value_type(&content.value);
     write!(output, ",\"type\":\"{kind}\",\"value\":")?;
     match &content.value {
-        CellValue::Text(value) | CellValue::Error(value) => write_json_string(output, value)?,
-        CellValue::Number(value) => write!(output, "{value}")?,
-        CellValue::Bool(value) => write!(output, "{value}")?,
+        CellValue::Text(text) | CellValue::Error(text) => write_json_string(output, text)?,
         CellValue::Blank => output.write_all(b"null")?,
+        // Numbers are finite and displayed without exponents, and booleans as
+        // true or false, so both display as JSON literals.
+        value => write!(output, "{value}")?,
     }
     output.write_all(b",\"formula\":")?;
     match &content.formula {
@@ -675,11 +775,13 @@ fn cmd_list(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resu
             write_json_string(output, sheet.name())?;
             output.write_all(b",\"path\":")?;
             write_json_string(output, sheet.path())?;
-            output.write_all(b"}")
+            let visibility = visibility_name(sheet.visibility());
+            write!(output, ",\"visibility\":\"{visibility}\"}}")
         })?;
     } else {
+        let escape = Escape::names(terminal);
         for sheet in sheets {
-            write_plain_line(output, sheet.name(), terminal)?;
+            writeln!(output, "{}", Escaped(sheet.name(), escape))?;
         }
     }
     Ok(())
@@ -692,11 +794,24 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
         "sheetpatch get [--json] INPUT SHEET CELL [CELL ...]",
     )?;
     let sheet = line.text(1)?;
-    let cells = (2..args.len())
-        .map(|index| {
-            parse_cell(line.text(index)?).map_err(|message| Failure::invalid("get", message))
-        })
+    let ranges = (2..args.len())
+        .map(|index| parse_range("get", line.text(index)?))
         .collect::<Result<Vec<_>, _>>()?;
+    // Count before expanding, so that a whole-sheet range fails without
+    // allocating an address for every cell.
+    let count = ranges.iter().fold(0u64, |count, range| {
+        count.saturating_add(range.cell_count())
+    });
+    if count > MAX_GET_CELLS {
+        return Err(Failure::invalid(
+            "get",
+            format!(
+                "too many cells: the CELL arguments name {count} cells, but one get reads at most {MAX_GET_CELLS}"
+            ),
+        ));
+    }
+    let mut cells = Vec::with_capacity(count as usize);
+    cells.extend(ranges.into_iter().flat_map(CellRange::cells));
     let workbook = Source::new(line.command, &args[0])?.open()?;
     require_sheet(&workbook, sheet)?;
     let contents = workbook.get_cells_at(sheet, cells.iter().copied())?;
@@ -707,8 +822,52 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
             |output, (cell, content)| write_json_cell(output, sheet, *cell, content),
         )?;
     } else {
+        let escape = Escape::values(terminal);
         for content in &contents {
-            write_scalar(output, &content.value, terminal)?;
+            writeln!(output, "{}", Escaped(&content.value, escape))?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+    let args = line.positionals(
+        &[Slot::Path("INPUT"), Slot::Text, Slot::Range],
+        2,
+        "sheetpatch cells [--json] INPUT SHEET [RANGE]",
+    )?;
+    let sheet = line.text(1)?;
+    let range = args
+        .get(2)
+        .map(|_| parse_range("cells", line.text(2)?))
+        .transpose()?;
+    let workbook = Source::new(line.command, &args[0])?.open()?;
+    require_sheet(&workbook, sheet)?;
+    let view = workbook.prepare_sheet(sheet)?;
+    // Filter the worksheet's own cells; a large range is never expanded.
+    let cells: Vec<CellRef> = view
+        .cell_refs()
+        .filter(|&cell| range.is_none_or(|range| range.contains(cell)))
+        .collect();
+    let contents = view.get_cells_at(cells.iter().copied())?;
+    // Skip cells that hold only formatting.
+    let listed = cells
+        .iter()
+        .zip(&contents)
+        .filter(|(_, content)| !content.value.is_blank() || content.formula.is_some());
+    if line.flag {
+        write_json_array(output, listed, |output, (cell, content)| {
+            write_json_cell(output, sheet, *cell, content)
+        })?;
+    } else {
+        let escape = Escape::values(terminal);
+        for (cell, content) in listed {
+            let kind = value_type(&content.value);
+            writeln!(
+                output,
+                "{cell}\t{kind}\t{}",
+                Escaped(&content.value, escape)
+            )?;
         }
     }
     Ok(())
@@ -777,8 +936,9 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
         .transpose()?;
     let rows = read_patch_arg(patch)?;
     let mut workbook = source.open()?;
-    let sheets: HashSet<&str> = workbook.sheets().iter().map(Sheet::name).collect();
-    if let Some((line_number, edit)) = rows.iter().find(|(_, edit)| !sheets.contains(edit.sheet()))
+    if let Some((line_number, edit)) = rows
+        .iter()
+        .find(|(_, edit)| workbook.sheet(edit.sheet()).is_none())
     {
         return Err(Failure::Rejected(format!(
             "Patch line {line_number}: {}",
@@ -786,7 +946,13 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
         )));
     }
     let count = rows.len();
-    workbook.apply_edits(rows.into_iter().map(|(_, edit)| edit))?;
+    // The rows are kept to name the line of a refused edit.
+    workbook
+        .apply_edits(rows.iter().map(|(_, edit)| edit.clone()))
+        .map_err(|error| match refused_line(&rows, &error) {
+            Some(line_number) => Failure::Context(format!("Patch line {line_number}"), error),
+            None => Failure::Workbook(error),
+        })?;
     match destination {
         Some(destination) => destination.save(&workbook, false, output),
         None => {
@@ -847,6 +1013,7 @@ fn run(args: &[OsString], output: &mut impl Write, terminal: bool) -> Result<(),
     match command {
         Command::List => cmd_list(&line, output, terminal),
         Command::Get => cmd_get(&line, output, terminal),
+        Command::Cells => cmd_cells(&line, output, terminal),
         Command::Set => cmd_set(&line, output, terminal),
         Command::Patch => cmd_patch(&line, output, terminal),
         Command::Compact => cmd_compact(&line, output, terminal),
@@ -876,6 +1043,11 @@ fn main() -> ExitCode {
     }
 }
 
+// The integration tests' archive builder and temporary directories.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,12 +1056,62 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/libreoffice.xlsx"
     );
+    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
     fn args(values: &[&str]) -> Vec<OsString> {
         std::iter::once("sheetpatch")
             .chain(values.iter().copied())
             .map(OsString::from)
             .collect()
+    }
+
+    /// A workbook of empty worksheets with the given XML-escaped names.
+    fn named_sheets(names: &[&str]) -> Vec<u8> {
+        let sheets: String = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                format!(
+                    "<sheet name='{name}' sheetId='{}' r:id='s{index}'/>",
+                    index + 1
+                )
+            })
+            .collect();
+        let relationships: String = (0..names.len())
+            .map(|index| {
+                format!(
+                    "<Relationship Id='s{index}' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet{index}.xml'/>"
+                )
+            })
+            .collect();
+        let workbook = format!(
+            "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{sheets}</sheets></workbook>"
+        );
+        let root = format!(
+            "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        );
+        let rels = format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>");
+        let worksheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let paths: Vec<String> = (0..names.len())
+            .map(|index| format!("xl/worksheets/sheet{index}.xml"))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            (
+                "[Content_Types].xml",
+                b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='xml' ContentType='application/xml'/></Types>",
+            ),
+            ("_rels/.rels", root.as_bytes()),
+            ("xl/workbook.xml", workbook.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ];
+        entries.extend(
+            paths
+                .iter()
+                .map(|path| (path.as_str(), worksheet.as_bytes())),
+        );
+        common::stored_archive(&entries)
     }
 
     fn patch_values(source: &str) -> Vec<CellValue> {
@@ -929,9 +1151,15 @@ mod tests {
                 vec!["sheetpatch", "get", "--json", "", "Data", "A1", "B2"],
                 4..7,
             ),
+            (vec!["sheetpatch", "get", "", "Data", "A1:B2", "C3"], 3..6),
             (
                 vec!["sheetpatch", "set", "", "", "Data", "A1", "text", "value"],
                 4..8,
+            ),
+            (vec!["sheetpatch", "cells", "", "Data", "A1:B2"], 3..5),
+            (
+                vec!["sheetpatch", "cells", "--json", "", "Data", "A1:B2"],
+                4..6,
             ),
         ] {
             let args: Vec<_> = args.into_iter().map(OsString::from).collect();
@@ -968,21 +1196,37 @@ mod tests {
     #[test]
     fn terminal_output_escapes_controls_and_other_output_is_exact() {
         let text = "a\u{1b}]0;title\u{7}\u{1b}[2J\tb\nc\r\0\u{7f}\u{85}\u{9b}\u{a0}é😀";
-        let mut exact = Vec::new();
-        write_plain_line(&mut exact, text, false).unwrap();
-        assert_eq!(exact, format!("{text}\n").as_bytes());
-        let mut escaped = Vec::new();
-        write_plain_line(&mut escaped, text, true).unwrap();
+        assert_eq!(Escaped(text, Escape::values(false)).to_string(), text);
+        assert_eq!(Escaped(text, Escape::names(false)).to_string(), text);
         assert_eq!(
-            String::from_utf8(escaped).unwrap(),
-            "a\\u{1b}]0;title\\u{7}\\u{1b}[2J\tb\nc\\u{d}\\u{0}\\u{7f}\\u{85}\\u{9b}\u{a0}é😀\n"
+            Escaped(text, Escape::values(true)).to_string(),
+            "a\\u{1b}]0;title\\u{7}\\u{1b}[2J\tb\nc\\u{d}\\u{0}\\u{7f}\\u{85}\\u{9b}\u{a0}é😀"
         );
+        // Names are listed one per line, so tabs and line feeds are escaped too.
+        assert_eq!(
+            Escaped(text, Escape::names(true)).to_string(),
+            "a\\u{1b}]0;title\\u{7}\\u{1b}[2J\\u{9}b\\u{a}c\\u{d}\\u{0}\\u{7f}\\u{85}\\u{9b}\u{a0}é😀"
+        );
+        // Values use their own display; only text and error tokens hold controls.
+        for (value, expected) in [
+            (CellValue::Number(-0.5), "-0.5"),
+            (CellValue::Number(1e21), "1000000000000000000000"),
+            (CellValue::Bool(true), "true"),
+            (CellValue::Error("#N/A".into()), "#N/A"),
+            (CellValue::Blank, ""),
+            (CellValue::Text("x\ty\u{1b}".into()), "x\ty\\u{1b}"),
+        ] {
+            assert_eq!(Escaped(&value, Escape::values(true)).to_string(), expected);
+            assert_eq!(
+                Escaped(&value, Escape::values(false)).to_string(),
+                value.to_string()
+            );
+        }
     }
 
     #[test]
     fn terminal_reads_escape_stored_controls_but_json_stays_exact() {
-        let directory = env::temp_dir().join(format!("sheetpatch-main-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = common::TempDir::new();
         let path = directory.join("controls.xlsx");
         let mut workbook = Workbook::open(FIXTURE).unwrap();
         workbook
@@ -997,20 +1241,70 @@ mod tests {
             let mut output = Vec::new();
             run(&args(&["get", path, "Notes", "A2"]), &mut output, terminal).unwrap();
             assert_eq!(String::from_utf8(output).unwrap(), expected);
+            let mut output = Vec::new();
+            run(
+                &args(&["cells", path, "Notes", "A2"]),
+                &mut output,
+                terminal,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!("A2\ttext\t{expected}")
+            );
         }
-        let mut json = Vec::new();
-        run(
-            &args(&["get", "--json", path, "Notes", "A2"]),
-            &mut json,
-            true,
+        for command in ["get", "cells"] {
+            let mut json = Vec::new();
+            run(
+                &args(&[command, "--json", path, "Notes", "A2"]),
+                &mut json,
+                true,
+            )
+            .unwrap();
+            assert!(
+                String::from_utf8(json)
+                    .unwrap()
+                    .contains("\"x\\r\u{9b}2J\u{7f}\\ty\""),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_lists_escape_every_control_in_sheet_names() {
+        let directory = common::TempDir::new();
+        let path = directory.join("names.xlsx");
+        std::fs::write(
+            &path,
+            named_sheets(&[
+                "Two&#10;Lines",
+                "Tab&#9;Name",
+                "CR&#13;",
+                "CSI&#x9b;2J",
+                "Plain",
+            ]),
         )
         .unwrap();
+        let path = path.to_str().unwrap();
+        for (terminal, expected) in [
+            (false, "Two\nLines\nTab\tName\nCR\r\nCSI\u{9b}2J\nPlain\n"),
+            (
+                true,
+                "Two\\u{a}Lines\nTab\\u{9}Name\nCR\\u{d}\nCSI\\u{9b}2J\nPlain\n",
+            ),
+        ] {
+            let mut output = Vec::new();
+            run(&args(&["list", path]), &mut output, terminal).unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+        let mut json = Vec::new();
+        run(&args(&["list", "--json", path]), &mut json, true).unwrap();
+        let json = String::from_utf8(json).unwrap();
         assert!(
-            String::from_utf8(json)
-                .unwrap()
-                .contains("\"x\\r\u{9b}2J\u{7f}\\ty\"")
+            json.starts_with("[{\"name\":\"Two\\nLines\",\"path\":"),
+            "{json}"
         );
-        std::fs::remove_dir_all(directory).unwrap();
+        assert!(json.contains("{\"name\":\"Tab\\tName\","), "{json}");
     }
 
     #[test]
@@ -1043,17 +1337,88 @@ mod tests {
         }
         for command in [
             vec!["--help"],
+            vec!["help", "cells"],
             vec!["--version"],
             vec!["get", FIXTURE, "Data", "A1"],
+            vec!["get", FIXTURE, "Data", "A1:C3"],
+            vec!["cells", FIXTURE, "Data"],
+            vec!["cells", "--json", FIXTURE, "Data", "B1:B9"],
+            vec!["list", FIXTURE],
             vec!["list", "--json", FIXTURE],
-            vec!["compact", FIXTURE, "-"],
         ] {
+            // `main` ends text output quietly when its reader closed the pipe.
             match run(&args(&command), &mut FailedWriter, false) {
                 Err(Failure::Output(error)) => {
                     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
                 }
                 other => panic!("unexpected output result for {command:?}: {other:?}"),
             }
+        }
+        let directory = common::TempDir::new();
+        let patch = directory.join("p.tsv");
+        std::fs::write(&patch, "Data\tA1\ttext\tx\n").unwrap();
+        for command in [
+            vec!["compact", FIXTURE, "-"],
+            vec!["set", FIXTURE, "-", "Data", "A1", "text", "x"],
+            vec!["patch", FIXTURE, "-", patch.to_str().unwrap()],
+        ] {
+            // A truncated workbook is a failure, even behind a closed pipe.
+            match run(&args(&command), &mut FailedWriter, false) {
+                Err(failure @ Failure::Context(_, sheetpatch::Error::Io(_))) => {
+                    assert_eq!(failure.exit_code(), 1);
+                    assert_eq!(
+                        failure.to_string(),
+                        "cannot write workbook to standard output: closed consumer"
+                    );
+                }
+                other => panic!("unexpected output result for {command:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn refused_edits_name_the_last_patch_line_for_their_cell() {
+        let rows = read_patch(
+            "Data\tA1\ttext\tfirst\nData\tA10\tnumber\t1\nData\tA1\ttext\tlast\nOther \"Data\"\tB2\tblank\n"
+                .as_bytes(),
+            "test",
+        )
+        .unwrap();
+        let line = |error| refused_line(&rows, &error);
+        let unsupported = |message: &str| sheetpatch::Error::Unsupported(message.into());
+        assert_eq!(
+            line(unsupported("worksheet \"Data\": A1 contains a formula")),
+            Some(3)
+        );
+        assert_eq!(
+            line(unsupported("worksheet \"Data\": A10 contains a formula")),
+            Some(2)
+        );
+        assert_eq!(
+            line(sheetpatch::Error::Xml(
+                "worksheet \"Data\": A1: cell has multiple value payloads".into()
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            line(sheetpatch::Error::InvalidWorkbook(
+                "worksheet \"Other \\\"Data\\\"\": B2: invalid".into()
+            )),
+            Some(4)
+        );
+        for error in [
+            // Cells and worksheets that no line targets, and messages naming none.
+            unsupported("worksheet \"Data\": A100 contains a formula"),
+            unsupported("worksheet \"Data\": B2 contains a formula"),
+            unsupported("worksheet \"Other\": B2 contains a formula"),
+            unsupported("worksheet \"Other \\\"Data\\\"\": B20 contains a formula"),
+            unsupported("worksheet \"Data\": overlapping XML edits"),
+            unsupported("A1 contains a formula"),
+            unsupported("editing a digitally signed OOXML package would invalidate its signature"),
+            sheetpatch::Error::InvalidValue("worksheet \"Data\": A1 is invalid".into()),
+            sheetpatch::Error::SheetNotFound("Data".into()),
+        ] {
+            assert_eq!(line(error), None);
         }
     }
 

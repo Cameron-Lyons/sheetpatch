@@ -1,11 +1,13 @@
 //! Standard stream workbooks, output destinations, and I/O error context.
+mod common;
+
+use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 const FIXTURE: &str = concat!(
@@ -60,29 +62,9 @@ fn text(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sheetpatch-cli-streams-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-
-    fn count(&self) -> usize {
-        fs::read_dir(&self.0).unwrap().count()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// The number of files in `directory`.
+fn count(directory: &TempDir) -> usize {
+    fs::read_dir(directory.path()).unwrap().count()
 }
 
 #[test]
@@ -101,10 +83,22 @@ fn every_command_reads_a_workbook_from_standard_input() {
         success(piped(&["get", "--json", "-", "Data", "D1"], &workbook)),
         success(cli(&["get", "--json", FIXTURE, "Data", "D1"]))
     );
+    assert_eq!(
+        success(piped(&["get", "-", "Data", "C1:D1"], &workbook)),
+        b"1\n25\n"
+    );
+    assert_eq!(
+        success(piped(&["cells", "-", "Notes"], &workbook)),
+        b"A1\ttext\tKeep this sheet\n"
+    );
+    assert_eq!(
+        success(piped(&["cells", "--json", "-", "Data", "B1:C9"], &workbook)),
+        success(cli(&["cells", "--json", FIXTURE, "Data", "B1:C9"]))
+    );
 
     let directory = TempDir::new();
-    let output = directory.0.join("out.xlsx");
-    let patch = directory.0.join("p.tsv");
+    let output = directory.join("out.xlsx");
+    let patch = directory.join("p.tsv");
     fs::write(&patch, "Data\tB1\tnumber\t7\n").unwrap();
     for (args, address, expected) in [
         (
@@ -143,8 +137,8 @@ fn every_command_reads_a_workbook_from_standard_input() {
 #[test]
 fn workbooks_written_to_standard_output_match_saved_files() {
     let directory = TempDir::new();
-    let saved = directory.0.join("saved.xlsx");
-    let patch = directory.0.join("p.tsv");
+    let saved = directory.join("saved.xlsx");
+    let patch = directory.join("p.tsv");
     let rows = "Data\tA1\ttext\tPatched\nNotes\tB2\tbool\ttrue\n";
     fs::write(&patch, rows).unwrap();
     for args in [
@@ -163,7 +157,7 @@ fn workbooks_written_to_standard_output_match_saved_files() {
             .collect();
         assert_eq!(success(cli(&to_stdout)), fs::read(&saved).unwrap());
     }
-    assert_eq!(directory.count(), 2);
+    assert_eq!(count(&directory), 2);
 
     // The patch comes from standard input while the workbook goes to standard output.
     let streamed = success(piped(&["patch", FIXTURE, "-", "-"], rows.as_bytes()));
@@ -180,13 +174,13 @@ fn workbooks_written_to_standard_output_match_saved_files() {
         &workbook,
     ));
     assert_eq!(cell(edited, "Notes", "A1"), CellValue::Text("Piped".into()));
-    assert_eq!(directory.count(), 2);
+    assert_eq!(count(&directory), 2);
 }
 
 #[test]
 fn input_and_patch_cannot_both_read_standard_input() {
     let directory = TempDir::new();
-    let destination = directory.0.join("out.xlsx");
+    let destination = directory.join("out.xlsx");
     let workbook = fs::read(FIXTURE).unwrap();
     for args in [
         vec!["patch", "-", text(&destination), "-"],
@@ -205,7 +199,7 @@ fn input_and_patch_cannot_both_read_standard_input() {
         );
         assert!(message.contains("Usage:"));
     }
-    assert_eq!(directory.count(), 0);
+    assert_eq!(count(&directory), 0);
 }
 
 #[test]
@@ -225,9 +219,9 @@ fn invalid_standard_input_workbooks_name_the_stream() {
 #[test]
 fn io_errors_name_the_path_and_operation() {
     let directory = TempDir::new();
-    let input = directory.0.join("in.xlsx");
-    let patch = directory.0.join("p.tsv");
-    let missing = directory.0.join("missing");
+    let input = directory.join("in.xlsx");
+    let patch = directory.join("p.tsv");
+    let missing = directory.join("missing");
     fs::copy(FIXTURE, &input).unwrap();
     fs::write(&patch, "Data\tA1\ttext\tx\n").unwrap();
     let missing_workbook = missing.join("in.xlsx");
@@ -239,8 +233,8 @@ fn io_errors_name_the_path_and_operation() {
             format!("cannot read workbook '{}': ", missing_workbook.display()),
         ),
         (
-            vec!["list", text(&directory.0)],
-            format!("cannot read workbook '{}': ", directory.0.display()),
+            vec!["list", text(directory.path())],
+            format!("cannot read workbook '{}': ", directory.path().display()),
         ),
         (
             vec!["patch", text(&input), text(&input), text(&missing_patch)],
@@ -283,7 +277,7 @@ fn io_errors_name_the_path_and_operation() {
         assert!(!message.contains("Usage:"), "{message}");
     }
     assert_eq!(fs::read(&input).unwrap(), fs::read(FIXTURE).unwrap());
-    assert_eq!(directory.count(), 2);
+    assert_eq!(count(&directory), 2);
 }
 
 // Native byte paths are exercised on Linux; macOS rejects invalid UTF-8 names.
@@ -293,9 +287,7 @@ fn io_errors_display_non_unicode_paths_lossily() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     let directory = TempDir::new();
-    let missing = directory
-        .0
-        .join(OsString::from_vec(b"missing-\xff.xlsx".to_vec()));
+    let missing = directory.join(OsString::from_vec(b"missing-\xff.xlsx".to_vec()));
     let output = command(&["list"])
         .arg(&missing)
         .stdin(Stdio::null())
@@ -316,10 +308,17 @@ fn io_errors_display_non_unicode_paths_lossily() {
 #[cfg(target_os = "linux")]
 #[test]
 fn full_standard_output_reports_a_write_error() {
-    for args in [
-        vec!["get", FIXTURE, "Data", "A1"],
-        vec!["list", "--json", FIXTURE],
-        vec!["compact", FIXTURE, "-"],
+    let text_error = "sheetpatch: cannot write output: ";
+    let workbook_error = "sheetpatch: cannot write workbook to standard output: ";
+    for (args, prefix) in [
+        (vec!["get", FIXTURE, "Data", "A1"], text_error),
+        (vec!["list", "--json", FIXTURE], text_error),
+        (vec!["cells", FIXTURE, "Data"], text_error),
+        (vec!["compact", FIXTURE, "-"], workbook_error),
+        (
+            vec!["set", FIXTURE, "-", "Data", "A1", "text", "x"],
+            workbook_error,
+        ),
     ] {
         let output = command(&args)
             .stdout(
@@ -333,19 +332,92 @@ fn full_standard_output_reports_a_write_error() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         let message = String::from_utf8(output.stderr).unwrap();
+        assert!(message.starts_with(prefix), "{message}");
+        assert!(!message.contains("I/O error"), "{message}");
+    }
+}
+
+/// A workbook whose 1 MiB of untouched package data outgrows any default
+/// pipe buffer.
+fn large_workbook() -> Vec<u8> {
+    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let root = format!(
+        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+    );
+    let workbook = format!(
+        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
+    );
+    let rels = format!(
+        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
+    );
+    let worksheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let padding = vec![b'x'; 1 << 20];
+    common::stored_archive(&[
+        (
+            "[Content_Types].xml",
+            b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='xml' ContentType='application/xml'/></Types>",
+        ),
+        ("_rels/.rels", root.as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+        ("xl/media/padding.bin", &padding),
+    ])
+}
+
+#[test]
+fn a_reader_that_closes_the_pipe_early_fails_a_workbook_write() {
+    // A truncated archive is unusable, so unlike text output, a closed pipe
+    // is reported and the exit status is 1.
+    let directory = TempDir::new();
+    let input = directory.join("large.xlsx");
+    let patch = directory.join("p.tsv");
+    fs::write(&input, large_workbook()).unwrap();
+    fs::write(&patch, "Data\tA1\tnumber\t1\n").unwrap();
+    for args in [
+        vec!["compact", text(&input), "-"],
+        vec!["set", text(&input), "-", "Data", "A1", "bool", "true"],
+        vec!["patch", text(&input), "-", text(&patch)],
+    ] {
+        let mut child = command(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let message = String::from_utf8(output.stderr).unwrap();
         assert!(
-            message.starts_with("sheetpatch: cannot write output: "),
+            message.starts_with("sheetpatch: cannot write workbook to standard output: "),
             "{message}"
         );
+        assert_eq!(message.lines().count(), 1, "{message}");
     }
+    // The same workbook streams completely to a reader that keeps the pipe open.
+    let streamed = success(cli(&[
+        "set",
+        text(&input),
+        "-",
+        "Data",
+        "A1",
+        "bool",
+        "true",
+    ]));
+    assert!(streamed.len() > 1 << 20);
+    assert_eq!(cell(streamed, "Data", "A1"), CellValue::Bool(true));
+    assert_eq!(count(&directory), 2);
 }
 
 #[cfg(unix)]
 #[test]
 fn saving_to_a_symlink_replaces_the_link_and_keeps_its_target() {
     let directory = TempDir::new();
-    let target = directory.0.join("target.xlsx");
-    let link = directory.0.join("link.xlsx");
+    let target = directory.join("target.xlsx");
+    let link = directory.join("link.xlsx");
     fs::write(&target, b"target bytes stay unchanged").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
     for args in [
@@ -367,5 +439,5 @@ fn saving_to_a_symlink_replaces_the_link_and_keeps_its_target() {
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
     }
-    assert_eq!(directory.count(), 2);
+    assert_eq!(count(&directory), 2);
 }
