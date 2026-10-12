@@ -148,8 +148,8 @@ impl Workbook {
     ///
     /// Input larger than the largest possible ZIP32 archive (about 8 GiB) is
     /// rejected with [`Error::Unsupported`]: a regular file before it is read,
-    /// and a pipe or device once that much has been read. On Unix, the file's
-    /// permissions become the creation mode for new destinations of
+    /// and a pipe or device once that much has been read. On Unix, a regular
+    /// file's permissions become the creation mode for new destinations of
     /// [`Self::save`] and [`Self::save_compact`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         use std::io::{self, Read};
@@ -180,7 +180,8 @@ impl Workbook {
             return Err(too_large());
         }
         let mut workbook = Self::from_bytes(bytes)?;
-        workbook.source_permissions = Some(metadata.permissions());
+        // Pipes and devices carry no meaningful file permissions to inherit.
+        workbook.source_permissions = metadata.is_file().then(|| metadata.permissions());
         Ok(workbook)
     }
 
