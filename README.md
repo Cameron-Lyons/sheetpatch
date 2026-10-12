@@ -45,7 +45,7 @@ fn main() -> sheetpatch::Result<()> {
     // Ranges visit their cells row by row, pairing with the typed batches.
     let block: CellRange = "B6:D7".parse()?;
     book.set_cells_at("Summary", block.cells().zip([1, 2, 3, 4, 5, 6]))?;
-    let block_values = book.get_cells_at("Summary", block.cells())?;
+    let block_values = book.get_cells_at("Summary", block)?;
     let total: f64 = block_values.iter().filter_map(|cell| cell.value.as_number()).sum();
     println!("block total: {total}");
 
@@ -64,11 +64,14 @@ fn main() -> sheetpatch::Result<()> {
 ```
 
 `Workbook::from_bytes(Vec<u8>)` and `Workbook::to_bytes()` support in-memory
-workflows. Addresses use A1 notation, accept lowercase letters, and must fit
-Excel's row and column limits (`CellRef::MAX_ROW`, `CellRef::MAX_COLUMN`).
+workflows, and `Workbook::from_reader` reads a workbook from any `std::io::Read`,
+such as standard input. Addresses use A1 notation, accept lowercase letters, and
+must fit Excel's row and column limits (`CellRef::MAX_ROW`, `CellRef::MAX_COLUMN`).
 `CellRange` parses `"A1:C3"` with corners in any order, or a single cell, and
 provides `first`, `last`, `height`, `width`, `cell_count`, `contains`, and
-`cells`.
+`cells`. A range is itself iterable, row by row, so it can be passed directly to
+`get_cells_at`. Ranges are ordered by their top-left and then bottom-right cell,
+for use as sorted keys.
 
 ### Values
 
@@ -83,14 +86,17 @@ every integer; write longer identifiers as text. There is deliberately no `f32`
 conversion. Error values must be Excel error codes, such as `#N/A` or `#DIV/0!`
 (see [Supported scope](#supported-scope)). `as_text`, `as_number`, `as_bool`,
 `as_error`, and `is_blank` return typed views; `Display` prints a value as the
-CLI's `get` does, without applying number formats.
+CLI's `get` does, without applying number formats. A precision such as `{:.2}`
+rounds numbers and never truncates other values.
 
 To edit dates, write the Excel numeric serial into a cell that already has a date
 format, or a new cell whose row or column style supplies one. Serials depend on
 the workbook's date system: `uses_1904_dates()` reports whether serials count
 from 1904-01-01 (serial 0) instead of the 1900 system, in which 1900-01-01 is
 serial 1. For example, 2024-01-15 is 45306 in the 1900 system and 43844 in the
-1904 system. ISO 8601 date cells (`t="d"`) read as serials in the workbook's system.
+1904 system. ISO 8601 date cells (`t="d"`) read as serials in the workbook's
+system. In the 1900 system, Excel's day zero, 1899-12-31, is serial 0; a time
+without a date reads as a fraction of serial 0 in either system.
 
 ### Batches and transactions
 
@@ -109,11 +115,12 @@ Reopen the saved file to use it as the new baseline.
 
 `sheets()` lists editable worksheets in workbook order, hidden ones included;
 chart sheets are retained as opaque parts. `sheet(name)` finds one worksheet,
-`Sheet::visibility()` reports hidden and very hidden tabs, and `is_signed()`
-reports digitally signed packages, whose edits are refused. Worksheet names
-match exactly, including case. Package discovery resolves URI-escaped
-relationship targets and compares part paths without ASCII case, retaining the
-actual ZIP member names. Ambiguous equivalent names for an accessed part are rejected.
+`Sheet::visibility()` reports hidden and very hidden tabs (`as_str` gives the
+`list --json` spelling), and `is_signed()` reports digitally signed packages,
+whose edits are refused. Worksheet names match exactly, including case. Package
+discovery resolves URI-escaped relationship targets and compares part paths
+without ASCII case, retaining the actual ZIP member names. Ambiguous equivalent
+names for an accessed part are rejected.
 
 `get_cell` returns a `CellContent` with a scalar `value`, stored `formula` text,
 and `style_index`. Its fields are public for reading; it is `#[non_exhaustive]`,
@@ -132,29 +139,39 @@ let sheet = book.prepare_sheet("Summary")?;
 let total = sheet.get_cell("C2")?;
 let details = sheet.get_cells(["C3", "C4", "C3"])?;
 if let Some(range) = sheet.used_range() {
-    let everything = sheet.get_cells_at(range.cells())?;
+    let everything = sheet.get_cells_at(range)?;
 }
 # Ok::<(), sheetpatch::Error>(())
 ```
 
 The view includes pending edits, preserves read order and duplicates, and loads
-shared strings only when requested values need them. `cell_refs()` lists every
-cell in row-major order, and `used_range()` returns the smallest range containing
-them, style-only cells included; both come from the cells themselves, not the
-stored `<dimension>`. The view borrows the workbook; drop it before making edits.
-Dropping the view releases the parsed index. Ordinary reads retain cached
-decompressed XML but release their index after each call. Both workbooks and
-prepared views can be shared across threads.
+shared strings only when requested values need them. `cells()` lists every
+cell in row-major order as an `ExactSizeIterator`, and `used_range()` returns the
+smallest range containing them, style-only cells included; both come from the
+cells themselves, not the stored `<dimension>`. The view borrows the workbook;
+drop it before making edits. Dropping the view releases the parsed index.
+Ordinary reads retain cached decompressed XML but release their index after each
+call. Both workbooks and prepared views can be shared across threads.
 
-Errors raised inside a worksheet name it and, where one applies, the cell, as in
-`unsupported: worksheet "Summary": B2 contains a formula`. `Error` is
-non-exhaustive, so matches need a fallback arm.
+An edit of a protected cell (see [Supported scope](#supported-scope)) returns
+`Error::ProtectedCell { sheet, cell, reason }`, displayed as
+`protected cell: worksheet "Summary": D2 contains a formula`. Other errors raised
+inside a worksheet name it and, where one applies, the cell. Errors in another
+part, such as the shared-string table or a worksheet's relationships and table
+parts, name that part instead, as in `part "xl/sharedStrings.xml": …`. Malformed
+cell data, such as a numeric cell whose value is not a number, returns
+`Error::InvalidWorkbook`; `Error::Unsupported` is for valid input and edits
+outside the supported scope. `SheetNotFound` and `InvalidCellReference` quote
+their input, as in `worksheet not found: "Summary"`. Messages are for people and
+their wording may change; match on variants and fields. `Error` is
+non-exhaustive, so matches need a fallback arm; so is the `ProtectedCell`
+variant, whose patterns need `..`.
 
 `write_to` streams a workbook to any `std::io::Write` implementation and flushes
-it before returning; a failing writer may hold a partial archive. File saves use
-that same path, avoiding allocation of another complete ZIP. Worksheets are
-decompressed lazily and cached; shared strings are loaded only when a requested
-cell needs them.
+it before returning; an error after output has started, such as a failing writer,
+may leave a partial archive in it. File saves use that same path, avoiding
+allocation of another complete ZIP. Worksheets are decompressed lazily and cached;
+shared strings are loaded only when a requested cell needs them.
 
 ## Use from the command line
 
@@ -219,13 +236,14 @@ extension, especially `.xlsm` for VBA workbooks.
 A patch file contains tab-separated `sheet`, `cell`, `type`, and `value` fields, one edit
 per line. Types are `text`, `number`, `bool`, `error`, and `blank`; `blank` may omit
 its value. Text keeps trailing whitespace and additional tabs. Patch files must
-use UTF-8, optionally with a BOM, and LF or CRLF line endings. A carriage return
-followed by more data on the same line is rejected rather than merging classic
-Mac lines into one value; one that ends the file, or directly precedes a CRLF
-ending, stays in the value. Empty lines and tab-free lines beginning with `#` are ignored.
-Literal multiline values use the Rust API. Invalid rows and rows naming a missing
-worksheet report their line number; a refused edit names the last line for that
-cell, as in `Patch line 5: unsupported: worksheet "Summary": D2 contains a formula`.
+use UTF-8, optionally with a BOM, and LF or CRLF line endings. Any other carriage
+return is rejected, including one before a CRLF ending, rather than merging
+classic Mac lines into one value or leaving a stray carriage return; only a final
+line without a line feed may end with one, which stays in the value. Empty lines
+and tab-free lines beginning with `#` are ignored. Literal multiline values use
+the Rust API. Invalid rows and rows naming a missing worksheet report their line
+number; an edit refused for a protected cell names the last line for that cell,
+as in `Patch line 5: protected cell: worksheet "Summary": D2 contains a formula`.
 Any error leaves the destination unchanged.
 
 `patch --check` validates the complete transaction and output generation,
@@ -245,7 +263,8 @@ whose name starts with `-` as `./-name`. Sheet names and values may start with `
 
 Use `-` as INPUT to read the workbook from standard input, and as OUTPUT to write
 it to standard output; each is refused on a terminal, and INPUT and PATCH cannot
-both be `-`. Output to standard output is streamed, not atomic:
+both be `-`. Like `Workbook::from_reader`, standard input is read only up to the
+largest possible ZIP32 archive. Output to standard output is streamed, not atomic:
 
 ```sh
 ./target/release/sheetpatch set - - Summary B2 number 5 < report.xlsm > edited.xlsm
@@ -268,7 +287,8 @@ complete, so any failure to write it, including a closed pipe, exits with code 1
 and `cannot write workbook to standard output`. On a terminal, plain `get` and
 `cells` output shows control characters other than tab and line feed (C0, DEL,
 and C1) as `\u{..}` escapes, and `list` escapes every control character in sheet
-names. Pipes, files, and `--json` output receive the exact text.
+names. Pipes and files receive the exact text. `--json` strings decode to the
+exact text and escape every control character, including DEL and C1 as `\u00XX`.
 
 ## Saving
 
@@ -286,13 +306,15 @@ permissions. Owner, ACLs, and extended attributes are not preserved, because the
 replacement is a new file. On Unix, a new destination saved from a workbook
 opened with `Workbook::open`, including CLI outputs from an input file, is created
 with the input's permission bits restricted by the umask, as `cp` does, so it is
-never more permissive than the input; `from_bytes` and standard input use the
-default mode. Saves replace the destination directory entry: an output symlink
-to a regular file is replaced rather than written through, and hard links to the
-old file keep the old contents. On Unix, like `sed -i`, a save replaces a
-read-only destination as long as its directory is writable; Windows refuses to
-replace a read-only destination. After the rename, Unix saves sync the directory
-(best effort) so a completed save survives a crash.
+never more permissive than the input. It gets the input's group when the user
+may assign it, and otherwise no group permissions. `from_bytes`, `from_reader`,
+and standard input use the default mode. Setuid, setgid, and sticky bits are
+never kept, on new or replaced files. Saves replace the destination directory
+entry: an output symlink to a regular file is replaced rather than written
+through, and hard links to the old file keep the old contents. On Unix, like
+`sed -i`, a save replaces a read-only destination as long as its directory is
+writable; Windows refuses to replace a read-only destination. After the rename,
+Unix saves sync the directory (best effort) so a completed save survives a crash.
 
 ## What lossless means
 
@@ -303,7 +325,7 @@ replace a read-only destination. After the rename, Unix saves sync the directory
 | Existing cell formatting | Style, other attributes, and unfamiliar sibling content are retained. |
 | New cells and rows | Inserted in coordinate order. A new cell takes its row's style when the row has a custom format, otherwise its column's style; existing cells are never restyled. Existing dimension and row-span hints are widened as needed. |
 | Text | Written as inline strings; shared strings stay untouched. Whitespace, XML characters, and literal Excel escape sequences are preserved. Characters XML 1.0 forbids, such as NUL and other control characters, are stored as Excel's `_xHHHH_` escapes and read back exactly. |
-| Unchanged values | Writing the value a cell already stores, including a shared string's own text, leaves the worksheet unchanged; edits may load the shared-string table to compare. Protections still apply. |
+| Unchanged values | Writing the value a cell already stores, including a shared string's own text or an ISO 8601 date cell's serial, leaves the worksheet unchanged; edits may load the shared-string table to compare. Protections still apply. |
 | Blank values | Value and type are cleared; the cell and its formatting remain. Clearing a missing cell changes nothing. |
 | Save without edits | The entire original archive is returned unchanged. |
 
@@ -336,14 +358,19 @@ in cached results. The original workbook's calculation settings are retained.
   be UTF-8 XML 1.0, and be at most 64 MiB, as must saved replacements. Pending
   worksheet XML of 4 GiB or more cannot be indexed and is refused. Other untouched
   compression methods are retained without decoding. ZIP patched-data entries can
-  only be preserved untouched. Workbooks are held in memory; `Workbook::open`
-  refuses input larger than the largest possible ZIP32 archive, about 8 GiB.
+  only be preserved untouched. Workbooks are held in memory; `Workbook::open`,
+  `Workbook::from_reader`, and CLI standard input refuse input larger than the
+  largest possible ZIP32 archive, about 8 GiB.
 - Archives that other ZIP readers could interpret differently are rejected:
-  an end-of-central-directory signature after the real record (for example,
-  inside the archive comment), Info-ZIP Unicode Path extra fields that rename a
-  member, conflicting local and central headers, and overlapping records.
-  `[Content_Types].xml` is found regardless of ASCII case; case-variant duplicates
-  are ambiguous.
+  an end-of-central-directory signature after the real record with room for a
+  complete end record before the end of the file (for example, inside the
+  archive comment), Info-ZIP Unicode Path extra fields of any version that
+  rename a member, conflicting local and central headers, and overlapping
+  records. In the rare case that a save's new central-directory offset would
+  form such a signature with the archive comment, that save is refused with
+  `Error::Unsupported`, as is `patch --check`; `write_to` may already have
+  written part of the archive. `[Content_Types].xml` is found regardless of
+  ASCII case; case-variant duplicates are ambiguous.
 - Explicit, sorted row and cell coordinates. Ambiguous or malformed worksheet
   layouts return an error before applying changes.
 - Unambiguous workbook metadata: invalid sheet `state` or `date1904` values, more
@@ -360,9 +387,11 @@ in cached results. The original workbook's calculation settings are retained.
   `#VALUE!`, `#REF!`, `#NAME?`, `#NUM!`, `#N/A`, `#GETTING_DATA`, `#SPILL!`,
   `#CALC!`, `#FIELD!`, `#BLOCKED!`, `#CONNECT!`, `#BUSY!`, `#UNKNOWN!`,
   `#PYTHON!`, or `#EXTERNAL!`. Reads return any stored error token.
-- ISO 8601 date cells (`t="d"`) read as numeric serials; rewriting one, even with
-  its current serial, stores a plain number. Values without a serial, such as
-  other UTC offsets or dates before the workbook's epoch, are refused on read.
+- ISO 8601 date cells (`t="d"`) read as numeric serials. Rewriting one with its
+  current serial leaves it unchanged; a different number is stored as a plain
+  number. Valid values without a serial, with a UTC offset other than `Z` or a
+  date before the workbook's epoch, return `Error::Unsupported` on read;
+  malformed values return `Error::InvalidWorkbook`.
 - Cells with value metadata (`vm`, including linked and rich data types) are
   preserved; edits that would change their scalar value or representation are
   refused so metadata cannot remain attached to a replacement value.
