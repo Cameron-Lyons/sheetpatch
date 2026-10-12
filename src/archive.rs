@@ -8,7 +8,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::Display,
-    io::Write,
+    io::{Read, Write},
     ops::Range,
 };
 
@@ -48,6 +48,10 @@ const EXTRA_ZIP64: u16 = 0x0001;
 const EXTRA_UNICODE_PATH: u16 = 0x7075;
 
 const MAX_READ: usize = 64 * 1024 * 1024;
+/// The length of the largest possible ZIP32 archive: the central directory's
+/// offset and size are each below `u32::MAX`, and only a 22-byte end record
+/// and a comment of at most 64 KiB follow it.
+pub(crate) const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
 // Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
 // produces archives about as small as the default level 6, several times faster.
 const DEFLATE_LEVEL: u32 = 4;
@@ -193,6 +197,26 @@ fn over_read_limit(member: impl Display) -> Error {
     ))
 }
 
+pub(crate) fn archive_too_large() -> Error {
+    unsupported("input exceeds the largest possible ZIP32 archive")
+}
+
+/// Append everything `reader` yields to `bytes`, refusing input longer than
+/// any ZIP32 archive once that much has been read.
+pub(crate) fn read_archive(reader: impl Read, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    read_at_most(reader, bytes, MAX_ARCHIVE_LEN)
+}
+
+fn read_at_most(reader: impl Read, mut bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
+    let start = bytes.len();
+    // One byte past the limit shows that the input is too long.
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if (bytes.len() - start) as u64 > limit {
+        return Err(archive_too_large());
+    }
+    Ok(bytes)
+}
+
 fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     bytes
         .get(offset..)
@@ -246,11 +270,13 @@ fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
         let field = bytes
             .get(4..4 + length)
             .ok_or_else(|| invalid("truncated ZIP extra field"))?;
-        // Python, Info-ZIP and libarchive replace the raw name with a version 1
-        // Unicode path whose CRC matches the raw name. Repeating the raw name is
-        // harmless; any other path would alias a member for those readers.
+        // Python, Info-ZIP and libarchive replace the raw name with a Unicode
+        // path whose CRC (after a version byte) matches the raw name. They
+        // disagree on versions: Python takes version 1, Info-ZIP also version
+        // 0 in the central directory, and libarchive any version in a local
+        // header. So the version is ignored here. Repeating the raw name is
+        // harmless; any other path would alias a member for some reader.
         if kind == EXTRA_UNICODE_PATH
-            && field.first() == Some(&1)
             && u32_at(field, 1).is_ok_and(|crc| crc == crc32(name.as_bytes()))
             && field[5..] != *name.as_bytes()
         {
@@ -261,6 +287,30 @@ fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
         bytes = &bytes[4 + length..];
     }
     Ok(())
+}
+
+/// Whether an end record followed by its comment, `ending`, contains another
+/// end-record signature with room for a complete record before EOF.
+///
+/// Readers that scan back from EOF select the last such signature even when
+/// its comment does not reach EOF, so one inside the record's own fields or
+/// comment makes the archive ambiguous. A signature too close to EOF for a
+/// complete record cannot be read as one; see also [`shadows_end_record`].
+fn hides_end_record(ending: &[u8]) -> bool {
+    let last = ending.len().saturating_sub(END_LEN);
+    (1..=last).any(|offset| ending[offset..offset + 4] == END.to_le_bytes())
+}
+
+/// Whether Python's `zipfile` would select an end-record signature after the
+/// start of `ending`, an end record followed by its comment. It takes the last
+/// signature in the archive's tail, and fails to open the archive when no
+/// complete record follows it. Only an archive without a comment is exempt:
+/// Python first looks for a record in exactly the last 22 bytes.
+fn shadows_end_record(ending: &[u8]) -> bool {
+    ending.len() > END_LEN
+        && ending[1..]
+            .windows(4)
+            .any(|window| window == END.to_le_bytes())
 }
 
 /// Locate the end-of-central-directory record. It must be the only record
@@ -290,12 +340,10 @@ fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
         }
         _ => return Err(invalid("ambiguous ZIP end-of-directory records")),
     };
-    // Many readers take the last signature even if its comment does not reach
-    // EOF, so one inside this record's fields or comment is ambiguous too.
-    if bytes[end + 4..]
-        .windows(4)
-        .any(|window| window == END.to_le_bytes())
-    {
+    // Fixed fields may legitimately hold the signature's bytes, for example a
+    // central directory at offset 0x06054b50. That matters only when the
+    // comment leaves room for a complete record after the signature.
+    if hides_end_record(&bytes[end..]) {
         return Err(invalid("ambiguous ZIP end-of-directory records"));
     }
     Ok(end)
@@ -608,8 +656,10 @@ impl Archive {
     /// Stream local records in their original order, replacing changed members.
     ///
     /// Only one changed member's compressed payload is held in memory at a
-    /// time. As with `Write::write_all`, a writer error may leave partial output.
-    /// The writer is flushed before success is reported.
+    /// time. As with `Write::write_all`, a writer error may leave partial output,
+    /// and so may the rare refusal of an ambiguous end record, which can only be
+    /// detected once the directory offset is known. The writer is flushed before
+    /// success is reported.
     pub(crate) fn write_to<W: Write>(
         &self,
         changes: &impl PartChanges,
@@ -798,6 +848,27 @@ impl Archive {
         replacements: &[Option<Sizes>],
     ) -> Result<()> {
         let central_start = zip32(*position, "ZIP central-directory offset")?;
+        // Central records are copied whole, so the directory keeps its size,
+        // which the input's end record already stored below u32::MAX.
+        let central_size = (self.end - self.central_start) as u32;
+        let mut ending = self.original[self.end..].to_vec();
+        set_u32(&mut ending, 12, central_size);
+        set_u32(&mut ending, 16, central_start);
+        // Only the directory offset (record bytes 16..20) can differ from the
+        // input's end record, which passed `hides_end_record` with the same
+        // comment. So a new signature starts at record offset 13 to 19, and
+        // only an archive comment exposes it to backward-scanning readers.
+        // Refuse that rare layout rather than write an archive that they would
+        // misread, or that Python could open before the save but not after.
+        if hides_end_record(&ending)
+            || (shadows_end_record(&ending) && !shadows_end_record(&self.original[self.end..]))
+        {
+            return Err(unsupported(
+                "saving would make the ZIP end-of-directory record ambiguous: the new \
+                 central-directory offset forms a record signature that readers searching \
+                 back through the archive comment would select",
+            ));
+        }
         for (index, entry) in self.entries.iter().enumerate() {
             let record = &self.original[entry.central.clone()];
             let mut header = [0; CENTRAL_HEADER_LEN];
@@ -812,16 +883,8 @@ impl Archive {
             emit(writer, position, &header)?;
             emit(writer, position, &record[CENTRAL_HEADER_LEN..])?;
         }
-        let central_size = zip32(
-            *position - central_start as usize,
-            "ZIP central-directory size",
-        )?;
-        let mut ending = [0; END_LEN];
-        ending.copy_from_slice(&self.original[self.end..self.end + END_LEN]);
-        set_u32(&mut ending, 12, central_size);
-        set_u32(&mut ending, 16, central_start);
-        emit(writer, position, &ending)?;
-        emit(writer, position, &self.original[self.end + END_LEN..])
+        debug_assert_eq!(*position - central_start as usize, central_size as usize);
+        emit(writer, position, &ending)
     }
 
     /// Require every byte before the central directory to belong to an active
@@ -1980,6 +2043,129 @@ mod tests {
         }
     }
 
+    /// An end record for `entries` members whose directory of `size` bytes
+    /// starts at `offset`, after bytes standing in for members and directory.
+    fn end_record(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 64 + END_LEN];
+        set_u32(&mut bytes, 64, END);
+        set_u16(&mut bytes, 64 + 8, entries);
+        set_u16(&mut bytes, 64 + 10, entries);
+        set_u32(&mut bytes, 64 + 12, size);
+        set_u32(&mut bytes, 64 + 16, offset);
+        set_u16(&mut bytes, 64 + 20, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        bytes
+    }
+
+    #[test]
+    fn end_record_fields_may_hold_the_signature_without_room_for_another_record() {
+        // A directory at offset 0x06054b50, which a ~101 MB archive can have,
+        // puts the signature at record offset 16. So do 0x4b50 entries and a
+        // directory size ending in 0x0605 at offset 10.
+        for (entries, size, offset, at) in [(1, 46, END, 16), (0x4b50, 0x0001_0605, 64, 10)] {
+            // Readers scanning back from EOF only select a signature followed by
+            // a complete record, which needs at least `at` comment bytes.
+            for length in [0, 1, at - 1] {
+                let bytes = end_record(entries, size, offset, &vec![b'c'; length]);
+                assert_eq!(end_of_central_directory(&bytes).unwrap(), 64, "{length}");
+            }
+            for length in [at, at + 1, u16::MAX as usize] {
+                let bytes = end_record(entries, size, offset, &vec![b'c'; length]);
+                assert!(matches!(
+                    end_of_central_directory(&bytes),
+                    Err(Error::InvalidWorkbook(message))
+                        if message == "ambiguous ZIP end-of-directory records"
+                ));
+            }
+        }
+    }
+
+    /// `bytes` with its archive comment replaced by `comment`.
+    fn with_comment(mut bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+        let end = Archive::new(bytes.clone()).unwrap().end;
+        bytes.truncate(end + END_LEN);
+        set_u16(&mut bytes, end + 20, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        bytes
+    }
+
+    #[test]
+    fn saves_refuse_directory_offsets_that_would_make_the_end_record_ambiguous() {
+        let comment = |first: &[u8], length: usize| {
+            let mut comment = first.to_vec();
+            comment.resize(length, b'c');
+            comment
+        };
+        // Local records would have to fill hundreds of megabytes to move the
+        // directory this far, so emit the directory from these positions.
+        for (offset, comment, refused) in [
+            (END, Vec::new(), false),
+            // Python would select the signature at offset 16 and, finding no
+            // complete record after it, fail to open the archive.
+            (END, comment(b"", 15), true),
+            // Other readers would select it too, and misread the archive.
+            (END, comment(b"", 16), true),
+            // The offset's top byte, the comment length 0x054b and the
+            // comment's first byte together spell a signature at offset 19.
+            (0x5000_0000, comment(&[6], 0x054b), true),
+            (0x5000_0000, comment(&[7], 0x054b), false),
+        ] {
+            let archive = Archive::new(with_comment(fixture(false), &comment)).unwrap();
+            let mut output = Vec::new();
+            let mut position = offset as usize;
+            let result = archive.emit_directory(&mut output, &mut position, &[0], &[None]);
+            if refused {
+                assert!(matches!(
+                    result,
+                    Err(Error::Unsupported(message)) if message.contains("ambiguous")
+                ));
+                assert!(output.is_empty());
+            } else {
+                result.unwrap();
+                // Readers select the end record that was written.
+                let end = output.len() - END_LEN - comment.len();
+                assert_eq!(end_of_central_directory(&output).unwrap(), end);
+                assert!(!shadows_end_record(&output[end..]));
+                assert_eq!(u32_at(&output, end + 16).unwrap(), offset);
+            }
+        }
+
+        // A signature Python cannot use in the input's own record is kept: here
+        // 0x4b50 entries and a 0x0605-byte directory, with a 5-byte comment.
+        // (The entry count is set after validation; the writer copies it.)
+        let mut padding = 0xcafe_u16.to_le_bytes().to_vec();
+        padding.extend_from_slice(&1483_u16.to_le_bytes());
+        padding.resize(4 + 1483, 0);
+        let input = with_comment(extra_fixture(&[], &padding), b"12345");
+        let mut archive = Archive::new(input).unwrap();
+        assert_eq!(archive.end - archive.central_start, 0x0605);
+        set_u16(&mut archive.original, archive.end + 8, 0x4b50);
+        set_u16(&mut archive.original, archive.end + 10, 0x4b50);
+        assert!(shadows_end_record(&archive.original[archive.end..]));
+        let mut output = Vec::new();
+        archive
+            .emit_directory(&mut output, &mut 0x100, &[0], &[None])
+            .unwrap();
+        let end = output.len() - END_LEN - 5;
+        assert!(shadows_end_record(&output[end..]));
+        assert_eq!(u32_at(&output, end + 16).unwrap(), 0x100);
+    }
+
+    #[test]
+    fn python_selects_any_later_signature_once_there_is_a_comment() {
+        // Without a comment Python reads the last 22 bytes as the record.
+        let bytes = end_record(1, 46, END, b"");
+        assert!(!shadows_end_record(&bytes[64..]));
+        // With one, it selects the last signature, here at offset 16.
+        for length in [1, 15, 16, 100] {
+            let bytes = end_record(1, 46, END, &vec![b'c'; length]);
+            assert!(shadows_end_record(&bytes[64..]), "{length}");
+            assert_eq!(hides_end_record(&bytes[64..]), length >= 16, "{length}");
+        }
+        let bytes = end_record(1, 46, 64, &[b'c'; 100]);
+        assert!(!shadows_end_record(&bytes[64..]));
+    }
+
     fn unicode_path(raw_name: &[u8], name: &[u8], version: u8) -> Vec<u8> {
         let mut field = 0x7075u16.to_le_bytes().to_vec();
         field.extend_from_slice(&(5 + name.len() as u16).to_le_bytes());
@@ -2011,28 +2197,36 @@ mod tests {
     #[test]
     fn rejects_unicode_path_extra_fields_that_rename_members() {
         let name = b"part.xml";
-        let renamed = unicode_path(name, b"evil.xml", 1);
-        let same = unicode_path(name, name, 1);
-        let late = [same.clone(), renamed.clone()].concat();
-        for (local, central) in [
-            (&same, &renamed),
-            (&renamed, &same),
-            (&renamed, &renamed),
-            (&same, &late),
-            (&late, &same),
-        ] {
-            assert!(matches!(
-                Archive::new(extra_fixture(local, central)),
-                Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
-            ));
+        // Readers differ in the versions they apply: Info-ZIP takes version 0
+        // in the central directory, and libarchive any version locally.
+        for version in [0, 1, 2] {
+            let renamed = unicode_path(name, b"evil.xml", version);
+            let same = unicode_path(name, name, version);
+            let late = [same.clone(), renamed.clone()].concat();
+            for (local, central) in [
+                (&Vec::new(), &renamed),
+                (&renamed, &Vec::new()),
+                (&same, &renamed),
+                (&renamed, &same),
+                (&renamed, &renamed),
+                (&same, &late),
+                (&late, &same),
+            ] {
+                assert!(matches!(
+                    Archive::new(extra_fixture(local, central)),
+                    Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
+                ));
+            }
         }
-        // Readers ignore other versions and fields whose CRC does not match
-        // the raw name, so those cannot rename a member for them either.
-        let other_version = unicode_path(name, b"evil.xml", 2);
+        // Readers ignore fields whose CRC does not match the raw name or that
+        // are too short to hold one, so those cannot rename a member for them.
+        let same = unicode_path(name, name, 1);
         let stale = unicode_path(b"part.bin", b"evil.xml", 1);
-        let both = [same.clone(), stale.clone()].concat();
+        let short = [0x75, 0x70, 4, 0, 1, 0, 0, 0].to_vec();
+        let both = [same.clone(), stale.clone(), short.clone()].concat();
         let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
-        for extra in [same, other_version, stale, both] {
+        let versions = [0, 2].map(|version| unicode_path(name, name, version));
+        for extra in [same, stale, short, both].into_iter().chain(versions) {
             let original = extra_fixture(&extra, &extra);
             let archive = Archive::new(original.clone()).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
@@ -2047,32 +2241,58 @@ mod tests {
 
     #[test]
     fn compaction_refuses_obsolete_records_renamed_by_unicode_path_fields() {
-        let same = unicode_path(b"part.xml", b"part.xml", 1);
-        let archive = Archive::new(extra_fixture(&same, &same)).unwrap();
-        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
-        let appended = append(&archive, &changes);
-        let mut compacted = Vec::new();
-        Archive::new(appended.clone())
-            .unwrap()
-            .compact_to(&BTreeMap::new(), &mut compacted)
-            .unwrap();
-        assert_eq!(
-            Archive::new(compacted).unwrap().read("part.xml").unwrap(),
-            b"updated"
-        );
-        // The obsolete record at offset 0 is opaque to normal saves, but
-        // compaction must parse it and so applies the same name rule.
-        let mut renamed = appended;
-        let unicode_name = 30 + b"part.xml".len() + 9;
-        renamed[unicode_name..unicode_name + 8].copy_from_slice(b"evil.xml");
-        let archive = Archive::new(renamed.clone()).unwrap();
-        assert_eq!(archive.write(&BTreeMap::new()).unwrap(), renamed);
-        let mut output = Vec::new();
-        assert!(matches!(
-            archive.compact_to(&BTreeMap::new(), &mut output),
-            Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
-        ));
-        assert!(output.is_empty());
+        for version in [0, 1, 2] {
+            let same = unicode_path(b"part.xml", b"part.xml", version);
+            let archive = Archive::new(extra_fixture(&same, &same)).unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+            let appended = append(&archive, &changes);
+            let mut compacted = Vec::new();
+            Archive::new(appended.clone())
+                .unwrap()
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(
+                Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+                b"updated"
+            );
+            // The obsolete record at offset 0 is opaque to normal saves, but
+            // compaction must parse it and so applies the same name rule.
+            let mut renamed = appended;
+            let unicode_name = 30 + b"part.xml".len() + 9;
+            renamed[unicode_name..unicode_name + 8].copy_from_slice(b"evil.xml");
+            let archive = Archive::new(renamed.clone()).unwrap();
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), renamed);
+            let mut output = Vec::new();
+            assert!(matches!(
+                archive.compact_to(&BTreeMap::new(), &mut output),
+                Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
+            ));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_reads_stop_one_byte_past_the_limit() {
+        let input = b"0123456789";
+        assert_eq!(read_at_most(&input[..], Vec::new(), 10).unwrap(), input);
+        let too_long = |result: Result<Vec<u8>>| {
+            matches!(
+                result,
+                Err(Error::Unsupported(message))
+                    if message == "input exceeds the largest possible ZIP32 archive"
+            )
+        };
+        assert!(too_long(read_at_most(&input[..], Vec::new(), 9)));
+        // An endless stream is not read beyond the limit.
+        assert!(too_long(read_at_most(
+            std::io::repeat(0),
+            Vec::new(),
+            1 << 16
+        )));
+        // Reserved capacity in the buffer does not count as input.
+        let reserved = Vec::with_capacity(64);
+        assert_eq!(read_at_most(&input[..], reserved, 10).unwrap(), input);
+        assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
     }
 
     #[test]

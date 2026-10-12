@@ -5,14 +5,14 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write},
     path::Path,
     process::ExitCode,
 };
 
 use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, SheetVisibility, Workbook};
 
-const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch cells [--json] INPUT SHEET [RANGE]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nOptions go right after the command. Write a file whose name starts with - as ./NAME.\nUse - as INPUT to read the workbook from stdin, or as OUTPUT to write it to stdout when stdout is not a terminal.\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin; INPUT and PATCH.tsv cannot both be -. Use LF or CRLF line endings.\nEmpty lines are ignored. Lines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in address order; formula results are cached and are not recalculated.\nA get CELL may be a range such as A1:C3, read row by row; one get reads at most 1048576 cells.\ncells prints CELL<TAB>TYPE<TAB>VALUE for each cell holding a value or formula, optionally within RANGE.\n--json returns an array: list includes names, paths and visibility; get and cells include types, values, formulas and styles.\nOn a terminal, plain list, get and cells output shows control characters as \\u{..} escapes; --json is exact.";
+const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n  sheetpatch cells [--json] INPUT SHEET [RANGE]\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n  sheetpatch compact INPUT OUTPUT\n  sheetpatch help [COMMAND]\n  sheetpatch --help\n  sheetpatch --version\n\nOptions go right after the command. Write a file whose name starts with - as ./NAME.\nUse - as INPUT to read the workbook from stdin, or as OUTPUT to write it to stdout when stdout is not a terminal.\nPatch rows: SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE. Blank needs no value.\nUse - as PATCH.tsv to read stdin; INPUT and PATCH.tsv cannot both be -. Use LF or CRLF line endings.\nEmpty lines are ignored. Lines starting with # without tabs are comments.\n--check validates a patch against the workbook without saving.\nQuote sheet names and text values containing spaces. Formats: .xlsx, .xlsm, .xltx, .xltm.\nget prints each stored value in CELL argument order; formula results are cached and are not recalculated.\nA get CELL may be a range such as A1:C3, read row by row; one get reads at most 1048576 cells.\ncells prints CELL<TAB>TYPE<TAB>VALUE for each cell holding a value or formula, optionally within RANGE.\n--json returns an array: list includes names, paths and visibility; get and cells include types, values, formulas and styles.\nOn a terminal, plain list output shows every control character in names as a \\u{..} escape, and plain get and cells output shows control characters other than tab and line feed that way; --json is exact.";
 
 /// The most cells one `get` reads, counting every cell of each range.
 const MAX_GET_CELLS: u64 = 1_048_576;
@@ -27,16 +27,16 @@ fn command_help(command: &str) -> Option<&'static str> {
             "Usage: sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n\nRead A1 addresses in input order with one worksheet parse. A CELL may also be a range such as A1:C3, which is read row by row from its top-left cell; one get reads at most 1048576 cells. Names are case-sensitive; addresses accept lowercase letters. Formula results are stored caches, without recalculation. --json includes normalized addresses, scalar types, values, formulas and style indices. Blank values use null in JSON and an empty line in plain output. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes; --json output is exact.",
         ),
         "cells" => Some(
-            "Usage: sheetpatch cells [--json] INPUT SHEET [RANGE]\n\nList the cells of a worksheet that hold a value or a formula, row by row, with one worksheet parse. A RANGE such as A1:C3 or B2 limits the list to the cells within it. Cells holding only formatting are skipped. Plain output has one CELL<TAB>TYPE<TAB>VALUE line per cell, with the types text, number, bool, error or blank, and values printed as get prints them. Prefixing each line with the sheet name and a tab gives patch rows for values without line breaks. Formula results are stored caches, without recalculation. --json returns the same objects as get --json, including formulas and style indices, and is exact. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes.",
+            "Usage: sheetpatch cells [--json] INPUT SHEET [RANGE]\n\nList the cells of a worksheet that hold a value or a formula, row by row, with one worksheet parse. A RANGE such as A1:C3 or B2 limits the list to the cells within it. Cells holding only formatting are skipped. Plain output has one CELL<TAB>TYPE<TAB>VALUE line per cell, with the types text, number, bool, error or blank, and values printed as get prints them. Prefixing each line with the sheet name and a tab gives patch rows for values without line breaks, except that rows for formula cells cannot be applied: patch refuses edits to formula cells. Formula results are stored caches, without recalculation. --json returns the same objects as get --json, including formulas and style indices, and is exact. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes.",
         ),
         "set" => Some(
             "Usage:\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n\nSet one scalar cell value and save atomically. Text stays text even when it starts with =. Numbers must be finite; booleans are true or false; error tokens include #N/A and #DIV/0!. Blank clears the value while retaining formatting. Formula cells and merged-range followers are protected. INPUT and OUTPUT may be the same path. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal.",
         ),
         "patch" => Some(
-            "Usage:\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n\nApply a transaction of tab-separated SHEET, CELL, TYPE and VALUE fields. Types: text, number, bool, error, blank. Blank may omit VALUE. Duplicate cells use the last value. Text retains extra tabs and trailing whitespace. UTF-8 BOM and CRLF files are accepted; a carriage return inside a row is rejected. Empty lines and tab-free lines starting with # are ignored. Use - as PATCH.tsv to read standard input. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal; INPUT and PATCH.tsv cannot both be -. --check validates the complete transaction and output generation without saving; success reports the number of patch rows. Check and apply both use the same edit protections and ZIP limits.",
+            "Usage:\n  sheetpatch patch INPUT OUTPUT PATCH.tsv\n  sheetpatch patch --check INPUT PATCH.tsv\n\nApply a transaction of tab-separated SHEET, CELL, TYPE and VALUE fields. Types: text, number, bool, error, blank. Blank may omit VALUE. Duplicate cells use the last value. Text retains extra tabs and trailing whitespace. UTF-8 BOM and CRLF files are accepted; any other carriage return is rejected unless it is the last byte of the file, which stays in the value. Empty lines and tab-free lines starting with # are ignored. Use - as PATCH.tsv to read standard input. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal; INPUT and PATCH.tsv cannot both be -. --check validates the complete transaction and output generation without saving; success reports the number of patch rows. Check and apply both use the same edit protections and ZIP limits.",
         ),
         "compact" => Some(
-            "Usage: sheetpatch compact INPUT OUTPUT\n\nRemove safely recognized obsolete ZIP records and save atomically. Unknown archive prefixes or gaps are protected. Compaction retains untouched active records, does not calculate formulas, and does not securely erase copies or filesystem history. INPUT and OUTPUT may be the same path. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal.",
+            "Usage: sheetpatch compact INPUT OUTPUT\n\nRemove safely recognized obsolete ZIP records and save atomically. An archive with unrecognized prefixes or gaps is refused rather than having them removed. Compaction retains untouched active records, does not calculate formulas, and does not securely erase copies or filesystem history. INPUT and OUTPUT may be the same path. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal.",
         ),
         _ => None,
     }
@@ -350,15 +350,10 @@ impl<'a> Source<'a> {
             Self::File(path) => Workbook::open(path).map_err(|error| {
                 Failure::Context(format!("cannot read workbook {}", quoted_path(path)), error)
             }),
-            Self::Stdin => {
-                let context = || "cannot read workbook from standard input".to_owned();
-                let mut bytes = Vec::new();
-                io::stdin()
-                    .lock()
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| Failure::Context(context(), error.into()))?;
-                Workbook::from_bytes(bytes).map_err(|error| Failure::Context(context(), error))
-            }
+            // Reading stops once the input exceeds the largest ZIP32 archive.
+            Self::Stdin => Workbook::from_reader(io::stdin().lock()).map_err(|error| {
+                Failure::Context("cannot read workbook from standard input".into(), error)
+            }),
         }
     }
 }
@@ -534,7 +529,8 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Vec<(usize, Cell
                 ));
             }
         }
-        if line.ends_with('\n') {
+        let terminated = line.ends_with('\n');
+        if terminated {
             line.pop();
             if line.ends_with('\r') {
                 line.pop();
@@ -546,9 +542,16 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Vec<(usize, Cell
             &line
         };
         // A carriage return ends a line only before a line feed. Followed by
-        // more data, it would merge classic Mac lines into one text value. A
-        // final carriage return without a line feed remains part of the value.
-        if line.strip_suffix('\r').unwrap_or(line).contains('\r') {
+        // more data, it would merge classic Mac lines into one text value, and
+        // before a CRLF it would leave a stray carriage return in the value.
+        // Only a final line without a line feed may end with one, which then
+        // remains part of the value.
+        let body = if terminated {
+            line
+        } else {
+            line.strip_suffix('\r').unwrap_or(line)
+        };
+        if body.contains('\r') {
             return Err(invalid(
                 "carriage return without line feed; use LF or CRLF line endings".into(),
             ));
@@ -593,7 +596,9 @@ fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
             '\t' => "\\t",
             '\u{08}' => "\\b",
             '\u{0c}' => "\\f",
-            '\u{00}'..='\u{1f}' => "",
+            // JSON requires escapes only for C0 controls. Escaping DEL and C1
+            // controls too keeps them out of terminals showing the output.
+            '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => "",
             _ => continue,
         };
         output.write_all(&value.as_bytes()[start..index])?;
@@ -1191,6 +1196,16 @@ mod tests {
                 "\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\""
             )
         );
+        // DEL and C1 controls are escaped too, so raw JSON on a terminal
+        // cannot carry them; the characters around them stay literal.
+        let input: String = ('\u{7e}'..='\u{a1}').collect();
+        let mut output = Vec::new();
+        write_json_string(&mut output, &input).unwrap();
+        let escapes: String = (0x7f..=0x9f).map(|code| format!("\\u{code:04x}")).collect();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("\"~{escapes}\u{a0}\u{a1}\"")
+        );
     }
 
     #[test]
@@ -1264,7 +1279,7 @@ mod tests {
             assert!(
                 String::from_utf8(json)
                     .unwrap()
-                    .contains("\"x\\r\u{9b}2J\u{7f}\\ty\""),
+                    .contains("\"x\\r\\u009b2J\\u007f\\ty\""),
                 "{command}"
             );
         }
@@ -1457,10 +1472,12 @@ mod tests {
     fn patch_preserves_a_carriage_return_without_a_line_feed() {
         let edits = read_patch("Data\tA1\ttext\tvalue\r".as_bytes(), "test").unwrap();
         assert_eq!(edits[0].1.value(), &CellValue::Text("value\r".into()));
-        // A carriage return before a CRLF terminator is likewise the last byte.
         assert_eq!(
-            patch_values("Data\tA1\ttext\tvalue\r\r\n"),
-            vec![CellValue::Text("value\r".into())]
+            patch_values("Data\tA1\ttext\tfirst\r\nData\tA2\ttext\tlast\r"),
+            vec![
+                CellValue::Text("first".into()),
+                CellValue::Text("last\r".into())
+            ]
         );
     }
 
@@ -1475,6 +1492,14 @@ mod tests {
             (b"Data\tA1\ttext\tok\nData\tA2\ttext\ta\rb\n", 2),
             (b"# one\r# two\r", 1),
             (b"Data\tA1\ttext\tvalue\r\r", 1),
+            // A line feed ends the line, so a carriage return left after
+            // removing LF or CRLF is not the final byte of the input.
+            (b"Data\tA1\ttext\tvalue\r\r\n", 1),
+            (
+                b"Data\tA1\ttext\tok\r\nData\tA2\ttext\tvalue\r\r\nData\tA3\tblank\n",
+                2,
+            ),
+            (b"Data\tA1\ttext\tok\n# note\r\r\n", 2),
         ] {
             assert_eq!(
                 patch_error(source),

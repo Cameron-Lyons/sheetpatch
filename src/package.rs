@@ -1,6 +1,7 @@
 use crate::{
     CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result,
-    archive::{Archive, PartChanges},
+    archive::{self, Archive, PartChanges},
+    atomic::SourcePermissions,
     worksheet::{PreparedWorksheet, patch_cells, read_cells, read_shared_strings},
 };
 use std::{borrow::Cow, collections::BTreeMap, fmt, fs, io::Write, path::Path, sync::OnceLock};
@@ -92,9 +93,9 @@ pub struct Workbook {
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
-    // Permissions of the file this workbook was opened from, used as the
-    // creation mode for new save destinations so a copy is not more permissive.
-    source_permissions: Option<fs::Permissions>,
+    // Permissions and group of the file this workbook was opened from, used
+    // for new save destinations so a copy is not more permissive.
+    source_permissions: Option<SourcePermissions>,
 }
 
 // The archive and XML are omitted: they can be many megabytes.
@@ -279,40 +280,52 @@ impl Workbook {
     /// Input larger than the largest possible ZIP32 archive (about 8 GiB) is
     /// rejected with [`Error::Unsupported`]: a regular file before it is read,
     /// and a pipe or device once that much has been read. On Unix, a regular
-    /// file's permissions become the creation mode for new destinations of
+    /// file's permission bits and group apply to new destinations of
     /// [`Self::save`] and [`Self::save_compact`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        use std::io::{self, Read};
-
-        // The central directory's offset and size are each below u32::MAX, and
-        // only a 22-byte end record and a comment of at most 64 KiB follow it.
-        const MAX_LEN: u64 = 2 * u32::MAX as u64 + 22 + u16::MAX as u64;
-        let too_large =
-            || Error::Unsupported("input exceeds the largest possible ZIP32 archive".into());
         let file = fs::File::open(path)?;
         let metadata = file.metadata()?;
         let mut bytes = Vec::new();
         if metadata.is_file() {
-            if metadata.len() > MAX_LEN {
-                return Err(too_large());
+            if metadata.len() > archive::MAX_ARCHIVE_LEN {
+                return Err(archive::archive_too_large());
             }
             // Fall back to an unsized read on targets where the length does
             // not fit in memory; reading then reports the allocation failure.
             if let Ok(len) = usize::try_from(metadata.len()) {
                 bytes
                     .try_reserve_exact(len)
-                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
             }
         }
-        // Devices and pipes have no useful length; stop reading at the limit.
-        file.take(MAX_LEN + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_LEN {
-            return Err(too_large());
-        }
-        let mut workbook = Self::from_bytes(bytes)?;
+        // Devices and pipes have no useful length; reading stops at the limit.
+        let mut workbook = Self::from_bytes(archive::read_archive(file, bytes)?)?;
         // Pipes and devices carry no meaningful file permissions to inherit.
-        workbook.source_permissions = metadata.is_file().then(|| metadata.permissions());
+        workbook.source_permissions = metadata
+            .is_file()
+            .then(|| SourcePermissions::new(&metadata));
         Ok(workbook)
+    }
+
+    /// Read a workbook from a stream, such as standard input, and discover
+    /// worksheets through its relationships. Worksheet XML and shared strings
+    /// are parsed lazily when first accessed.
+    ///
+    /// At most the largest possible ZIP32 archive (about 8 GiB) is read;
+    /// longer input is rejected with [`Error::Unsupported`] once that much has
+    /// been read. Read errors are returned as [`Error::Io`]. No source
+    /// permissions are recorded, so new destinations of [`Self::save`] and
+    /// [`Self::save_compact`] are created with the default permissions, as
+    /// for [`Self::from_bytes`].
+    ///
+    /// ```no_run
+    /// use sheetpatch::Workbook;
+    /// let book = Workbook::from_reader(std::io::stdin().lock())?;
+    /// println!("{} worksheets", book.sheets().len());
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
+    pub fn from_reader(reader: impl std::io::Read) -> Result<Self> {
+        Self::from_bytes(archive::read_archive(reader, Vec::new())?)
     }
 
     /// Open an in-memory workbook, retaining its original archive bytes.
@@ -710,7 +723,8 @@ impl Workbook {
     /// record sequence. Untouched local records and pre-existing ZIP gaps remain;
     /// central-directory offsets may change. The writer is flushed before this
     /// returns, so buffered writers passed by value still report write errors.
-    /// A failing writer may contain a partial archive; use `save` for atomic files.
+    /// An error after output has started, such as a failing writer, may leave a
+    /// partial archive; use `save` for atomic files.
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.write_to(&self.changed_parts(), &mut writer)
     }
@@ -718,8 +732,9 @@ impl Workbook {
     /// Remove pre-existing obsolete ZIP records while retaining untouched active
     /// local headers, compressed bytes, and descriptors. Central-directory
     /// offsets may change. Opaque ZIP prefixes or gaps cause an error. The writer
-    /// is flushed before this returns.
-    /// A failing writer may contain a partial archive; use `save_compact` for files.
+    /// is flushed before this returns. An error after output has started, such
+    /// as a failing writer, may leave a partial archive; use `save_compact` for
+    /// files.
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changed_parts(), &mut writer)
     }
@@ -745,9 +760,13 @@ impl Workbook {
     /// An existing destination keeps its permissions; on Unix it also keeps its
     /// group when the process may assign it, and otherwise loses group access.
     /// On Unix, a new destination for a workbook read by [`Self::open`] is
-    /// created with the source file's permissions, restricted by the umask.
+    /// created with the source file's permissions, restricted by the umask,
+    /// and the same group rule: it gets the source file's group when the
+    /// process may assign it, and otherwise no group access. Setuid, setgid
+    /// and sticky bits are never applied; writing the contents would clear
+    /// setuid and setgid anyway.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        crate::atomic::write(path.as_ref(), self.source_permissions.as_ref(), |writer| {
+        crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_to(writer)
         })
     }
@@ -757,7 +776,7 @@ impl Workbook {
     /// Saving does not clear pending edits or replace the retained original.
     /// Destinations and permissions are handled as described for [`Self::save`].
     pub fn save_compact(&self, path: impl AsRef<Path>) -> Result<()> {
-        crate::atomic::write(path.as_ref(), self.source_permissions.as_ref(), |writer| {
+        crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_compact_to(writer)
         })
     }

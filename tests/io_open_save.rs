@@ -130,6 +130,39 @@ fn oversized_inputs_are_rejected_before_reading() {
     }
 }
 
+#[test]
+fn workbooks_read_from_streams_match_opened_files() {
+    let opened = Workbook::open(FIXTURE).unwrap();
+    let streamed = Workbook::from_reader(fs::File::open(FIXTURE).unwrap()).unwrap();
+    assert_eq!(streamed.sheets(), opened.sheets());
+    assert_eq!(streamed.to_bytes().unwrap(), fs::read(FIXTURE).unwrap());
+    // Any reader works, including a byte slice or a mutable reference.
+    let bytes = fs::read(FIXTURE).unwrap();
+    let mut reader = io::Cursor::new(&bytes);
+    let mut workbook = Workbook::from_reader(&mut reader).unwrap();
+    workbook.set_cell("Data", "A1", "streamed").unwrap();
+    let saved = Workbook::from_reader(&workbook.to_bytes().unwrap()[..]).unwrap();
+    assert_eq!(
+        saved.get_cell("Data", "A1").unwrap().value,
+        "streamed".into()
+    );
+
+    struct Failing;
+    impl io::Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("stream failed"))
+        }
+    }
+    match Workbook::from_reader(Failing) {
+        Err(Error::Io(error)) => assert_eq!(error.to_string(), "stream failed"),
+        other => panic!("expected an I/O error, got {:?}", other.err()),
+    }
+    assert!(matches!(
+        Workbook::from_reader(&b"not a workbook"[..]),
+        Err(Error::InvalidWorkbook(_))
+    ));
+}
+
 #[cfg(unix)]
 mod permissions {
     use super::*;
@@ -209,6 +242,82 @@ mod permissions {
         let saved = directory.join("saved.xlsx");
         workbook.save(&saved).unwrap();
         assert_eq!(mode(&saved), 0o666 & !umask);
+        // A stream carries no permissions, even when it reads a private file.
+        let private = source(&directory, 0o600);
+        let workbook = Workbook::from_reader(fs::File::open(private).unwrap()).unwrap();
+        let streamed = directory.join("streamed.xlsx");
+        workbook.save(&streamed).unwrap();
+        assert_eq!(mode(&streamed), 0o666 & !umask);
+    }
+
+    fn gid(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+
+        fs::metadata(path).unwrap().gid()
+    }
+
+    /// The user's groups other than the one its new files receive.
+    fn other_groups(default: u32) -> Vec<u32> {
+        let output = Command::new("id").arg("-G").output().unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .filter_map(|gid| gid.parse().ok())
+            .filter(|&gid| gid != default)
+            .collect()
+    }
+
+    #[test]
+    fn new_destinations_take_the_source_group_with_its_permissions() {
+        let directory = TempDir::new();
+        let umask = umask(&directory);
+        let input = source(&directory, 0o640);
+        let default = gid(&input);
+        // Skip without a second group to give the source.
+        let Some(&other) = other_groups(default).first() else {
+            return;
+        };
+        std::os::unix::fs::chown(&input, None, Some(other)).unwrap();
+        let mut workbook = Workbook::open(&input).unwrap();
+        workbook.set_cell("Data", "A1", "edited").unwrap();
+        let saved = directory.join("saved.xlsx");
+        workbook.save(&saved).unwrap();
+        assert_eq!((gid(&saved), mode(&saved)), (other, 0o640 & !umask));
+
+        // A setgid directory's group does not receive the source group's
+        // permissions: the copy is given the source's group instead.
+        fs::remove_file(&input).unwrap();
+        let input = source(&directory, 0o640);
+        assert_eq!(gid(&input), default);
+        let shared = directory.join("shared");
+        fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(other)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2775)).unwrap();
+        let workbook = Workbook::open(&input).unwrap();
+        let saved = shared.join("saved.xlsx");
+        workbook.save_compact(&saved).unwrap();
+        assert_eq!((gid(&saved), mode(&saved)), (default, 0o640 & !umask));
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn saves_drop_setuid_and_setgid_bits() {
+        let directory = TempDir::new();
+        let umask = umask(&directory);
+        // The kernel would clear these bits when the contents are written,
+        // so saves never apply them.
+        let input = source(&directory, 0o2750);
+        assert_eq!(mode(&input), 0o2750);
+        let mut workbook = Workbook::open(&input).unwrap();
+        workbook.set_cell("Data", "A1", "edited").unwrap();
+        let saved = directory.join("saved.xlsx");
+        workbook.save(&saved).unwrap();
+        assert_eq!(mode(&saved), 0o750 & !umask);
+        fs::set_permissions(&saved, fs::Permissions::from_mode(0o4755)).unwrap();
+        workbook.save(&saved).unwrap();
+        assert_eq!(mode(&saved), 0o755);
+        workbook.save(&input).unwrap();
+        assert_eq!(mode(&input), 0o750);
     }
 
     #[test]
