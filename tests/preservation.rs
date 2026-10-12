@@ -1,12 +1,11 @@
-use std::{
-    fs,
-    io::{Read, Write},
-    path::PathBuf,
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-};
+mod common;
 
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use std::{fs, io::Write, process::Command};
+
+use common::{
+    TempDir, ZipLayout, archive_comment, central_directory_offset, payload, write_zip, zip_entries,
+    zip_entry,
+};
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -57,143 +56,19 @@ fn fixture_at(
     archive(&entries)
 }
 
+// Deflated entries with DOS timestamps, Unix modes, and entry and archive
+// comments, so preservation checks cover metadata the crate must retain.
+// Parts larger than 1 MiB are stored: only the 64 MiB read-limit fixture is
+// that large, and its checks concern part sizes rather than compression.
+const LAYOUT: ZipLayout<'static> = ZipLayout {
+    deflate_level: Some(7),
+    store_larger_than: 1 << 20,
+    entry_comment: Some(b"retain entry metadata"),
+    archive_comment: b"Archive comment preserved by sheetpatch",
+};
+
 fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut central = Vec::new();
-    for &(name, bytes) in entries {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(7));
-        encoder.write_all(bytes).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let crc = crc32(bytes);
-        let local_offset = output.len() as u32;
-        let entry_comment = b"retain entry metadata";
-        put_u32(&mut output, 0x04034b50);
-        put_u16(&mut output, 20); // minimum extraction version
-        put_u16(&mut output, 0); // flags
-        put_u16(&mut output, 8); // raw deflate
-        put_u16(&mut output, 0x4220); // DOS time
-        put_u16(&mut output, 0x5d47); // DOS date
-        put_u32(&mut output, crc);
-        put_u32(&mut output, compressed.len() as u32);
-        put_u32(&mut output, bytes.len() as u32);
-        put_u16(&mut output, name.len() as u16);
-        put_u16(&mut output, 0); // extra field length
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(&compressed);
-
-        put_u32(&mut central, 0x02014b50);
-        put_u16(&mut central, 0x0314); // Unix producer
-        put_u16(&mut central, 20);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 8);
-        put_u16(&mut central, 0x4220);
-        put_u16(&mut central, 0x5d47);
-        put_u32(&mut central, crc);
-        put_u32(&mut central, compressed.len() as u32);
-        put_u32(&mut central, bytes.len() as u32);
-        put_u16(&mut central, name.len() as u16);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, entry_comment.len() as u16);
-        put_u16(&mut central, 0); // starting disk
-        put_u16(&mut central, 0); // internal attributes
-        put_u32(&mut central, 0o100640 << 16); // Unix mode
-        put_u32(&mut central, local_offset);
-        central.extend_from_slice(name.as_bytes());
-        central.extend_from_slice(entry_comment);
-    }
-    let central_offset = output.len();
-    output.extend_from_slice(&central);
-    put_u32(&mut output, 0x06054b50);
-    put_u16(&mut output, 0);
-    put_u16(&mut output, 0);
-    put_u16(&mut output, entries.len() as u16);
-    put_u16(&mut output, entries.len() as u16);
-    put_u32(&mut output, central.len() as u32);
-    put_u32(&mut output, central_offset as u32);
-    let comment = b"Archive comment preserved by sheetpatch";
-    put_u16(&mut output, comment.len() as u16);
-    output.extend_from_slice(comment);
-    output
-}
-
-fn put_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut Vec<u8>, value: u32) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
-struct ArchiveEntry {
-    name: String,
-    method: u16,
-    crc: u32,
-    uncompressed_size: usize,
-    compressed_start: usize,
-    compressed_size: usize,
-    local_bytes: Vec<u8>,
-    central_bytes: Vec<u8>,
-}
-
-fn archive_entries(bytes: &[u8]) -> Vec<ArchiveEntry> {
-    let end = bytes
-        .windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
-        .unwrap();
-    let count = u16_at(bytes, end + 10);
-    let mut offset = u32_at(bytes, end + 16) as usize;
-    let mut entries = Vec::new();
-    for _ in 0..count {
-        assert_eq!(u32_at(bytes, offset), 0x02014b50);
-        let name_len = u16_at(bytes, offset + 28) as usize;
-        let extra_len = u16_at(bytes, offset + 30) as usize;
-        let comment_len = u16_at(bytes, offset + 32) as usize;
-        let local = u32_at(bytes, offset + 42) as usize;
-        assert_eq!(u32_at(bytes, local), 0x04034b50);
-        let data_start =
-            local + 30 + u16_at(bytes, local + 26) as usize + u16_at(bytes, local + 28) as usize;
-        let entry_len = 46 + name_len + extra_len + comment_len;
-        entries.push(ArchiveEntry {
-            name: String::from_utf8(bytes[offset + 46..offset + 46 + name_len].to_vec()).unwrap(),
-            method: u16_at(bytes, offset + 10),
-            crc: u32_at(bytes, offset + 16),
-            uncompressed_size: u32_at(bytes, offset + 24) as usize,
-            compressed_start: data_start,
-            compressed_size: u32_at(bytes, offset + 20) as usize,
-            local_bytes: bytes[local..data_start + u32_at(bytes, offset + 20) as usize].to_vec(),
-            central_bytes: bytes[offset..offset + entry_len].to_vec(),
-        });
-        offset += entry_len;
-    }
-    entries
-}
-
-fn archive_comment(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
-        .unwrap();
-    let comment_len = u16_at(bytes, end + 20) as usize;
-    &bytes[end + 22..end + 22 + comment_len]
+    write_zip(entries, &LAYOUT)
 }
 
 fn fixture(worksheet: &str) -> Vec<u8> {
@@ -205,34 +80,8 @@ fn fixture(worksheet: &str) -> Vec<u8> {
     )
 }
 
-fn payload(bytes: &[u8], name: &str) -> Vec<u8> {
-    let file = archive_entries(bytes)
-        .into_iter()
-        .find(|entry| entry.name == name)
-        .unwrap();
-    let compressed = &bytes[file.compressed_start..file.compressed_start + file.compressed_size];
-    let output = match file.method {
-        0 => compressed.to_vec(),
-        8 => {
-            let mut output = Vec::new();
-            DeflateDecoder::new(compressed)
-                .read_to_end(&mut output)
-                .unwrap();
-            output
-        }
-        method => panic!("unexpected compression method: {method}"),
-    };
-    assert_eq!(output.len(), file.uncompressed_size);
-    assert_eq!(crc32(&output), file.crc);
-    output
-}
-
-fn compressed_payload(bytes: &[u8], name: &str) -> Vec<u8> {
-    let file = archive_entries(bytes)
-        .into_iter()
-        .find(|entry| entry.name == name)
-        .unwrap();
-    bytes[file.compressed_start..file.compressed_start + file.compressed_size].to_vec()
+fn compressed_payload<'a>(bytes: &'a [u8], name: &str) -> &'a [u8] {
+    zip_entry(bytes, name).compressed
 }
 
 fn worksheet_xml(bytes: &[u8]) -> String {
@@ -240,63 +89,55 @@ fn worksheet_xml(bytes: &[u8]) -> String {
 }
 
 fn assert_untouched_parts(original: &[u8], updated: &[u8]) {
-    let names: Vec<String> = archive_entries(original)
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect();
-    assert_eq!(archive_entries(updated).len(), names.len());
-    for name in names
+    let originals = zip_entries(original);
+    let updates = zip_entries(updated);
+    assert_eq!(updates.len(), originals.len());
+    for entry in originals
         .iter()
-        .filter(|name| name.as_str() != "xl/worksheets/sheet1.xml")
-    {
-        assert_eq!(
-            payload(updated, name),
-            payload(original, name),
-            "changed payload in {name}"
-        );
-        assert_eq!(
-            compressed_payload(updated, name),
-            compressed_payload(original, name),
-            "recompressed {name}"
-        );
-    }
-    assert_eq!(archive_comment(updated), archive_comment(original));
-    for entry in archive_entries(original)
-        .into_iter()
         .filter(|entry| entry.name != "xl/worksheets/sheet1.xml")
     {
-        let updated_entry = archive_entries(updated)
-            .into_iter()
+        let updated_entry = updates
+            .iter()
             .find(|updated| updated.name == entry.name)
             .unwrap();
         assert_eq!(
-            updated_entry.local_bytes, entry.local_bytes,
+            updated_entry.payload(),
+            entry.payload(),
+            "changed payload in {}",
+            entry.name
+        );
+        assert_eq!(
+            updated_entry.compressed, entry.compressed,
+            "recompressed {}",
+            entry.name
+        );
+        assert_eq!(
+            updated_entry.local, entry.local,
             "changed local record in {}",
             entry.name
         );
-        let mut original_metadata = entry.central_bytes;
-        let mut updated_metadata = updated_entry.central_bytes;
         // Local offsets necessarily move when an earlier worksheet changes size.
         // Every other central-directory byte must remain identical.
-        original_metadata[42..46].fill(0);
-        updated_metadata[42..46].fill(0);
         assert_eq!(
-            updated_metadata, original_metadata,
+            updated_entry.central_before_offset(),
+            entry.central_before_offset(),
+            "changed metadata in {}",
+            entry.name
+        );
+        assert_eq!(
+            updated_entry.central_after_offset(),
+            entry.central_after_offset(),
             "changed metadata in {}",
             entry.name
         );
     }
+    assert_eq!(archive_comment(updated), archive_comment(original));
 }
 
 fn assert_contiguous_local_records(bytes: &[u8]) {
-    let mut ranges: Vec<_> = archive_entries(bytes)
-        .into_iter()
-        .map(|entry| {
-            (
-                u32_at(&entry.central_bytes, 42) as usize,
-                entry.compressed_start + entry.compressed_size,
-            )
-        })
+    let mut ranges: Vec<_> = zip_entries(bytes)
+        .iter()
+        .map(|entry| (entry.local_offset, entry.local_offset + entry.local.len()))
         .collect();
     ranges.sort_unstable();
     let mut cursor = 0;
@@ -304,11 +145,7 @@ fn assert_contiguous_local_records(bytes: &[u8]) {
         assert_eq!(start, cursor, "unexpected unused bytes between ZIP records");
         cursor = end;
     }
-    let end = bytes
-        .windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
-        .unwrap();
-    assert_eq!(cursor, u32_at(bytes, end + 16) as usize);
+    assert_eq!(cursor, central_directory_offset(bytes));
 }
 
 #[test]
@@ -437,7 +274,7 @@ fn edits_prefixed_transitional_and_strict_worksheets_without_changing_namespaces
         );
         let original = fixture(&xml);
         let original = if namespace != MAIN_NS {
-            let entries: Vec<(String, Vec<u8>)> = archive_entries(&original)
+            let entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
                 .into_iter()
                 .map(|entry| {
                     let bytes = payload(&original, &entry.name);
@@ -522,7 +359,7 @@ fn invalid_values_and_addresses_fail_without_modifying_the_archive() {
     }
     assert!(
         workbook
-            .set_cell("Data & Notes", "A1", "invalid\0text")
+            .set_cell("Data & Notes", "A1", "a".repeat(32_768))
             .is_err()
     );
     assert_eq!(workbook.to_bytes().unwrap(), original);
@@ -537,7 +374,7 @@ fn rejects_non_ooxml_input() {
 #[test]
 fn signed_packages_can_be_read_but_cannot_be_edited() {
     let original = fixture(WORKSHEET);
-    let mut entries: Vec<(String, Vec<u8>)> = archive_entries(&original)
+    let mut entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
         .into_iter()
         .map(|entry| {
             let bytes = payload(&original, &entry.name);
@@ -568,7 +405,7 @@ fn signed_packages_can_be_read_but_cannot_be_edited() {
 #[test]
 fn signature_relationships_protect_unconventional_signature_paths() {
     let original = fixture(WORKSHEET);
-    let mut entries: Vec<(String, Vec<u8>)> = archive_entries(&original)
+    let mut entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
         .into_iter()
         .map(|entry| {
             let mut bytes = payload(&original, &entry.name);
@@ -593,31 +430,10 @@ fn signature_relationships_protect_unconventional_signature_paths() {
     assert_eq!(workbook.to_bytes().unwrap(), signed);
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sheetpatch-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn cli_lists_sheets_and_can_atomically_replace_the_input() {
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsm");
+    let input = directory.join("input.xlsm");
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     let listed = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
         .arg("list")
@@ -645,7 +461,7 @@ fn cli_lists_sheets_and_can_atomically_replace_the_input() {
     let bytes = fs::read(&input).unwrap();
     assert!(worksheet_xml(&bytes).contains("CLI value"));
     assert!(Workbook::open(&input).is_ok());
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -691,12 +507,8 @@ fn cli_accepts_non_unicode_paths() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     let directory = TempDir::new();
-    let input = directory
-        .0
-        .join(OsString::from_vec(b"input-\xff.xlsx".to_vec()));
-    let output = directory
-        .0
-        .join(OsString::from_vec(b"output-\xfe.xlsx".to_vec()));
+    let input = directory.join(OsString::from_vec(b"input-\xff.xlsx".to_vec()));
+    let output = directory.join(OsString::from_vec(b"output-\xfe.xlsx".to_vec()));
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     let edited = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
         .arg("set")
@@ -722,8 +534,8 @@ fn cli_rejects_non_unicode_text_without_modifying_output() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsx");
-    let output = directory.0.join("output.xlsx");
+    let input = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     fs::write(&output, b"existing output").unwrap();
     let before = fs::read(&output).unwrap();
@@ -747,8 +559,8 @@ fn cli_rejects_non_unicode_text_without_modifying_output() {
 #[test]
 fn failed_cli_edits_leave_existing_output_unchanged() {
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsx");
-    let output = directory.0.join("output.xlsx");
+    let input = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     fs::write(&output, b"existing output").unwrap();
     let changed = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
@@ -776,9 +588,9 @@ fn cli_rejects_non_utf8_patch_rows_with_the_line_number_and_usage_exit_code() {
     use std::process::Stdio;
 
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsx");
-    let output = directory.0.join("output.xlsx");
-    let patch = directory.0.join("edits.tsv");
+    let input = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
+    let patch = directory.join("edits.tsv");
     let invalid = b"Data & Notes\tA1\ttext\tvalid edit\nData & Notes\tC1\ttext\t\xff\n";
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     fs::write(&output, b"existing output").unwrap();
@@ -811,7 +623,7 @@ fn cli_rejects_non_utf8_patch_rows_with_the_line_number_and_usage_exit_code() {
 #[test]
 fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
     let directory = TempDir::new();
-    let input = directory.0.join("repeated.xlsm");
+    let input = directory.join("repeated.xlsm");
     let original = fixture(WORKSHEET);
     fs::write(&input, &original).unwrap();
     for (cell, value) in [("A1", "first"), ("C1", "second"), ("A1", "third")] {
@@ -825,13 +637,13 @@ fn repeated_saves_reopen_cleanly_and_keep_untouched_package_parts() {
         assert_eq!(reopened.to_bytes().unwrap(), updated);
     }
     assert!(worksheet_xml(&fs::read(&input).unwrap()).contains("third"));
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 #[test]
 fn failed_atomic_rename_keeps_existing_destination_and_removes_temporary_files() {
     let directory = TempDir::new();
-    let destination = directory.0.join("output.xlsx");
+    let destination = directory.join("output.xlsx");
     fs::create_dir(&destination).unwrap();
     let sentinel = destination.join("existing.txt");
     fs::write(&sentinel, b"existing destination content").unwrap();
@@ -844,11 +656,11 @@ fn failed_atomic_rename_keeps_existing_destination_and_removes_temporary_files()
         fs::read(&sentinel).unwrap(),
         b"existing destination content"
     );
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 fn replace_parts(original: &[u8], replacements: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut owned: Vec<(String, Vec<u8>)> = archive_entries(original)
+    let mut owned: Vec<(String, Vec<u8>)> = zip_entries(original)
         .into_iter()
         .map(|entry| {
             let bytes = replacements
@@ -1085,7 +897,7 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
         reopened.get_cell("Data & Notes", "A1").unwrap().value,
         CellValue::from("iteration 3")
     );
-    for entry in archive_entries(&original) {
+    for entry in zip_entries(&original) {
         if entry.name != "xl/worksheets/sheet1.xml" {
             assert_eq!(
                 payload(&compact, &entry.name),
@@ -1123,9 +935,9 @@ fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
     );
 
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsm");
-    let output = directory.0.join("output.xlsm");
-    let patch = directory.0.join("patch.tsv");
+    let input = directory.join("input.xlsm");
+    let output = directory.join("output.xlsm");
+    let patch = directory.join("patch.tsv");
     fs::write(&input, &original).unwrap();
     fs::write(&output, b"keep destination unchanged").unwrap();
     fs::write(
@@ -1155,15 +967,15 @@ fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
     assert_eq!(applied.stderr, checked.stderr);
     assert_eq!(fs::read(&input).unwrap(), original);
     assert_eq!(fs::read(&output).unwrap(), b"keep destination unchanged");
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 3);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
 }
 
 #[test]
 fn cli_patch_get_and_compact_support_atomic_batch_workflows() {
     let directory = TempDir::new();
-    let input = directory.0.join("input.xlsm");
-    let output = directory.0.join("output.xlsm");
-    let patch = directory.0.join("patch.tsv");
+    let input = directory.join("input.xlsm");
+    let output = directory.join("output.xlsm");
+    let patch = directory.join("patch.tsv");
     fs::write(&input, fixture(WORKSHEET)).unwrap();
     fs::write(&patch, "Data & Notes\tA1\ttext\tfirst\nData & Notes\tD3\tnumber\t12.5\nData & Notes\tE3\terror\t#N/A\n").unwrap();
     let binary = env!("CARGO_BIN_EXE_sheetpatch");

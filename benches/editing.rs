@@ -9,19 +9,25 @@
 //! Run one filtered operation under `/usr/bin/time -v` to compare process peak RSS;
 //! this includes fixture construction and correctness checks as well as samples.
 
+// Shared with the integration tests: an independent ZIP writer and reader.
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
     hint::black_box,
-    io::{self, Read, Write},
+    io,
     time::{Duration, Instant},
 };
 
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use common::{ZipEntry, ZipLayout, payloads, write_zip, zip_entries};
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
+// Default Deflate level, without optional ZIP metadata or comments.
+const LAYOUT: ZipLayout<'static> = ZipLayout::deflated(6);
 const CASES: &[(usize, usize)] = &[(10_000, 100), (50_000, 500)];
 const CASE_NAMES: &[&str] = &[
     "narrow_10000",
@@ -134,112 +140,14 @@ fn fixture_with_sheet(sheet: &[u8]) -> Vec<u8> {
 }
 
 fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut central = Vec::new();
-    for &(name, bytes) in entries {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(6));
-        encoder.write_all(bytes).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let crc = crc32(bytes);
-        let offset = output.len() as u32;
-        put32(&mut output, 0x0403_4b50);
-        for value in [20, 0, 8, 0, 0] {
-            put16(&mut output, value);
-        }
-        for value in [crc, compressed.len() as u32, bytes.len() as u32] {
-            put32(&mut output, value);
-        }
-        put16(&mut output, name.len() as u16);
-        put16(&mut output, 0);
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(&compressed);
-        put32(&mut central, 0x0201_4b50);
-        for value in [20, 20, 0, 8, 0, 0] {
-            put16(&mut central, value);
-        }
-        for value in [crc, compressed.len() as u32, bytes.len() as u32] {
-            put32(&mut central, value);
-        }
-        put16(&mut central, name.len() as u16);
-        for _ in 0..4 {
-            put16(&mut central, 0);
-        }
-        put32(&mut central, 0);
-        put32(&mut central, offset);
-        central.extend_from_slice(name.as_bytes());
-    }
-    let offset = output.len() as u32;
-    output.extend_from_slice(&central);
-    put32(&mut output, 0x0605_4b50);
-    put16(&mut output, 0);
-    put16(&mut output, 0);
-    put16(&mut output, entries.len() as u16);
-    put16(&mut output, entries.len() as u16);
-    put32(&mut output, central.len() as u32);
-    put32(&mut output, offset);
-    put16(&mut output, 0);
-    output
+    write_zip(entries, &LAYOUT)
 }
 
-fn put16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn read16(bytes: &[u8], at: usize) -> usize {
-    u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize
-}
-
-fn read32(bytes: &[u8], at: usize) -> usize {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
-struct Entry<'a> {
-    local: &'a [u8],
-    compressed: &'a [u8],
-    central_prefix: &'a [u8],
-    central_suffix: &'a [u8],
-}
-
-fn entries(bytes: &[u8]) -> BTreeMap<String, Entry<'_>> {
-    let end = bytes.len() - 22;
-    assert_eq!(&bytes[end..end + 4], b"PK\x05\x06");
-    let mut offset = read32(bytes, end + 16);
-    let mut entries = BTreeMap::new();
-    for _ in 0..read16(bytes, end + 10) {
-        assert_eq!(&bytes[offset..offset + 4], b"PK\x01\x02");
-        let local = read32(bytes, offset + 42);
-        let start = local + 30 + read16(bytes, local + 26) + read16(bytes, local + 28);
-        let size = read32(bytes, offset + 20);
-        let name_size = read16(bytes, offset + 28);
-        let central_size = 46 + name_size + read16(bytes, offset + 30) + read16(bytes, offset + 32);
-        let name = String::from_utf8(bytes[offset + 46..offset + 46 + name_size].to_vec()).unwrap();
-        entries.insert(
-            name,
-            Entry {
-                local: &bytes[local..start + size],
-                compressed: &bytes[start..start + size],
-                central_prefix: &bytes[offset..offset + 42],
-                central_suffix: &bytes[offset + 46..offset + central_size],
-            },
-        );
-        offset += central_size;
-    }
-    entries
+fn entries(bytes: &[u8]) -> BTreeMap<String, ZipEntry<'_>> {
+    zip_entries(bytes)
+        .into_iter()
+        .map(|entry| (entry.name.clone(), entry))
+        .collect()
 }
 
 fn verify_output(input: &[u8], output: &[u8], expected: &[u8]) {
@@ -251,11 +159,11 @@ fn verify_parts(input: &[u8], output: &[u8], expected: &[(&str, &[u8])]) {
     let replacements = entries(output);
     assert_eq!(originals.len(), replacements.len());
     for &(path, xml) in expected {
-        let mut decoded = Vec::new();
-        DeflateDecoder::new(replacements[path].compressed)
-            .read_to_end(&mut decoded)
-            .unwrap();
-        assert_eq!(decoded, xml, "effective worksheet XML must match: {path}");
+        assert_eq!(
+            replacements[path].payload(),
+            xml,
+            "effective worksheet XML must match: {path}"
+        );
     }
     for (name, original) in originals {
         if !expected.iter().any(|&(path, _)| path == name) {
@@ -263,11 +171,13 @@ fn verify_parts(input: &[u8], output: &[u8], expected: &[(&str, &[u8])]) {
             assert_eq!(original.local, replacement.local, "{name}");
             assert_eq!(original.compressed, replacement.compressed, "{name}");
             assert_eq!(
-                original.central_prefix, replacement.central_prefix,
+                original.central_before_offset(),
+                replacement.central_before_offset(),
                 "{name}"
             );
             assert_eq!(
-                original.central_suffix, replacement.central_suffix,
+                original.central_after_offset(),
+                replacement.central_after_offset(),
                 "{name}"
             );
         }
@@ -324,7 +234,8 @@ fn report(label: &str, cells: usize, count: usize, samples: usize, elapsed: Opti
     }
 }
 
-// New APIs begin here; the helpers above also run against the original baseline.
+// New APIs begin here; the helpers above (with tests/common/mod.rs) also run
+// against the original baseline.
 fn bulk(input: &[u8], edits: &[(String, CellValue)]) -> Workbook {
     let mut book = Workbook::from_bytes(input.to_vec()).unwrap();
     book.set_cells(
@@ -406,16 +317,7 @@ fn guarded_batches(samples: usize) {
 
 fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> Vec<u8> {
     let base = fixture_with_sheet(sheets[0].1);
-    let mut parts: BTreeMap<String, Vec<u8>> = entries(&base)
-        .into_iter()
-        .map(|(name, entry)| {
-            let mut bytes = Vec::new();
-            DeflateDecoder::new(entry.compressed)
-                .read_to_end(&mut bytes)
-                .unwrap();
-            (name, bytes)
-        })
-        .collect();
+    let mut parts = payloads(&base);
     let office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     let mut workbook = format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{office}'><sheets>");
     let mut relationships = String::from(

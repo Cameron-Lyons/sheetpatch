@@ -7,7 +7,8 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
-    io::Write,
+    fmt::Display,
+    io::{Read, Write},
     ops::Range,
 };
 
@@ -20,7 +21,40 @@ const CENTRAL: u32 = 0x0201_4b50;
 const END: u32 = 0x0605_4b50;
 const DESCRIPTOR: u32 = 0x0807_4b50;
 const ZIP64_LOCATOR: u32 = 0x0706_4b50;
+// Legacy .xls files and password-encrypted OOXML packages are not ZIP archives
+// but OLE compound files.
+const OLE_SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+
+const LOCAL_HEADER_LEN: usize = 30;
+const CENTRAL_HEADER_LEN: usize = 46;
+const END_LEN: usize = 22;
+const ZIP64_LOCATOR_LEN: usize = 20;
+const DESCRIPTOR_LEN: usize = 12;
+const SIGNED_DESCRIPTOR_LEN: usize = 16;
+
+const FLAG_ENCRYPTED: u16 = 0x0001;
+const FLAG_DESCRIPTOR: u16 = 0x0008;
+const FLAG_PATCHED: u16 = 0x0020;
+const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
+const FLAG_MASKED_HEADERS: u16 = 0x2000;
+// Patched data is not encryption: active patched members stay opaque, while
+// compaction refuses to discard obsolete ones (`FLAG_PATCHED` at those sites).
+const ENCRYPTION_FLAGS: u16 = FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTION | FLAG_MASKED_HEADERS;
+
+const STORED: u16 = 0;
+const DEFLATED: u16 = 8;
+
+const EXTRA_ZIP64: u16 = 0x0001;
+const EXTRA_UNICODE_PATH: u16 = 0x7075;
+
 const MAX_READ: usize = 64 * 1024 * 1024;
+/// The length of the largest possible ZIP32 archive: the central directory's
+/// offset and size are each below `u32::MAX`, and only a 22-byte end record
+/// and a comment of at most 64 KiB follow it.
+pub(crate) const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
+// Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
+// produces archives about as small as the default level 6, several times faster.
+const DEFLATE_LEVEL: u32 = 4;
 
 pub(crate) trait PartChanges {
     // Names are unique; iteration order is also the validation error order.
@@ -42,13 +76,48 @@ impl PartChanges for BTreeMap<String, Vec<u8>> {
     }
 }
 
+/// A member's CRC-32 and sizes, which local headers, central headers and data
+/// descriptors all store as consecutive fields in this order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sizes {
+    crc: u32,
+    compressed_size: u32,
+    size: u32,
+}
+
+impl Sizes {
+    fn read(bytes: &[u8], offset: usize) -> Result<Self> {
+        Ok(Self {
+            crc: u32_at(bytes, offset)?,
+            compressed_size: u32_at(bytes, add(offset, 4)?)?,
+            size: u32_at(bytes, add(offset, 8)?)?,
+        })
+    }
+
+    fn write(self, bytes: &mut [u8], offset: usize) {
+        set_u32(bytes, offset, self.crc);
+        set_u32(bytes, offset + 4, self.compressed_size);
+        set_u32(bytes, offset + 8, self.size);
+    }
+
+    /// Whether header fields agree with the actual values. A header followed
+    /// by a data descriptor may leave any field zero instead.
+    fn matches(self, actual: Self, has_descriptor: bool) -> bool {
+        [
+            (self.crc, actual.crc),
+            (self.compressed_size, actual.compressed_size),
+            (self.size, actual.size),
+        ]
+        .into_iter()
+        .all(|(header, actual)| header == actual || (has_descriptor && header == 0))
+    }
+}
+
 pub(crate) struct Entry {
     pub(crate) name: String,
     flags: u16,
     method: u16,
-    crc: u32,
-    compressed_size: u32,
-    size: u32,
+    sizes: Sizes,
     central: Range<usize>,
     local_header: Range<usize>,
     data: Range<usize>,
@@ -65,19 +134,32 @@ pub(crate) struct Archive {
     end: usize,
 }
 
+/// A central-directory header whose variable fields lie within the directory.
+struct CentralHeader<'a> {
+    flags: u16,
+    method: u16,
+    sizes: Sizes,
+    name: &'a str,
+    extra: &'a [u8],
+    local_start: usize,
+    record: Range<usize>,
+}
+
+/// A local header whose fixed fields, name and extra field end by a limit.
+struct LocalHeader<'a> {
+    flags: u16,
+    method: u16,
+    sizes: Sizes,
+    raw_name: &'a [u8],
+    extra: &'a [u8],
+    data_start: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StoredDescriptor {
     data_end: usize,
     end: usize,
-    crc: u32,
-    size: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Replacement {
-    crc: u32,
-    compressed_size: u32,
-    size: u32,
+    sizes: Sizes,
 }
 
 struct ChangePlan<'a> {
@@ -100,28 +182,55 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidWorkbook(message.into())
 }
 
+fn unsupported(message: impl Into<String>) -> Error {
+    Error::Unsupported(message.into())
+}
+
+fn zip64() -> Error {
+    unsupported("ZIP64 workbooks are not supported")
+}
+
+fn over_read_limit(member: impl Display) -> Error {
+    unsupported(format!(
+        "{member} exceeds the {} MiB read limit",
+        MAX_READ >> 20
+    ))
+}
+
+pub(crate) fn archive_too_large() -> Error {
+    unsupported("input exceeds the largest possible ZIP32 archive")
+}
+
+/// Append everything `reader` yields to `bytes`, refusing input longer than
+/// any ZIP32 archive once that much has been read.
+pub(crate) fn read_archive(reader: impl Read, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    read_at_most(reader, bytes, MAX_ARCHIVE_LEN)
+}
+
+fn read_at_most(reader: impl Read, mut bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
+    let start = bytes.len();
+    // One byte past the limit shows that the input is too long.
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if (bytes.len() - start) as u64 > limit {
+        return Err(archive_too_large());
+    }
+    Ok(bytes)
+}
+
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
+    bytes
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<N>)
+        .copied()
+        .ok_or_else(|| invalid("truncated ZIP record"))
+}
+
 fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
-    let value = bytes
-        .get(
-            offset
-                ..offset
-                    .checked_add(2)
-                    .ok_or_else(|| invalid("ZIP offset overflow"))?,
-        )
-        .ok_or_else(|| invalid("truncated ZIP record"))?;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
+    field(bytes, offset).map(u16::from_le_bytes)
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
-    let value = bytes
-        .get(
-            offset
-                ..offset
-                    .checked_add(4)
-                    .ok_or_else(|| invalid("ZIP offset overflow"))?,
-        )
-        .ok_or_else(|| invalid("truncated ZIP record"))?;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    field(bytes, offset).map(u32::from_le_bytes)
 }
 
 fn add(a: usize, b: usize) -> Result<usize> {
@@ -139,52 +248,217 @@ fn set_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn zip32(value: usize, description: &str) -> Result<u32> {
     let value = u32::try_from(value)
-        .map_err(|_| Error::Unsupported(format!("{description} exceeds ZIP32 limits")))?;
+        .map_err(|_| unsupported(format!("{description} exceeds ZIP32 limits")))?;
     if value == u32::MAX {
-        return Err(Error::Unsupported(format!("{description} requires ZIP64")));
+        return Err(unsupported(format!("{description} requires ZIP64")));
     }
     Ok(value)
 }
 
-fn check_extra(mut bytes: &[u8]) -> Result<()> {
+/// Reject extra fields that change how other readers interpret a member: ZIP64
+/// sizes and Unicode paths that rename it.
+fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
     while !bytes.is_empty() {
         if bytes.len() < 4 {
             return Err(invalid("truncated ZIP extra field"));
         }
         let kind = u16_at(bytes, 0)?;
         let length = u16_at(bytes, 2)? as usize;
-        if kind == 1 {
-            return Err(Error::Unsupported(
-                "ZIP64 workbooks are not supported".into(),
-            ));
+        if kind == EXTRA_ZIP64 {
+            return Err(zip64());
         }
-        bytes = bytes
-            .get(4 + length..)
+        let field = bytes
+            .get(4..4 + length)
             .ok_or_else(|| invalid("truncated ZIP extra field"))?;
+        // Python, Info-ZIP and libarchive replace the raw name with a Unicode
+        // path whose CRC (after a version byte) matches the raw name. They
+        // disagree on versions: Python takes version 1, Info-ZIP also version
+        // 0 in the central directory, and libarchive any version in a local
+        // header. So the version is ignored here. Repeating the raw name is
+        // harmless; any other path would alias a member for some reader.
+        if kind == EXTRA_UNICODE_PATH
+            && u32_at(field, 1).is_ok_and(|crc| crc == crc32(name.as_bytes()))
+            && field[5..] != *name.as_bytes()
+        {
+            return Err(invalid(format!(
+                "ZIP Unicode path extra field renames member {name}"
+            )));
+        }
+        bytes = &bytes[4 + length..];
     }
     Ok(())
+}
+
+/// Whether an end record followed by its comment, `ending`, contains another
+/// end-record signature with room for a complete record before EOF.
+///
+/// Readers that scan back from EOF select the last such signature even when
+/// its comment does not reach EOF, so one inside the record's own fields or
+/// comment makes the archive ambiguous. A signature too close to EOF for a
+/// complete record cannot be read as one; see also [`shadows_end_record`].
+fn hides_end_record(ending: &[u8]) -> bool {
+    let last = ending.len().saturating_sub(END_LEN);
+    (1..=last).any(|offset| ending[offset..offset + 4] == END.to_le_bytes())
+}
+
+/// Whether Python's `zipfile` would select an end-record signature after the
+/// start of `ending`, an end record followed by its comment. It takes the last
+/// signature in the archive's tail, and fails to open the archive when no
+/// complete record follows it. Only an archive without a comment is exempt:
+/// Python first looks for a record in exactly the last 22 bytes.
+fn shadows_end_record(ending: &[u8]) -> bool {
+    ending.len() > END_LEN
+        && ending[1..]
+            .windows(4)
+            .any(|window| window == END.to_le_bytes())
+}
+
+/// Locate the end-of-central-directory record. It must be the only record
+/// that ends at EOF with its comment.
+fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
+    if bytes.len() < END_LEN {
+        return Err(invalid("file is not a ZIP workbook"));
+    }
+    // A valid EOCD ends at EOF, including its comment. Multiple matching
+    // EOCDs would make the member index ambiguous and are rejected.
+    let search_start = bytes.len().saturating_sub(END_LEN + u16::MAX as usize);
+    let mut endings = Vec::new();
+    for offset in (search_start..=bytes.len() - END_LEN).rev() {
+        if u32_at(bytes, offset)? == END {
+            let comment = u16_at(bytes, offset + 20)? as usize;
+            if add(add(offset, END_LEN)?, comment)? == bytes.len() {
+                endings.push(offset);
+            }
+        }
+    }
+    let end = match endings.as_slice() {
+        [end] => *end,
+        [] => {
+            return Err(invalid(
+                "ZIP end-of-directory record is missing or truncated",
+            ));
+        }
+        _ => return Err(invalid("ambiguous ZIP end-of-directory records")),
+    };
+    // Fixed fields may legitimately hold the signature's bytes, for example a
+    // central directory at offset 0x06054b50. That matters only when the
+    // comment leaves room for a complete record after the signature.
+    if hides_end_record(&bytes[end..]) {
+        return Err(invalid("ambiguous ZIP end-of-directory records"));
+    }
+    Ok(end)
+}
+
+/// Return the central directory's start and entry count from the EOCD.
+fn central_directory(bytes: &[u8], end: usize) -> Result<(usize, u16)> {
+    if end >= ZIP64_LOCATOR_LEN && u32_at(bytes, end - ZIP64_LOCATOR_LEN)? == ZIP64_LOCATOR {
+        return Err(zip64());
+    }
+    let disk = u16_at(bytes, end + 4)?;
+    let central_disk = u16_at(bytes, end + 6)?;
+    let disk_entries = u16_at(bytes, end + 8)?;
+    let count = u16_at(bytes, end + 10)?;
+    let central_size = u32_at(bytes, end + 12)?;
+    let central_offset = u32_at(bytes, end + 16)?;
+    if disk != 0 || central_disk != 0 || disk_entries != count {
+        return Err(unsupported("multi-disk ZIP workbooks are not supported"));
+    }
+    if count == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
+        return Err(zip64());
+    }
+    let central_start = central_offset as usize;
+    // Ending exactly at the EOCD also keeps the directory within the file.
+    if add(central_start, central_size as usize)? != end {
+        return Err(invalid("ZIP central-directory bounds are inconsistent"));
+    }
+    Ok((central_start, count))
+}
+
+fn central_header(bytes: &[u8], position: usize, end: usize) -> Result<CentralHeader<'_>> {
+    if add(position, CENTRAL_HEADER_LEN)? > end || u32_at(bytes, position)? != CENTRAL {
+        return Err(invalid("truncated or invalid ZIP central-directory entry"));
+    }
+    let flags = u16_at(bytes, position + 8)?;
+    if flags & ENCRYPTION_FLAGS != 0 {
+        return Err(unsupported("encrypted ZIP workbooks are not supported"));
+    }
+    let method = u16_at(bytes, position + 10)?;
+    let sizes = Sizes::read(bytes, position + 16)?;
+    let name_length = u16_at(bytes, position + 28)? as usize;
+    let extra_length = u16_at(bytes, position + 30)? as usize;
+    let comment_length = u16_at(bytes, position + 32)? as usize;
+    let disk = u16_at(bytes, position + 34)?;
+    let local_offset = u32_at(bytes, position + 42)?;
+    if sizes.compressed_size == u32::MAX
+        || sizes.size == u32::MAX
+        || local_offset == u32::MAX
+        || disk == u16::MAX
+    {
+        return Err(zip64());
+    }
+    if disk != 0 {
+        return Err(unsupported("multi-disk ZIP workbooks are not supported"));
+    }
+    let name_start = add(position, CENTRAL_HEADER_LEN)?;
+    let name_end = add(name_start, name_length)?;
+    let extra_end = add(name_end, extra_length)?;
+    let record_end = add(extra_end, comment_length)?;
+    if record_end > end {
+        return Err(invalid(
+            "ZIP central-directory entry exceeds directory bounds",
+        ));
+    }
+    let name = std::str::from_utf8(&bytes[name_start..name_end])
+        .map_err(|_| unsupported("ZIP member names must be UTF-8"))?;
+    Ok(CentralHeader {
+        flags,
+        method,
+        sizes,
+        name,
+        extra: &bytes[name_end..extra_end],
+        local_start: local_offset as usize,
+        record: position..record_end,
+    })
+}
+
+/// Decode the local header at `start`. `None` means no complete local header,
+/// including its name and extra field, ends by `limit`.
+fn local_header(bytes: &[u8], start: usize, limit: usize) -> Result<Option<LocalHeader<'_>>> {
+    let name_start = add(start, LOCAL_HEADER_LEN)?;
+    if name_start > limit || u32_at(bytes, start)? != LOCAL {
+        return Ok(None);
+    }
+    let name_end = add(name_start, u16_at(bytes, start + 26)? as usize)?;
+    let data_start = add(name_end, u16_at(bytes, start + 28)? as usize)?;
+    if data_start > limit {
+        return Ok(None);
+    }
+    Ok(Some(LocalHeader {
+        flags: u16_at(bytes, start + 6)?,
+        method: u16_at(bytes, start + 8)?,
+        sizes: Sizes::read(bytes, start + 14)?,
+        raw_name: &bytes[name_start..name_end],
+        extra: &bytes[name_end..data_start],
+        data_start,
+    }))
 }
 
 fn descriptor_end(
     bytes: &[u8],
     data_end: usize,
     limit: usize,
-    crc: u32,
-    compressed_size: u32,
-    size: u32,
+    expected: Sizes,
     name: &str,
 ) -> Result<usize> {
     let matches = |offset: usize| -> bool {
-        add(offset, 12).is_ok_and(|end| end <= limit)
-            && u32_at(bytes, offset).ok() == Some(crc)
-            && u32_at(bytes, offset + 4).ok() == Some(compressed_size)
-            && u32_at(bytes, offset + 8).ok() == Some(size)
+        add(offset, DESCRIPTOR_LEN).is_ok_and(|end| end <= limit)
+            && Sizes::read(bytes, offset).ok() == Some(expected)
     };
     let unsigned = matches(data_end);
     let signed = u32_at(bytes, data_end).ok() == Some(DESCRIPTOR) && matches(add(data_end, 4)?);
     match (unsigned, signed) {
-        (true, false) => add(data_end, 12),
-        (false, true) => add(data_end, 16),
+        (true, false) => add(data_end, DESCRIPTOR_LEN),
+        (false, true) => add(data_end, SIGNED_DESCRIPTOR_LEN),
         _ => Err(invalid(format!(
             "missing or ambiguous ZIP data descriptor for {name}"
         ))),
@@ -198,117 +472,79 @@ fn emit<W: Write>(writer: &mut W, position: &mut usize, bytes: &[u8]) -> Result<
     Ok(())
 }
 
+impl Entry {
+    /// Validate a member's local record against its central header.
+    fn new(bytes: &[u8], central: &CentralHeader<'_>, central_start: usize) -> Result<Self> {
+        let name = central.name;
+        let Some(local) = local_header(bytes, central.local_start, central_start)? else {
+            return Err(invalid(format!("invalid ZIP local header for {name}")));
+        };
+        if local.flags != central.flags || local.method != central.method {
+            return Err(invalid(format!("conflicting ZIP headers for {name}")));
+        }
+        if local.raw_name != name.as_bytes() {
+            return Err(invalid(format!("conflicting ZIP member name for {name}")));
+        }
+        check_extra(local.extra, name)?;
+        let sizes = central.sizes;
+        let has_descriptor = central.flags & FLAG_DESCRIPTOR != 0;
+        if !local.sizes.matches(sizes, has_descriptor) {
+            return Err(invalid(format!(
+                "conflicting ZIP sizes or checksum for {name}"
+            )));
+        }
+        if central.method == STORED && sizes.compressed_size != sizes.size {
+            return Err(invalid(format!(
+                "invalid stored ZIP member size for {name}"
+            )));
+        }
+        let data_end = add(local.data_start, sizes.compressed_size as usize)?;
+        if data_end > central_start {
+            return Err(invalid(format!(
+                "ZIP member {name} exceeds local-record bounds"
+            )));
+        }
+        let local_end = if has_descriptor {
+            descriptor_end(bytes, data_end, central_start, sizes, name)?
+        } else {
+            data_end
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            flags: central.flags,
+            method: central.method,
+            sizes,
+            central: central.record.clone(),
+            local_header: central.local_start..local.data_start,
+            data: local.data_start..data_end,
+            local_record: central.local_start..local_end,
+        })
+    }
+}
+
 impl Archive {
     pub(crate) fn new(original: Vec<u8>) -> Result<Self> {
-        if original.len() < 22 {
-            return Err(invalid("file is not a ZIP workbook"));
-        }
-        // A valid EOCD ends at EOF, including its comment. Multiple matching
-        // EOCDs would make the member index ambiguous and are rejected.
-        let search_start = original.len().saturating_sub(22 + u16::MAX as usize);
-        let mut endings = Vec::new();
-        for offset in (search_start..=original.len() - 22).rev() {
-            if u32_at(&original, offset)? == END {
-                let comment = u16_at(&original, offset + 20)? as usize;
-                if add(add(offset, 22)?, comment)? == original.len() {
-                    endings.push(offset);
-                }
-            }
-        }
-        let end = match endings.as_slice() {
-            [end] => *end,
-            [] => {
-                return Err(invalid(
-                    "ZIP end-of-directory record is missing or truncated",
-                ));
-            }
-            _ => return Err(invalid("ambiguous ZIP end-of-directory records")),
-        };
-        if end >= 20 && u32_at(&original, end - 20)? == ZIP64_LOCATOR {
-            return Err(Error::Unsupported(
-                "ZIP64 workbooks are not supported".into(),
+        if original.starts_with(&OLE_SIGNATURE) {
+            return Err(unsupported(
+                "legacy .xls and password-encrypted workbooks (OLE compound files) are not supported",
             ));
         }
-        let disk = u16_at(&original, end + 4)?;
-        let central_disk = u16_at(&original, end + 6)?;
-        let disk_entries = u16_at(&original, end + 8)?;
-        let count = u16_at(&original, end + 10)?;
-        let central_size = u32_at(&original, end + 12)?;
-        let central_offset = u32_at(&original, end + 16)?;
-        if disk != 0 || central_disk != 0 || disk_entries != count {
-            return Err(Error::Unsupported(
-                "multi-disk ZIP workbooks are not supported".into(),
-            ));
-        }
-        if count == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
-            return Err(Error::Unsupported(
-                "ZIP64 workbooks are not supported".into(),
-            ));
-        }
-        let central_start = central_offset as usize;
-        if add(central_start, central_size as usize)? != end {
-            return Err(invalid("ZIP central-directory bounds are inconsistent"));
-        }
-        if central_start > end {
-            return Err(invalid("ZIP central directory is outside the file"));
-        }
+        let end = end_of_central_directory(&original)?;
+        let (central_start, count) = central_directory(&original, end)?;
         let mut entries = Vec::with_capacity(count as usize);
         let mut index = HashMap::with_capacity(count as usize);
         let mut part_index = HashMap::with_capacity(count as usize);
         let mut position = central_start;
         for _ in 0..count {
-            if add(position, 46)? > end || u32_at(&original, position)? != CENTRAL {
-                return Err(invalid("truncated or invalid ZIP central-directory entry"));
-            }
-            let flags = u16_at(&original, position + 8)?;
-            if flags & (1 | 0x40 | 0x2000) != 0 {
-                return Err(Error::Unsupported(
-                    "encrypted ZIP workbooks are not supported".into(),
-                ));
-            }
-            let method = u16_at(&original, position + 10)?;
-            let crc = u32_at(&original, position + 16)?;
-            let compressed_size = u32_at(&original, position + 20)?;
-            let size = u32_at(&original, position + 24)?;
-            let name_length = u16_at(&original, position + 28)? as usize;
-            let extra_length = u16_at(&original, position + 30)? as usize;
-            let comment_length = u16_at(&original, position + 32)? as usize;
-            let entry_disk = u16_at(&original, position + 34)?;
-            let local_offset = u32_at(&original, position + 42)?;
-            if compressed_size == u32::MAX
-                || size == u32::MAX
-                || local_offset == u32::MAX
-                || entry_disk == u16::MAX
-            {
-                return Err(Error::Unsupported(
-                    "ZIP64 workbooks are not supported".into(),
-                ));
-            }
-            if entry_disk != 0 {
-                return Err(Error::Unsupported(
-                    "multi-disk ZIP workbooks are not supported".into(),
-                ));
-            }
-            let name_start = add(position, 46)?;
-            let name_end = add(name_start, name_length)?;
-            let extra_end = add(name_end, extra_length)?;
-            let record_end = add(extra_end, comment_length)?;
-            if record_end > end {
-                return Err(invalid(
-                    "ZIP central-directory entry exceeds directory bounds",
-                ));
-            }
-            let raw_name = &original[name_start..name_end];
-            let name = std::str::from_utf8(raw_name)
-                .map_err(|_| Error::Unsupported("ZIP member names must be UTF-8".into()))?
-                .to_owned();
+            let central = central_header(&original, position, end)?;
+            let name = central.name;
             if name.is_empty()
                 || name.contains('\0')
-                || index.insert(name.clone(), entries.len()).is_some()
+                || index.insert(name.to_owned(), entries.len()).is_some()
             {
                 return Err(invalid("empty, invalid, or duplicate ZIP member name"));
             }
-            check_extra(&original[name_end..extra_end])?;
+            check_extra(central.extra, name)?;
             // OPC part names compare without ASCII case, including the hex
             // digits in URI escapes. Retain exact ZIP names for preservation;
             // reject an ambiguous equivalent name only if that part is used.
@@ -316,72 +552,9 @@ impl Archive {
                 .entry(name.to_ascii_lowercase())
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(entries.len()));
-
-            let local_start = local_offset as usize;
-            if add(local_start, 30)? > central_start || u32_at(&original, local_start)? != LOCAL {
-                return Err(invalid(format!("invalid ZIP local header for {name}")));
-            }
-            let local_flags = u16_at(&original, local_start + 6)?;
-            let local_method = u16_at(&original, local_start + 8)?;
-            if local_flags != flags || local_method != method {
-                return Err(invalid(format!("conflicting ZIP headers for {name}")));
-            }
-            let local_name_length = u16_at(&original, local_start + 26)? as usize;
-            let local_extra_length = u16_at(&original, local_start + 28)? as usize;
-            let local_name_start = add(local_start, 30)?;
-            let local_name_end = add(local_name_start, local_name_length)?;
-            let data_start = add(local_name_end, local_extra_length)?;
-            if data_start > central_start
-                || original.get(local_name_start..local_name_end) != Some(raw_name)
-            {
-                return Err(invalid(format!("conflicting ZIP member name for {name}")));
-            }
-            check_extra(&original[local_name_end..data_start])?;
-            for (local_field, central_value) in [(14, crc), (18, compressed_size), (22, size)] {
-                let local_value = u32_at(&original, local_start + local_field)?;
-                if local_value != central_value && !(flags & 8 != 0 && local_value == 0) {
-                    return Err(invalid(format!(
-                        "conflicting ZIP sizes or checksum for {name}"
-                    )));
-                }
-            }
-            if method == 0 && compressed_size != size {
-                return Err(invalid(format!(
-                    "invalid stored ZIP member size for {name}"
-                )));
-            }
-            let data_end = add(data_start, compressed_size as usize)?;
-            if data_end > central_start {
-                return Err(invalid(format!(
-                    "ZIP member {name} exceeds local-record bounds"
-                )));
-            }
-            let local_end = if flags & 8 != 0 {
-                descriptor_end(
-                    &original,
-                    data_end,
-                    central_start,
-                    crc,
-                    compressed_size,
-                    size,
-                    &name,
-                )?
-            } else {
-                data_end
-            };
-            entries.push(Entry {
-                name,
-                flags,
-                method,
-                crc,
-                compressed_size,
-                size,
-                central: position..record_end,
-                local_header: local_start..data_start,
-                data: data_start..data_end,
-                local_record: local_start..local_end,
-            });
-            position = record_end;
+            let entry = Entry::new(&original, &central, central_start)?;
+            position = entry.central.end;
+            entries.push(entry);
         }
         if position != end {
             return Err(invalid("ZIP central-directory entry count is inconsistent"));
@@ -434,30 +607,27 @@ impl Archive {
             .get(name)
             .map(|&index| &self.entries[index])
             .ok_or_else(|| invalid(format!("ZIP member is missing: {name}")))?;
-        if entry.flags & 0x20 != 0 {
-            return Err(Error::Unsupported(format!(
-                "patched ZIP member data in {name}"
-            )));
+        if entry.flags & FLAG_PATCHED != 0 {
+            return Err(unsupported(format!("patched ZIP member data in {name}")));
         }
-        if entry.size as usize > MAX_READ {
-            return Err(Error::Unsupported(format!(
-                "ZIP member {name} exceeds the 64 MiB read limit"
-            )));
+        let sizes = entry.sizes;
+        if sizes.size as usize > MAX_READ {
+            return Err(over_read_limit(format_args!("ZIP member {name}")));
         }
         let compressed = &self.original[entry.data.clone()];
         let output = match entry.method {
-            0 => compressed.to_vec(),
-            8 => {
+            STORED => compressed.to_vec(),
+            DEFLATED => {
                 let mut decoder = Decompress::new(false);
                 // The declared length also bounds malformed streams that expand
                 // beyond their header, rather than trusting that header.
-                let mut output = Vec::with_capacity(entry.size as usize + 1);
+                let mut output = Vec::with_capacity(sizes.size as usize + 1);
                 let status = decoder
                     .decompress_vec(compressed, &mut output, FlushDecompress::Finish)
                     .map_err(|error| {
                         invalid(format!("invalid deflate stream in {name}: {error}"))
                     })?;
-                if status != Status::StreamEnd || decoder.total_in() != entry.compressed_size as u64
+                if status != Status::StreamEnd || decoder.total_in() != sizes.compressed_size as u64
                 {
                     return Err(invalid(format!(
                         "incomplete deflate stream or length mismatch in {name}"
@@ -466,12 +636,12 @@ impl Archive {
                 output
             }
             method => {
-                return Err(Error::Unsupported(format!(
+                return Err(unsupported(format!(
                     "ZIP compression method {method} in {name}"
                 )));
             }
         };
-        if output.len() != entry.size as usize || crc32(&output) != entry.crc {
+        if output.len() != sizes.size as usize || crc32(&output) != sizes.crc {
             return Err(invalid(format!("ZIP size or checksum mismatch in {name}")));
         }
         Ok(output)
@@ -486,7 +656,10 @@ impl Archive {
     /// Stream local records in their original order, replacing changed members.
     ///
     /// Only one changed member's compressed payload is held in memory at a
-    /// time. As with `Write::write_all`, a writer error may leave partial output.
+    /// time. As with `Write::write_all`, a writer error may leave partial output,
+    /// and so may the rare refusal of an ambiguous end record, which can only be
+    /// detected once the directory offset is known. The writer is flushed before
+    /// success is reported.
     pub(crate) fn write_to<W: Write>(
         &self,
         changes: &impl PartChanges,
@@ -494,10 +667,14 @@ impl Archive {
     ) -> Result<()> {
         if changes.is_empty() {
             writer.write_all(&self.original)?;
-            return Ok(());
+        } else {
+            let plan = self.validate_changes(changes)?;
+            self.emit_records(&plan, writer, RecordPolicy::PreserveGaps)?;
         }
-        let plan = self.validate_changes(changes)?;
-        self.emit_records(&plan, writer, RecordPolicy::PreserveGaps)
+        // A buffered writer moved into a public save method is dropped right
+        // after it returns, and dropping discards errors from its final write.
+        writer.flush()?;
+        Ok(())
     }
 
     fn emit_records<W: Write>(
@@ -506,16 +683,20 @@ impl Archive {
         writer: &mut W,
         policy: RecordPolicy,
     ) -> Result<()> {
-        let (order, preserve_gaps) = match policy {
-            RecordPolicy::PreserveGaps => (self.local_order.as_slice(), true),
-            RecordPolicy::Compact => (self.compaction_order()?, false),
+        let preserve_gaps = match policy {
+            RecordPolicy::PreserveGaps => true,
+            RecordPolicy::Compact => {
+                self.check_compactable()?;
+                false
+            }
         };
         let mut position = 0;
         let mut original_position = 0;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = vec![0; self.entries.len()];
         let mut pending = plan.data.iter().peekable();
-        for &index in order {
+        // Both policies keep the physical local-record order.
+        for &index in &self.local_order {
             let entry = &self.entries[index];
             // Prefixes, gaps and any obsolete records from older versions are
             // opaque here. Preserve them; only explicit compaction removes
@@ -579,14 +760,17 @@ impl Archive {
 
     /// Remove obsolete local records from earlier append saves. Unknown gaps
     /// are rejected before anything is written, so opaque content is never
-    /// silently discarded by compaction.
+    /// silently discarded by compaction. The writer is flushed before success
+    /// is reported.
     pub(crate) fn compact_to<W: Write>(
         &self,
         changes: &impl PartChanges,
         writer: &mut W,
     ) -> Result<()> {
         let plan = self.validate_changes(changes)?;
-        self.emit_records(&plan, writer, RecordPolicy::Compact)
+        self.emit_records(&plan, writer, RecordPolicy::Compact)?;
+        writer.flush()?;
+        Ok(())
     }
 
     fn validate_changes<'a>(&self, changes: &'a impl PartChanges) -> Result<ChangePlan<'a>> {
@@ -601,19 +785,15 @@ impl Archive {
                 )));
             };
             if data.len() > MAX_READ {
-                return Err(Error::Unsupported(format!(
-                    "ZIP member {name} exceeds the 64 MiB read limit"
-                )));
+                return Err(over_read_limit(format_args!("ZIP member {name}")));
             }
             let entry = &self.entries[index];
-            if entry.flags & 0x20 != 0 {
-                return Err(Error::Unsupported(format!(
-                    "patched ZIP member data in {name}"
-                )));
+            if entry.flags & FLAG_PATCHED != 0 {
+                return Err(unsupported(format!("patched ZIP member data in {name}")));
             }
             let method = entry.method;
-            if !matches!(method, 0 | 8) {
-                return Err(Error::Unsupported(format!(
+            if !matches!(method, STORED | DEFLATED) {
+                return Err(unsupported(format!(
                     "ZIP compression method {method} in {name}"
                 )));
             }
@@ -630,37 +810,34 @@ impl Archive {
         data: &[u8],
         writer: &mut W,
         position: &mut usize,
-    ) -> Result<Replacement> {
+    ) -> Result<Sizes> {
         let size = zip32(data.len(), "ZIP member size")?;
-        let compressed = if entry.method == 0 {
+        let compressed = if entry.method == STORED {
             Cow::Borrowed(data)
         } else {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
             encoder.write_all(data)?;
             Cow::Owned(encoder.finish()?)
         };
         let compressed_size = zip32(compressed.len(), "compressed ZIP member size")?;
-        let crc = crc32(data);
-        let flags = entry.flags & !8;
+        let sizes = Sizes {
+            crc: crc32(data),
+            compressed_size,
+            size,
+        };
         let original_header = &self.original[entry.local_header.clone()];
-        let mut header = [0; 30];
-        header.copy_from_slice(&original_header[..30]);
-        set_u16(&mut header, 6, flags);
-        set_u32(&mut header, 14, crc);
-        set_u32(&mut header, 18, compressed_size);
-        set_u32(&mut header, 22, size);
+        let mut header = [0; LOCAL_HEADER_LEN];
+        header.copy_from_slice(&original_header[..LOCAL_HEADER_LEN]);
+        set_u16(&mut header, 6, entry.flags & !FLAG_DESCRIPTOR);
+        sizes.write(&mut header, 14);
         zip32(
             add(add(*position, original_header.len())?, compressed.len())?,
             "ZIP local-record area",
         )?;
         emit(writer, position, &header)?;
-        emit(writer, position, &original_header[30..])?;
+        emit(writer, position, &original_header[LOCAL_HEADER_LEN..])?;
         emit(writer, position, &compressed)?;
-        Ok(Replacement {
-            crc,
-            compressed_size,
-            size,
-        })
+        Ok(sizes)
     }
 
     fn emit_directory<W: Write>(
@@ -668,38 +845,51 @@ impl Archive {
         writer: &mut W,
         position: &mut usize,
         offsets: &[u32],
-        replacements: &[Option<Replacement>],
+        replacements: &[Option<Sizes>],
     ) -> Result<()> {
         let central_start = zip32(*position, "ZIP central-directory offset")?;
+        // Central records are copied whole, so the directory keeps its size,
+        // which the input's end record already stored below u32::MAX.
+        let central_size = (self.end - self.central_start) as u32;
+        let mut ending = self.original[self.end..].to_vec();
+        set_u32(&mut ending, 12, central_size);
+        set_u32(&mut ending, 16, central_start);
+        // Only the directory offset (record bytes 16..20) can differ from the
+        // input's end record, which passed `hides_end_record` with the same
+        // comment. So a new signature starts at record offset 13 to 19, and
+        // only an archive comment exposes it to backward-scanning readers.
+        // Refuse that rare layout rather than write an archive that they would
+        // misread, or that Python could open before the save but not after.
+        if hides_end_record(&ending)
+            || (shadows_end_record(&ending) && !shadows_end_record(&self.original[self.end..]))
+        {
+            return Err(unsupported(
+                "saving would make the ZIP end-of-directory record ambiguous: the new \
+                 central-directory offset forms a record signature that readers searching \
+                 back through the archive comment would select",
+            ));
+        }
         for (index, entry) in self.entries.iter().enumerate() {
             let record = &self.original[entry.central.clone()];
-            let mut header = [0; 46];
-            header.copy_from_slice(&record[..46]);
-            if let Some(replacement) = replacements[index] {
-                set_u16(&mut header, 8, entry.flags & !8);
-                set_u32(&mut header, 16, replacement.crc);
-                set_u32(&mut header, 20, replacement.compressed_size);
-                set_u32(&mut header, 24, replacement.size);
+            let mut header = [0; CENTRAL_HEADER_LEN];
+            header.copy_from_slice(&record[..CENTRAL_HEADER_LEN]);
+            if let Some(sizes) = replacements[index] {
+                set_u16(&mut header, 8, entry.flags & !FLAG_DESCRIPTOR);
+                sizes.write(&mut header, 16);
             }
             // The local offset is the only field compaction changes for an
             // untouched member; comments, extras and all other metadata survive.
             set_u32(&mut header, 42, offsets[index]);
             emit(writer, position, &header)?;
-            emit(writer, position, &record[46..])?;
+            emit(writer, position, &record[CENTRAL_HEADER_LEN..])?;
         }
-        let central_size = zip32(
-            *position - central_start as usize,
-            "ZIP central-directory size",
-        )?;
-        let mut ending = [0; 22];
-        ending.copy_from_slice(&self.original[self.end..self.end + 22]);
-        set_u32(&mut ending, 12, central_size);
-        set_u32(&mut ending, 16, central_start);
-        emit(writer, position, &ending)?;
-        emit(writer, position, &self.original[self.end + 22..])
+        debug_assert_eq!(*position - central_start as usize, central_size as usize);
+        emit(writer, position, &ending)
     }
 
-    fn compaction_order(&self) -> Result<&[usize]> {
+    /// Require every byte before the central directory to belong to an active
+    /// record or a recognizable obsolete one, so compaction drops nothing opaque.
+    fn check_compactable(&self) -> Result<()> {
         let mut position = 0;
         let mut stored_descriptors = None;
         for &index in &self.local_order {
@@ -708,8 +898,8 @@ impl Archive {
                 position = self.orphan_end(position, &mut stored_descriptors)?;
             }
             if position != entry.local_record.start {
-                return Err(Error::Unsupported(
-                    "cannot compact overlapping or unrecognized ZIP local records".into(),
+                return Err(unsupported(
+                    "cannot compact overlapping or unrecognized ZIP local records",
                 ));
             }
             position = entry.local_record.end;
@@ -718,11 +908,11 @@ impl Archive {
             position = self.orphan_end(position, &mut stored_descriptors)?;
         }
         if position != self.central_start {
-            return Err(Error::Unsupported(
-                "cannot compact unrecognized data before the ZIP directory".into(),
+            return Err(unsupported(
+                "cannot compact unrecognized data before the ZIP directory",
             ));
         }
-        Ok(&self.local_order)
+        Ok(())
     }
 
     fn orphan_end(
@@ -730,87 +920,66 @@ impl Archive {
         start: usize,
         stored_descriptors: &mut Option<StoredDescriptors>,
     ) -> Result<usize> {
-        let unsupported = || {
-            Error::Unsupported(
-                "cannot compact opaque ZIP prefix, gaps, or unrecognized obsolete records".into(),
-            )
+        let opaque = || {
+            unsupported("cannot compact opaque ZIP prefix, gaps, or unrecognized obsolete records")
         };
         let bytes = &self.original;
-        if add(start, 30)? > self.central_start || u32_at(bytes, start)? != LOCAL {
-            return Err(unsupported());
+        let Some(LocalHeader {
+            flags,
+            method,
+            sizes: header,
+            raw_name,
+            extra,
+            data_start,
+        }) = local_header(bytes, start, self.central_start)?
+        else {
+            return Err(opaque());
+        };
+        if flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0 || !matches!(method, STORED | DEFLATED) {
+            return Err(opaque());
         }
-        let flags = u16_at(bytes, start + 6)?;
-        let method = u16_at(bytes, start + 8)?;
-        if flags & (1 | 0x20 | 0x40 | 0x2000) != 0 || !matches!(method, 0 | 8) {
-            return Err(unsupported());
+        if header.compressed_size == u32::MAX || header.size == u32::MAX {
+            return Err(opaque());
         }
-        let local_crc = u32_at(bytes, start + 14)?;
-        let local_compressed_size = u32_at(bytes, start + 18)?;
-        let local_size = u32_at(bytes, start + 22)?;
-        if local_compressed_size == u32::MAX || local_size == u32::MAX {
-            return Err(unsupported());
-        }
-        let name_length = u16_at(bytes, start + 26)? as usize;
-        let extra_length = u16_at(bytes, start + 28)? as usize;
-        let name_start = add(start, 30)?;
-        let name_end = add(name_start, name_length)?;
-        let data_start = add(name_end, extra_length)?;
-        if data_start > self.central_start {
-            return Err(unsupported());
-        }
-        let name = std::str::from_utf8(&bytes[name_start..name_end]).map_err(|_| unsupported())?;
+        let name = std::str::from_utf8(raw_name).map_err(|_| opaque())?;
         let Some(&index) = self.index.get(name) else {
-            return Err(unsupported());
+            return Err(opaque());
         };
         if self.entries[index].method != method {
-            return Err(unsupported());
+            return Err(opaque());
         }
-        check_extra(&bytes[name_end..data_start])?;
-        let has_descriptor = flags & 8 != 0;
-        let (compressed_size, size, crc) = if method == 8 {
-            let end = if has_descriptor && local_compressed_size == 0 {
+        check_extra(extra, name)?;
+        let has_descriptor = flags & FLAG_DESCRIPTOR != 0;
+        let actual = if method == DEFLATED {
+            let end = if has_descriptor && header.compressed_size == 0 {
                 self.central_start
             } else {
-                add(data_start, local_compressed_size as usize)?
+                add(data_start, header.compressed_size as usize)?
             };
             if end > self.central_start {
-                return Err(unsupported());
+                return Err(opaque());
             }
             inspect_deflate(&bytes[data_start..end], name)?
-        } else if has_descriptor && local_compressed_size == 0 {
+        } else if has_descriptor && header.compressed_size == 0 {
             let descriptors = stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
-            return self.stored_orphan_end(data_start, local_crc, local_size, name, descriptors);
+            return self.stored_orphan_end(data_start, header, name, descriptors);
         } else {
-            let end = add(data_start, local_compressed_size as usize)?;
-            if end > self.central_start || local_compressed_size as usize > MAX_READ {
-                return Err(unsupported());
+            let end = add(data_start, header.compressed_size as usize)?;
+            if end > self.central_start || header.compressed_size as usize > MAX_READ {
+                return Err(opaque());
             }
-            (
-                local_compressed_size,
-                local_compressed_size,
-                crc32(&bytes[data_start..end]),
-            )
+            Sizes {
+                crc: crc32(&bytes[data_start..end]),
+                compressed_size: header.compressed_size,
+                size: header.compressed_size,
+            }
         };
-        for (header_value, value) in [
-            (local_crc, crc),
-            (local_compressed_size, compressed_size),
-            (local_size, size),
-        ] {
-            if header_value != value && !(has_descriptor && header_value == 0) {
-                return Err(unsupported());
-            }
+        if !header.matches(actual, has_descriptor) {
+            return Err(opaque());
         }
-        let data_end = add(data_start, compressed_size as usize)?;
+        let data_end = add(data_start, actual.compressed_size as usize)?;
         if has_descriptor {
-            descriptor_end(
-                bytes,
-                data_end,
-                self.central_start,
-                crc,
-                compressed_size,
-                size,
-                name,
-            )
+            descriptor_end(bytes, data_end, self.central_start, actual, name)
         } else {
             Ok(data_end)
         }
@@ -831,22 +1000,24 @@ impl Archive {
             .chain(std::iter::once(self.central_start));
         for boundary in boundaries {
             for signed in [false, true] {
-                let Some(data_end) = boundary.checked_sub(if signed { 16 } else { 12 }) else {
+                let length = if signed {
+                    SIGNED_DESCRIPTOR_LEN
+                } else {
+                    DESCRIPTOR_LEN
+                };
+                let Some(data_end) = boundary.checked_sub(length) else {
                     continue;
                 };
                 if signed && u32_at(&self.original, data_end).ok() != Some(DESCRIPTOR) {
                     continue;
                 }
-                let fields = data_end + if signed { 4 } else { 0 };
-                // The descriptor lies entirely before this validated boundary.
-                let crc = u32_at(&self.original, fields).expect("descriptor CRC in bounds");
-                let compressed_size = u32_at(&self.original, fields + 4)
-                    .expect("descriptor compressed size in bounds");
-                let size = u32_at(&self.original, fields + 8).expect("descriptor size in bounds");
-                if size != compressed_size || size as usize > MAX_READ {
+                // Both forms end with these fields, entirely before the boundary.
+                let sizes = Sizes::read(&self.original, boundary - DESCRIPTOR_LEN)
+                    .expect("descriptor fields in bounds");
+                if sizes.size != sizes.compressed_size || sizes.size as usize > MAX_READ {
                     continue;
                 }
-                let Some(data_start) = data_end.checked_sub(size as usize) else {
+                let Some(data_start) = data_end.checked_sub(sizes.size as usize) else {
                     continue;
                 };
                 // A signature inside stored payload is not a record boundary.
@@ -858,8 +1029,7 @@ impl Archive {
                 let descriptor = StoredDescriptor {
                     data_end,
                     end: boundary,
-                    crc,
-                    size,
+                    sizes,
                 };
                 descriptors
                     .entry(data_start)
@@ -875,58 +1045,48 @@ impl Archive {
     }
 
     fn recognizable_local_header(&self, start: usize) -> bool {
-        let check = || -> Option<bool> {
-            let name_start = start.checked_add(30)?;
-            if name_start > self.central_start {
-                return Some(false);
-            }
-            let name_length = u16_at(&self.original, start + 26).ok()? as usize;
-            let extra_length = u16_at(&self.original, start + 28).ok()? as usize;
-            let name_end = name_start.checked_add(name_length)?;
-            let data_start = name_end.checked_add(extra_length)?;
-            if data_start > self.central_start {
-                return Some(false);
-            }
-            let name = std::str::from_utf8(&self.original[name_start..name_end]).ok()?;
-            let entry = &self.entries[*self.index.get(name)?];
-            if entry.local_record.start == start {
-                // Archive::new already validated this active record, including
-                // opaque compression methods retained without decoding.
-                return Some(true);
-            }
-            let flags = u16_at(&self.original, start + 6).ok()?;
-            let method = u16_at(&self.original, start + 8).ok()?;
-            Some(
-                flags & (1 | 0x20 | 0x40 | 0x2000) == 0
-                    && matches!(method, 0 | 8)
-                    && method == entry.method
-                    && check_extra(&self.original[name_end..data_start]).is_ok(),
-            )
+        let Ok(Some(header)) = local_header(&self.original, start, self.central_start) else {
+            return false;
         };
-        check().unwrap_or(false)
+        let Ok(name) = std::str::from_utf8(header.raw_name) else {
+            return false;
+        };
+        let Some(&index) = self.index.get(name) else {
+            return false;
+        };
+        let entry = &self.entries[index];
+        if entry.local_record.start == start {
+            // Archive::new already validated this active record, including
+            // opaque compression methods retained without decoding.
+            return true;
+        }
+        header.flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) == 0
+            && matches!(header.method, STORED | DEFLATED)
+            && header.method == entry.method
+            && check_extra(header.extra, name).is_ok()
     }
 
     fn stored_orphan_end(
         &self,
         data_start: usize,
-        local_crc: u32,
-        local_size: u32,
+        header: Sizes,
         name: &str,
         descriptors: &StoredDescriptors,
     ) -> Result<usize> {
         let Some(candidate) = descriptors.get(&data_start) else {
-            return Err(Error::Unsupported(
-                "cannot compact an unrecognized stored ZIP data descriptor".into(),
+            return Err(unsupported(
+                "cannot compact an unrecognized stored ZIP data descriptor",
             ));
         };
         let Some(descriptor) = candidate else {
-            return Err(Error::Unsupported(
-                "cannot compact an ambiguous stored ZIP data descriptor".into(),
+            return Err(unsupported(
+                "cannot compact an ambiguous stored ZIP data descriptor",
             ));
         };
-        if (local_crc != 0 && local_crc != descriptor.crc)
-            || (local_size != 0 && local_size != descriptor.size)
-            || crc32(&self.original[data_start..descriptor.data_end]) != descriptor.crc
+        // The header's compressed size is zero here; its CRC and size must be
+        // zero or agree with the descriptor.
+        if !header.matches(descriptor.sizes, true)
+            || crc32(&self.original[data_start..descriptor.data_end]) != descriptor.sizes.crc
         {
             return Err(invalid(format!(
                 "obsolete ZIP size or checksum mismatch in {name}"
@@ -936,9 +1096,7 @@ impl Archive {
             &self.original,
             descriptor.data_end,
             self.central_start,
-            descriptor.crc,
-            descriptor.size,
-            descriptor.size,
+            descriptor.sizes,
             name,
         )?;
         if end != descriptor.end {
@@ -954,7 +1112,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
 
-fn inspect_deflate(compressed: &[u8], name: &str) -> Result<(u32, u32, u32)> {
+fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
     let mut decoder = Decompress::new(false);
     let mut buffer = [0; 8192];
     let mut crc = crc32fast::Hasher::new();
@@ -973,18 +1131,17 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<(u32, u32, u32)> {
                 ))
             })?;
         if decoder.total_out() > MAX_READ as u64 {
-            return Err(Error::Unsupported(format!(
-                "obsolete ZIP member {name} exceeds the 64 MiB read limit"
-            )));
+            return Err(over_read_limit(format_args!("obsolete ZIP member {name}")));
         }
         let produced = (decoder.total_out() - previous_out) as usize;
         crc.update(&buffer[..produced]);
         if status == Status::StreamEnd {
-            return Ok((
-                zip32(decoder.total_in() as usize, "compressed ZIP member size")?,
-                decoder.total_out() as u32,
-                crc.finalize(),
-            ));
+            let compressed_size = zip32(decoder.total_in() as usize, "compressed ZIP member size")?;
+            return Ok(Sizes {
+                crc: crc.finalize(),
+                compressed_size,
+                size: decoder.total_out() as u32,
+            });
         }
         if decoder.total_in() == previous_in && decoder.total_out() == previous_out {
             return Err(invalid(format!(
@@ -1198,17 +1355,17 @@ mod tests {
         let after = &updated.entries[0];
         let mut expected_local = archive.original[before.local_header.clone()].to_vec();
         set_u16(&mut expected_local, 6, after.flags);
-        set_u32(&mut expected_local, 14, after.crc);
-        set_u32(&mut expected_local, 18, after.compressed_size);
-        set_u32(&mut expected_local, 22, after.size);
+        set_u32(&mut expected_local, 14, after.sizes.crc);
+        set_u32(&mut expected_local, 18, after.sizes.compressed_size);
+        set_u32(&mut expected_local, 22, after.sizes.size);
         assert_eq!(updated.original[after.local_header.clone()], expected_local);
         assert_eq!(after.local_record.end, after.data.end);
 
         let mut expected_central = archive.original[before.central.clone()].to_vec();
         set_u16(&mut expected_central, 8, after.flags);
-        set_u32(&mut expected_central, 16, after.crc);
-        set_u32(&mut expected_central, 20, after.compressed_size);
-        set_u32(&mut expected_central, 24, after.size);
+        set_u32(&mut expected_central, 16, after.sizes.crc);
+        set_u32(&mut expected_central, 20, after.sizes.compressed_size);
+        set_u32(&mut expected_central, 24, after.sizes.size);
         set_u32(&mut expected_central, 42, after.local_record.start as u32);
         assert_eq!(updated.original[after.central.clone()], expected_central);
         assert_eq!(
@@ -1294,9 +1451,9 @@ mod tests {
         if signed {
             bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
         }
-        bytes.extend_from_slice(&entry.crc.to_le_bytes());
-        bytes.extend_from_slice(&entry.compressed_size.to_le_bytes());
-        bytes.extend_from_slice(&entry.size.to_le_bytes());
+        bytes.extend_from_slice(&entry.sizes.crc.to_le_bytes());
+        bytes.extend_from_slice(&entry.sizes.compressed_size.to_le_bytes());
+        bytes.extend_from_slice(&entry.sizes.size.to_le_bytes());
         let central_start = bytes.len();
         let mut central = archive.original[entry.central.clone()].to_vec();
         set_u16(&mut central, 8, 8);
@@ -1853,5 +2010,412 @@ mod tests {
         let mut output = Vec::new();
         assert!(archive.compact_to(&BTreeMap::new(), &mut output).is_err());
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn rejects_end_of_directory_signatures_after_the_selected_record() {
+        let original = fixture(false);
+        let end = original.len() - 29;
+        // Signatures before the selected record, such as in stored member
+        // data, are not candidates for readers that scan back from the end.
+        let archive = Archive::new(original.clone()).unwrap();
+        let embedded = [b"stored ".as_slice(), &END.to_le_bytes(), b" data"].concat();
+        let changes = BTreeMap::from([("part.xml".into(), embedded.clone())]);
+        let stored = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        assert_eq!(stored.read("part.xml").unwrap(), embedded);
+        // Backward-scanning readers select the last signature even when its
+        // comment does not reach EOF: here an EOCD with an empty comment plus
+        // one trailing byte, or a signature starting in the length field.
+        let mut hidden = original[end..end + 22].to_vec();
+        set_u16(&mut hidden, 20, 0);
+        hidden.push(b'!');
+        let mut overlapping = vec![0x05, 0x06];
+        overlapping.resize(0x4b50, 0);
+        for comment in [hidden, overlapping] {
+            let mut bytes = original[..end + 20].to_vec();
+            bytes.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&comment);
+            assert!(matches!(
+                Archive::new(bytes),
+                Err(Error::InvalidWorkbook(message))
+                    if message == "ambiguous ZIP end-of-directory records"
+            ));
+        }
+    }
+
+    /// An end record for `entries` members whose directory of `size` bytes
+    /// starts at `offset`, after bytes standing in for members and directory.
+    fn end_record(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 64 + END_LEN];
+        set_u32(&mut bytes, 64, END);
+        set_u16(&mut bytes, 64 + 8, entries);
+        set_u16(&mut bytes, 64 + 10, entries);
+        set_u32(&mut bytes, 64 + 12, size);
+        set_u32(&mut bytes, 64 + 16, offset);
+        set_u16(&mut bytes, 64 + 20, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        bytes
+    }
+
+    #[test]
+    fn end_record_fields_may_hold_the_signature_without_room_for_another_record() {
+        // A directory at offset 0x06054b50, which a ~101 MB archive can have,
+        // puts the signature at record offset 16. So do 0x4b50 entries and a
+        // directory size ending in 0x0605 at offset 10.
+        for (entries, size, offset, at) in [(1, 46, END, 16), (0x4b50, 0x0001_0605, 64, 10)] {
+            // Readers scanning back from EOF only select a signature followed by
+            // a complete record, which needs at least `at` comment bytes.
+            for length in [0, 1, at - 1] {
+                let bytes = end_record(entries, size, offset, &vec![b'c'; length]);
+                assert_eq!(end_of_central_directory(&bytes).unwrap(), 64, "{length}");
+            }
+            for length in [at, at + 1, u16::MAX as usize] {
+                let bytes = end_record(entries, size, offset, &vec![b'c'; length]);
+                assert!(matches!(
+                    end_of_central_directory(&bytes),
+                    Err(Error::InvalidWorkbook(message))
+                        if message == "ambiguous ZIP end-of-directory records"
+                ));
+            }
+        }
+    }
+
+    /// `bytes` with its archive comment replaced by `comment`.
+    fn with_comment(mut bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+        let end = Archive::new(bytes.clone()).unwrap().end;
+        bytes.truncate(end + END_LEN);
+        set_u16(&mut bytes, end + 20, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        bytes
+    }
+
+    #[test]
+    fn saves_refuse_directory_offsets_that_would_make_the_end_record_ambiguous() {
+        let comment = |first: &[u8], length: usize| {
+            let mut comment = first.to_vec();
+            comment.resize(length, b'c');
+            comment
+        };
+        // Local records would have to fill hundreds of megabytes to move the
+        // directory this far, so emit the directory from these positions.
+        for (offset, comment, refused) in [
+            (END, Vec::new(), false),
+            // Python would select the signature at offset 16 and, finding no
+            // complete record after it, fail to open the archive.
+            (END, comment(b"", 15), true),
+            // Other readers would select it too, and misread the archive.
+            (END, comment(b"", 16), true),
+            // The offset's top byte, the comment length 0x054b and the
+            // comment's first byte together spell a signature at offset 19.
+            (0x5000_0000, comment(&[6], 0x054b), true),
+            (0x5000_0000, comment(&[7], 0x054b), false),
+        ] {
+            let archive = Archive::new(with_comment(fixture(false), &comment)).unwrap();
+            let mut output = Vec::new();
+            let mut position = offset as usize;
+            let result = archive.emit_directory(&mut output, &mut position, &[0], &[None]);
+            if refused {
+                assert!(matches!(
+                    result,
+                    Err(Error::Unsupported(message)) if message.contains("ambiguous")
+                ));
+                assert!(output.is_empty());
+            } else {
+                result.unwrap();
+                // Readers select the end record that was written.
+                let end = output.len() - END_LEN - comment.len();
+                assert_eq!(end_of_central_directory(&output).unwrap(), end);
+                assert!(!shadows_end_record(&output[end..]));
+                assert_eq!(u32_at(&output, end + 16).unwrap(), offset);
+            }
+        }
+
+        // A signature Python cannot use in the input's own record is kept: here
+        // 0x4b50 entries and a 0x0605-byte directory, with a 5-byte comment.
+        // (The entry count is set after validation; the writer copies it.)
+        let mut padding = 0xcafe_u16.to_le_bytes().to_vec();
+        padding.extend_from_slice(&1483_u16.to_le_bytes());
+        padding.resize(4 + 1483, 0);
+        let input = with_comment(extra_fixture(&[], &padding), b"12345");
+        let mut archive = Archive::new(input).unwrap();
+        assert_eq!(archive.end - archive.central_start, 0x0605);
+        set_u16(&mut archive.original, archive.end + 8, 0x4b50);
+        set_u16(&mut archive.original, archive.end + 10, 0x4b50);
+        assert!(shadows_end_record(&archive.original[archive.end..]));
+        let mut output = Vec::new();
+        archive
+            .emit_directory(&mut output, &mut 0x100, &[0], &[None])
+            .unwrap();
+        let end = output.len() - END_LEN - 5;
+        assert!(shadows_end_record(&output[end..]));
+        assert_eq!(u32_at(&output, end + 16).unwrap(), 0x100);
+    }
+
+    #[test]
+    fn python_selects_any_later_signature_once_there_is_a_comment() {
+        // Without a comment Python reads the last 22 bytes as the record.
+        let bytes = end_record(1, 46, END, b"");
+        assert!(!shadows_end_record(&bytes[64..]));
+        // With one, it selects the last signature, here at offset 16.
+        for length in [1, 15, 16, 100] {
+            let bytes = end_record(1, 46, END, &vec![b'c'; length]);
+            assert!(shadows_end_record(&bytes[64..]), "{length}");
+            assert_eq!(hides_end_record(&bytes[64..]), length >= 16, "{length}");
+        }
+        let bytes = end_record(1, 46, 64, &[b'c'; 100]);
+        assert!(!shadows_end_record(&bytes[64..]));
+    }
+
+    fn unicode_path(raw_name: &[u8], name: &[u8], version: u8) -> Vec<u8> {
+        let mut field = 0x7075u16.to_le_bytes().to_vec();
+        field.extend_from_slice(&(5 + name.len() as u16).to_le_bytes());
+        field.push(version);
+        field.extend_from_slice(&crc32(raw_name).to_le_bytes());
+        field.extend_from_slice(name);
+        field
+    }
+
+    fn extra_fixture(local_extra: &[u8], central_extra: &[u8]) -> Vec<u8> {
+        let archive = Archive::new(fixture(false)).unwrap();
+        let entry = &archive.entries[0];
+        let mut bytes = archive.original[entry.local_header.clone()].to_vec();
+        set_u16(&mut bytes, 28, local_extra.len() as u16);
+        bytes.extend_from_slice(local_extra);
+        bytes.extend_from_slice(&archive.original[entry.data.clone()]);
+        let central_start = bytes.len();
+        let mut central = archive.original[entry.central.clone()].to_vec();
+        set_u16(&mut central, 30, central_extra.len() as u16);
+        central.extend_from_slice(central_extra);
+        bytes.extend_from_slice(&central);
+        let mut ending = archive.original[archive.end..].to_vec();
+        set_u32(&mut ending, 12, central.len() as u32);
+        set_u32(&mut ending, 16, central_start as u32);
+        bytes.extend_from_slice(&ending);
+        bytes
+    }
+
+    #[test]
+    fn rejects_unicode_path_extra_fields_that_rename_members() {
+        let name = b"part.xml";
+        // Readers differ in the versions they apply: Info-ZIP takes version 0
+        // in the central directory, and libarchive any version locally.
+        for version in [0, 1, 2] {
+            let renamed = unicode_path(name, b"evil.xml", version);
+            let same = unicode_path(name, name, version);
+            let late = [same.clone(), renamed.clone()].concat();
+            for (local, central) in [
+                (&Vec::new(), &renamed),
+                (&renamed, &Vec::new()),
+                (&same, &renamed),
+                (&renamed, &same),
+                (&renamed, &renamed),
+                (&same, &late),
+                (&late, &same),
+            ] {
+                assert!(matches!(
+                    Archive::new(extra_fixture(local, central)),
+                    Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
+                ));
+            }
+        }
+        // Readers ignore fields whose CRC does not match the raw name or that
+        // are too short to hold one, so those cannot rename a member for them.
+        let same = unicode_path(name, name, 1);
+        let stale = unicode_path(b"part.bin", b"evil.xml", 1);
+        let short = [0x75, 0x70, 4, 0, 1, 0, 0, 0].to_vec();
+        let both = [same.clone(), stale.clone(), short.clone()].concat();
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        let versions = [0, 2].map(|version| unicode_path(name, name, version));
+        for extra in [same, stale, short, both].into_iter().chain(versions) {
+            let original = extra_fixture(&extra, &extra);
+            let archive = Archive::new(original.clone()).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+            let mut compacted = Vec::new();
+            archive.compact_to(&changes, &mut compacted).unwrap();
+            assert_eq!(compacted, archive.write(&changes).unwrap());
+            let updated = Archive::new(compacted).unwrap();
+            assert_eq!(updated.read("part.xml").unwrap(), b"updated");
+        }
+    }
+
+    #[test]
+    fn compaction_refuses_obsolete_records_renamed_by_unicode_path_fields() {
+        for version in [0, 1, 2] {
+            let same = unicode_path(b"part.xml", b"part.xml", version);
+            let archive = Archive::new(extra_fixture(&same, &same)).unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+            let appended = append(&archive, &changes);
+            let mut compacted = Vec::new();
+            Archive::new(appended.clone())
+                .unwrap()
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(
+                Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+                b"updated"
+            );
+            // The obsolete record at offset 0 is opaque to normal saves, but
+            // compaction must parse it and so applies the same name rule.
+            let mut renamed = appended;
+            let unicode_name = 30 + b"part.xml".len() + 9;
+            renamed[unicode_name..unicode_name + 8].copy_from_slice(b"evil.xml");
+            let archive = Archive::new(renamed.clone()).unwrap();
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), renamed);
+            let mut output = Vec::new();
+            assert!(matches!(
+                archive.compact_to(&BTreeMap::new(), &mut output),
+                Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
+            ));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_reads_stop_one_byte_past_the_limit() {
+        let input = b"0123456789";
+        assert_eq!(read_at_most(&input[..], Vec::new(), 10).unwrap(), input);
+        let too_long = |result: Result<Vec<u8>>| {
+            matches!(
+                result,
+                Err(Error::Unsupported(message))
+                    if message == "input exceeds the largest possible ZIP32 archive"
+            )
+        };
+        assert!(too_long(read_at_most(&input[..], Vec::new(), 9)));
+        // An endless stream is not read beyond the limit.
+        assert!(too_long(read_at_most(
+            std::io::repeat(0),
+            Vec::new(),
+            1 << 16
+        )));
+        // Reserved capacity in the buffer does not count as input.
+        let reserved = Vec::with_capacity(64);
+        assert_eq!(read_at_most(&input[..], reserved, 10).unwrap(), input);
+        assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
+    }
+
+    #[test]
+    fn rejects_ole_compound_files_as_unsupported() {
+        let mut bytes = vec![0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+        bytes.resize(4096, 0);
+        assert!(matches!(
+            Archive::new(bytes),
+            Err(Error::Unsupported(message)) if message.contains("OLE compound files")
+        ));
+        assert!(matches!(
+            Archive::new(vec![0; 4096]),
+            Err(Error::InvalidWorkbook(_))
+        ));
+    }
+
+    #[test]
+    fn streaming_flushes_the_writer_on_every_path() {
+        struct Flushes {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for Flushes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let archive = Archive::new(fixture(true)).unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"changed".to_vec())]);
+        for changes in [&BTreeMap::new(), &changes] {
+            for compact in [false, true] {
+                let mut writer = Flushes {
+                    bytes: Vec::new(),
+                    flushes: 0,
+                };
+                if compact {
+                    archive.compact_to(changes, &mut writer).unwrap();
+                } else {
+                    archive.write_to(changes, &mut writer).unwrap();
+                }
+                assert_eq!(writer.flushes, 1);
+                assert_eq!(writer.bytes, archive.write(changes).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_encryption_flags_and_accepts_informational_flags() {
+        let central = Archive::new(fixture(false)).unwrap().entries[0]
+            .central
+            .start;
+        let flagged = |flags: u16| {
+            let mut bytes = fixture(false);
+            set_u16(&mut bytes, 6, flags);
+            set_u16(&mut bytes, central + 8, flags);
+            Archive::new(bytes)
+        };
+        // Traditional encryption, strong encryption, and masked local headers.
+        for flags in [0x0001, 0x0040, 0x2000, 0x0002 | 0x0040] {
+            assert!(matches!(
+                flagged(flags),
+                Err(Error::Unsupported(message))
+                    if message == "encrypted ZIP workbooks are not supported"
+            ));
+        }
+        // Compression options and the UTF-8 name flag do not affect reading.
+        for flags in [0x0002, 0x0004, 0x0800] {
+            assert_eq!(
+                flagged(flags).unwrap().read("part.xml").unwrap(),
+                b"<part/>"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_declared_sizes_over_the_read_limit_before_decompressing() {
+        // A single final stored DEFLATE block holding the original payload.
+        let mut compressed = vec![1, 7, 0, 0xf8, 0xff];
+        compressed.extend_from_slice(b"<part/>");
+        let valid = deflate_fixture(&compressed);
+        let archive = Archive::new(valid.clone()).unwrap();
+        assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
+        let central = archive.entries[0].central.start;
+        let mut oversized = valid;
+        set_u32(&mut oversized, 22, MAX_READ as u32 + 1);
+        set_u32(&mut oversized, central + 24, MAX_READ as u32 + 1);
+        assert!(matches!(
+            Archive::new(oversized).unwrap().read("part.xml"),
+            Err(Error::Unsupported(message))
+                if message == "ZIP member part.xml exceeds the 64 MiB read limit"
+        ));
+    }
+
+    #[test]
+    fn rejects_overlapping_local_records() {
+        let keep = Archive::new(decorate_fixture(b"keep.xml", false)).unwrap();
+        let record = keep.original[keep.entries[0].local_record.clone()].to_vec();
+        let separate = combine(fixture(false), decorate_fixture(b"keep.xml", false));
+        assert_eq!(Archive::new(separate).unwrap().entries.len(), 2);
+        // A stored payload that is itself the other member's complete record.
+        let part = Archive::new(fixture(false)).unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), record)]);
+        let part = Archive::new(part.write(&changes).unwrap()).unwrap();
+        let mut bytes = part.original[..part.central_start].to_vec();
+        let central_start = bytes.len();
+        bytes.extend_from_slice(&part.original[part.entries[0].central.clone()]);
+        let mut central = keep.original[keep.entries[0].central.clone()].to_vec();
+        set_u32(&mut central, 42, part.entries[0].data.start as u32);
+        bytes.extend_from_slice(&central);
+        let mut ending = part.original[part.end..].to_vec();
+        set_u16(&mut ending, 8, 2);
+        set_u16(&mut ending, 10, 2);
+        set_u32(&mut ending, 12, (bytes.len() - central_start) as u32);
+        set_u32(&mut ending, 16, central_start as u32);
+        bytes.extend_from_slice(&ending);
+        assert!(matches!(
+            Archive::new(bytes),
+            Err(Error::InvalidWorkbook(message)) if message == "overlapping ZIP local records"
+        ));
     }
 }

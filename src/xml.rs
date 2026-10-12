@@ -45,9 +45,18 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && characters.all(|c| c == ':' || name_character(c))
 }
 
+// The deepest element nesting accepted in an XML part. Deeper input is
+// refused as unsupported rather than malformed.
+pub(crate) const MAX_DEPTH: usize = 256;
+
+// XML whitespace is exactly these four characters, unlike Rust's ASCII and
+// Unicode whitespace sets.
+pub(crate) fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 pub(crate) fn whitespace(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    text.bytes().all(is_space)
 }
 
 // Schema numeric values collapse XML whitespace, rather than Rust's broader
@@ -65,10 +74,7 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
         match quote {
             Some(delimiter) if byte == delimiter => {
                 quote = None;
-                if raw
-                    .get(position + 1)
-                    .is_some_and(|next| !matches!(next, b' ' | b'\t' | b'\r' | b'\n'))
-                {
+                if raw.get(position + 1).is_some_and(|&next| !is_space(next)) {
                     return Err(Error::Xml(
                         "missing whitespace between XML attributes".into(),
                     ));
@@ -85,8 +91,6 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
 // resolver also checks reserved bindings, but does so against the raw spelling
 // and permits prefix undeclarations used by Namespaces in XML 1.1.
 pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
-    const XML: &str = "http://www.w3.org/XML/1998/namespace";
-    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
     if start.name().as_ref().starts_with("xmlns:") {
         return Err(Error::Xml("xmlns cannot be an element prefix".into()));
     }
@@ -100,22 +104,33 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
         } else {
             continue;
         };
-        let value = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(Error::xml)?;
         if !value.chars().all(valid_char) {
             return Err(Error::Xml("invalid XML namespace character".into()));
         }
-        if prefix == Some("xmlns")
-            || value == XMLNS
-            || (value == XML && prefix != Some("xml"))
-            || (prefix == Some("xml") && value != XML)
-        {
-            return Err(Error::Xml("invalid reserved XML namespace binding".into()));
-        }
-        if prefix.is_some() && value.is_empty() {
-            return Err(Error::Xml(
-                "namespace prefixes cannot be undeclared in XML 1.0".into(),
-            ));
-        }
+        validate_namespace_binding(prefix, &value)?;
+    }
+    Ok(())
+}
+
+// Checks one declaration's normalized value. `prefix` is `None` for a default
+// namespace declaration (`xmlns`), and the declared prefix for `xmlns:prefix`.
+pub(crate) fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    if prefix == Some("xmlns")
+        || value == XMLNS
+        || (value == XML && prefix != Some("xml"))
+        || (prefix == Some("xml") && value != XML)
+    {
+        return Err(Error::Xml("invalid reserved XML namespace binding".into()));
+    }
+    if prefix.is_some() && value.is_empty() {
+        return Err(Error::Xml(
+            "namespace prefixes cannot be undeclared in XML 1.0".into(),
+        ));
     }
     Ok(())
 }
@@ -166,7 +181,9 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
                 key: QName("xmlns"),
                 value: Cow::Borrowed(ns.as_ref()),
             };
-            let value = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+            let value = attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(Error::xml)?;
             if !value.chars().all(valid_char) {
                 return Err(Error::Xml("invalid XML namespace character".into()));
             }
@@ -179,6 +196,45 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
     }
 }
 
+// An ST_Xstring escape token, `_xHHHH_`, starts at `position` when this
+// `_xHHHH` prefix is followed by an underscore. The decoder and the encoder
+// share this test, so encoded text always decodes to the original string.
+fn excel_escape_prefix_at(bytes: &[u8], position: usize) -> bool {
+    bytes.get(position..position + 6).is_some_and(|prefix| {
+        prefix[0] == b'_'
+            && matches!(prefix[1], b'x' | b'X')
+            && prefix[2..].iter().all(u8::is_ascii_hexdigit)
+    })
+}
+
+// The inverse of `excel_text`. Characters XML 1.0 forbids, all within the BMP,
+// become `_xHHHH_` escapes as Excel writes them. A literal underscore is
+// escaped as `_x005F_` where it would otherwise start a token in the output:
+// before `xHHHH_`, or before `xHHHH` and a character that is itself escaped.
+pub(crate) fn excel_escaped(text: &str) -> Cow<'_, str> {
+    if text.chars().all(|c| c != '_' && valid_char(c)) {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len() + 8);
+    for (position, character) in text.char_indices() {
+        if character == '_'
+            && excel_escape_prefix_at(bytes, position)
+            && text[position + 6..]
+                .chars()
+                .next()
+                .is_some_and(|next| next == '_' || !valid_char(next))
+        {
+            output.push_str("_x005F_");
+        } else if valid_char(character) {
+            output.push(character);
+        } else {
+            output.push_str(&format!("_x{:04X}_", u32::from(character)));
+        }
+    }
+    Cow::Owned(output)
+}
+
 // ST_Xstring escapes represent UTF-16 code units, including surrogate pairs.
 // Decode only once so the escaped underscore in `_x005F_x0041_` stays literal.
 pub(crate) fn excel_text(text: &str) -> Result<String> {
@@ -189,14 +245,7 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
     let mut units = Vec::with_capacity(text.len());
     let mut position = 0;
     while position < bytes.len() {
-        if bytes[position] == b'_'
-            && position + 7 <= bytes.len()
-            && matches!(bytes[position + 1], b'x' | b'X')
-            && bytes[position + 2..position + 6]
-                .iter()
-                .all(u8::is_ascii_hexdigit)
-            && bytes[position + 6] == b'_'
-        {
+        if excel_escape_prefix_at(bytes, position) && bytes.get(position + 6) == Some(&b'_') {
             units.push(u16::from_str_radix(&text[position + 2..position + 6], 16).unwrap());
             position += 7;
         } else {
@@ -279,9 +328,52 @@ mod tests {
     fn xml_space_is_limited_to_the_four_defined_characters() {
         assert!(whitespace(" \t\r\n"));
         assert_eq!(trim_whitespace(" \t\r\n17\n\t "), "17");
+        let spaces: Vec<u8> = (0..=u8::MAX).filter(|&byte| is_space(byte)).collect();
+        assert_eq!(spaces, b"\t\n\r ");
         for text in ["\u{a0}", "\u{2000}", "\u{85}", "text"] {
             assert!(!whitespace(text));
             assert_eq!(trim_whitespace(text), text);
+        }
+    }
+
+    #[test]
+    fn excel_escaping_is_the_exact_inverse_of_decoding() {
+        assert!(matches!(excel_escaped("Plain 雪 x0041"), Cow::Borrowed(_)));
+        for (text, escaped) in [
+            (
+                "\0\u{1}\u{8}\u{b}\u{c}\u{e}\u{1f}",
+                "_x0000__x0001__x0008__x000B__x000C__x000E__x001F_",
+            ),
+            ("\u{fffe}\u{ffff}\t\n\r", "_xFFFE__xFFFF_\t\n\r"),
+            ("_x0041_ _Xbeef_", "_x005F_x0041_ _x005F_Xbeef_"),
+            // A literal prefix before an escaped character would otherwise
+            // read back as one token.
+            ("_x0001\u{1}", "_x005F_x0001_x0001_"),
+            ("_x0041 _x004G_ _x041_ _", "_x0041 _x004G_ _x041_ _"),
+        ] {
+            assert_eq!(excel_escaped(text), escaped, "{text:?}");
+            assert_eq!(excel_text(escaped).unwrap(), text);
+        }
+        let pieces = [
+            "_", "x", "X", "0", "1", "F", "d", "a", "\u{1}", "\u{fffe}", "\0", "雪", "_x0041_",
+            "_x0001", "_xD83D_", "_X005F", "x005F_",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            for step in 0..(state % 12) {
+                text.push_str(pieces[(state >> (step * 5 + 4)) as usize % pieces.len()]);
+            }
+            let escaped = excel_escaped(&text);
+            assert!(escaped.chars().all(valid_char), "{text:?}");
+            assert_eq!(
+                excel_text(&escaped).unwrap(),
+                text,
+                "{text:?} -> {escaped:?}"
+            );
         }
     }
 

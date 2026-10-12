@@ -1,4 +1,6 @@
-use sheetpatch::{CellValue, Workbook};
+mod common;
+
+use sheetpatch::{CellValue, Error, Workbook};
 use std::collections::BTreeMap;
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -37,58 +39,14 @@ fn fixture(sheets: &str, relationships: &str, replacements: &[(&str, &str)]) -> 
     stored_archive(&parts)
 }
 
-// Independent, minimal ZIP writer: package tests do not use the crate's writer
-// to construct the archive that its package discovery must accept or reject.
+// The shared test-only writer is independent of the crate's writer, so package
+// discovery is checked against archives the crate did not construct.
 fn stored_archive(parts: &BTreeMap<&str, String>) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut central = Vec::new();
-    for (&name, xml) in parts {
-        let bytes = xml.as_bytes();
-        let offset = output.len() as u32;
-        let mut crc = !0u32;
-        for &byte in bytes {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
-            }
-        }
-        let crc = !crc;
-        output.extend_from_slice(&0x04034b50u32.to_le_bytes());
-        for value in [20u16, 0, 0, 0, 0] {
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, bytes.len() as u32, bytes.len() as u32] {
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        output.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        output.extend_from_slice(&0u16.to_le_bytes());
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(bytes);
-
-        central.extend_from_slice(&0x02014b50u32.to_le_bytes());
-        for value in [20u16, 20, 0, 0, 0, 0] {
-            central.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, bytes.len() as u32, bytes.len() as u32] {
-            central.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [name.len() as u16, 0, 0, 0, 0] {
-            central.extend_from_slice(&value.to_le_bytes());
-        }
-        central.extend_from_slice(&0u32.to_le_bytes());
-        central.extend_from_slice(&offset.to_le_bytes());
-        central.extend_from_slice(name.as_bytes());
-    }
-    let offset = output.len() as u32;
-    output.extend_from_slice(&central);
-    output.extend_from_slice(&0x06054b50u32.to_le_bytes());
-    for value in [0u16, 0, parts.len() as u16, parts.len() as u16] {
-        output.extend_from_slice(&value.to_le_bytes());
-    }
-    output.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    output.extend_from_slice(&offset.to_le_bytes());
-    output.extend_from_slice(&0u16.to_le_bytes());
-    output
+    let entries: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(&name, xml)| (name, xml.as_bytes()))
+        .collect();
+    common::stored_archive(&entries)
 }
 
 #[test]
@@ -281,7 +239,7 @@ fn duplicate_batch_addresses_validate_every_input_and_keep_pending_changes_on_fa
     for invalid in [
         CellValue::Number(f64::NAN),
         CellValue::Number(f64::INFINITY),
-        CellValue::Text("invalid\0text".into()),
+        CellValue::Text("a".repeat(32_768)),
     ] {
         assert!(
             workbook
@@ -392,6 +350,90 @@ fn legacy_decoded_zip_part_names_remain_readable_when_encoded_parts_are_absent()
         reopened.get_cell("Data", "B1").unwrap().value,
         CellValue::Number(12.0)
     );
+}
+
+fn worksheet_relationship(id: &str, target: &str, mode: &str) -> String {
+    format!("<Relationship Id='{id}' Type='{OFFICE_NS}/worksheet' Target='{target}'{mode}/>")
+}
+
+#[test]
+fn sheets_sharing_one_worksheet_part_are_rejected() {
+    // Edits are tracked per worksheet part, so two names for one part would let
+    // a later edit through one name silently replace an edit through the other.
+    let sheets = format!("<sheets>{SHEET}<sheet name='Alias' sheetId='2' r:id='two'/></sheets>");
+    let distinct = format!(
+        "{RELATIONSHIP}{}",
+        worksheet_relationship("two", "worksheets/sheet2.xml", "")
+    );
+    let workbook = Workbook::from_bytes(fixture(&sheets, &distinct, &[])).unwrap();
+    assert_eq!(workbook.sheets()[1].path(), "xl/worksheets/sheet2.xml");
+    for target in [
+        "worksheets/sheet1.xml",
+        "/xl/worksheets/sheet1.xml",
+        "../xl/worksheets/sheet1.xml",
+    ] {
+        let rels = format!(
+            "{RELATIONSHIP}{}",
+            worksheet_relationship("two", target, "")
+        );
+        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        assert!(
+            matches!(&error, Some(Error::InvalidWorkbook(message)) if message.contains("duplicate")),
+            "{target}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn external_sheet_relationships_are_rejected() {
+    let sheets = format!("<sheets>{SHEET}</sheets>");
+    let internal = worksheet_relationship("one", "worksheets/sheet1.xml", " TargetMode='Internal'");
+    let workbook = Workbook::from_bytes(fixture(&sheets, &internal, &[])).unwrap();
+    assert_eq!(workbook.sheets()[0].path(), "xl/worksheets/sheet1.xml");
+    for target in [
+        "worksheets/sheet1.xml",
+        "file:///C:/Books/Linked.xlsx",
+        "https://example.com/linked.xlsx",
+    ] {
+        let rels = worksheet_relationship("one", target, " TargetMode='External'");
+        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        assert!(
+            matches!(&error, Some(Error::Unsupported(message)) if message.contains("external")),
+            "{target}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn packages_need_exactly_one_internal_office_document_relationship() {
+    let sheets = format!("<sheets>{SHEET}</sheets>");
+    let roots = |relationships: &str| {
+        format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>")
+    };
+    let office = format!(
+        "<Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/>"
+    );
+    let single = roots(&office);
+    assert!(
+        Workbook::from_bytes(fixture(&sheets, RELATIONSHIP, &[("_rels/.rels", &single)])).is_ok()
+    );
+    for extra in [
+        format!("<Relationship Id='again' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/>"),
+        format!("<Relationship Id='other' Type='{OFFICE_NS}/officeDocument' Target='/xl/worksheets/sheet1.xml'/>"),
+        "<Relationship Id='strict' Type='http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument' Target='xl/workbook.xml'/>".to_owned(),
+    ] {
+        let duplicated = roots(&format!("{office}{extra}"));
+        let error = Workbook::from_bytes(fixture(
+            &sheets,
+            RELATIONSHIP,
+            &[("_rels/.rels", &duplicated)],
+        ))
+        .err();
+        assert!(
+            matches!(&error, Some(Error::InvalidWorkbook(message)) if message.contains("officeDocument")),
+            "{extra}: {error:?}"
+        );
+    }
 }
 
 #[test]

@@ -1,6 +1,7 @@
+use super::date::{DateError, excel_serial};
 use super::index::WorksheetIndex;
-use super::parse::{Element, NamespaceId, parse};
-use super::{decoded, unique, unsupported};
+use super::parse::{Element, NamespaceId, XmlDocument, parse_with};
+use super::{ReadError, at_cell, decoded, invalid, unique, unsupported, xml_error};
 use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
@@ -14,10 +15,25 @@ pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     if element.empty {
         return Ok(String::new());
     }
-    let mut reader = quick_xml::Reader::from_reader(&xml[element.open_end..element.close_start]);
+    let mut content = &xml[element.open_end()..element.close_start()];
+    // Text without markup, references or carriage returns is its own value.
+    if !content
+        .iter()
+        .any(|&byte| matches!(byte, b'<' | b'&' | b'\r'))
+    {
+        return String::from_utf8(content.to_vec()).map_err(|e| xml_error(e.to_string()));
+    }
     let mut text = String::new();
+    // A new reader discards a leading UTF-8 byte order mark, which inside an
+    // element is the ordinary character U+FEFF. Consume each leading copy, so
+    // the reader never starts at one.
+    while let Some(rest) = content.strip_prefix("\u{feff}".as_bytes()) {
+        text.push('\u{feff}');
+        content = rest;
+    }
+    let mut reader = quick_xml::Reader::from_reader(content);
     loop {
-        match reader.read_event()? {
+        match reader.read_event().map_err(Error::xml)? {
             Event::Text(value) => {
                 text.push_str(&value.xml10_content());
             }
@@ -48,31 +64,46 @@ pub(super) fn rich_text(
     // Ignoring text hidden in compatibility branches or other containers would
     // return an incomplete scalar value. Phonetic text is a known, separate
     // annotation and remains excluded from the displayed text.
-    for element in &elements[elements[index].children_start..elements[index].children_end] {
+    for element in &elements[elements[index].descendants()] {
         let known_container = element.is(namespace, "r") || element.is(namespace, "rPh");
         let known_text = element.is(namespace, "t");
-        if (known_container && element.parent != Some(index))
+        if (known_container && element.parent() != Some(index))
             || (known_text
-                && !element.parent.is_some_and(|parent| {
+                && !element.parent().is_some_and(|parent| {
                     parent == index
                         || ((elements[parent].is(namespace, "r")
                             || elements[parent].is(namespace, "rPh"))
-                            && elements[parent].parent == Some(index))
+                            && elements[parent].parent() == Some(index))
                 }))
         {
             return Err(unsupported("rich text inside an unsupported XML container"));
         }
     }
     let mut text = String::new();
+    let mut append = |element: &Element| -> Result<()> {
+        let piece = element_text(xml, element)?;
+        // Only an underscore can start an Excel escape.
+        let piece = if piece.contains('_') {
+            excel_text(&piece)?
+        } else {
+            piece
+        };
+        if text.is_empty() {
+            text = piece;
+        } else {
+            text.push_str(&piece);
+        }
+        Ok(())
+    };
     for child in elements[index].children(elements) {
         let element = &elements[child];
         if element.is(namespace, "t") {
-            text.push_str(&excel_text(&element_text(xml, element)?)?);
+            append(element)?;
         } else if element.is(namespace, "r") {
             for child in element.children(elements) {
                 let element = &elements[child];
                 if element.is(namespace, "t") {
-                    text.push_str(&excel_text(&element_text(xml, element)?)?);
+                    append(element)?;
                 }
             }
         }
@@ -80,33 +111,166 @@ pub(super) fn rich_text(
     Ok(text)
 }
 
-pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
-    let document = parse(xml)?;
+fn is_string_table(document: &XmlDocument) -> bool {
     let root = &document.elements[0];
-    let namespace = root.namespace;
-    if root.local_name() != "sst" || !document.is_spreadsheet_namespace(namespace) {
+    root.local_name() == "sst" && document.is_spreadsheet_namespace(root.namespace)
+}
+
+/// Decodes each string as its `si` element completes and then releases that
+/// subtree, so the parse holds one string's markup rather than the whole
+/// table while still validating every event. Decoding errors are reported
+/// only after the rest of the part is known to be valid, giving them the same
+/// precedence as when the full table was indexed first.
+pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
+    let mut strings = Vec::new();
+    let mut hidden_string = false;
+    let mut decode_error = None;
+    let document = parse_with(xml, |document, index| {
+        if hidden_string || !is_string_table(document) {
+            return true;
+        }
+        let elements = &document.elements;
+        let namespace = elements[0].namespace;
+        // Every element below the root arrives in exactly one released
+        // subtree, as the child itself or one of its descendants.
+        hidden_string = elements[elements[index].descendants()]
+            .iter()
+            .any(|element| element.is(namespace, "si"));
+        if !hidden_string && decode_error.is_none() && elements[index].is(namespace, "si") {
+            match rich_text(xml, elements, index, namespace) {
+                Ok(text) => strings.push(text),
+                Err(error) => decode_error = Some(error),
+            }
+        }
+        true
+    })?;
+    if !is_string_table(&document) {
         return Err(unsupported("expected an OOXML shared-string table"));
     }
-    let elements = document.elements;
-    let root = &elements[0];
-    if elements
-        .iter()
-        .any(|element| element.is(namespace, "si") && element.parent != Some(0))
-    {
+    if hidden_string {
         return Err(unsupported("shared string outside the shared-string table"));
     }
-    root.children(&elements)
-        .filter(|&index| elements[index].is(namespace, "si"))
-        .map(|index| rich_text(xml, &elements, index, namespace))
-        .collect()
+    decode_error.map_or(Ok(strings), Err)
+}
+
+// A cell's stored value. A shared string is resolved separately: failing to
+// load the table concerns that part rather than the cell.
+enum StoredValue {
+    Value(CellValue),
+    SharedString(usize),
+}
+
+fn stored_value(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    cell: &Element,
+    date1904: bool,
+) -> Result<StoredValue> {
+    let elements = &index.elements;
+    let namespace = index.namespace;
+    let payload_index = unique(
+        cell.children(elements).filter(|&child| {
+            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
+        }),
+        "cell has multiple value payloads",
+    )?;
+    let Some(payload_index) = payload_index else {
+        return Ok(StoredValue::Value(CellValue::Blank));
+    };
+    let payload = &elements[payload_index];
+    let kind = cell
+        .attr(&index.attributes, "t")
+        .map_or("n", |attribute| attribute.value.as_ref());
+    if kind == "inlineStr" {
+        if !payload.is(namespace, "is") {
+            return Err(unsupported("inline string cell without an inline payload"));
+        }
+        let text = rich_text(xml, elements, payload_index, namespace)?;
+        return Ok(StoredValue::Value(CellValue::Text(text)));
+    }
+    if !payload.is(namespace, "v") {
+        return Err(unsupported("non-inline cell has an inline payload"));
+    }
+    let text = element_text(xml, payload)?;
+    // Values that their cell type cannot hold make the workbook malformed;
+    // only valid ISO 8601 dates outside the supported forms are unsupported.
+    let value = match kind {
+        "n" if trim_xml_whitespace(&text).is_empty() => CellValue::Blank,
+        "n" => {
+            let number = trim_xml_whitespace(&text)
+                .parse::<f64>()
+                .map_err(|_| invalid("invalid numeric cell value"))?;
+            if !number.is_finite() {
+                return Err(invalid("non-finite numeric cell value"));
+            }
+            CellValue::Number(number)
+        }
+        "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
+            "0" | "false" => false,
+            "1" | "true" => true,
+            _ => return Err(invalid("invalid boolean cell value")),
+        }),
+        "str" => CellValue::Text(excel_text(&text)?),
+        "e" => CellValue::Error(excel_text(&text)?),
+        // Dates read as the serial number Excel would store for them.
+        "d" => CellValue::Number(excel_serial(trim_xml_whitespace(&text), date1904).map_err(
+            |error| match error {
+                DateError::Invalid => invalid("invalid ISO 8601 date cell value"),
+                DateError::TimeZoneOffset => {
+                    unsupported("ISO 8601 date cell value with a time-zone offset")
+                }
+                DateError::BeforeEpoch => unsupported(
+                    "ISO 8601 date cell value before the start of the workbook's date system",
+                ),
+            },
+        )?),
+        "s" => {
+            return trim_xml_whitespace(&text)
+                .parse::<usize>()
+                .map(StoredValue::SharedString)
+                .map_err(|_| invalid("invalid shared-string index"));
+        }
+        _ => return Err(invalid(format!("invalid cell value type {kind:?}"))),
+    };
+    Ok(StoredValue::Value(value))
+}
+
+// The cell's style, formula and stored value, read in that order.
+fn stored_cell(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    cell: &Element,
+    date1904: bool,
+) -> Result<(Option<u32>, Option<String>, StoredValue)> {
+    let elements = &index.elements;
+    let style_index = cell
+        .attr(&index.attributes, "s")
+        .map(|attribute| {
+            trim_xml_whitespace(&attribute.value)
+                .parse::<u32>()
+                .map_err(|_| invalid("invalid cell style index"))
+        })
+        .transpose()?;
+    let formulas = cell
+        .children(elements)
+        .filter(|&child| elements[child].is(index.namespace, "f"));
+    let formula = unique(formulas, "cell has multiple formulas")?
+        .map(|formula| element_text(xml, &elements[formula]))
+        .transpose()?;
+    Ok((
+        style_index,
+        formula,
+        stored_value(xml, index, cell, date1904)?,
+    ))
 }
 
 pub(super) fn cell_content<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
-    shared_strings: &mut impl FnMut() -> Result<&'a [String]>,
-) -> Result<CellContent> {
+    shared_strings: &mut impl FnMut() -> Result<Option<&'a [String]>>,
+    date1904: bool,
+) -> std::result::Result<CellContent, ReadError> {
     let Some(cell_index) = index.cell(address) else {
         return Ok(CellContent {
             value: CellValue::Blank,
@@ -114,85 +278,28 @@ pub(super) fn cell_content<'a>(
             style_index: None,
         });
     };
-    let elements = &index.elements;
-    let attributes = &index.attributes;
-    let namespace = index.namespace;
-    let cell = &elements[cell_index];
-    let style_index = cell
-        .attr(attributes, "s")
-        .map(|attribute| {
-            trim_xml_whitespace(&attribute.value)
-                .parse::<u32>()
-                .map_err(|_| unsupported("invalid cell style index"))
-        })
-        .transpose()?;
-    let children = |name| {
-        cell.children(elements)
-            .filter(move |&child| elements[child].is(namespace, name))
-    };
-    let formula = unique(children("f"), "cell has multiple formulas")?
-        .map(|index| element_text(xml, &elements[index]))
-        .transpose()?;
-    let payload_index = unique(
-        cell.children(elements).filter(|&child| {
-            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
-        }),
-        "cell has multiple value payloads",
-    )?;
-    let value = if let Some(payload_index) = payload_index {
-        let payload = &elements[payload_index];
-        let kind = cell
-            .attr(attributes, "t")
-            .map_or("n", |attribute| attribute.value.as_ref());
-        if kind == "inlineStr" {
-            if !payload.is(namespace, "is") {
-                return Err(unsupported("inline string cell without an inline payload"));
-            }
-            CellValue::Text(rich_text(xml, elements, payload_index, namespace)?)
-        } else {
-            if !payload.is(namespace, "v") {
-                return Err(unsupported("non-inline cell has an inline payload"));
-            }
-            let text = element_text(xml, payload)?;
-            match kind {
-                "n" if trim_xml_whitespace(&text).is_empty() => CellValue::Blank,
-                "n" => {
-                    let number = trim_xml_whitespace(&text)
-                        .parse::<f64>()
-                        .map_err(|_| unsupported("invalid numeric cell value"))?;
-                    if !number.is_finite() {
-                        return Err(unsupported("non-finite numeric cell value"));
-                    }
-                    CellValue::Number(number)
-                }
-                "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
-                    "0" | "false" => false,
-                    "1" | "true" => true,
-                    _ => return Err(unsupported("invalid boolean cell value")),
-                }),
-                "str" => CellValue::Text(excel_text(&text)?),
-                "e" => CellValue::Error(excel_text(&text)?),
-                "s" => {
-                    let position = trim_xml_whitespace(&text)
-                        .parse::<usize>()
-                        .map_err(|_| unsupported("invalid shared-string index"))?;
-                    let strings = shared_strings()?;
-                    CellValue::Text(
-                        strings
-                            .get(position)
-                            .ok_or_else(|| {
-                                Error::InvalidWorkbook(
-                                    "shared-string index is out of bounds".into(),
-                                )
-                            })?
-                            .clone(),
-                    )
-                }
-                _ => return Err(unsupported(format!("unsupported cell value type {kind:?}"))),
-            }
+    let (style_index, formula, value) =
+        stored_cell(xml, index, &index.elements[cell_index], date1904)
+            .map_err(|error| at_cell(address, error))?;
+    let value = match value {
+        StoredValue::Value(value) => value,
+        StoredValue::SharedString(position) => {
+            // A table that exists but cannot be loaded concerns that part;
+            // a missing table or index is the cell's problem.
+            let strings = shared_strings()
+                .map_err(ReadError::SharedStrings)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{address}: shared-string cell, but the workbook has no shared-string table"
+                    ))
+                })?;
+            let text = strings.get(position).ok_or_else(|| {
+                invalid(format!(
+                    "{address}: shared-string index {position} is out of bounds"
+                ))
+            })?;
+            CellValue::Text(text.clone())
         }
-    } else {
-        CellValue::Blank
     };
     Ok(CellContent {
         value,
@@ -205,8 +312,9 @@ pub(super) fn read_cells<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     cells: &[CellRef],
-    mut shared_strings: impl FnMut() -> Result<&'a [String]>,
-) -> Result<Vec<CellContent>> {
+    mut shared_strings: impl FnMut() -> Result<Option<&'a [String]>>,
+    date1904: bool,
+) -> std::result::Result<Vec<CellContent>, ReadError> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }
@@ -221,6 +329,6 @@ pub(super) fn read_cells<'a>(
     };
     cells
         .iter()
-        .map(|&cell| cell_content(xml, index, cell, &mut load_strings))
+        .map(|&cell| cell_content(xml, index, cell, &mut load_strings, date1904))
         .collect()
 }

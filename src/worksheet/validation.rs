@@ -1,6 +1,6 @@
 use super::index::Range;
 use super::parse::{Attribute, Element, NamespaceId};
-use super::unsupported;
+use super::{protected, protection, unsupported};
 use crate::{CellRef, CellValue, Result};
 use std::collections::BTreeMap;
 
@@ -26,14 +26,11 @@ pub(super) fn validate_payload(
         | "condense" | "extend" | "sz" | "u" | "vertAlign" | "scheme" => &["val"],
         _ => return Err(unsupported("unfamiliar XML inside the cell value payload")),
     };
-    if attributes[element.attributes.clone()]
-        .iter()
-        .any(|attribute| {
-            attribute.name != "xmlns"
-                && !attribute.name.starts_with("xmlns:")
-                && !allowed_attributes.contains(&attribute.name)
-        })
-    {
+    if element.attributes(attributes).iter().any(|attribute| {
+        attribute.name != "xmlns"
+            && !attribute.name.starts_with("xmlns:")
+            && !allowed_attributes.contains(&attribute.name)
+    }) {
         return Err(unsupported(
             "unfamiliar attributes inside the cell value payload",
         ));
@@ -62,6 +59,8 @@ pub(super) fn sort_guard_events(events: &mut Vec<GuardEvent>) {
     if events.len() < 2 {
         return;
     }
+    // Three byte-wide passes cover every event row, up to one past the last.
+    const _: () = assert!(CellRef::MAX_ROW < 1 << 24);
     let mut scratch = events.clone();
     for shift in [0, 8, 16] {
         let mut counts = [0usize; 256];
@@ -92,11 +91,12 @@ pub(super) fn validate_ranges(
         return Ok(());
     }
     let violation = |cell: CellRef| {
-        unsupported(if merged {
-            format!("{cell} is not the anchor of its merged range")
+        let reason = if merged {
+            protection::MERGED
         } else {
-            format!("{cell} belongs to a formula range")
-        })
+            protection::FORMULA_RANGE
+        };
+        protected(cell, reason)
     };
     // With either dimension small, direct membership checks cost less than
     // sorting events and allocating a column index. Large batches still use
@@ -175,7 +175,9 @@ pub(super) fn validate_ranges(
         return Ok(());
     }
     sort_guard_events(&mut events);
-    let mut active = vec![0i32; 16_386];
+    // Fenwick indexes are one-based columns. A range also updates the slot
+    // after its last column, which is one past the grid's final column.
+    let mut active = vec![0i32; usize::from(CellRef::MAX_COLUMN) + 2];
     let mut position = 0;
     for &cell in cells.keys() {
         while position < events.len() && events[position].row <= cell.row {

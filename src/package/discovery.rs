@@ -1,12 +1,15 @@
 //! Validated OOXML package discovery and relationship target resolution.
-use super::Sheet;
+use super::{Sheet, SheetVisibility, in_part};
 use crate::{
-    Error, Result,
+    CellRange, CellRef, Error, Result,
     archive::Archive,
-    xml::{excel_text, namespace, valid_qname},
+    xml::{MAX_DEPTH, excel_text, namespace, trim_whitespace, valid_qname},
 };
-use quick_xml::{events::Event, reader::NsReader};
-use std::collections::{BTreeMap, BTreeSet};
+use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    rc::Rc,
+};
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const SIGNATURE_ORIGIN: &str =
@@ -20,19 +23,129 @@ const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relati
 pub(super) struct PackageMetadata {
     pub(super) sheets: Vec<Sheet>,
     pub(super) signed: bool,
+    pub(super) date1904: bool,
     pub(super) shared_strings_path: Option<String>,
 }
 
 pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
-    if !archive.contains("[Content_Types].xml") {
-        return Err(Error::InvalidWorkbook("missing [Content_Types].xml".into()));
+    validate_content_types(archive)?;
+    let office = office_document(archive)?;
+    let workbook = xml_nodes(&archive.read(&office.path)?, workbook_node)?;
+    let (sheets_index, date1904) = workbook_properties(&workbook)?;
+    let rels_path = relationships_path(&office.path);
+    let rels_path = archive.part_name(&rels_path)?.unwrap_or(&rels_path);
+    let rels = relationships(&archive.read(rels_path)?)?;
+    let shared_strings_path = shared_strings_path(archive, &office.uri, &rels)?;
+    let sheets = sheets(archive, &office.uri, &workbook, sheets_index, &rels)?;
+    Ok(PackageMetadata {
+        sheets,
+        signed: office.signed,
+        date1904,
+        shared_strings_path,
+    })
+}
+
+/// The header rows of the Excel tables related to a worksheet part. Excel
+/// requires each header cell's text to equal its table column's name. Errors
+/// name the relationships or table part they concern, not the worksheet.
+pub(super) fn table_headers(archive: &Archive, worksheet: &str) -> Result<Vec<CellRange>> {
+    let rels_path = relationships_path(worksheet);
+    let Some(rels_path) = archive
+        .part_name(&rels_path)
+        .map_err(|error| in_part(&rels_path, error))?
+    else {
+        return Ok(Vec::new());
+    };
+    let in_rels = |error| in_part(rels_path, error);
+    let mut headers = Vec::new();
+    let relationships = archive
+        .read(rels_path)
+        .and_then(|xml| relationships(&xml))
+        .map_err(in_rels)?;
+    for relationship in relationships {
+        if !office_type(&relationship.kind, "table") {
+            continue;
+        }
+        if relationship.external {
+            return Err(in_rels(Error::InvalidWorkbook(format!(
+                "table relationship {} is external",
+                relationship.id
+            ))));
+        }
+        let path =
+            resolve_part_target(archive, worksheet, &relationship.target).map_err(in_rels)?;
+        if !archive.contains(&path) {
+            return Err(in_rels(Error::InvalidWorkbook(format!(
+                "missing table part {path}"
+            ))));
+        }
+        let header = archive
+            .read(&path)
+            .and_then(|xml| table_header(&xml))
+            .map_err(|error| in_part(&path, error))?;
+        headers.extend(header);
     }
-    let content_types = xml_nodes(&archive.read("[Content_Types].xml")?)?;
-    if content_types[0].local != "Types" || content_types[0].namespace != CONTENT_TYPES_NS {
+    Ok(headers)
+}
+
+fn table_header(xml: &[u8]) -> Result<Option<CellRange>> {
+    let invalid = |problem: &str| Error::InvalidWorkbook(format!("table {problem}"));
+    let nodes = xml_nodes(xml, root_only)?;
+    let table = &nodes[0];
+    if table.local != "table" || !main_namespace(&table.namespace) {
+        return Err(Error::InvalidWorkbook(
+            "expected a SpreadsheetML table".into(),
+        ));
+    }
+    let reference = table
+        .attr("", "ref")
+        .ok_or_else(|| invalid("lacks a ref"))?;
+    let range: CellRange = trim_whitespace(reference)
+        .parse()
+        .map_err(|_| invalid("has an invalid ref"))?;
+    let rows = match table.attr("", "headerRowCount") {
+        None => 1,
+        Some(count) => trim_whitespace(count)
+            .parse::<u32>()
+            .map_err(|_| invalid("has an invalid headerRowCount"))?,
+    };
+    if rows > range.height() {
+        return Err(invalid("has more header rows than rows"));
+    }
+    Ok((rows > 0).then(|| {
+        let first = range.first();
+        let last = CellRef {
+            row: first.row + rows - 1,
+            column: range.last().column,
+        };
+        CellRange::new(first, last)
+    }))
+}
+
+fn validate_content_types(archive: &Archive) -> Result<()> {
+    // Like the other OPC parts, the content-types stream is found without
+    // regard to ASCII case, and equivalent names are ambiguous.
+    let path = archive
+        .part_name("[Content_Types].xml")?
+        .ok_or_else(|| Error::InvalidWorkbook("missing [Content_Types].xml".into()))?;
+    let types = xml_nodes(&archive.read(path)?, root_only)?;
+    if types[0].local != "Types" || &*types[0].namespace != CONTENT_TYPES_NS {
         return Err(Error::InvalidWorkbook("invalid content-types root".into()));
     }
-    let root_rels_path = archive.part_name("_rels/.rels")?.unwrap_or("_rels/.rels");
-    let roots = relationships(&archive.read(root_rels_path)?)?;
+    Ok(())
+}
+
+struct OfficeDocument {
+    /// The workbook part's URI, against which its relationships resolve.
+    uri: String,
+    /// The workbook part's ZIP member name.
+    path: String,
+    signed: bool,
+}
+
+fn office_document(archive: &Archive) -> Result<OfficeDocument> {
+    let rels_path = archive.part_name("_rels/.rels")?.unwrap_or("_rels/.rels");
+    let roots = relationships(&archive.read(rels_path)?)?;
     let mut office = roots
         .iter()
         .filter(|r| office_type(&r.kind, "officeDocument"));
@@ -44,9 +157,9 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
             ));
         }
     };
-    let workbook_uri = resolve_target("", &office.target)?;
-    let workbook_path = resolve_part_target(archive, "", &office.target)?;
-    if workbook_path
+    let uri = resolve_target("", &office.target)?;
+    let path = resolve_part_target(archive, "", &office.target)?;
+    if path
         .rsplit_once('.')
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("bin"))
     {
@@ -54,18 +167,40 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
             "binary Excel workbooks (.xlsb) are not supported".into(),
         ));
     }
-    let workbook_nodes = xml_nodes(&archive.read(&workbook_path)?)?;
-    let root = &workbook_nodes[0];
+    Ok(OfficeDocument {
+        uri,
+        path,
+        signed: signed(archive, &roots),
+    })
+}
+
+// A signature origin relationship, or any part in the conventional signature
+// folder, marks a signed package.
+fn signed(archive: &Archive, roots: &[Relationship]) -> bool {
+    roots.iter().any(|r| r.kind == SIGNATURE_ORIGIN)
+        || archive.entries().iter().any(|e| {
+            e.name
+                .split_once('/')
+                .is_some_and(|(root, _)| root.eq_ignore_ascii_case("_xmlsignatures"))
+        })
+}
+
+/// Validates the workbook root. Returns the index of its `sheets` element and
+/// whether its `workbookPr` element selects the 1904 date system.
+fn workbook_properties(nodes: &[Node]) -> Result<(usize, bool)> {
+    let root = &nodes[0];
     if root.local != "workbook" || !main_namespace(&root.namespace) {
         return Err(Error::InvalidWorkbook(
             "officeDocument is not a SpreadsheetML workbook".into(),
         ));
     }
-    let mut sheet_containers = workbook_nodes
+    let in_workbook =
+        |node: &Node, local: &str| node.local == local && node.namespace == root.namespace;
+    let mut containers = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.local == "sheets" && node.namespace == root.namespace);
-    let sheets_index = match (sheet_containers.next(), sheet_containers.next()) {
+        .filter(|(_, node)| in_workbook(node, "sheets"));
+    let sheets = match (containers.next(), containers.next()) {
         (Some((index, node)), None) if node.parent == Some(0) => index,
         _ => {
             return Err(Error::InvalidWorkbook(
@@ -73,34 +208,70 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
             ));
         }
     };
-    let rels_path = relationships_path(&workbook_path);
-    let rels_path = archive.part_name(&rels_path)?.unwrap_or(&rels_path);
-    let rels = relationships(&archive.read(rels_path)?)?;
-    let mut shared = rels
-        .iter()
-        .filter(|r| office_type(&r.kind, "sharedStrings"));
-    let shared = match (shared.next(), shared.next()) {
-        (Some(relationship), None) if !relationship.external => Some(relationship),
-        (None, None) => None,
+    // Only the root's own workbookPr children are retained.
+    let mut properties = nodes.iter().filter(|node| in_workbook(node, "workbookPr"));
+    let date1904 = match (properties.next(), properties.next()) {
+        (None, _) => false,
+        // An xsd:boolean, which collapses surrounding XML whitespace.
+        (Some(properties), None) => match properties.attr("", "date1904").map(trim_whitespace) {
+            None | Some("0" | "false") => false,
+            Some("1" | "true") => true,
+            Some(value) => {
+                return Err(Error::InvalidWorkbook(format!(
+                    "invalid workbookPr date1904 value {value:?}"
+                )));
+            }
+        },
         _ => {
             return Err(Error::InvalidWorkbook(
-                "expected at most one internal shared-string relationship".into(),
+                "workbook must contain at most one workbookPr element".into(),
             ));
         }
     };
-    let shared_strings_path = shared
-        .map(|r| resolve_part_target(archive, &workbook_uri, &r.target))
-        .transpose()?;
+    Ok((sheets, date1904))
+}
+
+fn shared_strings_path(
+    archive: &Archive,
+    workbook_uri: &str,
+    rels: &[Relationship],
+) -> Result<Option<String>> {
+    let mut shared = rels
+        .iter()
+        .filter(|r| office_type(&r.kind, "sharedStrings"));
+    match (shared.next(), shared.next()) {
+        (Some(relationship), None) if !relationship.external => {
+            resolve_part_target(archive, workbook_uri, &relationship.target).map(Some)
+        }
+        (None, None) => Ok(None),
+        _ => Err(Error::InvalidWorkbook(
+            "expected at most one internal shared-string relationship".into(),
+        )),
+    }
+}
+
+/// The worksheets in tab order. Chart, dialog, and macro sheets are skipped,
+/// after their names and locations are validated like a worksheet's.
+fn sheets(
+    archive: &Archive,
+    workbook_uri: &str,
+    nodes: &[Node],
+    sheets_index: usize,
+    rels: &[Relationship],
+) -> Result<Vec<Sheet>> {
+    let namespace = &nodes[0].namespace;
     let relationships_by_id: BTreeMap<_, _> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
     let mut sheets = Vec::new();
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    for node in &workbook_nodes {
-        if node.local != "sheet" || node.namespace != root.namespace {
+    for node in nodes {
+        if node.local != "sheet" || node.namespace != *namespace {
             continue;
         }
         if node.parent != Some(sheets_index) {
-            return Err(Error::Unsupported("sheet outside workbook sheets".into()));
+            return Err(Error::InvalidWorkbook(
+                "sheet outside workbook sheets".into(),
+            ));
         }
         let name = excel_text(
             node.attr("", "name")
@@ -109,9 +280,11 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
         if !names.insert(name.clone()) {
             return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
         }
-        let mut ids = node.attributes.iter().filter(|a| {
-            a.local == "id" && matches!(a.namespace.as_str(), OFFICE_NS | STRICT_OFFICE_NS)
-        });
+        let visibility = visibility(node, &name)?;
+        let mut ids = node
+            .attributes
+            .iter()
+            .filter(|a| a.local == "id" && matches!(&*a.namespace, OFFICE_NS | STRICT_OFFICE_NS));
         let id = match (ids.next(), ids.next()) {
             (Some(attribute), None) => attribute.value.as_str(),
             _ => {
@@ -131,86 +304,165 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
         if !office_type(&relationship.kind, "worksheet") {
             continue;
         }
-        let path = resolve_part_target(archive, &workbook_uri, &relationship.target)?;
+        let path = resolve_part_target(archive, workbook_uri, &relationship.target)?;
         if !archive.contains(&path) {
             return Err(Error::InvalidWorkbook(format!(
                 "missing worksheet part {path}"
             )));
         }
+        // Earlier duplicate-name checks leave a shared part as the only cause.
         if !paths.insert(path.clone()) {
-            return Err(Error::InvalidWorkbook(
-                "duplicate worksheet name or target".into(),
-            ));
+            return Err(Error::InvalidWorkbook(format!(
+                "duplicate worksheet target {path}"
+            )));
         }
-        sheets.push(Sheet { name, path });
-    }
-    let signed = roots.iter().any(|r| r.kind == SIGNATURE_ORIGIN)
-        || archive.entries().iter().any(|e| {
-            e.name
-                .split_once('/')
-                .is_some_and(|(root, _)| root.eq_ignore_ascii_case("_xmlsignatures"))
+        sheets.push(Sheet {
+            name,
+            path,
+            visibility,
         });
-    Ok(PackageMetadata {
-        sheets,
-        signed,
-        shared_strings_path,
+    }
+    Ok(sheets)
+}
+
+fn visibility(sheet: &Node, name: &str) -> Result<SheetVisibility> {
+    // ST_SheetState is an enumeration, which collapses XML whitespace.
+    Ok(match sheet.attr("", "state").map(trim_whitespace) {
+        None | Some("visible") => SheetVisibility::Visible,
+        Some("hidden") => SheetVisibility::Hidden,
+        Some("veryHidden") => SheetVisibility::VeryHidden,
+        Some(state) => {
+            return Err(Error::InvalidWorkbook(format!(
+                "sheet {name} has an invalid state {state:?}"
+            )));
+        }
     })
 }
 
+/// Selects the elements kept from a package part by their depth below the
+/// root, namespace URI, and local name. The root is always kept.
+type Retain = fn(usize, &str, &str) -> bool;
+
+fn root_only(_: usize, _: &str, _: &str) -> bool {
+    false
+}
+
+// Misplaced relationships, sheet lists, and sheets are kept so that they can
+// be rejected; unrelated elements, wherever they occur, are not.
+fn relationship_node(_: usize, namespace: &str, local: &str) -> bool {
+    namespace == PACKAGE_NS && local == "Relationship"
+}
+
+fn workbook_node(depth: usize, namespace: &str, local: &str) -> bool {
+    main_namespace(namespace)
+        && match local {
+            "sheets" | "sheet" => true,
+            "workbookPr" => depth == 1,
+            _ => false,
+        }
+}
+
 struct Attribute {
-    namespace: String,
+    namespace: Rc<str>,
     local: String,
     value: String,
 }
 struct Node {
-    namespace: String,
+    namespace: Rc<str>,
     local: String,
     attributes: Vec<Attribute>,
+    /// The parent's index when the parent was retained.
     parent: Option<usize>,
 }
 impl Node {
     fn attr(&self, namespace: &str, local: &str) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|a| a.namespace == namespace && a.local == local)
+            .find(|a| &*a.namespace == namespace && a.local == local)
             .map(|a| a.value.as_str())
     }
 }
 
-fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
+// Normalized namespace URIs by their raw spelling. Parts use few namespaces;
+// the limit keeps distinct declarations from growing the cache without bound.
+struct Namespaces {
+    cache: HashMap<String, Rc<str>>,
+    unbound: Rc<str>,
+}
+
+impl Namespaces {
+    const CACHE_LIMIT: usize = 64;
+
+    fn resolve(&mut self, result: ResolveResult<'_>) -> Result<Rc<str>> {
+        match result {
+            ResolveResult::Bound(raw) => {
+                if let Some(uri) = self.cache.get(raw.as_ref()) {
+                    return Ok(Rc::clone(uri));
+                }
+                let uri: Rc<str> = namespace(ResolveResult::Bound(raw))?.into();
+                if self.cache.len() < Self::CACHE_LIMIT {
+                    self.cache.insert(raw.as_ref().to_owned(), Rc::clone(&uri));
+                }
+                Ok(uri)
+            }
+            other => namespace(other).map(|_| Rc::clone(&self.unbound)),
+        }
+    }
+}
+
+/// Parses and validates a whole package part, keeping its root and the
+/// elements that `retain` selects. Memory therefore grows with the retained
+/// elements, not with unrelated markup.
+fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     let xml = std::str::from_utf8(bytes)
-        .map_err(|_| Error::Unsupported("only UTF-8 workbook XML is supported".into()))?;
+        .map_err(|e| Error::Xml(format!("package XML must be UTF-8: {e}")))?;
     if !xml.chars().all(crate::xml::valid_char) {
         return Err(Error::Xml("invalid XML character".into()));
     }
-    let mut reader = NsReader::from_str(xml.strip_prefix('\u{feff}').unwrap_or(xml));
+    // After the first byte order mark, U+FEFF is text outside the root. The
+    // reader would silently discard a second one.
+    let xml = xml.strip_prefix('\u{feff}').unwrap_or(xml);
+    if xml.starts_with('\u{feff}') {
+        return Err(Error::Xml("text outside XML root".into()));
+    }
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().check_comments = true;
+    let mut namespaces = Namespaces {
+        cache: HashMap::new(),
+        unbound: Rc::from(""),
+    };
     let mut nodes = Vec::new();
-    let mut stack = Vec::new();
+    // Each open element's index among the retained nodes, if it was retained.
+    let mut stack: Vec<Option<usize>> = Vec::new();
     let mut roots = 0;
     let mut declaration_seen = false;
     loop {
         let event_start = reader.buffer_position();
-        let event = reader.read_event()?;
+        let event = reader.read_event().map_err(Error::xml)?;
         let is_empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(e) | Event::Empty(e) => {
                 if stack.is_empty() {
                     roots += 1;
                 }
-                if stack.len() >= 256 {
-                    return Err(Error::Xml("XML nesting exceeds 256 levels".into()));
+                if stack.len() >= MAX_DEPTH {
+                    return Err(Error::Unsupported(format!(
+                        "XML nesting deeper than {MAX_DEPTH} elements"
+                    )));
                 }
-                let name = e.name();
-                let name = name.as_ref();
-                if !valid_qname(name) || name.starts_with("xmlns:") {
+                if !valid_qname(e.name().as_ref()) {
                     return Err(Error::Xml("invalid XML element name".into()));
                 }
                 crate::xml::validate_namespaces(&e)?;
                 crate::xml::validate_attribute_spacing(&e)?;
-                let ns = namespace(reader.resolver().resolve_element(e.name()).0)?;
+                let namespace =
+                    namespaces.resolve(reader.resolver().resolve_element(e.name()).0)?;
+                let local = e.local_name();
+                let keep = stack.is_empty() || retain(stack.len(), &namespace, local.as_ref());
                 let mut attributes = Vec::new();
-                let mut keys = BTreeSet::new();
+                // quick-xml rejects repeated attribute names. Distinct prefixes
+                // can still expand to one namespace and local name.
+                let mut expanded = HashSet::new();
                 for attr in e.attributes() {
                     let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
                     let name = attr.key.as_ref();
@@ -220,33 +472,42 @@ fn xml_nodes(bytes: &[u8]) -> Result<Vec<Node>> {
                     if attr.value.contains('<') {
                         return Err(Error::Xml("literal '<' in XML attribute value".into()));
                     }
-                    let (resolved, local) = reader.resolver().resolve_attribute(attr.key);
-                    let namespace = namespace(resolved)?;
-                    let local = local.as_ref().to_owned();
-                    if !keys.insert((namespace.clone(), local.clone())) {
+                    let (resolved, attribute_local) = reader.resolver().resolve_attribute(attr.key);
+                    let attribute_namespace = namespaces.resolve(resolved)?;
+                    if name.contains(':')
+                        && !name.starts_with("xmlns:")
+                        && !expanded.insert((
+                            Rc::clone(&attribute_namespace),
+                            attribute_local.into_inner(),
+                        ))
+                    {
                         return Err(Error::Xml("duplicate XML attribute".into()));
                     }
                     let value = attr
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                        .into_owned();
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map_err(Error::xml)?;
                     if !value.chars().all(crate::xml::valid_char) {
                         return Err(Error::Xml("invalid XML attribute character".into()));
                     }
-                    attributes.push(Attribute {
-                        namespace,
-                        local,
-                        value,
-                    });
+                    if keep {
+                        attributes.push(Attribute {
+                            namespace: attribute_namespace,
+                            local: attribute_local.into_inner().to_owned(),
+                            value: value.into_owned(),
+                        });
+                    }
                 }
-                let node = Node {
-                    namespace: ns,
-                    local: e.local_name().as_ref().to_owned(),
-                    attributes,
-                    parent: stack.last().copied(),
-                };
-                nodes.push(node);
+                let index = keep.then(|| {
+                    nodes.push(Node {
+                        namespace,
+                        local: local.as_ref().to_owned(),
+                        attributes,
+                        parent: stack.last().copied().flatten(),
+                    });
+                    nodes.len() - 1
+                });
                 if !is_empty {
-                    stack.push(nodes.len() - 1);
+                    stack.push(index);
                 }
             }
             Event::End(_) => {
@@ -314,23 +575,20 @@ struct Relationship {
     external: bool,
 }
 fn relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
-    let nodes = xml_nodes(bytes)?;
-    if nodes[0].local != "Relationships" || nodes[0].namespace != PACKAGE_NS {
+    let nodes = xml_nodes(bytes, relationship_node)?;
+    if nodes[0].local != "Relationships" || &*nodes[0].namespace != PACKAGE_NS {
         return Err(Error::InvalidWorkbook("invalid relationships root".into()));
     }
-    let mut ids = BTreeSet::new();
-    let mut result = Vec::new();
-    if nodes.iter().any(|node| {
-        node.namespace == PACKAGE_NS && node.local == "Relationship" && node.parent != Some(0)
-    }) {
+    // Every retained element after the root is a relationship.
+    let relationships = &nodes[1..];
+    if relationships.iter().any(|node| node.parent != Some(0)) {
         return Err(Error::InvalidWorkbook(
             "relationship outside relationships root".into(),
         ));
     }
-    for node in nodes
-        .iter()
-        .filter(|n| n.parent == Some(0) && n.namespace == PACKAGE_NS && n.local == "Relationship")
-    {
+    let mut ids = BTreeSet::new();
+    let mut result = Vec::new();
+    for node in relationships {
         let required = |key| {
             node.attr("", key)
                 .map(str::to_owned)
@@ -650,9 +908,80 @@ mod tests {
             "<?xml version='1.0' ignored='one'?><a/>",
             "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>",
             "<?xml version='1.0'encoding='UTF-8'?><a/>",
+            // Elements that are not retained are validated all the same.
+            "<a xmlns:p='urn:u' xmlns:q='urn:u'><b><c p:x='1' q:x='2'/></b></a>",
+            "<a><b><c q:x='1'/></b></a>",
+            "<a><b>&#1;</b></a>",
+            "\u{feff}\u{feff}<a/>",
         ] {
-            assert!(xml_nodes(xml.as_bytes()).is_err(), "{xml}");
+            assert!(xml_nodes(xml.as_bytes(), root_only).is_err(), "{xml}");
         }
+    }
+
+    #[test]
+    fn package_xml_errors_use_the_worksheet_parser_variants() {
+        let nested = |depth| format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        xml_nodes(nested(256).as_bytes(), root_only).unwrap();
+        for (xml, expected) in [
+            (nested(257).into_bytes(), Error::Unsupported(String::new())),
+            (b"<a>\xff</a>".to_vec(), Error::Xml(String::new())),
+            (
+                "\u{feff}\u{feff}<a/>".as_bytes().to_vec(),
+                Error::Xml(String::new()),
+            ),
+            (
+                b"<?xml version='1.0' encoding='UTF-16'?><a/>".to_vec(),
+                Error::Unsupported(String::new()),
+            ),
+            (
+                b"<!DOCTYPE a><a/>".to_vec(),
+                Error::Unsupported(String::new()),
+            ),
+        ] {
+            let error = xml_nodes(&xml, root_only).err().unwrap();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_retains_only_the_elements_it_needs() {
+        // Unrelated markup costs no retained memory, wherever it occurs.
+        let padding = "<a/><x:sheet x:id='1'/><b><Relationship/></b>".repeat(5_000);
+        let types = format!("<Types xmlns='{CONTENT_TYPES_NS}' xmlns:x='urn:x'>{padding}</Types>");
+        assert_eq!(xml_nodes(types.as_bytes(), root_only).unwrap().len(), 1);
+
+        let rels = format!(
+            "<Relationships xmlns='{PACKAGE_NS}' xmlns:x='urn:x'>{padding}<Relationship Id='a' Type='t' Target='b'/>{padding}</Relationships>"
+        )
+        .replace("<b><Relationship/></b>", "<b/>");
+        let nodes = xml_nodes(rels.as_bytes(), relationship_node).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[1].attr("", "Target"), Some("b"));
+
+        let workbook = format!(
+            "<workbook xmlns='{MAIN_NS}' xmlns:x='urn:x'>{padding}<workbookPr date1904='1'/><sheets>{padding}<sheet name='a'/></sheets><extLst><workbookPr/>{padding}<ext><sheet name='b'/></ext></extLst></workbook>"
+        );
+        let nodes = xml_nodes(workbook.as_bytes(), workbook_node).unwrap();
+        let retained: Vec<_> = nodes
+            .iter()
+            .map(|node| (node.local.as_str(), node.parent))
+            .collect();
+        // A misplaced sheet is kept, without its unretained parent, so that
+        // discovery can reject it.
+        assert_eq!(
+            retained,
+            [
+                ("workbook", None),
+                ("workbookPr", Some(0)),
+                ("sheets", Some(0)),
+                ("sheet", Some(2)),
+                ("sheet", None),
+            ]
+        );
     }
     #[test]
     fn complete_xml_supports_bom_declarations_and_unicode_names() {
@@ -661,7 +990,7 @@ mod tests {
             "<?xml version='1.0' standalone='no'?><a/>",
             "<?xml-stylesheet href='style.xsl'?><a xmlns:雪='urn:vendor' 雪:属性='value'/>",
         ] {
-            assert!(xml_nodes(xml.as_bytes()).is_ok(), "{xml}");
+            assert!(xml_nodes(xml.as_bytes(), root_only).is_ok(), "{xml}");
         }
     }
 }
