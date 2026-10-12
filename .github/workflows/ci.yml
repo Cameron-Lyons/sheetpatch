@@ -1,16 +1,25 @@
 name: CI
 
 on:
+  # Review branches run through pull requests; pushes run only for the default
+  # branch and release tags, so a pull-request push starts one run, not two.
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # Weekly re-audit of the unchanged lockfile against new advisories.
+  schedule:
+    - cron: "23 5 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request cancels its superseded run. Every other run
+  # has its own group, so main, tag, scheduled, and manual runs always complete.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +29,7 @@ env:
 jobs:
   quality:
     name: Quality
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,15 +40,20 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # Lints cfg(windows) code, which the Linux pass above never compiles.
+      - name: Clippy (Windows target)
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
       - name: Documentation
         run: cargo doc --locked --all-features --no-deps
 
   tests:
     name: Tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -67,6 +82,7 @@ jobs:
 
   package:
     name: Package
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -78,6 +94,13 @@ jobs:
           toolchain: stable
       - name: Release build
         run: cargo build --locked --release --all-targets --all-features
+      # One sample of the fast operations runs every benchmark correctness check
+      # except the slow sequential-edit comparison; timings are not compared.
+      - name: Benchmark correctness checks
+        env:
+          SHEETPATCH_BENCH_SAMPLES: "1"
+          SHEETPATCH_BENCH_OPERATIONS: bulk_at,prepared_single_reads,shared_prepared_reads
+        run: cargo bench --locked --bench editing
       - name: Verify publishable package
         run: cargo package --locked
       - name: Verify registry publishing dry run
@@ -121,6 +144,7 @@ jobs:
 
   interoperability:
     name: LibreOffice interoperability
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -139,20 +163,43 @@ jobs:
       - name: Export, edit, and reopen normal and compacted workbooks
         run: python3 scripts/check_interoperability.py --sheetpatch target/release/sheetpatch
 
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-audit
+      # Fails on vulnerable, unsound, or yanked locked dependencies; unmaintained
+      # notices are reported as warnings.
+      - name: Audit Cargo.lock against the RustSec advisory database
+        run: cargo audit --deny unsound --deny yanked
+
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [quality, tests, package, interoperability]
+    needs: [quality, tests, package, interoperability, advisories]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
       - name: Require every check to pass
         env:
+          EVENT: ${{ github.event_name }}
           QUALITY: ${{ needs.quality.result }}
           TESTS: ${{ needs.tests.result }}
           PACKAGE: ${{ needs.package.result }}
           INTEROPERABILITY: ${{ needs.interoperability.result }}
+          ADVISORIES: ${{ needs.advisories.result }}
         run: |
+          test "$ADVISORIES" = success
+          # Scheduled runs only re-audit dependencies; other jobs are skipped.
+          if [ "$EVENT" = schedule ]; then
+            exit 0
+          fi
           test "$QUALITY" = success
           test "$TESTS" = success
           test "$PACKAGE" = success

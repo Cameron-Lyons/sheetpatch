@@ -101,6 +101,9 @@ class Office:
         function(None, ctypes.c_void_p)(self.api.destroy)(self.pointer)
 
 
+CALCEXT_NS = "urn:org:documentfoundation:names:experimental:calc:xmlns:calcext:1.0"
+
+
 def check_ods(path):
     # Inspect values exported by LibreOffice after it has reopened the XLSX.
     namespaces = {
@@ -168,6 +171,19 @@ def check_ods(path):
     assert value("Data", 0, 4) == "Café ☕ _x0041_\nnext line"
     assert value("Data", 2, 5) == "Inserted"
     assert value("Notes", 0, 0) == "Keep this sheet"
+    # An XLSX error literal must reopen as an error (LibreOffice currently
+    # imports it as the formula of:=#N/A), not as text that looks like one.
+    error = cells[("Data", 0, 5)]
+    assert value("Data", 0, 5) == "#N/A"
+    assert (
+        error.get(f"{{{CALCEXT_NS}}}value-type") == "error"
+        or error.get(f"{{{namespaces['table']}}}formula") == "of:=#N/A"
+    ), "error value reopened as text"
+    blank = cells.get(("Data", 1, 5))
+    assert blank is None or (
+        blank.get(f"{{{namespaces['office']}}}value-type") is None
+        and not "".join(blank.itertext())
+    ), "blanked cell kept a value"
 
 
 def main():
@@ -201,6 +217,10 @@ def main():
                 ("C1", "bool", "false"),
                 ("E1", "text", "Café ☕ _x0041_\nnext line"),
                 ("F3", "text", "Inserted"),
+                ("F1", "error", "#N/A"),
+                # A blank is a no-op for an absent cell, so first give F2 a value.
+                ("F2", "text", "replaced by a blank"),
+                ("F2", "blank", ""),
             ):
                 subprocess.run(
                     [str(binary), "set", str(source), str(edited), "Data", address, kind, value],
@@ -213,7 +233,7 @@ def main():
                 output = workbook.with_suffix(".ods")
                 office.convert(workbook, output, "ods")
                 check_ods(output)
-            print("PASS: LibreOffice exported and reopened default and compacted XLSX files; values, formulas, and both sheets verified.")
+            print("PASS: LibreOffice exported and reopened default and compacted XLSX files; values, errors, blanks, formulas, and both sheets verified.")
         finally:
             office.close()
 
