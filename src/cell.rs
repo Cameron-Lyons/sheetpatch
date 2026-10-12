@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, iter::FusedIterator, str::FromStr};
 
 /// An A1 address within Excel's 16,384 columns and 1,048,576 rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -9,9 +9,17 @@ pub struct CellRef {
 }
 
 impl CellRef {
+    /// The largest one-based row number in a worksheet, 1,048,576.
+    pub const MAX_ROW: u32 = 1_048_576;
+    /// The largest one-based column number in a worksheet, 16,384 (column `XFD`).
+    pub const MAX_COLUMN: u16 = 16_384;
+
     /// Construct an address from one-based row and column numbers.
+    ///
+    /// Returns [`Error::InvalidCellReference`] unless the row is within
+    /// `1..=`[`Self::MAX_ROW`] and the column is within `1..=`[`Self::MAX_COLUMN`].
     pub fn new(row: u32, column: u16) -> Result<Self> {
-        if !(1..=1_048_576).contains(&row) || !(1..=16_384).contains(&column) {
+        if !(1..=Self::MAX_ROW).contains(&row) || !(1..=Self::MAX_COLUMN).contains(&column) {
             return Err(Error::InvalidCellReference(format!(
                 "row {row}, column {column}"
             )));
@@ -48,11 +56,11 @@ impl FromStr for CellRef {
         for &b in &bytes[..split] {
             column = column * 26 + u32::from(b.to_ascii_uppercase() - b'A' + 1);
         }
-        if column > 16_384 || !bytes[split..].iter().all(u8::is_ascii_digit) {
+        if column > u32::from(Self::MAX_COLUMN) || !bytes[split..].iter().all(u8::is_ascii_digit) {
             return Err(invalid());
         }
         let row: u32 = address[split..].parse().map_err(|_| invalid())?;
-        if !(1..=1_048_576).contains(&row) {
+        if !(1..=Self::MAX_ROW).contains(&row) {
             return Err(invalid());
         }
         Ok(Self {
@@ -82,9 +90,221 @@ impl fmt::Display for CellRef {
     }
 }
 
+/// A rectangular block of cells, such as `A1:C3`.
+///
+/// A range is stored by its top-left and bottom-right corners, so it is always
+/// non-empty and within Excel's grid. [`CellRange::cells`] visits its cells in
+/// row-major order, which pairs with the typed batch APIs for block reads and
+/// writes.
+///
+/// ```
+/// use sheetpatch::{CellRange, CellRef};
+///
+/// let range: CellRange = "c2:A1".parse()?;
+/// assert_eq!(range.to_string(), "A1:C2");
+/// assert_eq!((range.height(), range.width(), range.cell_count()), (2, 3, 6));
+/// assert!(range.contains(CellRef::new(2, 2)?));
+///
+/// let cells: Vec<String> = range.cells().map(|cell| cell.to_string()).collect();
+/// assert_eq!(cells, ["A1", "B1", "C1", "A2", "B2", "C2"]);
+/// # Ok::<(), sheetpatch::Error>(())
+/// ```
+///
+/// Reading and writing a block with a workbook:
+///
+/// ```no_run
+/// use sheetpatch::{CellRange, Workbook};
+///
+/// let mut book = Workbook::open("report.xlsx")?;
+/// let range: CellRange = "B2:D3".parse()?;
+/// let values = [1, 2, 3, 4, 5, 6];
+/// book.set_cells_at("Data", range.cells().zip(values))?;
+/// let cells = book.get_cells_at("Data", range.cells())?;
+/// assert_eq!(cells.len(), 6);
+/// # Ok::<(), sheetpatch::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CellRange {
+    first: CellRef,
+    last: CellRef,
+}
+
+impl CellRange {
+    /// Construct the smallest range containing both cells.
+    ///
+    /// The corners can be given in any order; they are normalized so that
+    /// [`Self::first`] is the top-left and [`Self::last`] the bottom-right cell.
+    pub fn new(a: CellRef, b: CellRef) -> Self {
+        Self {
+            first: CellRef {
+                row: a.row.min(b.row),
+                column: a.column.min(b.column),
+            },
+            last: CellRef {
+                row: a.row.max(b.row),
+                column: a.column.max(b.column),
+            },
+        }
+    }
+    /// Return the top-left cell.
+    pub fn first(self) -> CellRef {
+        self.first
+    }
+    /// Return the bottom-right cell.
+    pub fn last(self) -> CellRef {
+        self.last
+    }
+    /// Return the number of rows, at least 1.
+    pub fn height(self) -> u32 {
+        self.last.row - self.first.row + 1
+    }
+    /// Return the number of columns, at least 1.
+    pub fn width(self) -> u16 {
+        self.last.column - self.first.column + 1
+    }
+    /// Return the number of cells, `height × width`.
+    ///
+    /// This is a `u64` because a whole worksheet holds more than 2³² cells.
+    pub fn cell_count(self) -> u64 {
+        u64::from(self.height()) * u64::from(self.width())
+    }
+    /// Return whether the cell lies within this range.
+    pub fn contains(self, cell: CellRef) -> bool {
+        (self.first.row..=self.last.row).contains(&cell.row)
+            && (self.first.column..=self.last.column).contains(&cell.column)
+    }
+    /// Iterate over the range's cells in row-major order: every cell of the
+    /// first row from left to right, then the next row.
+    pub fn cells(self) -> CellRangeIter {
+        CellRangeIter {
+            range: self,
+            next: Some(self.first),
+        }
+    }
+}
+
+impl From<CellRef> for CellRange {
+    /// Convert a cell into a range containing only that cell.
+    fn from(cell: CellRef) -> Self {
+        Self {
+            first: cell,
+            last: cell,
+        }
+    }
+}
+
+impl FromStr for CellRange {
+    type Err = Error;
+
+    /// Parse `"A1:C3"` (corners in either order) or a single cell such as `"B2"`.
+    ///
+    /// Each corner follows [`CellRef`]'s rules: lowercase letters are accepted,
+    /// while `$` markers, whole rows or columns such as `"A:C"`, sheet prefixes
+    /// and surrounding whitespace are rejected with
+    /// [`Error::InvalidCellReference`].
+    fn from_str(range: &str) -> Result<Self> {
+        let invalid = |_: Error| Error::InvalidCellReference(range.to_owned());
+        match range.split_once(':') {
+            Some((first, last)) => Ok(Self::new(
+                first.parse().map_err(invalid)?,
+                last.parse().map_err(invalid)?,
+            )),
+            None => range.parse::<CellRef>().map(Self::from).map_err(invalid),
+        }
+    }
+}
+
+impl fmt::Display for CellRange {
+    /// Format as `"A1:C3"`, or as a single address such as `"B2"` when the
+    /// range holds one cell.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}:{}", self.first, self.last)
+        }
+    }
+}
+
+/// An iterator over a [`CellRange`]'s cells in row-major order, returned by
+/// [`CellRange::cells`].
+///
+/// Its `size_hint` is exact whenever the remaining count fits in `usize`. It
+/// does not implement [`ExactSizeIterator`], because a whole worksheet holds
+/// more cells than a 32-bit `usize` can count.
+#[derive(Clone, Debug)]
+pub struct CellRangeIter {
+    range: CellRange,
+    next: Option<CellRef>,
+}
+
+impl CellRangeIter {
+    fn remaining(&self) -> u64 {
+        self.next.map_or(0, |cell| {
+            u64::from(self.range.last.row - cell.row) * u64::from(self.range.width())
+                + u64::from(self.range.last.column - cell.column)
+                + 1
+        })
+    }
+}
+
+impl Iterator for CellRangeIter {
+    type Item = CellRef;
+
+    fn next(&mut self) -> Option<CellRef> {
+        let cell = self.next?;
+        let CellRange { first, last } = self.range;
+        self.next = if cell.column < last.column {
+            Some(CellRef {
+                row: cell.row,
+                column: cell.column + 1,
+            })
+        } else if cell.row < last.row {
+            Some(CellRef {
+                row: cell.row + 1,
+                column: first.column,
+            })
+        } else {
+            None
+        };
+        Some(cell)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match usize::try_from(self.remaining()) {
+            Ok(remaining) => (remaining, Some(remaining)),
+            Err(_) => (usize::MAX, None),
+        }
+    }
+}
+
+impl FusedIterator for CellRangeIter {}
+
 /// Cell contents. Existing number formats and other cell attributes are retained.
 /// Text is stored inline, so the workbook's shared-string table stays untouched.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Editing methods accept any `impl Into<CellValue>`. Strings (`&str`,
+/// `String`, `&String`, `Cow<str>`) and `char` become [`CellValue::Text`];
+/// `f64` and the integer types that convert exactly (`i8`, `i16`, `i32`, `u8`,
+/// `u16`, `u32`) become [`CellValue::Number`]; `bool` becomes
+/// [`CellValue::Bool`]; and `Option<T>` maps `None` to [`CellValue::Blank`].
+/// The 64-bit and pointer-sized integers (`i64`, `u64`, `isize`, `usize`) use
+/// `TryFrom` instead, which rejects values that `f64` cannot hold exactly.
+/// There is deliberately no `f32` conversion: `0.1f32` would widen to
+/// `0.10000000149011612`.
+///
+/// ```
+/// use sheetpatch::CellValue;
+///
+/// let name = String::from("Ada");
+/// assert_eq!(CellValue::from(&name), CellValue::Text("Ada".into()));
+/// assert_eq!(CellValue::from(7u32), CellValue::Number(7.0));
+/// assert_eq!(CellValue::from(None::<f64>), CellValue::Blank);
+/// assert_eq!(CellValue::try_from(42usize)?, CellValue::Number(42.0));
+/// assert!(CellValue::try_from(9_007_199_254_740_993i64).is_err());
+/// # Ok::<(), sheetpatch::Error>(())
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum CellValue {
     /// Text, written as an inline string without creating a formula.
     Text(String),
@@ -95,6 +315,9 @@ pub enum CellValue {
     /// An Excel error value, such as `#DIV/0!` or `#N/A`.
     Error(String),
     /// Remove the value, retaining the cell's formatting and unknown content.
+    ///
+    /// This is the [`Default`] value.
+    #[default]
     Blank,
 }
 
@@ -131,7 +354,14 @@ impl CellValue {
 
 /// A cell's scalar value, optional formula text, and existing style index.
 /// Formula values are cached results; no calculation is performed.
+///
+/// Values are returned by the read methods such as
+/// [`Workbook::get_cell`](crate::Workbook::get_cell). The fields are public for
+/// reading, but the struct is `#[non_exhaustive]` so that more read metadata
+/// can be added in compatible releases: it cannot be built with a struct
+/// literal outside this crate, and destructuring patterns need a `..` rest.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CellContent {
     /// The scalar value, or a formula's stored cached result.
     pub value: CellValue,
@@ -145,7 +375,7 @@ pub struct CellContent {
 }
 
 /// One validated edit, usable in a transaction spanning multiple worksheets.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CellEdit {
     pub(crate) sheet: String,
     pub(crate) cell: CellRef,
@@ -197,6 +427,84 @@ impl CellEdit {
     }
 }
 
+/// Typed accessors, which return `None` (or `false`) for other variants.
+///
+/// ```
+/// use sheetpatch::CellValue;
+///
+/// let values = [
+///     CellValue::from(2.5),
+///     CellValue::from("n/a"),
+///     CellValue::Blank,
+///     CellValue::from(4),
+/// ];
+/// let total: f64 = values.iter().filter_map(CellValue::as_number).sum();
+/// assert_eq!(total, 6.5);
+/// assert_eq!(values[1].as_text(), Some("n/a"));
+/// assert!(values[2].is_blank());
+/// ```
+impl CellValue {
+    /// Return the text of a [`CellValue::Text`] value.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+    /// Return the number of a [`CellValue::Number`] value.
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number(number) => Some(*number),
+            _ => None,
+        }
+    }
+    /// Return the boolean of a [`CellValue::Bool`] value.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+    /// Return the error token, such as `#N/A`, of a [`CellValue::Error`] value.
+    pub fn as_error(&self) -> Option<&str> {
+        match self {
+            Self::Error(token) => Some(token),
+            _ => None,
+        }
+    }
+    /// Return whether this is [`CellValue::Blank`].
+    pub fn is_blank(&self) -> bool {
+        matches!(self, Self::Blank)
+    }
+}
+
+impl fmt::Display for CellValue {
+    /// Format the value as plain text, matching the CLI's `get` output.
+    ///
+    /// Text and error tokens are written verbatim, numbers use `f64`'s
+    /// `Display` (shortest round-trip digits, never an exponent), booleans are
+    /// `true` or `false`, and a blank is an empty string. Number formats are
+    /// not applied. Width, alignment and precision flags are honored.
+    ///
+    /// ```
+    /// use sheetpatch::CellValue;
+    ///
+    /// assert_eq!(CellValue::from(42).to_string(), "42");
+    /// assert_eq!(CellValue::from(0.1 + 0.2).to_string(), "0.30000000000000004");
+    /// assert_eq!(format!("{:.2}", CellValue::from(2.0 / 3.0)), "0.67");
+    /// assert_eq!(CellValue::Error("#N/A".into()).to_string(), "#N/A");
+    /// assert_eq!(CellValue::Blank.to_string(), "");
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) | Self::Error(text) => f.pad(text),
+            Self::Number(number) => fmt::Display::fmt(number, f),
+            Self::Bool(value) => fmt::Display::fmt(value, f),
+            Self::Blank => f.pad(""),
+        }
+    }
+}
+
 impl From<&str> for CellValue {
     fn from(v: &str) -> Self {
         Self::Text(v.to_owned())
@@ -207,19 +515,104 @@ impl From<String> for CellValue {
         Self::Text(v)
     }
 }
+impl From<&String> for CellValue {
+    fn from(v: &String) -> Self {
+        Self::Text(v.clone())
+    }
+}
+impl From<Cow<'_, str>> for CellValue {
+    fn from(v: Cow<'_, str>) -> Self {
+        Self::Text(v.into_owned())
+    }
+}
+impl From<char> for CellValue {
+    fn from(v: char) -> Self {
+        Self::Text(v.to_string())
+    }
+}
 impl From<f64> for CellValue {
     fn from(v: f64) -> Self {
         Self::Number(v)
     }
 }
-impl From<i32> for CellValue {
-    fn from(v: i32) -> Self {
-        Self::Number(f64::from(v))
-    }
+macro_rules! exact_number_from {
+    ($($int:ty),*) => {$(
+        /// Converts the integer to an exactly equal [`CellValue::Number`].
+        impl From<$int> for CellValue {
+            fn from(v: $int) -> Self {
+                Self::Number(f64::from(v))
+            }
+        }
+    )*};
 }
+exact_number_from!(i8, i16, i32, u8, u16, u32);
 impl From<bool> for CellValue {
     fn from(v: bool) -> Self {
         Self::Bool(v)
+    }
+}
+/// Converts `Some(value)` like `value` itself, and `None` to
+/// [`CellValue::Blank`], which clears the cell's value.
+impl<T: Into<CellValue>> From<Option<T>> for CellValue {
+    fn from(v: Option<T>) -> Self {
+        v.map_or(Self::Blank, Into::into)
+    }
+}
+
+/// 2^53: every integer up to this magnitude has an exact `f64` representation.
+const MAX_EXACT_INTEGER: u64 = 1 << 53;
+
+fn inexact_integer(v: impl fmt::Display) -> Error {
+    Error::InvalidValue(format!(
+        "integer {v} exceeds 2^53 in magnitude, so it cannot be stored exactly as a number; \
+         write it as text"
+    ))
+}
+
+/// Converts the integer to an exactly equal [`CellValue::Number`], or returns
+/// [`Error::InvalidValue`] when its magnitude exceeds 2^53
+/// (9,007,199,254,740,992), beyond which `f64` cannot represent every integer.
+/// Write identifiers that need more digits as text.
+impl TryFrom<i64> for CellValue {
+    type Error = Error;
+
+    fn try_from(v: i64) -> Result<Self> {
+        if v.unsigned_abs() > MAX_EXACT_INTEGER {
+            return Err(inexact_integer(v));
+        }
+        Ok(Self::Number(v as f64))
+    }
+}
+/// Converts the integer to an exactly equal [`CellValue::Number`], or returns
+/// [`Error::InvalidValue`] when it exceeds 2^53 (9,007,199,254,740,992), beyond
+/// which `f64` cannot represent every integer. Write identifiers that need more
+/// digits as text.
+impl TryFrom<u64> for CellValue {
+    type Error = Error;
+
+    fn try_from(v: u64) -> Result<Self> {
+        if v > MAX_EXACT_INTEGER {
+            return Err(inexact_integer(v));
+        }
+        Ok(Self::Number(v as f64))
+    }
+}
+/// Converts like the [`i64`] conversion, rejecting magnitudes above 2^53.
+impl TryFrom<isize> for CellValue {
+    type Error = Error;
+
+    fn try_from(v: isize) -> Result<Self> {
+        let v = i64::try_from(v).map_err(|_| inexact_integer(v))?;
+        Self::try_from(v)
+    }
+}
+/// Converts like the [`u64`] conversion, rejecting values above 2^53.
+impl TryFrom<usize> for CellValue {
+    type Error = Error;
+
+    fn try_from(v: usize) -> Result<Self> {
+        let v = u64::try_from(v).map_err(|_| inexact_integer(v))?;
+        Self::try_from(v)
     }
 }
 

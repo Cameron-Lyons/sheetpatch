@@ -38,7 +38,7 @@ impl fmt::Display for Error {
             Self::InvalidValue(e) => write!(f, "invalid cell value: {e}"),
             Self::SheetNotFound(e) => write!(f, "worksheet not found: {e}"),
             Self::SharedStringsUnavailable => write!(f, "shared-string table is unavailable"),
-            Self::Unsupported(e) => write!(f, "unsupported edit: {e}"),
+            Self::Unsupported(e) => write!(f, "unsupported: {e}"),
         }
     }
 }
