@@ -459,7 +459,8 @@ impl Workbook {
     /// Serialize into a writer without allocating a second complete archive.
     /// Changed worksheet records replace their original records in the local
     /// record sequence. Untouched local records and pre-existing ZIP gaps remain;
-    /// central-directory offsets may change.
+    /// central-directory offsets may change. The writer is flushed before this
+    /// returns, so buffered writers passed by value still report write errors.
     /// A failing writer may contain a partial archive; use `save` for atomic files.
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.write_to(&self.changed_parts(), &mut writer)
@@ -467,7 +468,8 @@ impl Workbook {
 
     /// Remove pre-existing obsolete ZIP records while retaining untouched active
     /// local headers, compressed bytes, and descriptors. Central-directory
-    /// offsets may change. Opaque ZIP prefixes or gaps cause an error.
+    /// offsets may change. Opaque ZIP prefixes or gaps cause an error. The writer
+    /// is flushed before this returns.
     /// A failing writer may contain a partial archive; use `save_compact` for files.
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changed_parts(), &mut writer)
