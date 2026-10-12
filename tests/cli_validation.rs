@@ -154,3 +154,118 @@ fn command_help_is_available_without_opening_an_input() {
     assert_eq!(unknown.status.code(), Some(2));
     assert!(unknown.stdout.is_empty());
 }
+
+#[test]
+fn carriage_returns_inside_rows_are_rejected_with_their_line() {
+    let directory = TempDir::new();
+    let workbook = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    fs::copy(FIXTURE, &workbook).unwrap();
+    for (patch, line) in [
+        (
+            "Data\tA2\ttext\tAlpha\rData\tB2\tnumber\t42\rData\tC2\ttext\tGamma\r",
+            1,
+        ),
+        ("Data\tA1\ttext\tok\r\nData\tA2\ttext\tsplit\rvalue\r\n", 2),
+    ] {
+        let path = directory.0.join("edits.tsv");
+        fs::write(&path, patch).unwrap();
+        for args in [
+            vec!["patch", "--check", workbook.to_str().unwrap(), "-"],
+            vec![
+                "patch",
+                workbook.to_str().unwrap(),
+                output.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        ] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(patch.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert_eq!(result.status.code(), Some(2));
+            assert!(result.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(result.stderr).unwrap(),
+                format!(
+                    "sheetpatch: Patch line {line}: carriage return without line feed; use LF or CRLF line endings\nRun 'sheetpatch help patch' for the format.\n"
+                )
+            );
+        }
+    }
+    assert!(!output.exists());
+    // A final carriage return without a line feed stays in the text value.
+    let result = check_stdin(FIXTURE, b"Data\tA1\ttext\tvalue\r");
+    assert_eq!(result.stdout, b"Validated 1 patch row.\n");
+}
+
+#[test]
+fn missing_sheets_report_the_patch_line_and_quoted_name() {
+    let directory = TempDir::new();
+    let workbook = directory.0.join("input.xlsx");
+    let output = directory.0.join("output.xlsx");
+    fs::copy(FIXTURE, &workbook).unwrap();
+    for (patch, expected) in [
+        (
+            "Data\tA1\ttext\tok\n\n# comment\nNotes\tB2\tnumber\t1\nMissing \tA1\ttext\tx\nOther\tA1\ttext\tx\n",
+            "Patch line 5: worksheet not found: \"Missing \"",
+        ),
+        // Concatenated BOM files: only the first BOM is a byte-order mark.
+        (
+            "\u{feff}Data\tA1\ttext\tx\n\u{feff}Data\tA2\ttext\ty\n",
+            "Patch line 2: worksheet not found: \"\\u{feff}Data\"",
+        ),
+        ("\tA1\ttext\tx\n", "Patch line 1: worksheet not found: \"\""),
+    ] {
+        for check in [true, false] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sheetpatch"));
+            command.arg("patch");
+            if check {
+                command.args(["--check", workbook.to_str().unwrap(), "-"]);
+            } else {
+                command.args([workbook.to_str().unwrap(), output.to_str().unwrap(), "-"]);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(patch.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert_eq!(result.status.code(), Some(1));
+            assert!(result.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(result.stderr).unwrap(),
+                format!("sheetpatch: {expected}\n")
+            );
+        }
+    }
+    assert!(!output.exists());
+    assert_eq!(fs::read(&workbook).unwrap(), fs::read(FIXTURE).unwrap());
+}
+
+#[test]
+fn patch_data_errors_print_one_line_and_a_format_hint() {
+    let output = check_stdin(FIXTURE, b"Data\tA1\ttext\tok\nData\tA2\tnumber\t42 \n");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "sheetpatch: Patch line 2: Invalid finite number: \"42 \"\nRun 'sheetpatch help patch' for the format.\n"
+    );
+}

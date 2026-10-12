@@ -3,7 +3,7 @@ use sheetpatch::{CellValue, Workbook};
 use std::{
     fs,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -170,5 +170,41 @@ fn invalid_read_and_set_arguments_fail_before_opening_the_input() {
         let output = cli(&args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn large_reads_are_complete_and_in_order() {
+    let mut args = vec!["get", FIXTURE, "Data"];
+    let mut expected = String::new();
+    for _ in 0..3000 {
+        args.extend(["A1", "D1", "F3"]);
+        expected.push_str("Original text\n25\n\n");
+    }
+    assert_eq!(success(&args), expected);
+}
+
+#[test]
+fn a_reader_that_closes_the_pipe_early_ends_output_quietly() {
+    // 8,000 values of about 14 bytes exceed any default pipe buffer, so the
+    // child must see the closed pipe. The arguments stay within Windows
+    // command-line limits.
+    for json in [false, true] {
+        let mut args = vec!["get"];
+        if json {
+            args.push("--json");
+        }
+        args.extend([FIXTURE, "Data"]);
+        args.extend(std::iter::repeat_n("A1", 8000));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     }
 }
