@@ -4,7 +4,8 @@ Version 1.0 stabilizes the documented scalar editing and preservation API in
 README.md. It does not add formula calculation, structural editing, or other
 spreadsheet object-model operations. Public API removals or signature changes
 require a new major version. New `Error` and `SheetVisibility` variants, and new
-`CellContent` fields, remain compatible because those types are non-exhaustive.
+`CellContent` and `Error::ProtectedCell` fields, remain compatible because they
+are non-exhaustive. Error message wording is not part of the stable API.
 Keep the stated Rust minimum supported version accurate and explicitly document
 any future increase.
 

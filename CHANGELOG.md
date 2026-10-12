@@ -19,10 +19,24 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   patterns need `..`.
 - The public `From<quick_xml::Error> for Error` conversion is removed, keeping the
   pre-1.0 `quick-xml` dependency out of the stable API.
-- `Error::Unsupported` displays as `unsupported: …` instead of
-  `unsupported edit: …`, which also changes CLI messages. Errors raised inside a
-  worksheet are prefixed with `worksheet "Name": ` and name the cell or row where
-  one applies; variants are unchanged.
+- Edits refused for a protected cell return the new non-exhaustive
+  `Error::ProtectedCell { sheet, cell, reason }` variant instead of
+  `Error::Unsupported`. Protected cells are formula cells, cells in a shared,
+  array, or data-table formula range, and merged cells other than their range's
+  anchor, as well as the newly protected table header and value-metadata cells.
+- `Error::SharedStringsUnavailable` is removed. A shared-string cell in a workbook
+  without a shared-string table returns `Error::InvalidWorkbook` naming the cell.
+- Malformed cell data (invalid or non-finite numbers, booleans, shared-string
+  indices, style indices, and unknown cell types) returns `Error::InvalidWorkbook`
+  instead of `Error::Unsupported`.
+- Error messages changed, including CLI messages. `Error::Unsupported` displays as
+  `unsupported: …` instead of `unsupported edit: …`. `SheetNotFound` and
+  `InvalidCellReference` quote their input, as in `worksheet not found: "Data"`.
+  Errors raised inside a worksheet are prefixed with `worksheet "Name": ` and name
+  the cell or row where one applies; errors in the shared-string table, a
+  worksheet's relationships, or its table parts are prefixed with
+  `part "path": ` instead. `Error::Io`'s `source()` returns the I/O error's own
+  source, since the message already includes the I/O error.
 - A save destination without a file name (such as `""`, `.`, or `dir/..`) returns
   `Error::Io` of kind `InvalidInput` instead of `Error::InvalidValue`. Existing
   directories, FIFOs, devices, and sockets are refused the same way before output
@@ -39,41 +53,53 @@ Changes that can affect 0.2 code, scripts, or workbooks:
 - New cells take their row's style when the row has a custom format, otherwise
   their column's style; 0.2 created them unstyled. Malformed column or row style
   definitions refuse only edits that create a cell needing them.
-- Newly refused inputs: archives with additional end-of-central-directory
-  signatures or Info-ZIP Unicode Path fields that rename a member; case-variant
-  `[Content_Types].xml` duplicates; duplicate worksheet targets; invalid sheet
-  `state` or `workbookPr date1904` values, or more than one `workbookPr`; edits
-  that change an Excel table header cell; edits to worksheets with malformed or
-  missing table relationships or parts; and `Workbook::open` input over the
-  largest possible ZIP32 archive (about 8 GiB).
+- Newly refused inputs: archives with an additional end-of-central-directory
+  signature that leaves room for a complete end record, such as one in the
+  archive comment, or with Info-ZIP Unicode Path fields of any version that
+  rename a member; case-variant `[Content_Types].xml` duplicates; duplicate
+  worksheet targets; invalid sheet `state` or `workbookPr date1904` values, or
+  more than one `workbookPr`; edits that change an Excel table header cell; edits
+  to worksheets with malformed or missing table relationships or parts; and
+  `Workbook::open` input over the largest possible ZIP32 archive (about 8 GiB).
 - CLI options must come right after the command, and option-like arguments in
   path positions are usage errors; name such files `./-name`. `-` as INPUT or
   OUTPUT now means standard input or output. Patch lines containing a carriage
-  return followed by more data are rejected with exit code 2.
+  return other than in a CRLF ending are rejected with exit code 2, including
+  `\r\r\n` endings that 0.2 read as a value ending in a carriage return; only a
+  final line without a line feed may still end with one.
 
 ### Rust API
 
 - Stable API for typed addresses, scalar values, cell inspection, batch and
   cross-worksheet transactions, streaming output, and explicit ZIP compaction.
-  Public API documentation is required at compile time.
+  Public API documentation is required at compile time; fallible functions
+  document their errors, and `Workbook` documents its edit restrictions.
+- `Workbook::from_reader` reads a workbook from any `std::io::Read`, refusing
+  input beyond the largest possible ZIP32 archive (about 8 GiB).
+- `Error::ProtectedCell` names the worksheet, cell, and reason for a refused
+  edit of a protected cell, so callers can match fields instead of messages.
 - `get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`, and `CellEdit::at`
   accept validated `CellRef` values directly. `CellRef::MAX_ROW` and
   `CellRef::MAX_COLUMN` expose Excel's limits.
 - `CellRange` parses, formats, and iterates rectangular ranges in row-major order
-  for block reads and writes with the typed batch APIs.
+  for block reads and writes with the typed batch APIs. It implements
+  `IntoIterator`, so a range can be passed directly where cells are expected, and
+  `Ord`, ordering ranges by their top-left and then bottom-right cell.
+  `CellRef` and `CellRange` formatting honors width, fill, and alignment.
 - `CellValue` converts from `&String`, `Cow<str>`, `char`, the integer types that
   `f64` holds exactly, and `Option<T>` (`None` clears the cell). `i64`, `u64`,
   `isize`, and `usize` use `TryFrom`, rejecting magnitudes above 2^53. Values
-  implement `Default` (blank) and `Display`, and offer `as_text`, `as_number`,
-  `as_bool`, `as_error`, and `is_blank`. `CellEdit` implements `PartialEq`.
+  implement `Default` (blank) and `Display`, whose precision applies only to
+  numbers, and offer `as_text`, `as_number`, `as_bool`, `as_error`, and
+  `is_blank`. `CellEdit` implements `PartialEq`.
 - `prepare_sheet` returns a read-only `WorksheetView` for repeated reads using one
-  validated worksheet index, retained only for the view's lifetime. Its
-  `cell_refs` lists every cell in row-major order and `used_range` returns the
-  smallest range containing them.
+  validated worksheet index, retained only for the view's lifetime. Its `cells`
+  iterator (an `ExactSizeIterator`) lists every cell in row-major order and
+  `used_range` returns the smallest range containing them.
 - `Workbook::sheet`, `is_signed`, and `uses_1904_dates`, and `Sheet::visibility`
-  with the non-exhaustive `SheetVisibility` enum, describe the package. `Sheet`
-  implements `PartialEq`, `Eq`, and `Hash`; `Workbook` and `WorksheetView`
-  implement `Debug` without printing contents.
+  with the non-exhaustive `SheetVisibility` enum and its `as_str` spelling,
+  describe the package. `Sheet` implements `PartialEq`, `Eq`, and `Hash`;
+  `Workbook` and `WorksheetView` implement `Debug` without printing contents.
 - `write_to` and `write_compact_to` flush the writer before returning, so
   buffered writers report final write errors.
 - `set_cell` and `set_cell_at` report a missing worksheet before an invalid
@@ -93,19 +119,22 @@ Changes that can affect 0.2 code, scripts, or workbooks:
 - `patch --check` validates a complete edit transaction and output generation
   against workbook protections and ZIP limits without writing a file, from a
   TSV file or standard input.
-- `-` reads the workbook from standard input or streams it to standard output;
-  neither is used on a terminal, and INPUT and PATCH cannot both be `-`.
+- `-` reads the workbook from standard input, up to the largest possible ZIP32
+  archive, or streams it to standard output; neither is used on a terminal, and
+  INPUT and PATCH cannot both be `-`.
 - Invalid syntax, addresses, ranges, values, patch rows, and non-Unicode text
   arguments exit with code 2 before a workbook is opened where possible; syntax
   errors print the usage and other invalid input prints one line with a help
   pointer. Workbook, missing-worksheet, and I/O errors exit with code 1, and I/O
   messages name the path or stream. Patch errors report their line number,
-  including rows naming a missing worksheet and the last row for a refused cell.
+  including rows naming a missing worksheet and the last row for a protected
+  cell.
 - Text output ends quietly with code 0 when its reader closes
   the pipe and reports other write failures with code 1; a workbook that cannot
   be completely written to standard output always exits with code 1. On a
   terminal, plain output escapes control characters so cell text and sheet names
-  cannot control the terminal; pipes, files, and JSON receive exact text.
+  cannot control the terminal; pipes and files receive exact text. JSON strings
+  escape every control character, including DEL and C1 as `\u00XX`.
 - Native filesystem paths work independently of Unicode text arguments. Invalid
   UTF-8 patch rows report their line number for files and standard input.
 
@@ -117,7 +146,8 @@ Changes that can affect 0.2 code, scripts, or workbooks:
 - Text round-trips exactly: control characters use `_xHHHH_` escapes, literal
   escape sequences stay literal, and a leading U+FEFF is preserved on read.
 - ISO 8601 date cells (`t="d"`) read as serial numbers in the workbook's 1900 or
-  1904 date system.
+  1904 date system, with 1899-12-31 as serial 0 in the 1900 system. Rewriting one
+  with its own serial leaves it unchanged.
 - Scalar changes to cells with value metadata are refused, preserving linked and
   rich data types. Unchanged values and unrelated cell edits retain metadata.
 - Excel table header cells may be rewritten with their current value but not
@@ -142,7 +172,9 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   bindings (checked after character-reference normalization) are rejected.
 - ZIP archives that other readers could interpret differently are rejected, and
   OLE compound files are recognized as unsupported formats. Binary workbook
-  detection handles uppercase extensions.
+  detection handles uppercase extensions. In the rare case that a save's new
+  central-directory offset would form an ambiguous end-record signature with the
+  archive comment, the save is refused.
 - ZIP patched-data entries stay opaque; reading, editing, and deleting obsolete
   patched records during compaction are refused. Compaction recognizes obsolete
   Stored records whose payload contains header- and descriptor-like bytes.
@@ -158,8 +190,9 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   are written; on Unix the replacement keeps the destination's group when it can
   be assigned, and otherwise loses group access. New destinations for workbooks
   opened from files are created with the input's permissions, restricted by the
-  umask. Unix saves sync the directory after the rename. Long destination
-  filenames are supported.
+  umask, and with the input's group under the same rule. Setuid, setgid, and
+  sticky bits are never kept. Unix saves sync the directory after the rename.
+  Long destination filenames are supported.
 
 ### Performance
 
