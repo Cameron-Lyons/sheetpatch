@@ -938,7 +938,9 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when an edited worksheet cannot be
-    /// written, for example because the output would exceed a ZIP32 limit.
+    /// written, for example because the output would exceed a ZIP32 limit or
+    /// its new central-directory offset would form an end-of-directory
+    /// signature exposed by the archive comment, making the archive ambiguous.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.archive.write(&self.changed_parts())
     }
