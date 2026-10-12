@@ -3,7 +3,7 @@ use super::{Sheet, SheetVisibility};
 use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
-    xml::{excel_text, namespace, trim_whitespace, valid_qname},
+    xml::{MAX_DEPTH, excel_text, namespace, trim_whitespace, valid_qname},
 };
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 use std::{
@@ -19,8 +19,6 @@ const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main
 const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
-// Package parts share the worksheet parser's nesting limit and error variant.
-const MAX_DEPTH: usize = 256;
 
 pub(super) struct PackageMetadata {
     pub(super) sheets: Vec<Sheet>,
