@@ -1,10 +1,11 @@
 //! Patch validation and command help are exercised through the public CLI.
+mod common;
+
+use common::TempDir;
 use std::{
     fs,
     io::Write,
-    path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 const FIXTURE: &str = concat!(
@@ -31,32 +32,11 @@ fn check_stdin(input: &str, patch: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sheetpatch-cli-validation-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn checks_complete_transactions_without_writing_the_workbook_or_other_files() {
     let directory = TempDir::new();
-    let workbook = directory.0.join("input.xlsx");
-    let patch = directory.0.join("edits.tsv");
+    let workbook = directory.join("input.xlsx");
+    let patch = directory.join("edits.tsv");
     fs::copy(FIXTURE, &workbook).unwrap();
     let original = fs::read(&workbook).unwrap();
     let contents = b"# comment\nData\tA1\ttext\tFirst\nData\tA1\ttext\tLast\nNotes\tB3\tnumber\t42\nData\tF3\tblank\n";
@@ -72,7 +52,7 @@ fn checks_complete_transactions_without_writing_the_workbook_or_other_files() {
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read(&workbook).unwrap(), original);
     assert_eq!(fs::read(&patch).unwrap(), contents);
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
 #[test]
@@ -94,7 +74,7 @@ fn stdin_checks_accept_empty_patches_and_report_raw_edit_counts() {
 #[test]
 fn checks_use_actual_workbook_guards_and_leave_inputs_unchanged_on_failure() {
     let directory = TempDir::new();
-    let workbook = directory.0.join("input.xlsx");
+    let workbook = directory.join("input.xlsx");
     fs::copy(FIXTURE, &workbook).unwrap();
     let original = fs::read(&workbook).unwrap();
     for patch in [
@@ -106,8 +86,74 @@ fn checks_use_actual_workbook_guards_and_leave_inputs_unchanged_on_failure() {
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.is_empty());
         assert_eq!(fs::read(&workbook).unwrap(), original);
-        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
+}
+
+#[test]
+fn refused_edits_report_the_last_patch_line_for_their_cell() {
+    let directory = TempDir::new();
+    let workbook = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
+    fs::copy(FIXTURE, &workbook).unwrap();
+    // D1 holds the formula B1*2. Duplicate cells apply the last line's value,
+    // so that line is the one reported.
+    for (patch, line) in [
+        ("Data\tA1\ttext\tAllowed\nData\tD1\tnumber\t99\n", 2),
+        (
+            "Data\tD1\tnumber\t1\nData\tA1\ttext\tx\n# comment\n\nData\td1\tblank\nNotes\tD1\ttext\tother sheet\n",
+            5,
+        ),
+    ] {
+        for check in [true, false] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sheetpatch"));
+            command.arg("patch");
+            if check {
+                command.args(["--check", workbook.to_str().unwrap(), "-"]);
+            } else {
+                command.args([workbook.to_str().unwrap(), output.to_str().unwrap(), "-"]);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(patch.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert_eq!(result.status.code(), Some(1));
+            assert!(result.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(result.stderr).unwrap(),
+                format!(
+                    "sheetpatch: Patch line {line}: unsupported: worksheet \"Data\": D1 contains a formula\n"
+                )
+            );
+        }
+    }
+    assert!(!output.exists());
+    assert_eq!(fs::read(&workbook).unwrap(), fs::read(FIXTURE).unwrap());
+    // A single set names its cell without a line.
+    let result = cli(&[
+        "set",
+        workbook.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "Data",
+        "D1",
+        "number",
+        "1",
+    ]);
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        "sheetpatch: unsupported: worksheet \"Data\": D1 contains a formula\n"
+    );
+    assert!(!output.exists());
 }
 
 #[test]
@@ -137,7 +183,12 @@ fn invalid_checks_report_patch_line_before_opening_the_workbook() {
 #[test]
 fn command_help_is_available_without_opening_an_input() {
     assert_eq!(cli(&["help"]).stdout, cli(&["--help"]).stdout);
-    for command in ["list", "get", "set", "patch", "compact", "help"] {
+    let usage = String::from_utf8(cli(&["help"]).stdout).unwrap();
+    for command in ["list", "get", "cells", "set", "patch", "compact", "help"] {
+        assert!(
+            usage.contains(&format!("\n  sheetpatch {command} ")),
+            "{command}"
+        );
         let named = cli(&["help", command]);
         assert!(named.status.success());
         assert!(named.stderr.is_empty());
@@ -158,8 +209,8 @@ fn command_help_is_available_without_opening_an_input() {
 #[test]
 fn carriage_returns_inside_rows_are_rejected_with_their_line() {
     let directory = TempDir::new();
-    let workbook = directory.0.join("input.xlsx");
-    let output = directory.0.join("output.xlsx");
+    let workbook = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
     fs::copy(FIXTURE, &workbook).unwrap();
     for (patch, line) in [
         (
@@ -168,7 +219,7 @@ fn carriage_returns_inside_rows_are_rejected_with_their_line() {
         ),
         ("Data\tA1\ttext\tok\r\nData\tA2\ttext\tsplit\rvalue\r\n", 2),
     ] {
-        let path = directory.0.join("edits.tsv");
+        let path = directory.join("edits.tsv");
         fs::write(&path, patch).unwrap();
         for args in [
             vec!["patch", "--check", workbook.to_str().unwrap(), "-"],
@@ -212,8 +263,8 @@ fn carriage_returns_inside_rows_are_rejected_with_their_line() {
 #[test]
 fn missing_sheets_report_the_patch_line_and_quoted_name() {
     let directory = TempDir::new();
-    let workbook = directory.0.join("input.xlsx");
-    let output = directory.0.join("output.xlsx");
+    let workbook = directory.join("input.xlsx");
+    let output = directory.join("output.xlsx");
     fs::copy(FIXTURE, &workbook).unwrap();
     for (patch, expected) in [
         (
