@@ -45,9 +45,18 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && characters.all(|c| c == ':' || name_character(c))
 }
 
+// The deepest element nesting accepted in an XML part. Deeper input is
+// refused as unsupported rather than malformed.
+pub(crate) const MAX_DEPTH: usize = 256;
+
+// XML whitespace is exactly these four characters, unlike Rust's ASCII and
+// Unicode whitespace sets.
+pub(crate) fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 pub(crate) fn whitespace(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    text.bytes().all(is_space)
 }
 
 // Schema numeric values collapse XML whitespace, rather than Rust's broader
@@ -65,10 +74,7 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
         match quote {
             Some(delimiter) if byte == delimiter => {
                 quote = None;
-                if raw
-                    .get(position + 1)
-                    .is_some_and(|next| !matches!(next, b' ' | b'\t' | b'\r' | b'\n'))
-                {
+                if raw.get(position + 1).is_some_and(|&next| !is_space(next)) {
                     return Err(Error::Xml(
                         "missing whitespace between XML attributes".into(),
                     ));
@@ -85,8 +91,6 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
 // resolver also checks reserved bindings, but does so against the raw spelling
 // and permits prefix undeclarations used by Namespaces in XML 1.1.
 pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
-    const XML: &str = "http://www.w3.org/XML/1998/namespace";
-    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
     if start.name().as_ref().starts_with("xmlns:") {
         return Err(Error::Xml("xmlns cannot be an element prefix".into()));
     }
@@ -106,18 +110,27 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
         if !value.chars().all(valid_char) {
             return Err(Error::Xml("invalid XML namespace character".into()));
         }
-        if prefix == Some("xmlns")
-            || value == XMLNS
-            || (value == XML && prefix != Some("xml"))
-            || (prefix == Some("xml") && value != XML)
-        {
-            return Err(Error::Xml("invalid reserved XML namespace binding".into()));
-        }
-        if prefix.is_some() && value.is_empty() {
-            return Err(Error::Xml(
-                "namespace prefixes cannot be undeclared in XML 1.0".into(),
-            ));
-        }
+        validate_namespace_binding(prefix, &value)?;
+    }
+    Ok(())
+}
+
+// Checks one declaration's normalized value. `prefix` is `None` for a default
+// namespace declaration (`xmlns`), and the declared prefix for `xmlns:prefix`.
+pub(crate) fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    if prefix == Some("xmlns")
+        || value == XMLNS
+        || (value == XML && prefix != Some("xml"))
+        || (prefix == Some("xml") && value != XML)
+    {
+        return Err(Error::Xml("invalid reserved XML namespace binding".into()));
+    }
+    if prefix.is_some() && value.is_empty() {
+        return Err(Error::Xml(
+            "namespace prefixes cannot be undeclared in XML 1.0".into(),
+        ));
     }
     Ok(())
 }
@@ -315,6 +328,8 @@ mod tests {
     fn xml_space_is_limited_to_the_four_defined_characters() {
         assert!(whitespace(" \t\r\n"));
         assert_eq!(trim_whitespace(" \t\r\n17\n\t "), "17");
+        let spaces: Vec<u8> = (0..=u8::MAX).filter(|&byte| is_space(byte)).collect();
+        assert_eq!(spaces, b"\t\n\r ");
         for text in ["\u{a0}", "\u{2000}", "\u{85}", "text"] {
             assert!(!whitespace(text));
             assert_eq!(trim_whitespace(text), text);

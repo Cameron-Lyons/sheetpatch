@@ -1314,11 +1314,11 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
     let boundary = Range {
         first: CellRef {
             row: 1,
-            column: 16_384,
+            column: CellRef::MAX_COLUMN,
         },
         last: CellRef {
-            row: 1_048_576,
-            column: 16_384,
+            row: CellRef::MAX_ROW,
+            column: CellRef::MAX_COLUMN,
         },
     };
     assert!(
@@ -1371,4 +1371,228 @@ fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() 
     });
     let error = validate_ranges(&cells, &ranges, true).unwrap_err();
     assert!(error.to_string().contains("B15"));
+}
+
+#[test]
+fn attribute_lists_end_only_at_the_tag_terminator() {
+    for tag in [
+        "<x:t /xml:space='preserve'>text</x:t>",
+        "<x:t xml:space='preserve'/ >text</x:t>",
+        "<x:t xml:space='preserve' / >text</x:t>",
+        "<x:t xml:space='preserve'/x:a='1'>text</x:t>",
+        "<x:t xml:space='preserve' /x:a='1'/>",
+        "<x:t xml:space='preserve'x:a='1'/>",
+        "<x:t x:a='1' x:a='2'/>",
+        "<x:t x:a=1/>",
+        "<x:t x:a/>",
+    ] {
+        let input = sheet(&format!("<sheetData/>{tag}"));
+        assert!(
+            matches!(parse(input.as_bytes()), Err(Error::Xml(_))),
+            "{tag}"
+        );
+    }
+    for tag in [
+        "<x:t xml:space='preserve' />",
+        "<x:t\txml:space = 'preserve'\r\n/>",
+        "<x:t x:a='1/>'>text</x:t>",
+        "<x:t\n>text</x:t\n>",
+    ] {
+        let input = sheet(&format!("<sheetData/>{tag}"));
+        let XmlDocument {
+            elements,
+            attributes,
+            ..
+        } = parse(input.as_bytes()).unwrap();
+        let element = elements.last().unwrap();
+        let spans = element.attributes(&attributes);
+        assert!(spans.iter().all(|attribute| {
+            input.as_bytes()[attribute.end() - 1] == input.as_bytes()[attribute.value_start() - 1]
+        }));
+        assert_eq!(
+            &input[element.start()..element.start() + 4],
+            "<x:t",
+            "{tag}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_attributes_are_found_in_tags_of_any_length() {
+    let tag = |count: usize, duplicate: &str| {
+        let attributes: String = (0..count)
+            .map(|index| {
+                let prefix = if index % 2 == 0 { "a" } else { "b" };
+                format!(" {prefix}:n{index}='{index}' n{index}='{index}'")
+            })
+            .collect();
+        sheet(&format!(
+            "<sheetData/><x:t xmlns:a='urn:same' xmlns:b='urn&#58;same'{attributes}{duplicate}/>"
+        ))
+    };
+    for count in [1, 7, 8, 9, 20, 40] {
+        let input = tag(count, "");
+        assert!(parse(input.as_bytes()).is_ok(), "{count}");
+        for duplicate in [
+            " n0='again'".to_owned(),
+            format!(" n{}='again'", count - 1),
+            // Different prefixes bound to one namespace repeat an expanded name.
+            " b:n0='again'".to_owned(),
+            format!(" a:n{}='again'", count - 1),
+        ] {
+            let input = tag(count, &duplicate);
+            assert!(
+                matches!(parse(input.as_bytes()), Err(Error::Xml(_))),
+                "{count}{duplicate}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn parse_records_stay_compact() {
+    use super::parse::{Attribute, Element};
+    assert_eq!(size_of::<Element>(), 64);
+    assert_eq!(size_of::<Attribute>(), 56);
+}
+
+#[test]
+fn xml_variants_follow_the_shared_policy() {
+    let nested = |depth: usize, root: &str| {
+        format!(
+            "<{root} xmlns='{TRANSITIONAL}'>{}{}</{root}>",
+            "<x>".repeat(depth),
+            "</x>".repeat(depth)
+        )
+    };
+    // The root and 255 nested elements are accepted; one more is refused.
+    let accepted = nested(255, "sst");
+    assert_eq!(
+        read_shared_strings(accepted.as_bytes()).unwrap(),
+        Vec::<String>::new()
+    );
+    for root in ["worksheet", "sst"] {
+        let input = nested(256, root);
+        let error = if root == "sst" {
+            read_shared_strings(input.as_bytes()).unwrap_err()
+        } else {
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), None).unwrap_err()
+        };
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    }
+    let mut invalid = sheet("<sheetData/>").into_bytes();
+    invalid.insert(invalid.len() - 2, 0xff);
+    assert!(matches!(
+        read_cell(&invalid, "A1".parse().unwrap(), None),
+        Err(Error::Xml(_))
+    ));
+    let encoded =
+        sheet("<sheetData/>").replace("version=\"1.0\"", "version=\"1.0\" encoding=\"UTF-16\"");
+    assert!(matches!(
+        read_cell(encoded.as_bytes(), "A1".parse().unwrap(), None),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn read_errors_name_the_cell() {
+    for (kind, payload, message) in [
+        ("n", "x", "B2: invalid numeric cell value"),
+        ("n", "1e999", "B2: non-finite numeric cell value"),
+        ("b", "2", "B2: invalid boolean cell value"),
+        (
+            "d",
+            "2026-02-29",
+            "B2: unsupported ISO 8601 date cell value",
+        ),
+        ("s", "-1", "B2: invalid shared-string index"),
+        ("q", "1", "B2: unsupported cell value type \"q\""),
+    ] {
+        let input = sheet(&format!(
+            "<sheetData><row r='2'><c r='B2' t='{kind}'><v>{payload}</v></c></row></sheetData>"
+        ));
+        assert!(
+            matches!(
+                read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&[])),
+                Err(Error::Unsupported(error)) if error == message
+            ),
+            "{message}"
+        );
+    }
+    let input = sheet("<sheetData><row r='2'><c r='B2' s='x'/></row></sheetData>");
+    assert!(matches!(
+        read_cell(input.as_bytes(), "B2".parse().unwrap(), None),
+        Err(Error::Unsupported(error)) if error == "B2: invalid cell style index"
+    ));
+    let input =
+        sheet("<sheetData><row r='2'><c r='B2' t='str'><v>_xD800_</v></c></row></sheetData>");
+    assert!(matches!(
+        read_cell(input.as_bytes(), "B2".parse().unwrap(), None),
+        Err(Error::Xml(error)) if error.starts_with("B2: ")
+    ));
+    let input = sheet("<sheetData><row r='2'><c r='B2' t='s'><v>5</v></c></row></sheetData>");
+    assert!(matches!(
+        read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&["only".into()])),
+        Err(Error::InvalidWorkbook(error)) if error == "B2: shared-string index 5 is out of bounds"
+    ));
+    // A failure to load the table concerns that part, not the cell.
+    let loaded = read_cells(
+        input.as_bytes(),
+        &["B2".parse().unwrap()],
+        || Err(Error::Xml("shared strings".into())),
+        false,
+    );
+    assert!(matches!(loaded, Err(Error::Xml(error)) if error == "shared strings"));
+}
+
+#[test]
+fn shared_strings_stream_without_changing_error_precedence() {
+    let table = |body: &str| format!("<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{body}</sst>");
+    let strings: Vec<_> = (0..500).map(|index| format!("s{index}_x0041_")).collect();
+    let body: String = strings
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            if index % 3 == 0 {
+                format!("<si><r><rPr><b/></rPr><t>{text}</t></r><rPh><t>p</t></rPh></si><x:e/>")
+            } else {
+                format!("<si><t>{text}</t></si>")
+            }
+        })
+        .collect();
+    let expected: Vec<_> = strings
+        .iter()
+        .map(|text| text.replace("_x0041_", "A"))
+        .collect();
+    assert_eq!(
+        read_shared_strings(table(&body).as_bytes()).unwrap(),
+        expected
+    );
+    let undecodable = "<si><t>_xD800_</t></si>";
+    let unsupported = "<si><t><x:e/></t></si>";
+    let hidden = "shared string outside the shared-string table";
+    for (body, expected) in [
+        // A string hidden anywhere outranks a decoding error before it.
+        (format!("{undecodable}<x:e><si/></x:e>"), hidden),
+        (format!("{unsupported}<si><x:e><si/></x:e></si>"), hidden),
+        // A malformed or unsupported document outranks both.
+        (format!("{unsupported}<si><t>x</t></sx>"), "XML error"),
+        (
+            format!("{unsupported}<x:e><si/></x:e><!DOCTYPE x>"),
+            "document type",
+        ),
+        // Otherwise the first string that cannot be decoded is reported.
+        (format!("{undecodable}{unsupported}"), "UTF-16"),
+        (format!("{unsupported}{undecodable}"), "elements inside"),
+    ] {
+        let error = read_shared_strings(table(&body).as_bytes()).unwrap_err();
+        assert!(error.to_string().contains(expected), "{body}: {error:?}");
+    }
+    let wrong_root =
+        format!("<worksheet xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{unsupported}</worksheet>");
+    assert!(matches!(
+        read_shared_strings(wrong_root.as_bytes()),
+        Err(Error::Unsupported(error)) if error == "expected an OOXML shared-string table"
+    ));
 }
