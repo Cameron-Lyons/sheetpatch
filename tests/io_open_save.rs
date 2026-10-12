@@ -68,7 +68,7 @@ fn destinations_without_a_file_name_are_reported_as_io_errors() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "sheetpatch: I/O error: destination must name a file\n"
+        "sheetpatch: cannot save '.': destination must name a file\n"
     );
 }
 
