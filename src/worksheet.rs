@@ -31,6 +31,11 @@ impl<'xml> PreparedWorksheet<'xml> {
         })
     }
 
+    /// The address of every `<c>` element, in row-major order.
+    pub(crate) fn cell_refs(&self) -> impl ExactSizeIterator<Item = CellRef> + '_ {
+        self.index.cells.iter().map(|&(cell, _)| cell)
+    }
+
     /// Reads cells in request order. Shared strings are loaded at most once,
     /// only for a requested `t="s"` cell. `date1904` selects the workbook's
     /// date system for ISO 8601 (`t="d"`) cells, which read as Excel serials.

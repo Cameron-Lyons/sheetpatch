@@ -1,17 +1,18 @@
 use crate::{
-    CellContent, CellEdit, CellRef, CellValue, Error, Result,
+    CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result,
     archive::{Archive, PartChanges},
     worksheet::{PreparedWorksheet, patch_cells, read_cells, read_shared_strings},
 };
-use std::{borrow::Cow, collections::BTreeMap, fs, io::Write, path::Path, sync::OnceLock};
+use std::{borrow::Cow, collections::BTreeMap, fmt, fs, io::Write, path::Path, sync::OnceLock};
 
 mod discovery;
 
 /// A worksheet discovered through the package's relationships.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Sheet {
     name: String,
     path: String,
+    visibility: SheetVisibility,
 }
 
 impl Sheet {
@@ -23,6 +24,44 @@ impl Sheet {
     pub fn path(&self) -> &str {
         &self.path
     }
+    /// Whether Excel shows the worksheet's tab, from the sheet's `state` in
+    /// the workbook. Hidden worksheets are read and edited like visible ones.
+    pub fn visibility(&self) -> SheetVisibility {
+        self.visibility
+    }
+
+    // Names this worksheet in an error raised while reading, preparing, or
+    // patching it, retaining the error's variant.
+    fn context(&self, error: Error) -> Error {
+        let name = &self.name;
+        match error {
+            Error::Xml(message) => Error::Xml(format!("worksheet {name:?}: {message}")),
+            Error::InvalidWorkbook(message) => {
+                Error::InvalidWorkbook(format!("worksheet {name:?}: {message}"))
+            }
+            Error::Unsupported(message) => {
+                Error::Unsupported(format!("worksheet {name:?}: {message}"))
+            }
+            error => error,
+        }
+    }
+}
+
+/// Whether Excel shows a worksheet's tab.
+///
+/// Additional states may be added in compatible releases. Callers should
+/// include a fallback arm when matching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SheetVisibility {
+    /// The tab is shown. A sheet without a `state` attribute is visible.
+    Visible,
+    /// The tab is hidden, and Excel's Unhide command can show it again
+    /// (`state="hidden"`).
+    Hidden,
+    /// The tab is hidden and not offered by Excel's Unhide command; only
+    /// macros or property editors can show it again (`state="veryHidden"`).
+    VeryHidden,
 }
 
 /// An existing OOXML workbook with pending surgical cell edits.
@@ -46,9 +85,10 @@ impl Sheet {
 pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
-    states: Vec<SheetState>,
+    sheet_xml: Vec<SheetXml>,
     changed_sheets: BTreeMap<String, usize>,
     signed: bool,
+    date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
@@ -57,17 +97,31 @@ pub struct Workbook {
     source_permissions: Option<fs::Permissions>,
 }
 
+// The archive and XML are omitted: they can be many megabytes.
+impl fmt::Debug for Workbook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Workbook")
+            .field("sheets", &self.sheets)
+            .field("signed", &self.signed)
+            .field("date1904", &self.date1904)
+            .field("changed_parts", &self.changed_sheets.keys())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
-struct SheetState {
+struct SheetXml {
     original: OnceLock<Vec<u8>>,
     // Present only when the XML differs from the original. Transactions update
     // this value and the workbook's changed-path index together at commit.
     current: Option<Vec<u8>>,
+    // Header rows of the worksheet's Excel tables, resolved on its first edit.
+    table_headers: OnceLock<Vec<CellRange>>,
 }
 
 struct ChangedParts<'a> {
     sheets: &'a BTreeMap<String, usize>,
-    states: &'a [SheetState],
+    sheet_xml: &'a [SheetXml],
 }
 
 impl PartChanges for ChangedParts<'_> {
@@ -75,7 +129,7 @@ impl PartChanges for ChangedParts<'_> {
         self.sheets.iter().map(|(path, &index)| {
             (
                 path.as_str(),
-                self.states[index]
+                self.sheet_xml[index]
                     .current
                     .as_deref()
                     .expect("changed worksheet has pending XML"),
@@ -99,10 +153,78 @@ pub struct WorksheetView<'a> {
     worksheet: PreparedWorksheet<'a>,
 }
 
+impl fmt::Debug for WorksheetView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorksheetView")
+            .field("sheet", self.sheet)
+            .field("cells", &self.worksheet.cell_refs().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl WorksheetView<'_> {
     /// The worksheet's name and resolved package path.
     pub fn sheet(&self) -> &Sheet {
         self.sheet
+    }
+
+    /// The address of every cell element in the worksheet, in row-major order.
+    ///
+    /// Cells that hold only a style and no value are included, as are cells
+    /// added by pending edits. Pass the addresses to [`Self::get_cells_at`]
+    /// to read the cells:
+    ///
+    /// ```
+    /// # let bytes = include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec();
+    /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
+    /// let sheet = book.prepare_sheet("Data")?;
+    /// let cells: Vec<_> = sheet.cell_refs().collect();
+    /// let contents = sheet.get_cells_at(cells.iter().copied())?;
+    /// for (cell, content) in cells.iter().zip(&contents) {
+    ///     println!("{cell}: {}", content.value);
+    /// }
+    /// assert_eq!(cells[0].to_string(), "A1");
+    /// assert_eq!(contents[3].formula.as_deref(), Some("B1*2"));
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
+    pub fn cell_refs(&self) -> impl Iterator<Item = CellRef> + '_ {
+        self.worksheet.cell_refs()
+    }
+
+    /// The smallest range containing every cell element, or `None` for a
+    /// worksheet without cells.
+    ///
+    /// Like Excel's used range, this includes cells that hold only a style.
+    /// It is computed from the cells themselves rather than the worksheet's
+    /// stored `<dimension>`, which other tools can leave stale.
+    ///
+    /// ```
+    /// # let bytes = include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec();
+    /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
+    /// let range = book.prepare_sheet("Data")?.used_range().unwrap();
+    /// assert_eq!(range.to_string(), "A1:E1");
+    /// let values = book.get_cells_at("Data", range.cells())?;
+    /// assert_eq!(values.len(), 5);
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
+    pub fn used_range(&self) -> Option<CellRange> {
+        let mut cells = self.worksheet.cell_refs();
+        let first = cells.next()?;
+        // Rows are in order, but a later row can start further left.
+        let (left, right, last_row) = cells.fold(
+            (first.column, first.column, first.row),
+            |(left, right, _), cell| (left.min(cell.column), right.max(cell.column), cell.row),
+        );
+        Some(CellRange::new(
+            CellRef {
+                row: first.row,
+                column: left,
+            },
+            CellRef {
+                row: last_row,
+                column: right,
+            },
+        ))
     }
 
     /// Read a cell without reparsing the worksheet.
@@ -121,11 +243,7 @@ impl WorksheetView<'_> {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let cells = addresses
-            .into_iter()
-            .map(|address| address.as_ref().parse())
-            .collect::<Result<Vec<CellRef>>>()?;
-        self.read_cells(&cells)
+        self.read_cells(&parse_addresses(addresses)?)
     }
 
     /// Read typed addresses, retaining input order and duplicate requests.
@@ -138,8 +256,20 @@ impl WorksheetView<'_> {
 
     fn read_cells(&self, cells: &[CellRef]) -> Result<Vec<CellContent>> {
         self.worksheet
-            .read_cells(cells, || self.workbook.shared_strings(), false)
+            .read_cells(
+                cells,
+                || self.workbook.shared_strings(),
+                self.workbook.date1904,
+            )
+            .map_err(|error| self.sheet.context(error))
     }
+}
+
+fn parse_addresses<S: AsRef<str>>(addresses: impl IntoIterator<Item = S>) -> Result<Vec<CellRef>> {
+    addresses
+        .into_iter()
+        .map(|address| address.as_ref().parse())
+        .collect()
 }
 
 impl Workbook {
@@ -192,9 +322,10 @@ impl Workbook {
         let discovery::PackageMetadata {
             sheets,
             signed,
+            date1904,
             shared_strings_path,
         } = discovery::discover(&archive)?;
-        let states = (0..sheets.len()).map(|_| SheetState::default()).collect();
+        let sheet_xml = (0..sheets.len()).map(|_| SheetXml::default()).collect();
         let sheet_indexes = sheets
             .iter()
             .enumerate()
@@ -203,9 +334,10 @@ impl Workbook {
         Ok(Self {
             archive,
             sheets,
-            states,
+            sheet_xml,
             changed_sheets: BTreeMap::new(),
             signed,
+            date1904,
             sheet_indexes,
             shared_strings_path,
             shared_strings: OnceLock::new(),
@@ -220,6 +352,34 @@ impl Workbook {
         &self.sheets
     }
 
+    /// The editable worksheet with this exact, case-sensitive name.
+    pub fn sheet(&self, name: &str) -> Option<&Sheet> {
+        self.sheet_indexes
+            .get(name)
+            .map(|&index| &self.sheets[index])
+    }
+
+    /// Whether the package is digitally signed.
+    ///
+    /// Editing would invalidate the signature, so every edit of a signed
+    /// workbook is refused with [`Error::Unsupported`]. Reads are unaffected.
+    pub fn is_signed(&self) -> bool {
+        self.signed
+    }
+
+    /// Whether the workbook uses the 1904 date system.
+    ///
+    /// Excel stores a date as a serial number of days. When this returns
+    /// `true`, serials for date-formatted cells count from 1904-01-01, which
+    /// is serial 0; otherwise they use the 1900 date system, in which
+    /// 1900-01-01 is serial 1. For example, 2024-01-15 is 43844 in the 1904
+    /// system and 45306 in the 1900 system. Write date serials in the
+    /// workbook's own system; ISO 8601 date cells (`t="d"`) also read as
+    /// serials in it.
+    pub fn uses_1904_dates(&self) -> bool {
+        self.date1904
+    }
+
     /// Set a scalar cell value, inserting a cell/row if needed.
     ///
     /// Formula cells and shared/array formula ranges are deliberately protected.
@@ -231,7 +391,9 @@ impl Workbook {
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        self.set_cell_at(sheet, address.parse()?, value)
+        // The sheet is resolved first, as in the batch and read methods.
+        let index = self.sheet_index(sheet)?;
+        self.set_cells_in_sheet(index, [address.parse().map(|cell| (cell, value))])
     }
 
     /// Set a scalar value using an already validated, one-based cell address.
@@ -244,10 +406,8 @@ impl Workbook {
         cell: CellRef,
         value: impl Into<CellValue>,
     ) -> Result<()> {
-        let value = value.into();
-        value.validate()?;
         let index = self.sheet_index(sheet)?;
-        self.apply_grouped_edits([(index, BTreeMap::from([(cell, value)]))])
+        self.set_cells_in_sheet(index, [Ok((cell, value))])
     }
 
     /// Apply edits to a worksheet in one parse and one XML patch.
@@ -329,12 +489,16 @@ impl Workbook {
         }
         let mut staged = Vec::with_capacity(grouped.size_hint().0);
         for (index, cells) in grouped {
-            let original = self.original_sheet(index)?;
-            let current = self.states[index].current.as_deref().unwrap_or(original);
-            let Cow::Owned(patched) = patch_cells(current, &cells, || self.shared_strings())?
+            let in_sheet = |error| self.sheets[index].context(error);
+            let original = self.original_sheet(index).map_err(in_sheet)?;
+            let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
+            let Cow::Owned(patched) =
+                patch_cells(current, &cells, || self.shared_strings()).map_err(in_sheet)?
             else {
                 continue;
             };
+            self.check_table_headers(index, current, &cells)
+                .map_err(in_sheet)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -345,7 +509,36 @@ impl Workbook {
             } else {
                 self.changed_sheets.remove(&self.sheets[index].path);
             }
-            self.states[index].current = changed;
+            self.sheet_xml[index].current = changed;
+        }
+        Ok(())
+    }
+
+    // Excel requires each table header cell's text to equal its table column's
+    // name, and repairs or removes a table whose header differs. An edit may
+    // rewrite a header cell's current value, but not change it.
+    fn check_table_headers(
+        &self,
+        index: usize,
+        xml: &[u8],
+        cells: &BTreeMap<CellRef, CellValue>,
+    ) -> Result<()> {
+        let headers = self.table_headers(index)?;
+        let (header_cells, values): (Vec<CellRef>, Vec<&CellValue>) = cells
+            .iter()
+            .filter(|(cell, _)| headers.iter().any(|header| header.contains(**cell)))
+            .unzip();
+        if header_cells.is_empty() {
+            return Ok(());
+        }
+        let current = read_cells(xml, &header_cells, || self.shared_strings(), self.date1904)?;
+        for ((cell, value), current) in header_cells.iter().zip(values).zip(current) {
+            if current.value != *value {
+                return Err(Error::Unsupported(format!(
+                    "{cell} is an Excel table header cell; \
+                     editing it would desynchronize the table's column names"
+                )));
+            }
         }
         Ok(())
     }
@@ -375,11 +568,7 @@ impl Workbook {
         S: AsRef<str>,
     {
         let index = self.sheet_index(sheet)?;
-        let cells = addresses
-            .into_iter()
-            .map(|address| address.as_ref().parse())
-            .collect::<Result<Vec<CellRef>>>()?;
-        self.read_cells_in_sheet(index, &cells)
+        self.read_cells_in_sheet(index, &parse_addresses(addresses)?)
     }
 
     /// Read a batch using typed addresses, parsing the worksheet once.
@@ -401,12 +590,14 @@ impl Workbook {
         if cells.is_empty() {
             return Ok(Vec::new());
         }
+        let in_sheet = |error| self.sheets[index].context(error);
         read_cells(
-            self.current_sheet(index)?,
+            self.current_sheet(index).map_err(in_sheet)?,
             cells,
             || self.shared_strings(),
-            false,
+            self.date1904,
         )
+        .map_err(in_sheet)
     }
 
     /// Prepare a worksheet for repeated reads using a single validated XML index.
@@ -426,10 +617,15 @@ impl Workbook {
     /// ```
     pub fn prepare_sheet(&self, sheet: &str) -> Result<WorksheetView<'_>> {
         let index = self.sheet_index(sheet)?;
+        let sheet = &self.sheets[index];
+        let worksheet = self
+            .current_sheet(index)
+            .and_then(PreparedWorksheet::parse)
+            .map_err(|error| sheet.context(error))?;
         Ok(WorksheetView {
-            sheet: &self.sheets[index],
+            sheet,
             workbook: self,
-            worksheet: PreparedWorksheet::parse(self.current_sheet(index)?)?,
+            worksheet,
         })
     }
 
@@ -441,13 +637,13 @@ impl Workbook {
     /// Discard every pending edit, restoring byte-identical original output.
     pub fn reset_changes(&mut self) {
         for &index in self.changed_sheets.values() {
-            self.states[index].current = None;
+            self.sheet_xml[index].current = None;
         }
         self.changed_sheets.clear();
     }
 
     fn current_sheet(&self, index: usize) -> Result<&[u8]> {
-        self.states[index]
+        self.sheet_xml[index]
             .current
             .as_deref()
             .map(Ok)
@@ -457,7 +653,7 @@ impl Workbook {
     fn changed_parts(&self) -> ChangedParts<'_> {
         ChangedParts {
             sheets: &self.changed_sheets,
-            states: &self.states,
+            sheet_xml: &self.sheet_xml,
         }
     }
 
@@ -468,29 +664,36 @@ impl Workbook {
             .ok_or_else(|| Error::SheetNotFound(name.to_owned()))
     }
 
+    // Each cache is loaded outside `get_or_init`, so a failed load is not
+    // cached. Concurrent first loads can only duplicate the work.
     fn original_sheet(&self, index: usize) -> Result<&[u8]> {
-        let cache = &self.states[index].original;
-        if cache.get().is_none() {
-            let xml = self.archive.read(&self.sheets[index].path)?;
-            let _ = cache.set(xml);
+        let cache = &self.sheet_xml[index].original;
+        if let Some(xml) = cache.get() {
+            return Ok(xml);
         }
-        Ok(cache.get().expect("worksheet cache initialized").as_slice())
+        let xml = self.archive.read(&self.sheets[index].path)?;
+        Ok(cache.get_or_init(|| xml))
+    }
+
+    fn table_headers(&self, index: usize) -> Result<&[CellRange]> {
+        let cache = &self.sheet_xml[index].table_headers;
+        if let Some(headers) = cache.get() {
+            return Ok(headers);
+        }
+        let headers = discovery::table_headers(&self.archive, &self.sheets[index].path)?;
+        Ok(cache.get_or_init(|| headers))
     }
 
     fn shared_strings(&self) -> Result<&[String]> {
-        if self.shared_strings.get().is_none() {
-            let path = self
-                .shared_strings_path
-                .as_ref()
-                .ok_or(Error::SharedStringsUnavailable)?;
-            let strings = read_shared_strings(&self.archive.read(path)?)?;
-            let _ = self.shared_strings.set(strings);
+        if let Some(strings) = self.shared_strings.get() {
+            return Ok(strings);
         }
-        Ok(self
-            .shared_strings
-            .get()
-            .expect("shared-string cache initialized")
-            .as_slice())
+        let path = self
+            .shared_strings_path
+            .as_ref()
+            .ok_or(Error::SharedStringsUnavailable)?;
+        let strings = read_shared_strings(&self.archive.read(path)?)?;
+        Ok(self.shared_strings.get_or_init(|| strings))
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
