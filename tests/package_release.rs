@@ -352,6 +352,46 @@ fn legacy_decoded_zip_part_names_remain_readable_when_encoded_parts_are_absent()
     );
 }
 
+#[test]
+fn workbook_relationship_parts_resolve_encoded_and_legacy_names_independently() {
+    for decoded_workbook in [false, true] {
+        for decoded_relationships in [false, true] {
+            let mut parts = common::payloads(&escaped_part_fixture(false, false));
+            if decoded_workbook {
+                let workbook = parts.remove("books/Workbook%20Main.xml").unwrap();
+                parts.insert("books/Workbook Main.xml".into(), workbook);
+            }
+            let encoded_rels = "books/_rels/Workbook%20Main.xml.rels";
+            let decoded_rels = "books/_rels/Workbook Main.xml.rels";
+            if decoded_relationships {
+                let relationships = parts.remove(encoded_rels).unwrap();
+                parts.insert(decoded_rels.into(), relationships);
+            } else {
+                // The canonical encoded relationships part takes precedence
+                // even when the workbook itself has a legacy decoded name.
+                parts.insert(decoded_rels.into(), b"<unrelated/>".to_vec());
+            }
+            let entries: Vec<_> = parts
+                .iter()
+                .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+                .collect();
+            let original = common::stored_archive(&entries);
+            let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
+            assert_eq!(workbook.to_bytes().unwrap(), original);
+            assert_eq!(
+                workbook.get_cell("Data", "A1").unwrap().value,
+                CellValue::Text("Canonical".into())
+            );
+            workbook.set_cell("Data", "B1", 12).unwrap();
+            let reopened = Workbook::from_bytes(workbook.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                reopened.get_cell("Data", "B1").unwrap().value,
+                CellValue::Number(12.0)
+            );
+        }
+    }
+}
+
 fn worksheet_relationship(id: &str, target: &str, mode: &str) -> String {
     format!("<Relationship Id='{id}' Type='{OFFICE_NS}/worksheet' Target='{target}'{mode}/>")
 }

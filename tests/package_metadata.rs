@@ -53,6 +53,36 @@ fn archive(properties: &str, data: &str, other: &str) -> Vec<u8> {
 }
 
 #[test]
+fn workbook_relationships_resolve_independently_of_legacy_zip_name_spelling() {
+    for (workbook_path, rels_path) in [
+        ("xl/book%20one.xml", "xl/_rels/book one.xml.rels"),
+        ("xl/book one.xml", "xl/_rels/book%20one.xml.rels"),
+    ] {
+        let mut parts = parts("", "", "");
+        let workbook = parts.remove("xl/workbook.xml").unwrap();
+        parts.insert(workbook_path.into(), workbook);
+        let relationships = parts.remove("xl/_rels/workbook.xml.rels").unwrap();
+        parts.insert(rels_path.into(), relationships);
+        let roots = parts.get_mut("_rels/.rels").unwrap();
+        *roots = roots.replace("xl/workbook.xml", "XL/BOOK%20ONE.XML");
+        if rels_path.contains("%20") {
+            // The encoded relationship part wins even when the workbook's
+            // ZIP name is decoded and a decoded relationship decoy exists.
+            parts.insert("xl/_rels/book one.xml.rels".into(), "not XML".into());
+        }
+
+        let original = stored(&parts);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(book.sheets().len(), 2);
+        assert_eq!(book.to_bytes().unwrap(), original);
+        assert_eq!(book.get_cell("Data", "B1").unwrap().value, 45_306.into());
+        book.set_cell("Data", "B1", 7).unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.get_cell("Data", "B1").unwrap().value, 7.into());
+    }
+}
+
+#[test]
 fn iso_date_cells_read_as_serials_in_the_workbook_date_system() {
     for (properties, uses_1904, serial) in [
         ("", false, 45_306.0),

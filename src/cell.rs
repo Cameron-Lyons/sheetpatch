@@ -310,6 +310,9 @@ impl IntoIterator for CellRange {
 /// Its `size_hint` is exact whenever the remaining count fits in `usize`. It
 /// does not implement [`ExactSizeIterator`], because a whole worksheet holds
 /// more cells than a 32-bit `usize` can count.
+/// [`Iterator::nth`], [`Iterator::last`] and [`Iterator::count`] take constant
+/// time, even for a range covering the whole worksheet. Counting panics if
+/// the remaining count exceeds `usize::MAX`.
 #[derive(Clone, Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct CellRangeIter {
@@ -354,6 +357,32 @@ impl Iterator for CellRangeIter {
             Ok(remaining) => (remaining, Some(remaining)),
             Err(_) => (usize::MAX, None),
         }
+    }
+
+    fn nth(&mut self, n: usize) -> Option<CellRef> {
+        let cell = self.next?;
+        let n = n as u64;
+        // Check before adding the offset, so an out-of-range skip exhausts
+        // the iterator without overflowing. A surviving offset fits in the grid.
+        if n >= self.remaining() {
+            self.next = None;
+            return None;
+        }
+        let width = u64::from(self.range.width());
+        let offset = u64::from(cell.column - self.range.first.column) + n;
+        self.next = Some(CellRef {
+            row: cell.row + (offset / width) as u32,
+            column: self.range.first.column + (offset % width) as u16,
+        });
+        self.next()
+    }
+
+    fn last(self) -> Option<CellRef> {
+        self.next.map(|_| self.range.last)
+    }
+
+    fn count(self) -> usize {
+        usize::try_from(self.remaining()).expect("cell range count exceeds usize::MAX")
     }
 }
 

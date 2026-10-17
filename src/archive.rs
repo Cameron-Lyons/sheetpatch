@@ -258,6 +258,9 @@ fn zip32(value: usize, description: &str) -> Result<u32> {
 /// Reject extra fields that change how other readers interpret a member: ZIP64
 /// sizes and Unicode paths that rename it.
 fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
+    // A long name can have thousands of stale Unicode path fields. Hash it
+    // only once, rather than once per field, to keep validation linear.
+    let mut name_crc = None;
     while !bytes.is_empty() {
         if bytes.len() < 4 {
             return Err(invalid("truncated ZIP extra field"));
@@ -277,7 +280,8 @@ fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
         // header. So the version is ignored here. Repeating the raw name is
         // harmless; any other path would alias a member for some reader.
         if kind == EXTRA_UNICODE_PATH
-            && u32_at(field, 1).is_ok_and(|crc| crc == crc32(name.as_bytes()))
+            && u32_at(field, 1)
+                .is_ok_and(|crc| crc == *name_crc.get_or_insert_with(|| crc32(name.as_bytes())))
             && field[5..] != *name.as_bytes()
         {
             return Err(invalid(format!(
@@ -2237,6 +2241,21 @@ mod tests {
             let updated = Archive::new(compacted).unwrap();
             assert_eq!(updated.read("part.xml").unwrap(), b"updated");
         }
+    }
+
+    #[test]
+    fn repeated_unicode_path_fields_with_long_names_still_check_the_last_field() {
+        let name = "a".repeat(u16::MAX as usize);
+        let stale = unicode_path(b"old-name", b"", 1);
+        assert_ne!(crc32(b"old-name"), crc32(name.as_bytes()));
+        let mut extra = stale.repeat(7000);
+        assert!(check_extra(&extra, &name).is_ok());
+        extra.extend_from_slice(&unicode_path(name.as_bytes(), b"renamed", 1));
+        assert!(extra.len() <= u16::MAX as usize);
+        assert!(matches!(
+            check_extra(&extra, &name),
+            Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
+        ));
     }
 
     #[test]

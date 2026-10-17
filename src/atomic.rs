@@ -147,12 +147,17 @@ fn existing_destination(path: &Path) -> io::Result<Option<fs::Metadata>> {
 /// The replacement is a new file, so its group is the one new files receive in
 /// that directory unless it can be changed to the destination's group. Group
 /// permission bits belong to the destination's group and are never granted to
-/// a different one. Setuid, setgid and sticky bits are never carried over:
-/// writing the contents would clear setuid and setgid anyway.
+/// a different one. Other permissions cannot exceed the old group's access:
+/// its members now fall into that class. Setuid, setgid and sticky bits are
+/// never carried over: writing the contents would clear setuid and setgid anyway.
 #[cfg(unix)]
 fn replacement_mode(destination_mode: u32, same_group: bool) -> u32 {
     let mode = destination_mode & 0o777;
-    if same_group { mode } else { mode & !0o070 }
+    if same_group {
+        mode
+    } else {
+        (mode & 0o700) | (mode & (mode >> 3) & 0o007)
+    }
 }
 
 /// Give `file` the group `gid` when the process may, and report whether it
@@ -210,20 +215,21 @@ fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Tempor
         return Ok(temp);
     }
     // The file was created in another group, such as the group of a setgid
-    // directory. If the creation mode gave that group access, a member may
-    // already have opened the file, so discard it unwritten and start again
-    // without group bits. Its mode still shows what the umask allows.
+    // directory. Group or other permissions may already have let someone
+    // open it who cannot access the source. Discard it unwritten and start
+    // owner-only before assigning the group. Its mode still shows the umask.
     let mode = created.mode() & 0o777;
-    let temp = if mode & 0o070 == 0 {
+    let temp = if mode & 0o077 == 0 {
         temp
     } else {
         drop(temp);
-        create_temporary(parent, Some(mode & !0o070))?
+        create_temporary(parent, Some(mode & 0o700))?
     };
-    if assign_group(temp.file(), source.gid)? {
-        temp.file()
-            .set_permissions(fs::Permissions::from_mode(mode))?;
-    }
+    let same_group = assign_group(temp.file(), source.gid)?;
+    temp.file()
+        .set_permissions(fs::Permissions::from_mode(replacement_mode(
+            mode, same_group,
+        )))?;
     Ok(temp)
 }
 
@@ -253,7 +259,8 @@ fn sync_directory(_: &Path) {}
 ///
 /// An existing destination's permissions are applied to its replacement
 /// before contents are written; on Unix its group is kept too when the process
-/// may assign it, and otherwise group access is removed. On Unix a new
+/// may assign it, and otherwise group access is removed and other access is
+/// limited to what both the original group and others had. On Unix a new
 /// destination gets the `source` file's permission bits, restricted by the
 /// umask, under the same group rule, or the default mode when it is `None`.
 /// Setuid, setgid and sticky bits are never applied.
@@ -688,6 +695,33 @@ mod tests {
         assert_eq!(replacement_mode(0o4755, false), 0o705);
         assert_eq!(replacement_mode(0o7777, true), 0o777);
         assert_eq!(replacement_mode(0o100_644, true), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changing_groups_does_not_grant_other_access_to_the_original_group() {
+        // Unix checks group permissions before other permissions. Members of
+        // the old group denied read access by 0604 must not gain it when they
+        // become "other" after the replacement gets a different group.
+        for (original, expected) in [(0o604, 0o600), (0o646, 0o604), (0o624, 0o600)] {
+            assert_eq!(replacement_mode(original, false), expected);
+            assert_eq!(replacement_mode(original, true), original);
+        }
+
+        let directory = TempDir::new("other-access");
+        let Some(foreign) = foreign_gid(&directory.0) else {
+            return;
+        };
+        let umask = umask(&directory);
+        let destination = directory.join("private-to-group.xlsx");
+        let source = SourcePermissions {
+            mode: 0o604,
+            gid: foreign,
+        };
+        // Check both the temporary during serialization and the saved file.
+        assert_eq!(create(&destination, source), 0o600 & !umask);
+        assert_eq!(mode(&destination), 0o600 & !umask);
+        assert_eq!(directory.entries(), 1);
     }
 
     #[cfg(unix)]

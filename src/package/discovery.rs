@@ -21,10 +21,16 @@ const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/r
 const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
 
 pub(super) struct PackageMetadata {
-    pub(super) sheets: Vec<Sheet>,
+    pub(super) sheets: Vec<DiscoveredSheet>,
     pub(super) signed: bool,
     pub(super) date1904: bool,
     pub(super) shared_strings_path: Option<String>,
+}
+
+pub(super) struct DiscoveredSheet {
+    pub(super) sheet: Sheet,
+    /// Relationships resolve against the URI, even for legacy decoded ZIP names.
+    pub(super) uri: String,
 }
 
 pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
@@ -32,9 +38,8 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
     let office = office_document(archive)?;
     let workbook = xml_nodes(&archive.read(&office.path)?, workbook_node)?;
     let (sheets_index, date1904) = workbook_properties(&workbook)?;
-    let rels_path = relationships_path(&office.path);
-    let rels_path = archive.part_name(&rels_path)?.unwrap_or(&rels_path);
-    let rels = relationships(&archive.read(rels_path)?)?;
+    let rels_path = part_path(archive, &relationships_path(&office.uri))?;
+    let rels = relationships(&archive.read(&rels_path)?)?;
     let shared_strings_path = shared_strings_path(archive, &office.uri, &rels)?;
     let sheets = sheets(archive, &office.uri, &workbook, sheets_index, &rels)?;
     Ok(PackageMetadata {
@@ -48,18 +53,16 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
 /// The header rows of the Excel tables related to a worksheet part. Excel
 /// requires each header cell's text to equal its table column's name. Errors
 /// name the relationships or table part they concern, not the worksheet.
-pub(super) fn table_headers(archive: &Archive, worksheet: &str) -> Result<Vec<CellRange>> {
-    let rels_path = relationships_path(worksheet);
-    let Some(rels_path) = archive
-        .part_name(&rels_path)
-        .map_err(|error| in_part(&rels_path, error))?
-    else {
+pub(super) fn table_headers(archive: &Archive, worksheet_uri: &str) -> Result<Vec<CellRange>> {
+    let rels_uri = relationships_path(worksheet_uri);
+    let rels_path = part_path(archive, &rels_uri).map_err(|error| in_part(&rels_uri, error))?;
+    if !archive.contains(&rels_path) {
         return Ok(Vec::new());
-    };
-    let in_rels = |error| in_part(rels_path, error);
+    }
+    let in_rels = |error| in_part(&rels_path, error);
     let mut headers = Vec::new();
     let relationships = archive
-        .read(rels_path)
+        .read(&rels_path)
         .and_then(|xml| relationships(&xml))
         .map_err(in_rels)?;
     for relationship in relationships {
@@ -73,7 +76,7 @@ pub(super) fn table_headers(archive: &Archive, worksheet: &str) -> Result<Vec<Ce
             ))));
         }
         let path =
-            resolve_part_target(archive, worksheet, &relationship.target).map_err(in_rels)?;
+            resolve_part_target(archive, worksheet_uri, &relationship.target).map_err(in_rels)?;
         if !archive.contains(&path) {
             return Err(in_rels(Error::InvalidWorkbook(format!(
                 "missing table part {path}"
@@ -158,7 +161,7 @@ fn office_document(archive: &Archive) -> Result<OfficeDocument> {
         }
     };
     let uri = resolve_target("", &office.target)?;
-    let path = resolve_part_target(archive, "", &office.target)?;
+    let path = part_path(archive, &uri)?;
     if path
         .rsplit_once('.')
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("bin"))
@@ -258,7 +261,7 @@ fn sheets(
     nodes: &[Node],
     sheets_index: usize,
     rels: &[Relationship],
-) -> Result<Vec<Sheet>> {
+) -> Result<Vec<DiscoveredSheet>> {
     let namespace = &nodes[0].namespace;
     let relationships_by_id: BTreeMap<_, _> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
     let mut sheets = Vec::new();
@@ -304,7 +307,8 @@ fn sheets(
         if !office_type(&relationship.kind, "worksheet") {
             continue;
         }
-        let path = resolve_part_target(archive, workbook_uri, &relationship.target)?;
+        let uri = resolve_target(workbook_uri, &relationship.target)?;
+        let path = part_path(archive, &uri)?;
         if !archive.contains(&path) {
             return Err(Error::InvalidWorkbook(format!(
                 "missing worksheet part {path}"
@@ -316,10 +320,13 @@ fn sheets(
                 "duplicate worksheet target {path}"
             )));
         }
-        sheets.push(Sheet {
-            name,
-            path,
-            visibility,
+        sheets.push(DiscoveredSheet {
+            sheet: Sheet {
+                name,
+                path,
+                visibility,
+            },
+            uri,
         });
     }
     Ok(sheets)
@@ -746,7 +753,13 @@ fn escape_path(path: &str) -> Result<String> {
 
 fn resolve_part_target(archive: &Archive, source: &str, target: &str) -> Result<String> {
     let path = resolve_target(source, target)?;
-    if let Some(name) = archive.part_name(&path)? {
+    part_path(archive, &path)
+}
+
+// Resolve a normalized part URI to its actual ZIP member name. Relationship
+// parts use the same encoded-first lookup as the parts they describe.
+fn part_path(archive: &Archive, path: &str) -> Result<String> {
+    if let Some(name) = archive.part_name(path)? {
         return Ok(name.to_owned());
     }
     // Earlier versions accepted ZIP names with decoded spaces and Unicode.
@@ -772,7 +785,7 @@ fn resolve_part_target(archive: &Archive, source: &str, target: &str) -> Result<
     {
         return Ok(name.to_owned());
     }
-    Ok(path)
+    Ok(path.to_owned())
 }
 
 #[cfg(test)]

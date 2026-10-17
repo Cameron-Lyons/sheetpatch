@@ -171,6 +171,16 @@ fn unknown_and_repeated_options_are_usage_errors() {
             "option \"--json\" is repeated",
         ),
         (
+            vec!["get", "--help", "--help"],
+            "option \"--help\" is repeated",
+        ),
+        (vec!["cells", "-h", "-h"], "option \"-h\" is repeated"),
+        (
+            vec!["patch", "--help", "--check", "-h"],
+            "option \"-h\" is repeated",
+        ),
+        (vec!["set", "-h", "--help"], "option \"--help\" is repeated"),
+        (
             vec!["get", "--json", "--json", "in.xlsx", "Data", "A1"],
             "option \"--json\" is repeated",
         ),
