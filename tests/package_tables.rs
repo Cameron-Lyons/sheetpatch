@@ -123,6 +123,48 @@ fn table_body_and_cells_outside_tables_remain_editable() {
 }
 
 #[test]
+fn table_relationships_resolve_independently_of_legacy_zip_name_spelling() {
+    for (target, sheet_path, rels_path) in [
+        (
+            "worksheets/sheet%20one.xml",
+            "xl/worksheets/sheet%20one.xml",
+            "xl/worksheets/_rels/sheet one.xml.rels",
+        ),
+        (
+            "worksheets/sheet%20one.xml",
+            "xl/worksheets/sheet one.xml",
+            "xl/worksheets/_rels/sheet%20one.xml.rels",
+        ),
+        (
+            "worksheets/sheet%25.xml",
+            "xl/worksheets/sheet%.xml",
+            "xl/worksheets/_rels/sheet%.xml.rels",
+        ),
+    ] {
+        let mut parts = parts("ref='A1:B3'");
+        let sheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+        parts.insert(sheet_path.into(), sheet);
+        let rels = parts.remove(SHEET_RELS).unwrap();
+        parts.insert(rels_path.into(), rels);
+        if rels_path.contains("%20") {
+            parts.insert(
+                "xl/worksheets/_rels/sheet one.xml.rels".into(),
+                format!("<Relationships xmlns='{PACKAGE_NS}'/>"),
+            );
+        }
+        let workbook_rels = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *workbook_rels = workbook_rels.replace("worksheets/sheet1.xml", target);
+
+        let mut book = book(&parts);
+        assert_refused(book.set_cell("Data", "B1", "Changed"), "B1");
+        assert!(!book.has_changes());
+        book.set_cell("Data", "B2", 7).unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+    }
+}
+
+#[test]
 fn edits_that_change_a_header_cell_are_refused_without_changes() {
     for attributes in ["ref='A1:B3'", "ref=' A1:B3 ' headerRowCount=' 1 '"] {
         let original = archive(&parts(attributes));
@@ -189,6 +231,47 @@ fn strict_table_relationships_and_namespaces_are_recognized() {
     let mut book = self::book(&parts);
     assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
     book.set_cell("Data", "B2", 1).unwrap();
+}
+
+#[test]
+fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
+    for suffix in ["%41", "%", "%2F"] {
+        let mut parts = parts("ref='A1:B3'");
+        let directory = format!("xl/worksheets{suffix}");
+        let worksheet_path = format!("{directory}/sheet1.xml");
+        let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+        parts.insert(worksheet_path.clone(), worksheet);
+        let relationships = parts.remove(SHEET_RELS).unwrap();
+        parts.insert(
+            format!("{directory}/_rels/sheet1.xml.rels"),
+            relationships.replace("../tables/table1.xml", "table1.xml"),
+        );
+        let table = parts.remove(TABLE_PATH).unwrap();
+        parts.insert(format!("{directory}/table1.xml"), table);
+        let relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *relationships = relationships.replace(
+            "worksheets/sheet1.xml",
+            &format!("worksheets{}/sheet1.xml", suffix.replace('%', "%25")),
+        );
+        // Mistaking the decoded ZIP name's literal "%41" for a URI escape
+        // would read this unrelated table and leave the real headers editable.
+        parts.insert(
+            "xl/worksheetsA/table1.xml".into(),
+            format!("<table xmlns='{MAIN_NS}' ref='Z1:Z3'/>"),
+        );
+
+        let original = archive(&parts);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(book.sheets()[0].path(), worksheet_path);
+        assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+        assert_eq!(book.to_bytes().unwrap(), original);
+        book.set_cell("Data", "B2", 7).unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.get_cell("Data", "B2").unwrap().value,
+            CellValue::Number(7.0)
+        );
+    }
 }
 
 #[test]

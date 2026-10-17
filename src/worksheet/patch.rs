@@ -296,7 +296,11 @@ fn spans_edit(
     };
     let invalid = || unsupported(format!("row {row_number}: invalid row spans"));
     let mut spans = Vec::new();
-    for span in attribute.value.split_whitespace() {
+    for span in attribute
+        .value
+        .split([' ', '\t', '\r', '\n'])
+        .filter(|span| !span.is_empty())
+    {
         let Some((first, last)) = span.split_once(':') else {
             return Err(invalid());
         };
@@ -310,13 +314,18 @@ fn spans_edit(
     if spans.is_empty() {
         return Err(unsupported(format!("row {row_number}: empty row spans")));
     }
-    let mut first = spans.iter().map(|span| span.0).min().unwrap();
+    spans.sort_unstable();
+    let mut first = spans[0].0;
     let mut last = spans.iter().map(|span| span.1).max().unwrap();
+    let mut spans = spans.into_iter().peekable();
     let mut changed = false;
+    // Changed columns arrive in order. Sweep the sorted intervals once rather
+    // than checking every span for every cell in a large fragmented row.
     for column in columns {
-        changed |= !spans
-            .iter()
-            .any(|&(start, end)| (start..=end).contains(&column));
+        while spans.peek().is_some_and(|&(_, end)| end < column) {
+            spans.next();
+        }
+        changed |= spans.peek().is_none_or(|&(start, _)| column < start);
         first = first.min(column);
         last = last.max(column);
     }

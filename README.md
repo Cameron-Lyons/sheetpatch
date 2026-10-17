@@ -302,12 +302,15 @@ return `Error::Io` of kind `InvalidInput` before any output is generated.
 Existing destination permissions are applied to the temporary file before
 workbook contents are written. On Unix the replacement also keeps the
 destination's group when the user may assign it; otherwise it gets no group
-permissions. Owner, ACLs, and extended attributes are not preserved, because the
+permissions, and other permissions are limited to those shared by the original
+group and others, so members of the original group cannot gain access. Owner,
+ACLs, and extended attributes are not preserved, because the
 replacement is a new file. On Unix, a new destination saved from a workbook
 opened with `Workbook::open`, including CLI outputs from an input file, is created
 with the input's permission bits restricted by the umask, as `cp` does, so it is
 never more permissive than the input. It gets the input's group when the user
-may assign it, and otherwise no group permissions. `from_bytes`, `from_reader`,
+may assign it, and otherwise uses the same restricted group and other
+permissions. `from_bytes`, `from_reader`,
 and standard input use the default mode. Setuid, setgid, and sticky bits are
 never kept, on new or replaced files. Saves replace the destination directory
 entry: an output symlink to a regular file is replaced rather than written

@@ -1771,3 +1771,69 @@ fn shared_strings_stream_without_changing_error_precedence() {
         Err(Error::Unsupported(error)) if error == "expected an OOXML shared-string table"
     ));
 }
+
+#[test]
+fn row_spans_preserve_unsorted_overlapping_intervals_until_a_gap_is_filled() {
+    let spans = "8:10&#9;2:4&#10;3:7&#13;12:12";
+    let input = sheet(&format!(
+        "<sheetData><row r='1' spans='{spans}'/></sheetData>"
+    ));
+    let covered = batch(
+        &input,
+        &[
+            ("B1", 1.0.into()),
+            ("E1", 2.0.into()),
+            ("J1", 3.0.into()),
+            ("L1", 4.0.into()),
+        ],
+    )
+    .unwrap();
+    assert!(covered.contains(&format!("spans='{spans}'")));
+    let gap = edit(&covered, "K1", 5.0.into()).unwrap();
+    assert!(gap.contains("spans='2:12'"));
+    let widened = batch(&covered, &[("A1", 6.0.into()), ("M1", 7.0.into())]).unwrap();
+    assert!(widened.contains("spans='1:13'"));
+}
+
+#[test]
+fn fragmented_row_spans_support_large_batches() {
+    let spans = (1..2048)
+        .rev()
+        .filter(|column| column % 2 == 1)
+        .map(|column| format!("{column}:{column}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let input = sheet(&format!(
+        "<sheetData><row r='1' spans='{spans}'/></sheetData>"
+    ));
+    for parity in [0, 1] {
+        let changes = (1..=2048)
+            .filter(|column| column % 2 == parity)
+            .map(|column| (CellRef { row: 1, column }, CellValue::Number(1.0)))
+            .collect();
+        let output = patch_cells(input.as_bytes(), &changes, || None, false).unwrap();
+        let expected = if parity == 0 { "1:2048" } else { &spans };
+        assert!(
+            std::str::from_utf8(&output)
+                .unwrap()
+                .contains(&format!("spans='{expected}'"))
+        );
+        assert_eq!(
+            PreparedWorksheet::parse(&output).unwrap().cells().len(),
+            1024
+        );
+    }
+}
+
+#[test]
+fn row_spans_reject_non_xml_whitespace() {
+    for separator in ['\u{85}', '\u{a0}', '\u{2000}'] {
+        let input = sheet(&format!(
+            "<sheetData><row r='1' spans='1:1{separator}3:3'/></sheetData>"
+        ));
+        assert!(matches!(
+            edit(&input, "B1", 1.0.into()),
+            Err(Error::Unsupported(message)) if message == "row 1: invalid row spans"
+        ));
+    }
+}

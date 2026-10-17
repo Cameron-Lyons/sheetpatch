@@ -430,6 +430,48 @@ fn range_cells_iterate_in_row_major_order_with_an_exact_length() {
 }
 
 #[test]
+fn range_skips_match_sequential_iteration_and_remain_exhausted() {
+    for text in ["B2:D5", "XFC1048575:XFD1048576", "C3", "A1:A5", "A1:E1"] {
+        let block = range(text);
+        let expected: Vec<_> = block.cells().collect();
+        for consumed in 0..=expected.len() {
+            for skipped in 0..=expected.len() + 1 {
+                let mut actual = block.cells();
+                let mut sequential = expected.clone().into_iter();
+                for _ in 0..consumed {
+                    assert_eq!(actual.next(), sequential.next());
+                }
+                assert_eq!(actual.nth(skipped), sequential.nth(skipped), "{text}");
+                assert_eq!(actual.size_hint(), sequential.size_hint());
+                assert_eq!(actual.clone().last(), sequential.clone().last());
+                assert_eq!(actual.clone().count(), sequential.clone().count());
+                assert_eq!(actual.collect::<Vec<_>>(), sequential.collect::<Vec<_>>());
+            }
+        }
+        let mut exhausted = block.cells();
+        assert_eq!(exhausted.nth(usize::MAX), None);
+        assert_eq!(exhausted.nth(1), None);
+        assert_eq!(exhausted.next(), None);
+        assert_eq!(exhausted.size_hint(), (0, Some(0)));
+        assert_eq!(exhausted.last(), None);
+    }
+}
+
+#[test]
+fn whole_sheet_ranges_can_jump_to_the_far_corner() {
+    let sheet = range("A1:XFD1048576");
+    assert_eq!(sheet.cells().last(), Some(cell("XFD1048576")));
+    if let Ok(penultimate) = usize::try_from(sheet.cell_count() - 2) {
+        let mut cells = sheet.cells();
+        assert_eq!(cells.clone().count(), penultimate + 2);
+        assert_eq!(cells.nth(penultimate), Some(cell("XFC1048576")));
+        assert_eq!(cells.size_hint(), (1, Some(1)));
+        assert_eq!(cells.next(), Some(cell("XFD1048576")));
+        assert_eq!(cells.last(), None);
+    }
+}
+
+#[test]
 fn ranges_drive_typed_block_reads_and_writes() {
     let mut book = Workbook::from_bytes(FIXTURE.to_vec()).unwrap();
     assert_eq!(

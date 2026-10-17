@@ -209,6 +209,8 @@ impl fmt::Debug for Workbook {
 
 #[derive(Default)]
 struct SheetXml {
+    // The part URI can differ from its ZIP name in legacy decoded archives.
+    uri: String,
     original: OnceLock<Vec<u8>>,
     // Present only when the XML differs from the original. Transactions update
     // this value and the workbook's changed-path index together at commit.
@@ -479,7 +481,18 @@ impl Workbook {
             date1904,
             shared_strings_path,
         } = discovery::discover(&archive)?;
-        let sheet_xml = (0..sheets.len()).map(|_| SheetXml::default()).collect();
+        let (sheets, sheet_xml): (Vec<_>, Vec<_>) = sheets
+            .into_iter()
+            .map(|discovery::DiscoveredSheet { sheet, uri }| {
+                (
+                    sheet,
+                    SheetXml {
+                        uri,
+                        ..SheetXml::default()
+                    },
+                )
+            })
+            .unzip();
         let sheet_indexes = sheets
             .iter()
             .enumerate()
@@ -908,7 +921,7 @@ impl Workbook {
         if let Some(headers) = cache.get() {
             return Ok(headers);
         }
-        let headers = discovery::table_headers(&self.archive, &self.sheets[index].path)?;
+        let headers = discovery::table_headers(&self.archive, &self.sheet_xml[index].uri)?;
         Ok(cache.get_or_init(|| headers))
     }
 
@@ -1001,7 +1014,9 @@ impl Workbook {
     /// [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
     /// replaced by the new file rather than written through.
     /// An existing destination keeps its permissions; on Unix it also keeps its
-    /// group when the process may assign it, and otherwise loses group access.
+    /// group when the process may assign it. Otherwise group access is removed,
+    /// and other access is limited to permissions shared by the original group
+    /// and others, so members of the original group cannot gain access.
     /// On Unix, a new destination for a workbook read by [`Self::open`] is
     /// created with the source file's permissions, restricted by the umask,
     /// and the same group rule: it gets the source file's group when the

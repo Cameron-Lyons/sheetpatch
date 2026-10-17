@@ -220,7 +220,12 @@ impl<'a> CommandLine<'a> {
         };
         while let Some(arg) = args.get(line.start).filter(|arg| is_option(arg)) {
             match arg.to_str() {
-                Some("--help" | "-h") => line.help = true,
+                Some(option @ ("--help" | "-h")) => {
+                    if line.help {
+                        return Err(Failure::Usage(format!("option {option:?} is repeated")));
+                    }
+                    line.help = true;
+                }
                 Some(option) if command.option().is_some_and(|(flag, _)| flag == option) => {
                     if line.flag {
                         return Err(Failure::Usage(format!("option {option:?} is repeated")));
@@ -485,17 +490,22 @@ fn require_sheet(workbook: &Workbook, sheet: &str) -> Result<(), Failure> {
     }
 }
 
-/// Find the patch line behind an edit refused for a protected cell: the last
-/// line that targets that worksheet and cell, which supplied the value that
-/// was applied.
-fn protected_line(rows: &[(usize, CellEdit)], error: &sheetpatch::Error) -> Option<usize> {
+/// The source of a patch edit, without retaining its value.
+struct PatchLocation {
+    line: usize,
+    sheet: String,
+    cell: CellRef,
+}
+
+/// Find the last patch line that supplied a refused cell's value.
+fn protected_line(rows: &[PatchLocation], error: &sheetpatch::Error) -> Option<usize> {
     let sheetpatch::Error::ProtectedCell { sheet, cell, .. } = error else {
         return None;
     };
     rows.iter()
         .rev()
-        .find(|(_, edit)| edit.sheet() == sheet && edit.cell() == *cell)
-        .map(|&(line, _)| line)
+        .find(|row| row.sheet == *sheet && row.cell == *cell)
+        .map(|row| row.line)
 }
 
 /// Read patch rows with their one-based line numbers. `origin` names the
@@ -934,10 +944,19 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
         )));
     }
     let count = rows.len();
-    // The rows are kept to name the line of a refused edit.
+    // Retain only locations for diagnostics; move values into the transaction
+    // instead of keeping a second copy of every text value in a large patch.
+    let mut locations = Vec::with_capacity(count);
     workbook
-        .apply_edits(rows.iter().map(|(_, edit)| edit.clone()))
-        .map_err(|error| match protected_line(&rows, &error) {
+        .apply_edits(rows.into_iter().map(|(line, edit)| {
+            locations.push(PatchLocation {
+                line,
+                sheet: edit.sheet().to_owned(),
+                cell: edit.cell(),
+            });
+            edit
+        }))
+        .map_err(|error| match protected_line(&locations, &error) {
             Some(line_number) => Failure::Context(format!("Patch line {line_number}"), error),
             None => Failure::Workbook(error),
         })?;
@@ -1389,9 +1408,18 @@ mod tests {
             ),
             "{protected:?}"
         );
-        let line = |patch: &str| {
-            protected_line(&read_patch(patch.as_bytes(), "test").unwrap(), &protected)
+        let locations = |patch: &str| {
+            read_patch(patch.as_bytes(), "test")
+                .unwrap()
+                .into_iter()
+                .map(|(line, edit)| PatchLocation {
+                    line,
+                    sheet: edit.sheet().to_owned(),
+                    cell: edit.cell(),
+                })
+                .collect::<Vec<_>>()
         };
+        let line = |patch: &str| protected_line(&locations(patch), &protected);
         // The last line for the worksheet and cell supplied the applied value.
         assert_eq!(
             line(
@@ -1403,7 +1431,7 @@ mod tests {
         assert_eq!(line("Other\tD1\tblank\nData\tD10\tnumber\t1\n"), None);
         // Only protected-cell refusals have a line, even when another error's
         // message names a cell that a line targets.
-        let rows = read_patch("Data\tA1\ttext\tx\n".as_bytes(), "test").unwrap();
+        let rows = locations("Data\tA1\ttext\tx\n");
         for error in [
             sheetpatch::Error::Unsupported("worksheet \"Data\": A1 contains a formula".into()),
             sheetpatch::Error::Xml(
