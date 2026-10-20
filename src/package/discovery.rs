@@ -3,11 +3,19 @@ use super::{Sheet, SheetVisibility, in_part};
 use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
-    xml::{MAX_DEPTH, excel_text, namespace, trim_whitespace, valid_qname},
+    xml::{
+        MAX_DEPTH, NamespaceCache, NamespaceReader, excel_text, namespace, trim_whitespace,
+        valid_qname,
+    },
 };
-use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
+use quick_xml::{
+    events::Event,
+    name::{QName, ResolveResult},
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::Deref,
     rc::Rc,
 };
 
@@ -19,6 +27,7 @@ const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main
 const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+const COMPATIBILITY_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
 pub(super) struct PackageMetadata {
     pub(super) sheets: Vec<DiscoveredSheet>,
@@ -61,6 +70,8 @@ pub(super) fn table_headers(archive: &Archive, worksheet_uri: &str) -> Result<Ve
     }
     let in_rels = |error| in_part(&rels_path, error);
     let mut headers = Vec::new();
+    let mut tables = HashSet::new();
+    let mut targets = HashSet::new();
     let relationships = archive
         .read(&rels_path)
         .and_then(|xml| relationships(&xml))
@@ -75,12 +86,24 @@ pub(super) fn table_headers(archive: &Archive, worksheet_uri: &str) -> Result<Ve
                 relationship.id
             ))));
         }
+        // This worksheet's source URI is fixed. Reusing a target that already
+        // resolved avoids rescanning a long inherited path for every alias.
+        // Check external mode first, even when the target spelling repeats.
+        if targets.contains(relationship.target.as_str()) {
+            continue;
+        }
         let path =
             resolve_part_target(archive, worksheet_uri, &relationship.target).map_err(in_rels)?;
         if !archive.contains(&path) {
             return Err(in_rels(Error::InvalidWorkbook(format!(
                 "missing table part {path}"
             ))));
+        }
+        targets.insert(relationship.target);
+        // Different relationship IDs and URI spellings can name one part.
+        // Validate every relationship, but read each resolved table only once.
+        if !tables.insert(path.clone()) {
+            continue;
         }
         let header = archive
             .read(&path)
@@ -197,6 +220,17 @@ fn workbook_properties(nodes: &[Node]) -> Result<(usize, bool)> {
             "officeDocument is not a SpreadsheetML workbook".into(),
         ));
     }
+    // Other spreadsheet readers recognize both dialects in one document.
+    // Ignoring the other known namespace could omit a worksheet or silently
+    // select the wrong date system.
+    if nodes
+        .iter()
+        .any(|node| main_namespace(&node.namespace) && node.namespace != root.namespace)
+    {
+        return Err(Error::Unsupported(
+            "workbook mixes strict and transitional SpreadsheetML namespaces".into(),
+        ));
+    }
     let in_workbook =
         |node: &Node, local: &str| node.local == local && node.namespace == root.namespace;
     let mut containers = nodes
@@ -211,7 +245,17 @@ fn workbook_properties(nodes: &[Node]) -> Result<(usize, bool)> {
             ));
         }
     };
-    // Only the root's own workbookPr children are retained.
+    // Compatibility branches can substitute a workbookPr with a different
+    // date system. Do not silently select 1900 dates or guess which branch
+    // another spreadsheet reader will process.
+    if nodes
+        .iter()
+        .any(|node| in_workbook(node, "workbookPr") && node.parent != Some(0))
+    {
+        return Err(Error::Unsupported(
+            "workbookPr inside a markup-compatibility branch may change the date system".into(),
+        ));
+    }
     let mut properties = nodes.iter().filter(|node| in_workbook(node, "workbookPr"));
     let date1904 = match (properties.next(), properties.next()) {
         (None, _) => false,
@@ -347,24 +391,40 @@ fn visibility(sheet: &Node, name: &str) -> Result<SheetVisibility> {
 }
 
 /// Selects the elements kept from a package part by their depth below the
-/// root, namespace URI, and local name. The root is always kept.
-type Retain = fn(usize, &str, &str) -> bool;
+/// root, namespace URI, local name, and retained parent. The root is always kept.
+type Retain = fn(usize, &str, &str, Option<&Node>) -> bool;
 
-fn root_only(_: usize, _: &str, _: &str) -> bool {
+fn root_only(_: usize, _: &str, _: &str, _: Option<&Node>) -> bool {
     false
 }
 
 // Misplaced relationships, sheet lists, and sheets are kept so that they can
 // be rejected; unrelated elements, wherever they occur, are not.
-fn relationship_node(_: usize, namespace: &str, local: &str) -> bool {
+fn relationship_node(_: usize, namespace: &str, local: &str, _: Option<&Node>) -> bool {
     namespace == PACKAGE_NS && local == "Relationship"
 }
 
-fn workbook_node(depth: usize, namespace: &str, local: &str) -> bool {
+fn compatibility_branch(node: &Node) -> bool {
+    &*node.namespace == COMPATIBILITY_NS && matches!(node.local.as_str(), "Choice" | "Fallback")
+}
+
+fn workbook_node(depth: usize, namespace: &str, local: &str, parent: Option<&Node>) -> bool {
+    // Retain only compatibility branches that can substitute direct workbook
+    // children, including nested AlternateContent. Ordinary opaque extensions
+    // and their unrelated workbookPr elements stay outside discovery.
+    if namespace == COMPATIBILITY_NS {
+        return match local {
+            "AlternateContent" => depth == 1 || parent.is_some_and(compatibility_branch),
+            "Choice" | "Fallback" => parent.is_some_and(|node| {
+                &*node.namespace == COMPATIBILITY_NS && node.local == "AlternateContent"
+            }),
+            _ => false,
+        };
+    }
     main_namespace(namespace)
         && match local {
             "sheets" | "sheet" => true,
-            "workbookPr" => depth == 1,
+            "workbookPr" => depth == 1 || parent.is_some_and(compatibility_branch),
             _ => false,
         }
 }
@@ -390,30 +450,100 @@ impl Node {
     }
 }
 
+// Hash a URI once per binding, including when checking expanded attribute
+// names. The fingerprint speeds lookup; exact URI equality still decides it.
+#[derive(Clone)]
+struct NamespaceName {
+    uri: Rc<str>,
+    fingerprint: u64,
+}
+
+impl NamespaceName {
+    fn new(uri: Rc<str>) -> Self {
+        let mut hash = DefaultHasher::new();
+        uri.hash(&mut hash);
+        Self {
+            uri,
+            fingerprint: hash.finish(),
+        }
+    }
+}
+
+impl Deref for NamespaceName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.uri
+    }
+}
+
+impl PartialEq for NamespaceName {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && (Rc::ptr_eq(&self.uri, &other.uri) || self.uri == other.uri)
+    }
+}
+
+impl Eq for NamespaceName {}
+
+impl Hash for NamespaceName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fingerprint.hash(state);
+    }
+}
+
 // Normalized namespace URIs by their raw spelling. Parts use few namespaces;
 // the limit keeps distinct declarations from growing the cache without bound.
 struct Namespaces {
-    cache: HashMap<String, Rc<str>>,
-    unbound: Rc<str>,
+    cache: HashMap<String, NamespaceName>,
+    bindings: NamespaceCache<NamespaceName>,
+    unbound: NamespaceName,
 }
 
 impl Namespaces {
     const CACHE_LIMIT: usize = 64;
 
-    fn resolve(&mut self, result: ResolveResult<'_>) -> Result<Rc<str>> {
-        match result {
+    fn resolve(
+        &mut self,
+        reader: &NamespaceReader<'_>,
+        name: QName<'_>,
+        attribute: bool,
+    ) -> Result<NamespaceName> {
+        if let Some(uri) = self.bindings.get(reader, name, attribute) {
+            return Ok(uri);
+        }
+        let result = if attribute {
+            reader.resolver().resolve_attribute(name).0
+        } else {
+            reader.resolver().resolve_element(name).0
+        };
+        let uri = match result {
             ResolveResult::Bound(raw) => {
                 if let Some(uri) = self.cache.get(raw.as_ref()) {
-                    return Ok(Rc::clone(uri));
+                    uri.clone()
+                } else {
+                    let uri = NamespaceName::new(namespace(ResolveResult::Bound(raw))?.into());
+                    // Reuse equivalent escaped spellings within the bounded
+                    // cache, so aliases share the cheap pointer equality path.
+                    let uri = self
+                        .cache
+                        .values()
+                        .find(|cached| **cached == uri)
+                        .cloned()
+                        .unwrap_or(uri);
+                    if self.cache.len() < Self::CACHE_LIMIT {
+                        self.cache.insert(raw.as_ref().to_owned(), uri.clone());
+                    }
+                    uri
                 }
-                let uri: Rc<str> = namespace(ResolveResult::Bound(raw))?.into();
-                if self.cache.len() < Self::CACHE_LIMIT {
-                    self.cache.insert(raw.as_ref().to_owned(), Rc::clone(&uri));
-                }
-                Ok(uri)
             }
-            other => namespace(other).map(|_| Rc::clone(&self.unbound)),
-        }
+            other => {
+                namespace(other)?;
+                self.unbound.clone()
+            }
+        };
+        self.bindings.insert(reader, name, attribute, uri.clone());
+        Ok(uri)
     }
 }
 
@@ -432,17 +562,19 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     if xml.starts_with('\u{feff}') {
         return Err(Error::Xml("text outside XML root".into()));
     }
-    let mut reader = NsReader::from_str(xml);
+    let mut reader = NamespaceReader::from_str(xml);
     reader.config_mut().check_comments = true;
     let mut namespaces = Namespaces {
         cache: HashMap::new(),
-        unbound: Rc::from(""),
+        bindings: NamespaceCache::default(),
+        unbound: NamespaceName::new(Rc::from("")),
     };
     let mut nodes = Vec::new();
     // Each open element's index among the retained nodes, if it was retained.
     let mut stack: Vec<Option<usize>> = Vec::new();
     let mut roots = 0;
     let mut declaration_seen = false;
+    let mut has_process_content = false;
     loop {
         let event_start = reader.buffer_position();
         let event = reader.read_event().map_err(Error::xml)?;
@@ -462,10 +594,16 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                 }
                 crate::xml::validate_namespaces(&e)?;
                 crate::xml::validate_attribute_spacing(&e)?;
-                let namespace =
-                    namespaces.resolve(reader.resolver().resolve_element(e.name()).0)?;
+                let namespace = namespaces.resolve(&reader, e.name(), false)?;
                 let local = e.local_name();
-                let keep = stack.is_empty() || retain(stack.len(), &namespace, local.as_ref());
+                let parent = stack.last().copied().flatten();
+                let keep = stack.is_empty()
+                    || retain(
+                        stack.len(),
+                        &namespace,
+                        local.as_ref(),
+                        parent.map(|index| &nodes[index]),
+                    );
                 let mut attributes = Vec::new();
                 // quick-xml rejects repeated attribute names. Distinct prefixes
                 // can still expand to one namespace and local name.
@@ -479,14 +617,12 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                     if attr.value.contains('<') {
                         return Err(Error::Xml("literal '<' in XML attribute value".into()));
                     }
-                    let (resolved, attribute_local) = reader.resolver().resolve_attribute(attr.key);
-                    let attribute_namespace = namespaces.resolve(resolved)?;
+                    let attribute_local = attr.key.local_name();
+                    let attribute_namespace = namespaces.resolve(&reader, attr.key, true)?;
                     if name.contains(':')
                         && !name.starts_with("xmlns:")
-                        && !expanded.insert((
-                            Rc::clone(&attribute_namespace),
-                            attribute_local.into_inner(),
-                        ))
+                        && !expanded
+                            .insert((attribute_namespace.clone(), attribute_local.into_inner()))
                     {
                         return Err(Error::Xml("duplicate XML attribute".into()));
                     }
@@ -496,9 +632,12 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                     if !value.chars().all(crate::xml::valid_char) {
                         return Err(Error::Xml("invalid XML attribute character".into()));
                     }
+                    has_process_content |= &*attribute_namespace == COMPATIBILITY_NS
+                        && attribute_local.as_ref() == "ProcessContent"
+                        && !trim_whitespace(&value).is_empty();
                     if keep {
                         attributes.push(Attribute {
-                            namespace: attribute_namespace,
+                            namespace: attribute_namespace.uri,
                             local: attribute_local.into_inner().to_owned(),
                             value: value.into_owned(),
                         });
@@ -506,10 +645,10 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                 }
                 let index = keep.then(|| {
                     nodes.push(Node {
-                        namespace,
+                        namespace: namespace.uri,
                         local: local.as_ref().to_owned(),
                         attributes,
-                        parent: stack.last().copied().flatten(),
+                        parent,
                     });
                     nodes.len() - 1
                 });
@@ -549,13 +688,7 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                 if stack.is_empty() {
                     return Err(Error::Xml("content outside XML root".into()));
                 }
-                let reference = e.as_ref();
-                let spelling = format!("&{reference};");
-                let value = quick_xml::escape::unescape(&spelling)
-                    .map_err(|e| Error::Xml(e.to_string()))?;
-                if !value.chars().all(crate::xml::valid_char) {
-                    return Err(Error::Xml("invalid XML character reference".into()));
-                }
+                crate::xml::reference(&e)?;
             }
             Event::PI(e) => {
                 let target = e.target();
@@ -572,7 +705,170 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     if roots != 1 || !stack.is_empty() {
         return Err(Error::Xml("expected one complete XML root".into()));
     }
+    if has_process_content && nodes[0].local == "workbook" && main_namespace(&nodes[0].namespace) {
+        reject_promoted_workbook_properties(xml)?;
+    }
     Ok(nodes)
+}
+
+// ProcessContent can promote children of an ignored vendor wrapper into the
+// workbook. Inspect only documents using it, after complete XML validation.
+// This follows possible workbook-level paths, not a general MC processor.
+#[derive(Default)]
+struct CompatibilityNames {
+    names: HashMap<NamespaceName, HashSet<Rc<str>>>,
+    added: Vec<(NamespaceName, Rc<str>)>,
+}
+
+impl CompatibilityNames {
+    fn insert(&mut self, namespace: NamespaceName, local: &str) {
+        let names = self.names.entry(namespace.clone()).or_default();
+        if !names.contains(local) {
+            let local: Rc<str> = local.into();
+            names.insert(Rc::clone(&local));
+            self.added.push((namespace, local));
+        }
+    }
+
+    fn matches(&self, namespace: &NamespaceName, local: &str) -> bool {
+        self.names
+            .get(namespace)
+            .is_some_and(|names| names.contains(local) || names.contains("*"))
+    }
+
+    fn truncate(&mut self, length: usize) {
+        while self.added.len() > length {
+            let (namespace, local) = self.added.pop().unwrap();
+            let names = self.names.get_mut(&namespace).unwrap();
+            names.remove(&local);
+            if names.is_empty() {
+                self.names.remove(&namespace);
+            }
+        }
+    }
+}
+
+fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum Parent {
+        Workbook,
+        Promoted,
+        AlternateContent(bool),
+        Opaque,
+    }
+    let mut reader = NamespaceReader::from_str(xml);
+    let mut namespaces = Namespaces {
+        cache: HashMap::new(),
+        bindings: NamespaceCache::default(),
+        unbound: NamespaceName::new(Rc::from("")),
+    };
+    // Namespace / expanded-name lookup stays bounded even for long inherited
+    // rule lists. Only newly inserted names need removing when a scope closes.
+    let mut rules: [CompatibilityNames; 2] = Default::default();
+    let mut stack: Vec<(Parent, [usize; 2])> = Vec::new();
+    loop {
+        let event = reader.read_event().map_err(Error::xml)?;
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                let parent = stack.last().map(|frame| frame.0);
+                let checkpoint = rules.each_ref().map(|names| names.added.len());
+                let ns = namespaces.resolve(&reader, e.name(), false)?;
+                let local = e.local_name();
+                // Rules on the wrapper itself apply before deciding whether
+                // to ignore or process that wrapper.
+                if !matches!(parent, Some(Parent::Opaque)) {
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|error| Error::Xml(error.to_string()))?;
+                        let name = attr.key.local_name();
+                        if &*namespaces.resolve(&reader, attr.key, true)? != COMPATIBILITY_NS {
+                            continue;
+                        }
+                        let name = name.as_ref();
+                        let kind = match name {
+                            "Ignorable" => 0,
+                            "ProcessContent" => 1,
+                            _ => continue,
+                        };
+                        let value = attr
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .map_err(Error::xml)?;
+                        for token in value
+                            .split([' ', '\t', '\r', '\n'])
+                            .filter(|v| !v.is_empty())
+                        {
+                            let qualified;
+                            let token = if name == "Ignorable" {
+                                qualified = format!("{token}:_");
+                                qualified.as_str()
+                            } else {
+                                token
+                            };
+                            let (resolved, local) = reader.resolver().resolve_element(QName(token));
+                            // An unbound directive cannot name a valid
+                            // prefixed element in this already validated XML.
+                            if !matches!(resolved, ResolveResult::Bound(_)) {
+                                continue;
+                            }
+                            let uri = namespaces.resolve(&reader, QName(token), false)?;
+                            rules[kind].insert(uri, if kind == 0 { "*" } else { local.as_ref() });
+                        }
+                    }
+                }
+                let current = match parent {
+                    None => Parent::Workbook,
+                    Some(Parent::Workbook | Parent::Promoted) => {
+                        if matches!(parent, Some(Parent::Promoted))
+                            && main_namespace(&ns)
+                            && local.as_ref() == "workbookPr"
+                        {
+                            return Err(Error::Unsupported(
+                                "workbookPr inside an mc:ProcessContent wrapper may change the date system"
+                                    .into(),
+                            ));
+                        }
+                        if &*ns == COMPATIBILITY_NS && local.as_ref() == "AlternateContent" {
+                            Parent::AlternateContent(matches!(parent, Some(Parent::Promoted)))
+                        } else if !main_namespace(&ns)
+                            && &*ns != COMPATIBILITY_NS
+                            && rules[0].matches(&ns, "*")
+                            && rules[1].matches(&ns, local.as_ref())
+                        {
+                            Parent::Promoted
+                        } else {
+                            Parent::Opaque
+                        }
+                    }
+                    Some(Parent::AlternateContent(promoted))
+                        if &*ns == COMPATIBILITY_NS
+                            && matches!(local.as_ref(), "Choice" | "Fallback") =>
+                    {
+                        if promoted {
+                            Parent::Promoted
+                        } else {
+                            Parent::Workbook
+                        }
+                    }
+                    _ => Parent::Opaque,
+                };
+                if empty {
+                    for (names, length) in rules.iter_mut().zip(checkpoint) {
+                        names.truncate(length);
+                    }
+                } else {
+                    stack.push((current, checkpoint));
+                }
+            }
+            Event::End(_) => {
+                let (_, checkpoint) = stack.pop().expect("validated XML is balanced");
+                for (names, length) in rules.iter_mut().zip(checkpoint) {
+                    names.truncate(length);
+                }
+            }
+            Event::Eof => return Ok(()),
+            _ => (),
+        }
+    }
 }
 
 struct Relationship {
@@ -792,6 +1088,20 @@ fn part_path(archive: &Archive, path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::Workbook;
+
+    #[test]
+    fn namespace_fingerprint_collisions_keep_exact_uri_equality() {
+        let first = NamespaceName::new(Rc::from("urn:first"));
+        let collision = NamespaceName {
+            uri: Rc::from("urn:other"),
+            fingerprint: first.fingerprint,
+        };
+        let mut attributes = HashSet::new();
+        assert!(attributes.insert((first, "value")));
+        assert!(attributes.insert((collision, "value")));
+        assert!(!attributes.insert((NamespaceName::new(Rc::from("urn:first")), "value")));
+    }
+
     #[test]
     fn resolve_relative_and_absolute_part_uris() {
         assert_eq!(

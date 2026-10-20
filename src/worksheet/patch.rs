@@ -248,11 +248,15 @@ fn patched_cell<'s>(
     if unchanged {
         return Ok(false);
     }
-    // Unlike cell metadata (`cm`), value metadata describes the old value and
-    // can link to rich data in other package parts. Retaining that link after
-    // replacing a scalar payload would silently leave stale value semantics.
+    // Value metadata can link to rich data in other package parts. Cell metadata
+    // has per-type edit/clear flags in the metadata part (ECMA-376 18.9.10), so
+    // even a cell-level link may not survive a value change. Without interpreting
+    // those records, keep both links and their original payload intact.
     if cell.attr(attributes, "vm").is_some() {
         return Err(protected(address, protection::VALUE_METADATA));
+    }
+    if cell.attr(attributes, "cm").is_some() {
+        return Err(protected(address, protection::CELL_METADATA));
     }
     let value_bytes = payload(cell, value);
     if let Some(kind) = attribute_edit(cell, attributes, "t", value_type(value)) {
@@ -342,32 +346,31 @@ fn spans_edit(
     ))
 }
 
-// Excel gives a new cell its row's style when the row has a custom format, and
-// otherwise its column's default style. Style zero needs no attribute.
-fn default_style(
-    index: &WorksheetIndex,
-    row: Option<&Element>,
-    cell: CellRef,
-) -> Result<Option<u32>> {
-    if let Some(row) = row {
-        let attributes = &index.attributes;
-        let custom_format = row
-            .attr(attributes, "customFormat")
-            .map(|attribute| trim_xml_whitespace(&attribute.value));
-        if !matches!(custom_format, None | Some("0" | "false")) {
-            if !matches!(custom_format, Some("1" | "true")) {
-                return Err(unsupported(format!("{cell}: invalid row format flag")));
-            }
-            let Some(style) = row.attr(attributes, "s") else {
-                return Ok(None);
-            };
-            return trim_xml_whitespace(&style.value)
-                .parse::<u32>()
-                .map(|style| (style != 0).then_some(style))
-                .map_err(|_| unsupported(format!("{cell}: invalid row style index")));
-        }
+#[derive(Clone, Copy)]
+enum RowStyle {
+    ColumnDefault,
+    Custom(u32),
+}
+
+// A custom row format overrides column defaults, including style zero.
+fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<RowStyle> {
+    let attributes = &index.attributes;
+    let custom_format = row
+        .attr(attributes, "customFormat")
+        .map(|attribute| trim_xml_whitespace(&attribute.value));
+    if matches!(custom_format, None | Some("0" | "false")) {
+        return Ok(RowStyle::ColumnDefault);
     }
-    index.column_style(cell)
+    if !matches!(custom_format, Some("1" | "true")) {
+        return Err(unsupported(format!("{cell}: invalid row format flag")));
+    }
+    let Some(style) = row.attr(attributes, "s") else {
+        return Ok(RowStyle::Custom(0));
+    };
+    trim_xml_whitespace(&style.value)
+        .parse::<u32>()
+        .map(RowStyle::Custom)
+        .map_err(|_| unsupported(format!("{cell}: invalid row style index")))
 }
 
 // One row's edits, in column order.
@@ -391,6 +394,10 @@ fn patch_existing_row<'s>(
     let mut cell_position = 0;
     let mut changed_columns = Vec::new();
     let mut empty_row_cells = Vec::new();
+    // Resolve only when a new nonblank cell needs a style. Existing cells and
+    // blank edits must not start validating row defaults; later insertions can
+    // reuse the first result without rescanning attributes or numeric text.
+    let mut cached_row_style = None;
     // Trailing cells follow the last existing cell. Only an extension list
     // after that cell comes later; one placed before or between cells must not
     // move new cells ahead of existing ones.
@@ -418,12 +425,19 @@ fn patch_existing_row<'s>(
         } else if matches!(value, CellValue::Blank) {
             continue;
         } else {
-            let bytes = new_cell(
-                element,
-                cell,
-                default_style(index, Some(element), cell)?,
-                value,
-            );
+            let default = match cached_row_style {
+                Some(style) => style,
+                None => {
+                    let style = row_style(index, element, cell)?;
+                    cached_row_style = Some(style);
+                    style
+                }
+            };
+            let style = match default {
+                RowStyle::ColumnDefault => index.column_style(cell)?,
+                RowStyle::Custom(style) => (style != 0).then_some(style),
+            };
+            let bytes = new_cell(element, cell, style, value);
             if element.empty {
                 empty_row_cells.extend(bytes);
             } else {
@@ -470,12 +484,7 @@ fn new_row(
     let mut cells = Vec::new();
     for &(&cell, value) in changes {
         if !matches!(value, CellValue::Blank) {
-            cells.extend(new_cell(
-                data,
-                cell,
-                default_style(index, None, cell)?,
-                value,
-            ));
+            cells.extend(new_cell(data, cell, index.column_style(cell)?, value));
             changed_cells.push(cell);
         }
     }

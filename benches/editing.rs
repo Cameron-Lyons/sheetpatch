@@ -38,6 +38,9 @@ const CASE_NAMES: &[&str] = &[
     "shared_strings",
     "insertion",
     "multisheet",
+    "tables",
+    "control_text",
+    "row_style",
 ];
 const OPERATIONS: &[&str] = &[
     "sequential",
@@ -63,6 +66,9 @@ const OPERATIONS: &[&str] = &[
     "shared_prepared_reads",
     "insert_bulk_at",
     "multisheet_apply",
+    "table_warm_bulk_at",
+    "control_text_bulk_at",
+    "row_style_bulk_at",
 ];
 
 fn selected(variable: &str, name: &str) -> bool {
@@ -315,6 +321,87 @@ fn guarded_batches(samples: usize) {
     }
 }
 
+fn table_batches(samples: usize) {
+    let columns = 5_000;
+    let office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let mut table_parts = format!("<tableParts count='{columns}'>");
+    let mut relationships = String::from(
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
+    );
+    let mut parts = payloads(&fixture_with_sheet(&wide_worksheet(
+        2,
+        columns,
+        &BTreeMap::new(),
+    )));
+    for column in 1..=columns {
+        let first = CellRef::new(1, column).unwrap();
+        let last = CellRef::new(2, column).unwrap();
+        write!(table_parts, "<tablePart r:id='t{column}'/>").unwrap();
+        write!(
+            relationships,
+            "<Relationship Id='t{column}' Type='{office}/table' Target='../tables/table{column}.xml'/>"
+        )
+        .unwrap();
+        parts.insert(
+            format!("xl/tables/table{column}.xml"),
+            format!(
+                "<table xmlns='{MAIN_NS}' id='{column}' name='Table{column}' displayName='Table{column}' ref='{first}:{last}'><tableColumns count='1'><tableColumn id='1' name='{column}'/></tableColumns></table>"
+            )
+            .into_bytes(),
+        );
+    }
+    table_parts.push_str("</tableParts>");
+    relationships.push_str("</Relationships>");
+    let worksheet = |values: &BTreeMap<CellRef, i32>| {
+        String::from_utf8(wide_worksheet(2, columns, values))
+            .unwrap()
+            .replace("<worksheet ", &format!("<worksheet xmlns:r='{office}' "))
+            .replace("</worksheet>", &format!("{table_parts}</worksheet>"))
+            .into_bytes()
+    };
+    parts.insert(SHEET_PATH.into(), worksheet(&BTreeMap::new()));
+    parts.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        relationships.into_bytes(),
+    );
+    let borrowed: Vec<_> = parts
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let input = zip(&borrowed);
+    let edits: Vec<_> = (1..=columns)
+        .map(|column| {
+            (
+                CellRef::new(2, column).unwrap(),
+                CellValue::from(-i32::from(column)),
+            )
+        })
+        .collect();
+    let values = edits
+        .iter()
+        .map(|(cell, _)| (*cell, -i32::from(cell.column())))
+        .collect();
+    let mut book = bulk_at(&input, &edits);
+    verify_output(&input, &book.to_bytes().unwrap(), &worksheet(&values));
+    assert!(book.set_cell("Data", "A1", "changed").is_err());
+    // Reuse discovered table headers to isolate bulk-edit scaling from the
+    // cost of opening thousands of table parts. Reset keeps those caches.
+    report(
+        "table_warm_bulk_at",
+        2 * usize::from(columns),
+        edits.len(),
+        samples,
+        measure(samples, "table_warm_bulk_at", || {
+            book.reset_changes();
+            book.set_cells_at(
+                "Data",
+                edits.iter().map(|(cell, value)| (*cell, value.clone())),
+            )
+            .unwrap();
+        }),
+    );
+}
+
 fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> Vec<u8> {
     let base = fixture_with_sheet(sheets[0].1);
     let mut parts = payloads(&base);
@@ -390,7 +477,7 @@ fn wide_worksheet(rows: u32, columns: u16, values: &BTreeMap<CellRef, i32>) -> V
     xml.into_bytes()
 }
 
-fn numeric_case(
+fn edit_case(
     samples: usize,
     label: &str,
     sheet: &[u8],
@@ -584,7 +671,7 @@ fn extra_workloads(samples: usize) {
             .iter()
             .map(|(&cell, &value)| (cell, CellValue::from(value)))
             .collect();
-        numeric_case(
+        edit_case(
             samples,
             "wide_bulk_at",
             &wide_worksheet(rows, columns, &BTreeMap::new()),
@@ -614,7 +701,7 @@ fn extra_workloads(samples: usize) {
         let values = (0..count)
             .map(|index| (1 + index * cells / count, -((index + 1) as i32)))
             .collect();
-        let mut book = numeric_case(
+        let mut book = edit_case(
             samples,
             "opaque_bulk_at",
             &with_extensions(&BTreeMap::new()),
@@ -652,11 +739,38 @@ fn extra_workloads(samples: usize) {
             rows.push_str("</row>");
         }
         rows.push_str("</sheetData>");
-        numeric_case(
+        edit_case(
             samples,
             "insert_bulk_at",
             sheet.as_bytes(),
             sheet.replace("<sheetData/>", &rows).as_bytes(),
+            0,
+            &edits,
+        );
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "row_style") {
+        // A valid style index with a long lexical spelling should be parsed
+        // once when many inserted cells inherit the same row's custom format.
+        // Style zero is present in the fixture and needs no cell attribute.
+        let style = "0".repeat(64 * 1024);
+        let prefix = format!(
+            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1' customFormat='1' s='{style}'>"
+        );
+        let suffix = "</row></sheetData></worksheet>";
+        let sheet = format!("{prefix}{suffix}");
+        let mut expected = prefix;
+        let mut edits = Vec::new();
+        for column in 1..=1_024 {
+            let cell = CellRef::new(1, column).unwrap();
+            write!(expected, "<c r=\"{cell}\"><v>{column}</v></c>").unwrap();
+            edits.push((cell, CellValue::from(i32::from(column))));
+        }
+        expected.push_str(suffix);
+        edit_case(
+            samples,
+            "row_style_bulk_at",
+            sheet.as_bytes(),
+            expected.as_bytes(),
             0,
             &edits,
         );
@@ -703,6 +817,33 @@ fn extra_workloads(samples: usize) {
             edits.len(),
             samples,
             measure(samples, "multisheet_apply", run),
+        );
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "control_text") {
+        // Each cell holds exactly Excel's 32,767 UTF-16 units. Its XML spells
+        // every character as an escape, exercising output growth and formatting.
+        let text = "\0\u{1}\u{1f}\u{fffe}\u{ffff}".repeat(6_553) + "\0\u{1}";
+        let escaped = "_x0000__x0001__x001F__xFFFE__xFFFF_".repeat(6_553) + "_x0000__x0001_";
+        let sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let mut rows = String::from("<sheetData>");
+        let mut edits = Vec::new();
+        for row in 1..=64 {
+            let cell = CellRef::new(row, 1).unwrap();
+            write!(
+                rows,
+                "<row r=\"{row}\"><c r=\"{cell}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{escaped}</t></is></c></row>"
+            )
+            .unwrap();
+            edits.push((cell, CellValue::Text(text.clone())));
+        }
+        rows.push_str("</sheetData>");
+        edit_case(
+            samples,
+            "control_text_bulk_at",
+            sheet.as_bytes(),
+            sheet.replace("<sheetData/>", &rows).as_bytes(),
+            0,
+            &edits,
         );
     }
 }
@@ -887,6 +1028,9 @@ fn main() {
     }
     if selected("SHEETPATCH_BENCH_CASES", "guarded") {
         guarded_batches(samples);
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "tables") {
+        table_batches(samples);
     }
     extra_workloads(samples);
 }

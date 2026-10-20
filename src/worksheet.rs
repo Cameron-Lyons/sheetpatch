@@ -1,5 +1,5 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
-use crate::xml::{namespace as decoded_namespace, valid_char as valid_xml_char};
+use crate::xml::namespace as decoded_namespace;
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -34,6 +34,17 @@ impl<'xml> PreparedWorksheet<'xml> {
     /// The address of every `<c>` element, in row-major order.
     pub(crate) fn cells(&self) -> impl ExactSizeIterator<Item = CellRef> + '_ {
         self.index.cells.iter().map(|&(cell, _)| cell)
+    }
+
+    /// Reads one cell without allocating a batch result. The shared-string
+    /// loader is called only when the cell refers to that table.
+    pub(crate) fn read_cell<'strings>(
+        &self,
+        cell: CellRef,
+        mut shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+        date1904: bool,
+    ) -> std::result::Result<CellContent, ReadError> {
+        read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
     }
 
     /// Reads cells in request order. Shared strings are loaded at most once,
@@ -109,6 +120,7 @@ pub(crate) mod protection {
     pub(crate) const TABLE_HEADER: &str = "is an Excel table header cell; \
         editing it would desynchronize the table's column names";
     pub(crate) const VALUE_METADATA: &str = "has value metadata (a linked or rich data type)";
+    pub(crate) const CELL_METADATA: &str = "has cell metadata with unsupported edit semantics";
 }
 
 // A protected-cell refusal. The worksheet's name is not known here: the
@@ -148,14 +160,6 @@ fn unique<T>(mut items: impl Iterator<Item = T>, message: &'static str) -> Resul
         return Err(unsupported(message));
     }
     Ok(first)
-}
-
-fn decoded(input: &str) -> Result<String> {
-    let value = quick_xml::escape::unescape(input).map_err(|e| xml_error(e.to_string()))?;
-    if !value.chars().all(valid_xml_char) {
-        return Err(xml_error("invalid XML character reference"));
-    }
-    Ok(value.into_owned())
 }
 
 #[cfg(test)]

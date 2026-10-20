@@ -1,7 +1,7 @@
 use super::date::{DateError, excel_serial};
 use super::index::WorksheetIndex;
 use super::parse::{Element, NamespaceId, XmlDocument, parse_with};
-use super::{ReadError, at_cell, decoded, invalid, unique, unsupported, xml_error};
+use super::{ReadError, at_cell, invalid, unique, unsupported, xml_error};
 use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
@@ -41,8 +41,7 @@ pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
                 text.push_str(&value.xml10_content());
             }
             Event::GeneralRef(reference) => {
-                let name = reference.as_ref();
-                text.push_str(&decoded(&format!("&{name};"))?);
+                crate::xml::reference(&reference)?.append_to(&mut text);
             }
             Event::Comment(_) | Event::PI(_) => {}
             Event::Eof => return Ok(text),
@@ -55,12 +54,11 @@ pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     }
 }
 
-pub(super) fn rich_text(
-    xml: &[u8],
+pub(super) fn validate_rich_text_structure(
     elements: &[Element],
     index: usize,
     namespace: NamespaceId,
-) -> Result<String> {
+) -> Result<()> {
     // Ignoring text hidden in compatibility branches or other containers would
     // return an incomplete scalar value. Phonetic text is a known, separate
     // annotation and remains excluded from the displayed text.
@@ -78,7 +76,29 @@ pub(super) fn rich_text(
         {
             return Err(unsupported("rich text inside an unsupported XML container"));
         }
+        // CT_RElt permits one text element. Consumers can keep only the last
+        // duplicate, so concatenating them would give reads and no-op detection
+        // a different value. Each run's immediate children are scanned once.
+        if element.is(namespace, "r")
+            && element
+                .children(elements)
+                .filter(|&child| elements[child].is(namespace, "t"))
+                .nth(1)
+                .is_some()
+        {
+            return Err(unsupported("rich text run has multiple text elements"));
+        }
     }
+    Ok(())
+}
+
+pub(super) fn rich_text(
+    xml: &[u8],
+    elements: &[Element],
+    index: usize,
+    namespace: NamespaceId,
+) -> Result<String> {
+    validate_rich_text_structure(elements, index, namespace)?;
     let mut text = String::new();
     let mut append = |element: &Element| -> Result<()> {
         let piece = element_text(xml, element)?;
@@ -124,19 +144,27 @@ fn is_string_table(document: &XmlDocument) -> bool {
 pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     let mut strings = Vec::new();
     let mut hidden_string = false;
+    let mut mixed_namespace = false;
     let mut decode_error = None;
     let document = parse_with(xml, |document, index| {
-        if hidden_string || !is_string_table(document) {
+        if hidden_string || mixed_namespace || !is_string_table(document) {
             return true;
         }
         let elements = &document.elements;
         let namespace = elements[0].namespace;
         // Every element below the root arrives in exactly one released
         // subtree, as the child itself or one of its descendants.
-        hidden_string = elements[elements[index].descendants()]
-            .iter()
-            .any(|element| element.is(namespace, "si"));
-        if !hidden_string && decode_error.is_none() && elements[index].is(namespace, "si") {
+        for current in std::iter::once(index).chain(elements[index].descendants()) {
+            let element = &elements[current];
+            mixed_namespace |= element.namespace != namespace
+                && document.is_spreadsheet_namespace(element.namespace);
+            hidden_string |= current != index && element.is(namespace, "si");
+        }
+        if !hidden_string
+            && !mixed_namespace
+            && decode_error.is_none()
+            && elements[index].is(namespace, "si")
+        {
             match rich_text(xml, elements, index, namespace) {
                 Ok(text) => strings.push(text),
                 Err(error) => decode_error = Some(error),
@@ -146,6 +174,11 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     })?;
     if !is_string_table(&document) {
         return Err(unsupported("expected an OOXML shared-string table"));
+    }
+    if mixed_namespace {
+        return Err(unsupported(
+            "shared-string table mixes strict and transitional SpreadsheetML namespaces",
+        ));
     }
     if hidden_string {
         return Err(unsupported("shared string outside the shared-string table"));

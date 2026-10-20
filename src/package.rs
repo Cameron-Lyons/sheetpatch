@@ -151,6 +151,9 @@ impl SheetVisibility {
 /// - **Cells with value metadata** (a `vm` attribute), such as linked data
 ///   types and other rich values, whose metadata describes the current value.
 ///   Writing the current value again is allowed.
+/// - **Cells with cell metadata** (a `cm` attribute), whose metadata can require
+///   removal or other handling when its value is edited or cleared. These
+///   metadata rules are not interpreted; writing the current value again is allowed.
 ///
 /// These edits return [`Error::Unsupported`]:
 ///
@@ -190,8 +193,8 @@ pub struct Workbook {
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
-    // Permissions and group of the file this workbook was opened from, used
-    // for new save destinations so a copy is not more permissive.
+    // Permission bits and group of the file this workbook was opened from,
+    // used as the basis for new save destinations. ACLs are not copied.
     source_permissions: Option<SourcePermissions>,
 }
 
@@ -347,7 +350,13 @@ impl WorksheetView<'_> {
     ///
     /// Fails like [`Self::get_cell`], other than for the address.
     pub fn get_cell_at(&self, cell: CellRef) -> Result<CellContent> {
-        Ok(self.read_cells(&[cell])?.remove(0))
+        self.worksheet
+            .read_cell(
+                cell,
+                || self.workbook.shared_strings(),
+                self.workbook.date1904,
+            )
+            .map_err(|error| self.sheet.read_context(error))
     }
 
     /// Read multiple addresses, retaining input order and duplicate requests.
@@ -688,13 +697,18 @@ impl Workbook {
             ));
         }
         let mut staged = Vec::with_capacity(grouped.size_hint().0);
+        let mut loaded_shared_strings = None;
         for (index, cells) in grouped {
             let in_sheet = |error| self.sheets[index].context(error);
             let original = self.original_sheet(index).map_err(in_sheet)?;
             let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
             // Shared strings only recognize rewriting a cell's current text,
             // so a table that cannot be loaded leaves such an edit a change.
-            let shared_strings = || self.shared_strings().ok().flatten();
+            // The immutable table can fail only the same way on every sheet;
+            // remember that optional result for this transaction as well.
+            let shared_strings = || {
+                *loaded_shared_strings.get_or_insert_with(|| self.shared_strings().ok().flatten())
+            };
             let Cow::Owned(patched) =
                 patch_cells(current, &cells, shared_strings, self.date1904).map_err(in_sheet)?
             else {
@@ -728,23 +742,40 @@ impl Workbook {
     ) -> Result<()> {
         let sheet = &self.sheets[index];
         let headers = self.table_headers(index)?;
-        let (header_cells, values): (Vec<CellRef>, Vec<&CellValue>) = cells
-            .iter()
-            .filter(|(cell, _)| headers.iter().any(|header| header.contains(**cell)))
-            .unzip();
+        // Edits are ordered by row and column. Search only the rows occupied
+        // by each header instead of testing every edit against every table.
+        // Keep one sorted entry per cell so overlapping headers retain the
+        // same read and refusal order as ordinary worksheet batches.
+        let mut header_cells = BTreeMap::new();
+        for header in headers {
+            header_cells.extend(
+                cells
+                    .range(header.first()..=header.last())
+                    .filter(|(cell, _)| header.contains(**cell)),
+            );
+        }
         if header_cells.is_empty() {
             return Ok(());
         }
-        let current = read_cells(xml, &header_cells, || self.shared_strings(), self.date1904)
-            .map_err(|error| sheet.read_context(error))?;
-        for ((&cell, value), current) in header_cells.iter().zip(values).zip(current) {
+        let worksheet = PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?;
+        let mut changed_header = None;
+        // Keep one value at a time: many headers can refer to the same long
+        // shared string. Validate all reads before reporting the first changed
+        // header, preserving read-error precedence without retaining copies.
+        for (&cell, value) in header_cells {
+            let current = worksheet
+                .read_cell(cell, || self.shared_strings(), self.date1904)
+                .map_err(|error| sheet.read_context(error))?;
             if current.value != *value {
-                return Err(Error::ProtectedCell {
-                    sheet: sheet.name.clone(),
-                    cell,
-                    reason: protection::TABLE_HEADER.into(),
-                });
+                changed_header.get_or_insert(cell);
             }
+        }
+        if let Some(cell) = changed_header {
+            return Err(Error::ProtectedCell {
+                sheet: sheet.name.clone(),
+                cell,
+                reason: protection::TABLE_HEADER.into(),
+            });
         }
         Ok(())
     }
@@ -1013,14 +1044,19 @@ impl Workbook {
     /// before output is generated. Both cases return an [`Error::Io`] of kind
     /// [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
     /// replaced by the new file rather than written through.
-    /// An existing destination keeps its permissions; on Unix it also keeps its
-    /// group when the process may assign it. Otherwise group access is removed,
-    /// and other access is limited to permissions shared by the original group
-    /// and others, so members of the original group cannot gain access.
+    /// An existing destination keeps its permission bits; on Unix it also keeps
+    /// its group when the process may assign it. Otherwise group bits are cleared,
+    /// and other permission bits are limited to those shared by the original
+    /// group and others.
     /// On Unix, a new destination for a workbook read by [`Self::open`] is
-    /// created with the source file's permissions, restricted by the umask,
+    /// created using the source file's permission bits as its creation mode,
+    /// subject to the operating system's umask or default ACL rules,
     /// and the same group rule: it gets the source file's group when the
-    /// process may assign it, and otherwise no group access. Setuid, setgid
+    /// process may assign it, and otherwise its group bits are cleared.
+    /// Owner, ACLs, and extended attributes are not copied. A directory's default
+    /// ACL can grant additional users access to new and replacement files,
+    /// even when their permission bits match the original; on Linux it takes
+    /// precedence over the umask. Setuid, setgid
     /// and sticky bits are never applied; writing the contents would clear
     /// setuid and setgid anyway.
     ///

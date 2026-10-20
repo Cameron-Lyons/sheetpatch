@@ -222,6 +222,11 @@ and a tab gives patch rows for single-line values of cells without formulas.
 `cells --json` returns the same objects as `get --json`. An empty worksheet prints
 nothing, or `[]`.
 
+Both commands validate all requested values before printing. Large reads then
+emit values individually from the prepared worksheet. A cache limited by both
+cell count and decoded bytes keeps small reads fast without letting repeated or
+oversized stored strings multiply memory use.
+
 `list` prints worksheet names in workbook order, hidden ones included.
 `list --json` returns objects with `name`, package `path`, and `visibility`
 (`visible`, `hidden`, or `veryHidden`).
@@ -244,15 +249,18 @@ and tab-free lines beginning with `#` are ignored. Literal multiline values use
 the Rust API. Invalid rows and rows naming a missing worksheet report their line
 number; an edit refused for a protected cell names the last line for that cell,
 as in `Patch line 5: protected cell: worksheet "Summary": D2 contains a formula`.
-Any error leaves the destination unchanged.
+Every input row is validated, but only the final value for each cell is retained,
+so repeated edits do not accumulate discarded text in memory. Any error leaves
+the destination unchanged.
 
 `patch --check` validates the complete transaction and output generation,
 including worksheet names, formula and table-header protection, merged ranges,
-value metadata, and ZIP size limits, without saving. It reports the number of
-input edit rows, including duplicates. The same patch can then be applied with
-`patch INPUT OUTPUT PATCH.tsv`. Check mode returns the same validation errors as
-an actual edit. Generated ZIP bytes are streamed to a sink; no complete output
-archive is allocated or written to disk. An empty patch succeeds for a supported workbook.
+cell and value metadata, and ZIP size limits, without saving. It reports the
+number of input edit rows, including duplicates. The same patch can then be
+applied with `patch INPUT OUTPUT PATCH.tsv`. Check mode returns the same
+validation errors as an actual edit. Generated ZIP bytes are streamed to a sink;
+no complete output archive is allocated or written to disk. An empty patch
+succeeds for a supported workbook.
 
 ### Arguments, streams, and exit codes
 
@@ -279,6 +287,9 @@ and other invalid input prints one line pointing to `sheetpatch help COMMAND`.
 Workbook errors, missing worksheets, and I/O errors exit with code 1; I/O
 messages name the path or stream, as in `cannot save 'edited.xlsm': …`.
 Native filesystem paths are accepted even when they cannot be represented as Unicode.
+Diagnostics written to a terminal escape control characters other than tab and
+line feed, so paths and workbook metadata cannot send terminal-control commands.
+Redirected diagnostics retain their original text.
 
 Text output (`list`, `get`, `cells`, help, and `patch --check`) ends quietly with
 code 0 when its reader closes the pipe, as `head` does; other write failures, such
@@ -299,20 +310,24 @@ the destination. The destination must name a file: a path without a file name,
 and an existing directory, FIFO, device, or socket (also behind a symlink),
 return `Error::Io` of kind `InvalidInput` before any output is generated.
 
-Existing destination permissions are applied to the temporary file before
+Existing destination permission bits are applied to the temporary file before
 workbook contents are written. On Unix the replacement also keeps the
-destination's group when the user may assign it; otherwise it gets no group
-permissions, and other permissions are limited to those shared by the original
-group and others, so members of the original group cannot gain access. Owner,
-ACLs, and extended attributes are not preserved, because the
-replacement is a new file. On Unix, a new destination saved from a workbook
+destination's group when the user may assign it; otherwise its group bits are
+cleared, and its other bits are limited to those shared by the original group
+and others. On Unix, a new destination saved from a workbook
 opened with `Workbook::open`, including CLI outputs from an input file, is created
-with the input's permission bits restricted by the umask, as `cp` does, so it is
-never more permissive than the input. It gets the input's group when the user
-may assign it, and otherwise uses the same restricted group and other
-permissions. `from_bytes`, `from_reader`,
-and standard input use the default mode. Setuid, setgid, and sticky bits are
-never kept, on new or replaced files. Saves replace the destination directory
+using the input's permission bits as its creation mode, subject to the operating
+system's umask or default ACL rules. It uses the same group rule.
+`from_bytes`, `from_reader`, and standard input use the default mode.
+
+Owner, ACLs, and extended attributes are not copied. Both new and replacement
+files can inherit the destination directory's default ACL, which can grant
+access to additional users even when the permission bits match the original.
+On Linux, a default ACL takes precedence over the umask; see
+[`umask(2)`](https://man7.org/linux/man-pages/man2/umask.2.html).
+
+Setuid, setgid, and sticky bits are never kept, on new or replaced files.
+Saves replace the destination directory
 entry: an output symlink to a regular file is replaced rather than written
 through, and hard links to the old file keep the old contents. On Unix, like
 `sed -i`, a save replaces a read-only destination as long as its directory is
@@ -364,6 +379,10 @@ in cached results. The original workbook's calculation settings are retained.
   only be preserved untouched. Workbooks are held in memory; `Workbook::open`,
   `Workbook::from_reader`, and CLI standard input refuse input larger than the
   largest possible ZIP32 archive, about 8 GiB.
+- ZIP member names must be UTF-8; non-ASCII names also require the ZIP UTF-8 flag
+  in both headers. Without that flag, readers can interpret the same bytes as
+  different names. Legacy filename encodings are unsupported; see the
+  [ZIP encoding specification, Appendix D](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT).
 - Archives that other ZIP readers could interpret differently are rejected:
   an end-of-central-directory signature after the real record with room for a
   complete end record before the end of the file (for example, inside the
@@ -378,7 +397,12 @@ in cached results. The original workbook's calculation settings are retained.
   layouts return an error before applying changes.
 - Unambiguous workbook metadata: invalid sheet `state` or `date1904` values, more
   than one `workbookPr`, and duplicate worksheet targets are rejected when
-  opening. XML nested deeper than 256 elements is unsupported.
+  opening. `workbookPr` inside a markup-compatibility branch or a matching
+  `mc:ProcessContent` wrapper is unsupported, since processing that content
+  could change the date system. Mixed strict and transitional SpreadsheetML in
+  workbook metadata, worksheets, or shared strings is unsupported, since
+  ignoring the other dialect could omit data or bypass edit protections.
+  XML nested deeper than 256 elements is unsupported.
 - Formula cells and shared, array, or data-table formula ranges are protected
   against overwriting. Existing formulas remain untouched. Formula creation,
   structural edits, style creation, and calculation are outside this version's scope.
@@ -398,6 +422,10 @@ in cached results. The original workbook's calculation settings are retained.
 - Cells with value metadata (`vm`, including linked and rich data types) are
   preserved; edits that would change their scalar value or representation are
   refused so metadata cannot remain attached to a replacement value.
+- Cells with cell metadata (`cm`) are also protected against changes, since
+  their metadata can require removal when values are edited or cleared.
+  Metadata-specific edit rules are not interpreted. Reads and exact no-op
+  writes remain available.
 - Merged cells can be edited through their top-left anchor. Other cells in a
   merged range are protected.
 - Cell values, formulas, and merged ranges inside unsupported XML containers
@@ -407,6 +435,10 @@ in cached results. The original workbook's calculation settings are retained.
   unfamiliar cell attributes and sibling elements are preserved.
 - String reads refuse hidden text or shared-string entries in unsupported XML
   containers, preventing partial values or shifted shared-string indices.
+  Multiple text elements within a single rich-text run are also unsupported,
+  since spreadsheet readers can interpret them differently.
+  Edits also refuse inline strings with hidden rich text, preserving content
+  that cannot be interpreted safely.
 - Legacy `.xls` and password-encrypted workbooks (OLE compound files) are
   detected and return `Error::Unsupported`, as do binary `.xlsb`, encrypted ZIP
   entries, ZIP64, multi-disk ZIP, and XML DTDs. Digitally signed OOXML packages
@@ -476,27 +508,47 @@ Python package dependency.
 Batch edits parse each affected worksheet once and apply all XML changes in one
 pass. Formula and merged-range guards use direct membership checks for small
 collections of edits or ranges. Larger batches exclude ranges outside the edited
-cells' bounding rectangle before allocating a sweep index. Indexed ZIP/sheet
-lookup and cached decompression avoid repeated archive scans, and ZIP physical
-order is cached for repeated saves.
+cells' bounding rectangle before allocating a sweep index. Table-header guards
+search the ordered edits within each header's bounds, avoiding a comparison of
+every edited cell against every table, and compare current header values one
+at a time. Repeated table targets reuse their resolved paths, and relationships
+with different URI spellings still parse each distinct table part once.
+Inserted cells resolve their row's default style once, while column defaults
+remain specific to each column. Row defaults are validated only when needed.
+Indexed ZIP/sheet lookup and cached decompression avoid repeated archive scans,
+and ZIP physical order is cached for repeated saves.
 
 Worksheet parsing borrows names and attribute values from the original XML and
 reads each element's attributes in a single pass into compact records with
 32-bit offsets. Direct children use ranges in the parse index, attributes and row
 cells use shared buffers, and normalized namespace URIs use compact identifiers.
+Namespace resolution reuses active prefix bindings across descendants and
+restores cached parent bindings after nested declarations. Package attribute
+checks reuse cached URI fingerprints and still compare exact namespace names.
 One patch plan applies payload and attribute changes directly to worksheet spans;
 unchanged cell extensions are copied only into the final output. Edits that
 leave a worksheet unchanged retain its current XML without copying it. Shared
 strings are decoded while streaming, releasing each entry's XML as it completes,
-and package discovery validates whole parts but retains only the elements it
-needs. Prepared worksheet views reuse a validated index across reads, with
-retention controlled by the view's lifetime.
+and Excel text escapes are decoded without converting ordinary UTF-8 to a
+temporary UTF-16 buffer. Numeric and predefined XML text references are decoded
+directly, avoiding temporary strings for each reference. Writing XML-forbidden
+characters appends Excel escapes directly to the output buffer.
+Package discovery validates whole parts but retains
+only the elements it needs. For unchanged-value comparisons, multi-sheet edits
+attempt shared-string loading once per transaction, including when the table is
+damaged. Prepared worksheet views reuse a validated index
+across reads, with retention controlled by the view's lifetime; single-cell
+reads avoid allocating a batch result. CLI reads cache at most 128 decoded cells
+and 4 MiB of text and formula storage. Values beyond that cache are validated
+before printing and then read individually for output.
 
 Streaming saves borrow ZIP metadata and hold one replacement compressed part at
 a time, in addition to the input archive, cached original XML, and pending
 worksheet XML. Changed parts resolve to archive entry indexes once per save, and
 normal and compact saves share one record emitter with their respective
-gap-preservation rules. Replacement parts are recompressed with Deflate level 4,
+gap-preservation rules. Compaction searches for obsolete record boundaries only
+in gaps between validated active records, so active payload bytes do not become
+descriptor candidates. Replacement parts are recompressed with Deflate level 4,
 the fastest level that keeps lazy matching; untouched parts keep their original
 compressed bytes.
 
@@ -509,11 +561,14 @@ SHEETPATCH_BENCH_SAMPLES=3 cargo bench --locked --bench editing
 The harness independently checks expected worksheet XML and untouched compressed
 ZIP parts before measuring, and compares sequential edits, batching, streaming,
 compaction, batch reads, prepared reads, and unchanged batches. It also exercises
-wide rows, unfamiliar cell extensions, shared strings, new-row insertion, and
-multiple worksheets. Use `SHEETPATCH_BENCH_CASES` to select comma-separated cases
+wide rows, unfamiliar cell extensions, shared strings, new-row insertion,
+multiple worksheets, bulk edits across thousands of tables, row-style inheritance,
+and text requiring many Excel escapes.
+Use `SHEETPATCH_BENCH_CASES` to select comma-separated cases
 (`narrow_10000`, `narrow_50000`, `guarded`, `wide`, `opaque`, `shared_strings`,
-`insertion`, `multisheet`) and `SHEETPATCH_BENCH_OPERATIONS` to select exact
-operation names printed by the harness. For example:
+`insertion`, `multisheet`, `tables`, `row_style`, `control_text`) and
+`SHEETPATCH_BENCH_OPERATIONS` to select exact operation names printed by the
+harness. For example:
 
 ```sh
 SHEETPATCH_BENCH_CASES=narrow_50000 \

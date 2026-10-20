@@ -216,6 +216,104 @@ fn tables_without_a_header_row_leave_the_first_row_editable() {
 }
 
 #[test]
+fn multiple_tables_keep_header_columns_and_cell_error_order() {
+    let mut parts = parts("ref='B1:C3' headerRowCount='3'");
+    let relationships = parts.get_mut(SHEET_RELS).unwrap();
+    *relationships = relationships.replace(
+        "</Relationships>",
+        &format!(
+            "<Relationship Id='other' Type='{OFFICE_NS}/table' Target='../tables/table2.xml'/></Relationships>"
+        ),
+    );
+    parts.insert(
+        "xl/tables/table2.xml".into(),
+        format!(
+            "<table xmlns='{MAIN_NS}' id='2' name='Other' displayName='Other' ref='A1:A3'><tableColumns count='1'><tableColumn id='1' name='Name'/></tableColumns></table>"
+        ),
+    );
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace(
+        "<tableParts count='1'><tablePart r:id='table'/></tableParts>",
+        "<tableParts count='2'><tablePart r:id='table'/><tablePart r:id='other'/></tableParts>",
+    );
+    let mut book = book(&parts);
+    // Both cells lie between the header's first and last rows, but outside
+    // its columns. A2 is also in the other table's editable body.
+    book.set_cells("Data", [("A2", "left"), ("D2", "right")])
+        .unwrap();
+    let pending = book.to_bytes().unwrap();
+    assert_refused(book.set_cell("Data", "B2", "changed"), "B2");
+    assert_refused(book.set_cell("Data", "C3", "changed"), "C3");
+    // Neither relationship order nor input order changes the first refusal.
+    assert_refused(
+        book.set_cells("Data", [("C1", "changed"), ("A1", "changed")]),
+        "A1",
+    );
+    assert_eq!(book.to_bytes().unwrap(), pending);
+}
+
+#[test]
+fn later_header_read_errors_take_precedence_over_changed_headers() {
+    for (second_header, problem) in [
+        (
+            "<c r='B1' t='inlineStr' s='bad'><is><t>Amount</t></is></c>",
+            "B1: invalid cell style index",
+        ),
+        (
+            "<c r='B1' t='s'><v>1</v></c>",
+            "B1: shared-string index 1 is out of bounds",
+        ),
+    ] {
+        let mut parts = parts("ref='A1:B3'");
+        let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+        *sheet = sheet.replace(
+            "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+            second_header,
+        );
+        let mut book = book(&parts);
+        book.set_cell("Notes", "A1", 2).unwrap();
+        let pending = book.to_bytes().unwrap();
+        let error = book
+            .set_cells("Data", [("B1", "second change"), ("A1", "first change")])
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message)
+                if message.starts_with("worksheet \"Data\": ") && message.contains(problem)),
+            "{error}"
+        );
+        assert_eq!(book.to_bytes().unwrap(), pending);
+    }
+
+    // A later header can also fail while loading its separate shared-string
+    // part; that error retains the part's context and outranks the first edit.
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet
+        .replace(
+            "<c r='A1' t='s'><v>0</v></c>",
+            "<c r='A1' t='inlineStr'><is><t>Name</t></is></c>",
+        )
+        .replace(
+            "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+            "<c r='B1' t='s'><v>0</v></c>",
+        );
+    parts.insert(
+        "xl/sharedStrings.xml".into(),
+        format!("<sst xmlns='{MAIN_NS}'>"),
+    );
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    let error = book
+        .set_cells("Data", [("A1", "first change"), ("B1", "second change")])
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Xml(message) if message.starts_with("part \"xl/sharedStrings.xml\": ")),
+        "{error}"
+    );
+    assert_eq!(book.to_bytes().unwrap(), original);
+}
+
+#[test]
 fn strict_table_relationships_and_namespaces_are_recognized() {
     let mut parts = parts("ref='A1:B3'");
     let rels = parts[SHEET_RELS].replace(
@@ -231,6 +329,137 @@ fn strict_table_relationships_and_namespaces_are_recognized() {
     let mut book = self::book(&parts);
     assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
     book.set_cell("Data", "B2", 1).unwrap();
+}
+
+#[test]
+fn repeated_table_targets_keep_protection_and_relationship_error_order() {
+    let mut parts = parts("ref='A1:B3'");
+    let aliases = [
+        "../tables/table1.xml",
+        "../tables/table1.xml",
+        "../tables/./table1.xml",
+        "../tables/./table1.xml",
+        "../tables/%74able1.xml",
+        "/XL/TABLES/TABLE1.XML",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, target)| {
+        format!("<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{target}'/>")
+    })
+    .collect::<String>();
+    let rels = parts.get_mut(SHEET_RELS).unwrap();
+    *rels = rels.replace("</Relationships>", &format!("{aliases}</Relationships>"));
+
+    let original = archive(&parts);
+    let mut book = self::book(&parts);
+    assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+
+    // A duplicate target must not hide invalid relationship metadata. All
+    // relationships are parsed first, then target and table errors keep
+    // document order, ahead of a header cell's edit refusal.
+    for (late, broken_table, part, problem) in [
+        (
+            "Target='../tables/table1.xml' TargetMode='External'",
+            false,
+            SHEET_RELS,
+            "table relationship late is external",
+        ),
+        (
+            "Target='../../../outside.xml'",
+            false,
+            SHEET_RELS,
+            "relationship target escapes package root",
+        ),
+        (
+            "Target='../tables/missing.xml'",
+            false,
+            SHEET_RELS,
+            "missing table part",
+        ),
+        (
+            "Target='../tables/table1%xx.xml'",
+            false,
+            SHEET_RELS,
+            "invalid percent-encoded target",
+        ),
+        (
+            "Target='../tables/table1.xml' TargetMode='External'",
+            true,
+            TABLE_PATH,
+            "table has an invalid ref",
+        ),
+        (
+            "Target='../tables/table1.xml' TargetMode='invalid'",
+            true,
+            SHEET_RELS,
+            "invalid relationship TargetMode",
+        ),
+    ] {
+        let mut damaged = parts.clone();
+        let rels = damaged.get_mut(SHEET_RELS).unwrap();
+        *rels = rels.replace(
+            "</Relationships>",
+            &format!("<Relationship Id='late' Type='{OFFICE_NS}/table' {late}/></Relationships>"),
+        );
+        if broken_table {
+            let table = damaged.get_mut(TABLE_PATH).unwrap();
+            *table = table.replace("ref='A1:B3'", "ref='bad'");
+        }
+        let original = archive(&damaged);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        let error = book.set_cell("Data", "B1", "Total").unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message)
+                if message.starts_with(&format!("part {part:?}: ")) && message.contains(problem)),
+            "{late}, {broken_table}: {error}"
+        );
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+}
+
+#[test]
+fn many_repeated_table_targets_share_long_source_uris() {
+    let mut parts = parts("ref='A1:B3'");
+    let directory = format!("xl/{}", "nested".repeat(10_000));
+    let worksheet_path = format!("{directory}/sheet1.xml");
+    let relationships_path = format!("{directory}/_rels/sheet1.xml.rels");
+    let table_path = format!("{directory}/table1.xml");
+    let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+    parts.insert(worksheet_path, worksheet);
+    let table = parts.remove(TABLE_PATH).unwrap();
+    parts.insert(table_path, table);
+    let relationships = parts.remove(SHEET_RELS).unwrap();
+    let aliases = (0..1024)
+        .map(|index| {
+            format!(
+                "<Relationship Id='repeat{index}' Type='{OFFICE_NS}/table' Target='table1.xml'/>"
+            )
+        })
+        .collect::<String>();
+    parts.insert(
+        relationships_path,
+        relationships
+            .replace("../tables/table1.xml", "table1.xml")
+            .replace("</Relationships>", &format!("{aliases}</Relationships>")),
+    );
+    let workbook_relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *workbook_relationships = workbook_relationships.replace(
+        "Target='worksheets/sheet1.xml'",
+        &format!("Target='/{directory}/sheet1.xml'"),
+    );
+
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
 }
 
 #[test]

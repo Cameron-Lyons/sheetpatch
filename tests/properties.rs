@@ -252,7 +252,7 @@ fn text_fragment(rng: &mut Rng) -> String {
             rng.below(0x1_0000),
             control_character(rng)
         ),
-        // A literal, well-formed escape token in either case.
+        // A literal, well-formed escape token with lowercase hexadecimal digits.
         3 => format!("_x{:04x}_", rng.below(0x1_0000)),
         _ => rng.pick(TEXT_PIECES).to_string(),
     }
@@ -438,7 +438,7 @@ struct SheetModel {
     formula_cells: BTreeSet<CellRef>,
     formula_ranges: Vec<CellRange>,
     merges: Vec<CellRange>,
-    /// Cells with value metadata, which may only be "rewritten" unchanged.
+    /// Cells with cell or value metadata, which may only be "rewritten" unchanged.
     metadata_cells: BTreeSet<CellRef>,
     /// Cells whose value payload holds a comment, which no edit may discard.
     opaque_cells: BTreeSet<CellRef>,
@@ -536,7 +536,7 @@ const SOURCE_TEXTS: &[(&str, &str)] = &[
     ),
     ("Page_x000C_Break_x0009_", "Page\u{c}Break\t"),
     ("_x005F_x0041_ stays literal", "_x0041_ stays literal"),
-    ("_x0041__X0042_", "AB"),
+    ("_x0041__X0042_", "A_X0042_"),
     ("_xD83D__xDE00_ pair", "\u{1f600} pair"),
     ("line&#10;break&#13;", "line\nbreak\r"),
     ("crlf\r\nand cr\rbecome lf", "crlf\nand cr\nbecome lf"),
@@ -1162,8 +1162,9 @@ fn generate_sheet(
                 attributes.push(("vm".into(), "1".into()));
                 model.metadata_cells.insert(address);
             }
-            if rng.chance(1, 10) {
-                attributes.push(("cm".into(), "1".into()));
+            if rng.chance(1, 10) && !matches!(expected.value, CellValue::Blank) {
+                attributes.push(("cm".into(), rng.pick(&["0", "1"]).to_string()));
+                model.metadata_cells.insert(address);
             }
             if rng.chance(1, 10) {
                 attributes.push(("v:keep".into(), "yes".into()));
@@ -1731,14 +1732,18 @@ fn spelling(rng: &mut Rng) -> Spelling {
 /// only "rewritten" with their current value.
 fn accepted_edit(rng: &mut Rng, sheets: &[SheetModel], sheet: usize, allow_long: bool) -> Edit {
     let model = &sheets[sheet];
+    let available = |cell| {
+        !model.protected(cell)
+            && (!model.metadata_cells.contains(&cell) || valid_value(&model.expected(cell).value))
+    };
     let mut target = pick_cell(rng, model);
     for _ in 0..32 {
-        if !model.protected(target) {
+        if available(target) {
             break;
         }
         target = pick_cell(rng, model);
     }
-    if model.protected(target) {
+    if !available(target) {
         // Ranges never extend more than two rows past the generated grid.
         target = cell(model.extent.0 + 3, 1);
     }

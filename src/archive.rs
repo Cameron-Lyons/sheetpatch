@@ -36,6 +36,7 @@ const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DESCRIPTOR: u16 = 0x0008;
 const FLAG_PATCHED: u16 = 0x0020;
 const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
+const FLAG_UTF8: u16 = 0x0800;
 const FLAG_MASKED_HEADERS: u16 = 0x2000;
 // Patched data is not encryption: active patched members stay opaque, while
 // compaction refuses to discard obsolete ones (`FLAG_PATCHED` at those sites).
@@ -378,6 +379,17 @@ fn central_directory(bytes: &[u8], end: usize) -> Result<(usize, u16)> {
     Ok((central_start, count))
 }
 
+fn member_name(raw_name: &[u8], flags: u16) -> Result<&str> {
+    // Without bit 11, ZIP readers can decode these bytes as CP437 instead of
+    // UTF-8, even when the bytes happen to be valid UTF-8.
+    if flags & FLAG_UTF8 == 0 && !raw_name.is_ascii() {
+        return Err(unsupported(
+            "non-ASCII ZIP member names require the UTF-8 flag",
+        ));
+    }
+    std::str::from_utf8(raw_name).map_err(|_| unsupported("ZIP member names must be UTF-8"))
+}
+
 fn central_header(bytes: &[u8], position: usize, end: usize) -> Result<CentralHeader<'_>> {
     if add(position, CENTRAL_HEADER_LEN)? > end || u32_at(bytes, position)? != CENTRAL {
         return Err(invalid("truncated or invalid ZIP central-directory entry"));
@@ -412,8 +424,7 @@ fn central_header(bytes: &[u8], position: usize, end: usize) -> Result<CentralHe
             "ZIP central-directory entry exceeds directory bounds",
         ));
     }
-    let name = std::str::from_utf8(&bytes[name_start..name_end])
-        .map_err(|_| unsupported("ZIP member names must be UTF-8"))?;
+    let name = member_name(&bytes[name_start..name_end], flags)?;
     Ok(CentralHeader {
         flags,
         method,
@@ -945,7 +956,7 @@ impl Archive {
         if header.compressed_size == u32::MAX || header.size == u32::MAX {
             return Err(opaque());
         }
-        let name = std::str::from_utf8(raw_name).map_err(|_| opaque())?;
+        let name = member_name(raw_name, flags)?;
         let Some(&index) = self.index.get(name) else {
             return Err(opaque());
         };
@@ -996,13 +1007,30 @@ impl Archive {
     fn stored_descriptors(&self) -> StoredDescriptors {
         let mut descriptors = HashMap::new();
         let local_signature = LOCAL.to_le_bytes();
-        let boundaries = self.original[..self.central_start]
-            .windows(4)
-            .enumerate()
-            .filter(|(_, bytes)| *bytes == local_signature)
-            .map(|(offset, _)| offset)
-            .chain(std::iter::once(self.central_start));
-        for boundary in boundaries {
+        let directory = self.central_start..self.central_start;
+        // Active records are already bounded and cannot contain obsolete
+        // records. Only scan gaps, retaining the active start after each gap.
+        let boundaries = self
+            .local_order
+            .iter()
+            .map(|&index| &self.entries[index].local_record)
+            .chain(std::iter::once(&directory))
+            .scan(0, |previous_end, record| {
+                let gap = *previous_end..record.start;
+                *previous_end = record.end;
+                Some(gap)
+            })
+            .flat_map(|gap| {
+                let start = gap.start;
+                let end = gap.end;
+                self.original[gap]
+                    .windows(4)
+                    .enumerate()
+                    .filter(move |(_, bytes)| *bytes == local_signature)
+                    .map(move |(offset, _)| (start + offset, start, end))
+                    .chain(std::iter::once((end, start, end)))
+            });
+        for (boundary, gap_start, gap_end) in boundaries {
             for signed in [false, true] {
                 let length = if signed {
                     SIGNED_DESCRIPTOR_LEN
@@ -1024,10 +1052,18 @@ impl Archive {
                 let Some(data_start) = data_end.checked_sub(sizes.size as usize) else {
                     continue;
                 };
+                // An obsolete stream must lie entirely within one gap. Known
+                // active records cannot be payload or descriptors of another
+                // member, even when their bytes imitate a valid header.
+                if data_start < gap_start {
+                    continue;
+                }
                 // A signature inside stored payload is not a record boundary.
                 // Only index descriptors whose following header could be an
                 // active member or an obsolete member compaction understands.
-                if boundary != self.central_start && !self.recognizable_local_header(boundary) {
+                if boundary != self.central_start
+                    && !self.recognizable_local_header(boundary, gap_end)
+                {
                     continue;
                 }
                 let descriptor = StoredDescriptor {
@@ -1048,26 +1084,41 @@ impl Archive {
         descriptors
     }
 
-    fn recognizable_local_header(&self, start: usize) -> bool {
-        let Ok(Some(header)) = local_header(&self.original, start, self.central_start) else {
+    fn recognizable_local_header(&self, start: usize, gap_end: usize) -> bool {
+        if self
+            .local_order
+            .binary_search_by_key(&start, |&index| self.entries[index].local_record.start)
+            .is_ok()
+        {
+            // Active records were already validated, including opaque methods
+            // and flags that compaction retains without decoding.
+            return true;
+        }
+        let Ok(Some(header)) = local_header(&self.original, start, gap_end) else {
             return false;
         };
-        let Ok(name) = std::str::from_utf8(header.raw_name) else {
+        // Reject unsupported obsolete records before scanning their names.
+        // Fake headers can otherwise use nonzero method/flag bytes to make
+        // many overlapping long names pass the NUL check below.
+        if header.flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0
+            || !matches!(header.method, STORED | DEFLATED)
+        {
+            return false;
+        }
+        // Accepted member names cannot contain NUL. Check before decoding and
+        // hashing: false headers in stored data can overlap thousands of long
+        // candidate names, with an early NUL in each following header.
+        if header.raw_name.contains(&0) {
+            return false;
+        }
+        let Ok(name) = member_name(header.raw_name, header.flags) else {
             return false;
         };
         let Some(&index) = self.index.get(name) else {
             return false;
         };
         let entry = &self.entries[index];
-        if entry.local_record.start == start {
-            // Archive::new already validated this active record, including
-            // opaque compression methods retained without decoding.
-            return true;
-        }
-        header.flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) == 0
-            && matches!(header.method, STORED | DEFLATED)
-            && header.method == entry.method
-            && check_extra(header.extra, name).is_ok()
+        header.method == entry.method && check_extra(header.extra, name).is_ok()
     }
 
     fn stored_orphan_end(
@@ -1166,15 +1217,26 @@ mod tests {
     }
 
     fn fixture(descriptor: bool) -> Vec<u8> {
-        let name = b"part.xml";
-        let data = b"<part/>";
+        named_fixture(b"part.xml", 0, descriptor)
+    }
+
+    fn named_fixture(name: &[u8], flags: u16, descriptor: bool) -> Vec<u8> {
+        stored_fixture(name, b"<part/>", flags, descriptor.then_some(true))
+    }
+
+    fn stored_fixture(name: &[u8], data: &[u8], flags: u16, descriptor: Option<bool>) -> Vec<u8> {
         let crc = crc32(data);
-        let flags = if descriptor { 8 } else { 0 };
+        let flags = flags
+            | if descriptor.is_some() {
+                FLAG_DESCRIPTOR
+            } else {
+                0
+            };
         let mut bytes = vec![0; 30];
         set_u32(&mut bytes, 0, LOCAL);
         set_u16(&mut bytes, 4, 20);
         set_u16(&mut bytes, 6, flags);
-        if !descriptor {
+        if descriptor.is_none() {
             set_u32(&mut bytes, 14, crc);
             set_u32(&mut bytes, 18, data.len() as u32);
             set_u32(&mut bytes, 22, data.len() as u32);
@@ -1182,8 +1244,10 @@ mod tests {
         set_u16(&mut bytes, 26, name.len() as u16);
         bytes.extend_from_slice(name);
         bytes.extend_from_slice(data);
-        if descriptor {
-            bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
+        if let Some(signed) = descriptor {
+            if signed {
+                bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
+            }
             bytes.extend_from_slice(&crc.to_le_bytes());
             bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1921,6 +1985,15 @@ mod tests {
         payload.extend_from_slice(&6u32.to_le_bytes());
         payload.extend_from_slice(&LOCAL.to_le_bytes());
         payload.extend_from_slice(b"ordinary payload after the signature");
+        // A complete apparent header also stays payload when its name only
+        // matches an active UTF-8 name under the wrong encoding flag.
+        let false_size = payload.len() as u32;
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&false_size.to_le_bytes());
+        payload.extend_from_slice(&false_size.to_le_bytes());
+        let false_header = named_fixture("é.xml".as_bytes(), 0, false);
+        payload.extend_from_slice(&false_header[..LOCAL_HEADER_LEN + "é.xml".len()]);
+        payload.extend_from_slice(b"ordinary payload after the encoded name");
         let checksum = crc32(&payload);
         let mut bytes = archive.original[entry.local_header.clone()].to_vec();
         bytes.extend_from_slice(&payload);
@@ -1937,9 +2010,14 @@ mod tests {
         let mut ending = archive.original[archive.end..].to_vec();
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
-        let archive = Archive::new(combine(bytes, decorate_fixture(b"keep.xml", true))).unwrap();
+        let archive = Archive::new(combine_members([
+            bytes,
+            named_fixture("é.xml".as_bytes(), FLAG_UTF8, false),
+            decorate_fixture(b"keep.xml", true),
+        ]))
+        .unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), payload);
-        let opaque_record = archive.original[archive.entries[1].local_record.clone()].to_vec();
+        let opaque_record = archive.original[archive.entries[2].local_record.clone()].to_vec();
         let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
         let archive = Archive::new(append(&archive, &changes)).unwrap();
         let mut compacted = Vec::new();
@@ -1949,9 +2027,164 @@ mod tests {
         let archive = Archive::new(compacted).unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
         assert_eq!(
-            archive.original[archive.entries[1].local_record.clone()],
+            archive.original[archive.entries[2].local_record.clone()],
             opaque_record
         );
+    }
+
+    #[test]
+    fn active_payloads_cannot_supply_obsolete_stored_descriptors() {
+        for signed in [false, true] {
+            let original = stored_fixture(b"part.xml", b"old", 0, Some(signed));
+            let old = Archive::new(original.clone()).unwrap();
+            let old_data_start = old.entries[0].data.start;
+            let keep_data_start = old.central_start + LOCAL_HEADER_LEN + b"keep.xml".len();
+            for tail in [false, true] {
+                let mut payload = b"opaque payload".to_vec();
+                let false_size = (keep_data_start + payload.len() - old_data_start) as u32;
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&false_size.to_le_bytes());
+                payload.extend_from_slice(&false_size.to_le_bytes());
+                if !tail {
+                    // A complete apparent record inside active payload.
+                    let false_header = fixture(false);
+                    payload
+                        .extend_from_slice(&false_header[..LOCAL_HEADER_LEN + b"part.xml".len()]);
+                    payload.extend_from_slice(b"remaining payload");
+                }
+                for opaque in [false, true] {
+                    let mut keep = stored_fixture(b"keep.xml", &payload, 0, None);
+                    if opaque {
+                        let central = Archive::new(keep.clone()).unwrap().central_start;
+                        set_u16(&mut keep, 8, 99);
+                        set_u16(&mut keep, central + 10, 99);
+                    }
+                    let archive = Archive::new(combine(original.clone(), keep)).unwrap();
+                    let changes = BTreeMap::from([("part.xml".into(), b"new".to_vec())]);
+                    let appended = Archive::new(append(&archive, &changes)).unwrap();
+                    // In the tail case, the next real active record starts
+                    // immediately after the apparent descriptor.
+                    let keep = &appended.entries[1];
+                    let expected = appended.original[keep.local_record.clone()].to_vec();
+                    let mut compacted = Vec::new();
+                    appended
+                        .compact_to(&BTreeMap::new(), &mut compacted)
+                        .unwrap();
+                    assert_eq!(compacted.len(), appended.original.len() - old.central_start);
+                    let compacted = Archive::new(compacted).unwrap();
+                    assert_eq!(compacted.read("part.xml").unwrap(), b"new");
+                    assert_eq!(
+                        compacted.original[compacted.entries[1].local_record.clone()],
+                        expected
+                    );
+                    if !opaque {
+                        assert_eq!(compacted.read("keep.xml").unwrap(), payload);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_descriptors_inside_obsolete_payload_still_refuse_compaction() {
+        for signed in [false, true] {
+            let mut payload = b"prefix".to_vec();
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            let false_header = fixture(false);
+            payload.extend_from_slice(&false_header[..LOCAL_HEADER_LEN + b"part.xml".len()]);
+            payload.extend_from_slice(b"remaining obsolete payload");
+            let archive =
+                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+            let appended = Archive::new(append(
+                &archive,
+                &BTreeMap::from([("part.xml".into(), b"new".to_vec())]),
+            ))
+            .unwrap();
+            assert_eq!(appended.read("part.xml").unwrap(), b"new");
+            let mut output = Vec::new();
+            assert!(matches!(
+                appended.compact_to(&BTreeMap::new(), &mut output),
+                Err(Error::Unsupported(message)) if message.contains("ambiguous stored ZIP")
+            ));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn obsolete_header_candidates_cannot_extend_into_active_records() {
+        for signed in [false, true] {
+            let replacement = b"new";
+            let active_length = LOCAL_HEADER_LEN + b"part.xml".len() + replacement.len();
+            let descriptor_length = if signed {
+                SIGNED_DESCRIPTOR_LEN
+            } else {
+                DESCRIPTOR_LEN
+            };
+            let mut payload = b"prefix".to_vec();
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            let mut false_header = fixture(false)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
+            // One unknown extra field would swallow the real descriptor and
+            // the next active member if parsed past this obsolete gap.
+            let extra_length = descriptor_length + active_length;
+            set_u16(&mut false_header, 28, (4 + extra_length) as u16);
+            payload.extend_from_slice(&false_header);
+            payload.extend_from_slice(&0xbeefu16.to_le_bytes());
+            payload.extend_from_slice(&(extra_length as u16).to_le_bytes());
+            let archive =
+                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
+            let appended = Archive::new(append(&archive, &changes)).unwrap();
+            let mut compacted = Vec::new();
+            appended
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(compacted, archive.write(&changes).unwrap());
+        }
+    }
+
+    #[test]
+    fn stored_orphan_payload_with_many_false_long_names_compacts_exactly() {
+        for (fill, repeats) in [(0, 4096), (1, 18 * 1024 * 1024 / 64)] {
+            let original = fixture(true);
+            let archive = Archive::new(original.clone()).unwrap();
+            let entry = &archive.entries[0];
+            // Each apparent header has a 16 KiB name spanning hundreds of later
+            // headers. Zero-filled headers have impossible NUL-containing names;
+            // nonzero-filled headers have unsupported flags and methods, with
+            // preceding descriptor sizes of 0x01010101 (just over 16 MiB).
+            let mut pattern = [fill; 64];
+            set_u32(&mut pattern, 0, LOCAL);
+            if fill == 0 {
+                set_u16(&mut pattern, 4, 20);
+            }
+            set_u16(&mut pattern, 26, 0x4040);
+            let payload = pattern.repeat(repeats);
+            let mut bytes = archive.original[entry.local_header.clone()].to_vec();
+            bytes.extend_from_slice(&payload);
+            bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
+            bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            let active_start = bytes.len();
+            bytes.extend_from_slice(&archive.original[..archive.central_start]);
+            let central_start = bytes.len();
+            let mut central = archive.original[entry.central.clone()].to_vec();
+            set_u32(&mut central, 42, active_start as u32);
+            bytes.extend_from_slice(&central);
+            let mut ending = archive.original[archive.end..].to_vec();
+            set_u32(&mut ending, 16, central_start as u32);
+            bytes.extend_from_slice(&ending);
+            let archive = Archive::new(bytes).unwrap();
+            let mut compacted = Vec::new();
+            archive
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(compacted, original);
+        }
     }
 
     #[test]
@@ -2388,6 +2621,106 @@ mod tests {
                 flagged(flags).unwrap().read("part.xml").unwrap(),
                 b"<part/>"
             );
+        }
+    }
+
+    #[test]
+    fn member_name_encoding_is_preserved_when_reading_editing_and_compacting() {
+        for (name, flags) in [
+            ("part.xml", 0),
+            ("part.xml", FLAG_UTF8),
+            ("é.xml", FLAG_UTF8),
+        ] {
+            for descriptor in [false, true] {
+                let original = named_fixture(name.as_bytes(), flags, descriptor);
+                let archive = Archive::new(original.clone()).unwrap();
+                assert_eq!(archive.read(name).unwrap(), b"<part/>");
+                assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
+                let changes = BTreeMap::from([(name.into(), b"updated".to_vec())]);
+                let appended = Archive::new(append(&archive, &changes)).unwrap();
+                let mut compacted = Vec::new();
+                appended
+                    .compact_to(&BTreeMap::new(), &mut compacted)
+                    .unwrap();
+                assert_eq!(compacted, archive.write(&changes).unwrap());
+                let updated = Archive::new(compacted).unwrap();
+                assert_eq!(updated.read(name).unwrap(), b"updated");
+                assert_eq!(updated.entries[0].flags & FLAG_UTF8, flags);
+            }
+        }
+        // An explicitly encoded active member remains opaque when its method
+        // is unsupported; compaction preserves it without decoding its data.
+        let mut bytes = named_fixture("é.xml".as_bytes(), FLAG_UTF8, false);
+        let central = Archive::new(bytes.clone()).unwrap().central_start;
+        set_u16(&mut bytes, 8, 99);
+        set_u16(&mut bytes, central + 10, 99);
+        let archive = Archive::new(bytes.clone()).unwrap();
+        let mut compacted = Vec::new();
+        archive
+            .compact_to(&BTreeMap::new(), &mut compacted)
+            .unwrap();
+        assert_eq!(compacted, bytes);
+    }
+
+    #[test]
+    fn rejects_ambiguous_name_encodings_and_conflicting_encoding_flags() {
+        for descriptor in [false, true] {
+            for name in ["é.xml".as_bytes(), b"\xe9.xml"] {
+                assert!(matches!(
+                    Archive::new(named_fixture(name, 0, descriptor)),
+                    Err(Error::Unsupported(message))
+                        if message == "non-ASCII ZIP member names require the UTF-8 flag"
+                ));
+            }
+            assert!(matches!(
+                Archive::new(named_fixture(b"\xe9.xml", FLAG_UTF8, descriptor)),
+                Err(Error::Unsupported(message)) if message == "ZIP member names must be UTF-8"
+            ));
+            let original = named_fixture("é.xml".as_bytes(), FLAG_UTF8, descriptor);
+            let central = Archive::new(original.clone()).unwrap().central_start;
+            for flag_at in [6, central + 8] {
+                let mut bytes = original.clone();
+                let flags = u16_at(&bytes, flag_at).unwrap() & !FLAG_UTF8;
+                set_u16(&mut bytes, flag_at, flags);
+                let result = Archive::new(bytes);
+                if flag_at == 6 {
+                    assert!(matches!(
+                        result,
+                        Err(Error::InvalidWorkbook(message)) if message.contains("conflicting ZIP headers")
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Unsupported(message))
+                            if message == "non-ASCII ZIP member names require the UTF-8 flag"
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_refuses_obsolete_names_without_an_explicit_encoding() {
+        let name = "é.xml";
+        for descriptor in [false, true] {
+            let archive =
+                Archive::new(named_fixture(name.as_bytes(), FLAG_UTF8, descriptor)).unwrap();
+            let changes = BTreeMap::from([(name.into(), b"updated".to_vec())]);
+            let mut bytes = append(&archive, &changes);
+            // Only the obsolete record loses its encoding flag. Normal saves
+            // preserve it, while compaction must understand it before removal.
+            let flags = u16_at(&bytes, 6).unwrap() & !FLAG_UTF8;
+            set_u16(&mut bytes, 6, flags);
+            let archive = Archive::new(bytes.clone()).unwrap();
+            assert_eq!(archive.read(name).unwrap(), b"updated");
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), bytes);
+            let mut compacted = Vec::new();
+            assert!(matches!(
+                archive.compact_to(&BTreeMap::new(), &mut compacted),
+                Err(Error::Unsupported(message))
+                    if message == "non-ASCII ZIP member names require the UTF-8 flag"
+            ));
+            assert!(compacted.is_empty());
         }
     }
 

@@ -136,6 +136,83 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
 }
 
 #[test]
+fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
+    for shared_strings in [
+        None,
+        Some("<sst xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'>"),
+    ] {
+        let sheet = worksheet(
+            "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><f>1+1</f><v>2</v></c></row></sheetData>",
+        );
+        let mut parts = parts(&[
+            ("Alpha", sheet.clone()),
+            ("Beta", sheet.clone()),
+            ("Gamma", sheet),
+        ]);
+        let relationships = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+        parts.insert(
+            "xl/_rels/workbook.xml.rels".into(),
+            relationships
+                .replace(
+                    "</Relationships>",
+                    &format!(
+                        "<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
+                    ),
+                )
+                .into_bytes(),
+        );
+        if let Some(xml) = shared_strings {
+            parts.insert("xl/sharedStrings.xml".into(), xml.as_bytes().to_vec());
+        }
+        let original = archive(&parts);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        let expected = book.get_cell("Alpha", "A1").unwrap_err();
+        assert!(message(&expected).starts_with("part \"xl/sharedStrings.xml\": "));
+
+        // Earlier repairable cells are staged, but a later refusal still
+        // leaves every worksheet and the unreadable shared-string part intact.
+        let error = book
+            .apply_edits([
+                CellEdit::new("Alpha", "A1", "first").unwrap(),
+                CellEdit::new("Beta", "A1", "second").unwrap(),
+                CellEdit::new("Gamma", "B1", 7).unwrap(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            protected(&error),
+            ("Gamma", "B1".into(), "contains a formula")
+        );
+        assert_eq!(book.to_bytes().unwrap(), original);
+        assert_eq!(
+            book.get_cell("Beta", "A1").unwrap_err().to_string(),
+            expected.to_string()
+        );
+
+        book.apply_edits([
+            CellEdit::new("Alpha", "A1", "first").unwrap(),
+            CellEdit::new("Beta", "A1", "second").unwrap(),
+        ])
+        .unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.get_cell("Alpha", "A1").unwrap().value,
+            "first".into()
+        );
+        assert_eq!(
+            reopened.get_cell("Beta", "A1").unwrap().value,
+            "second".into()
+        );
+        // Memoizing an optional edit lookup must not turn later failed reads
+        // into a missing-table or missing-index error, in either workbook.
+        for workbook in [&book, &reopened] {
+            let actual = workbook.get_cell("Gamma", "A1").unwrap_err();
+            assert_eq!(discriminant(&actual), discriminant(&expected));
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+    }
+}
+
+#[test]
 fn worksheet_names_are_debug_quoted() {
     let mut book = book(&[(
         "Q\"1 & \\",

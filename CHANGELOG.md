@@ -23,7 +23,7 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   `Error::ProtectedCell { sheet, cell, reason }` variant instead of
   `Error::Unsupported`. Protected cells are formula cells, cells in a shared,
   array, or data-table formula range, and merged cells other than their range's
-  anchor, as well as the newly protected table header and value-metadata cells.
+  anchor, as well as the newly protected table headers and cells carrying metadata.
 - `Error::SharedStringsUnavailable` is removed. A shared-string cell in a workbook
   without a shared-string table returns `Error::InvalidWorkbook` naming the cell.
 - Malformed cell data (invalid or non-finite numbers, booleans, shared-string
@@ -135,6 +135,9 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   terminal, plain output escapes control characters so cell text and sheet names
   cannot control the terminal; pipes and files receive exact text. JSON strings
   escape every control character, including DEL and C1 as `\u00XX`.
+- Diagnostics on a terminal also escape control characters other than tab and
+  line feed, including those from file paths and malformed workbook metadata;
+  redirected diagnostics retain their original text.
 - Native filesystem paths work independently of Unicode text arguments. Invalid
   UTF-8 patch rows report their line number for files and standard input.
 
@@ -145,16 +148,26 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   type while retaining formatting and unfamiliar sibling content.
 - Text round-trips exactly: control characters use `_xHHHH_` escapes, literal
   escape sequences stay literal, and a leading U+FEFF is preserved on read.
+- The escape marker requires lowercase `x`; uppercase `_XHHHH_` stays literal
+  when reading cells and sheet names, preventing an edit from being incorrectly
+  treated as unchanged.
 - ISO 8601 date cells (`t="d"`) read as serial numbers in the workbook's 1900 or
   1904 date system, with 1899-12-31 as serial 0 in the 1900 system. Rewriting one
   with its own serial leaves it unchanged.
 - Scalar changes to cells with value metadata are refused, preserving linked and
   rich data types. Unchanged values and unrelated cell edits retain metadata.
+- Cells with cell metadata are protected too: their metadata types can require
+  disassociation on edits or clears, which cannot safely be assumed to preserve
+  the metadata. Reads and exact no-op writes remain available.
 - Excel table header cells may be rewritten with their current value but not
   changed, keeping header text equal to the table's column names.
 - Cell values, formulas, and merged ranges in unsupported XML containers cannot
   bypass worksheet edit protections, and shared-string and rich-text reads reject
-  hidden content that would shift indices or truncate values.
+  hidden content that would shift indices or truncate values. Inline-string
+  replacements use the same structural check, preventing edits from silently
+  discarding hidden rich text. Multiple text elements within one rich-text run
+  are refused, since spreadsheet readers can interpret them differently and
+  make an edit appear unchanged incorrectly.
 - Worksheet numeric attributes and scalar values accept surrounding XML
   whitespace. Shared-formula indices compare numerically, so spellings such as
   `1` and `01` no longer prevent edits to unrelated cells; invalid indices are
@@ -170,11 +183,23 @@ Changes that can affect 0.2 code, scripts, or workbooks:
 - Workbook sheet names decode Excel escape sequences. Ambiguous workbook layouts,
   invalid package XML, duplicate expanded XML attributes, and reserved namespace
   bindings (checked after character-reference normalization) are rejected.
+- Valid character references in `xmlns:xml` declarations are accepted in
+  worksheets, shared strings, and package metadata without changing their
+  original spelling or byte offsets.
+- Workbook properties inside markup-compatibility branches or matching
+  `mc:ProcessContent` wrappers are refused as unsupported, avoiding an incorrect
+  default date system when another spreadsheet reader processes those properties.
+- Mixed strict and transitional SpreadsheetML is refused in workbook metadata,
+  worksheets, and shared strings, preventing omitted data, incorrect date
+  systems, and bypassed formula or merged-cell protections.
 - ZIP archives that other readers could interpret differently are rejected, and
   OLE compound files are recognized as unsupported formats. Binary workbook
   detection handles uppercase extensions. In the rare case that a save's new
   central-directory offset would form an ambiguous end-record signature with the
   archive comment, the save is refused.
+- Non-ASCII ZIP member names require the UTF-8 flag in both headers, preventing
+  filename aliases and worksheet selection differences between ZIP readers.
+  Compaction also refuses to discard obsolete records with ambiguous encodings.
 - ZIP patched-data entries stay opaque; reading, editing, and deleting obsolete
   patched records during compaction are refused. Compaction recognizes obsolete
   Stored records whose payload contains header- and descriptor-like bytes.
@@ -189,8 +214,10 @@ Changes that can affect 0.2 code, scripts, or workbooks:
 - Saves are atomic. Existing destination permissions are applied before contents
   are written; on Unix the replacement keeps the destination's group when it can
   be assigned, and otherwise loses group access. New destinations for workbooks
-  opened from files are created with the input's permissions, restricted by the
-  umask, and with the input's group under the same rule. Setuid, setgid, and
+  opened from files use the input's permission bits as their creation mode,
+  subject to the operating system's umask or default ACL rules, and the input's
+  group under the same rule. ACLs are not copied; inherited directory ACLs can
+  grant additional users access even when mode bits match. Setuid, setgid, and
   sticky bits are never kept. Unix saves sync the directory after the rename.
   Long destination filenames are supported.
 
@@ -201,14 +228,50 @@ Changes that can affect 0.2 code, scripts, or workbooks:
   absolute spans without rebuilding cells. README.md lists measurements.
 - Shared strings are decoded while streaming, and package discovery retains only
   the elements it needs, greatly reducing peak memory for large parts.
+- Multi-sheet edits remember failed shared-string loads within the transaction,
+  avoiding repeated parsing of a damaged table during explicit cell repairs.
+- Namespace resolution caches active prefix bindings and restores parent caches
+  after shadowing. Package attribute and compatibility-rule lookups reuse URI
+  fingerprints with exact equality checks, avoiding repeated long-URI scans.
+- Excel text decoding copies ordinary UTF-8 directly and decodes only escape
+  tokens, avoiding a temporary UTF-16 copy of values containing underscores.
+- Numeric and predefined XML text references are validated and decoded without
+  reconstructing and allocating each reference, while retaining invalid-reference
+  diagnostics.
+- Writing XML-forbidden characters appends their Excel escapes directly to the
+  output buffer, avoiding a temporary string for every character.
+- CLI `get` and `cells` bound cached output by both cell count and allocated
+  text/formula bytes, preventing repeated or oversized stored strings from
+  multiplying memory use. Uncached values are validated before printing and
+  reread individually; small cached reads still decode once.
+- Prepared single-cell reads avoid allocating a batch result.
+- CLI patches validate every row while retaining only each cell's final value,
+  keeping repeated edits from accumulating discarded text. Diagnostic line
+  numbers and the input row count remain unchanged.
+- Table-header protection searches ordered edits within each header's bounds,
+  avoiding a comparison of every edit against every table.
+- Repeated table relationships reuse already resolved target spellings and parse
+  each distinct table part once, avoiding repeated long-path resolution,
+  decompression, and XML validation. Every relationship's metadata is validated.
+- Table-header checks compare values individually, avoiding a retained copy of
+  every header value while preserving validation order.
+- Insertions resolve each row's default style once, avoiding repeated attribute
+  scans and numeric parsing. Existing-cell edits and missing-cell clears still
+  skip row defaults, and column styles remain specific to each inserted cell.
+- Compaction rejects impossible embedded ZIP header names before decoding and
+  hashing them, avoiding repeated long-name scans inside obsolete stored data.
+- Compaction searches for obsolete stored-stream descriptors only outside active
+  ZIP records. Header-like bytes inside active payloads no longer cause false
+  ambiguity errors or inflate the descriptor index.
 - Replacement parts use Deflate level 4 instead of the default level 6, making
   saves of edited worksheets 2 to 3.4 times faster in the repository's
   measurements, with similar compressed size. ZIP saves borrow unchanged
   metadata, reuse validated physical entry order, and use optimized CRC32
   checksums; in-memory output reserves archive-sized capacity.
 - Benchmarks cover prepared and ordinary reads, wide rows, large cell extensions,
-  shared strings, insertions, multi-sheet transactions, and no-op batches, with
-  workload filters, and verify their output before measuring.
+  shared strings, insertions, multi-sheet transactions, many-table batches,
+  no-op batches, row-style inheritance, and control-heavy text. Workload filters
+  select cases and operations, and every case verifies its output before measuring.
 
 ### Quality
 

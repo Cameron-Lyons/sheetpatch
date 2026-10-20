@@ -309,7 +309,43 @@ fn metadata_for_an_existing_value_cannot_survive_a_value_change() {
     let output = edit(&input, "B1", CellValue::Number(4.0)).unwrap();
     assert_eq!(output, input.replace("<v>3</v>", "<v>4</v>"));
     let cell_metadata = input.replace(" vm=\"1\"", "");
-    assert!(edit(&cell_metadata, "A1", CellValue::from("replacement")).is_ok());
+    assert!(matches!(
+        edit(&cell_metadata, "A1", CellValue::from("replacement")),
+        Err(Error::ProtectedCell { cell, reason, .. })
+            if cell.to_string() == "A1"
+                && reason == "has cell metadata with unsupported edit semantics"
+    ));
+    assert_eq!(
+        edit(&cell_metadata, "A1", CellValue::Error("#VALUE!".into())).unwrap(),
+        cell_metadata
+    );
+}
+
+#[test]
+fn cell_metadata_guard_preserves_blank_no_ops_and_ignores_vendor_attributes() {
+    for attribute in ["cm='0'", "cm='1'", "cm=' &#9;1&#13; '"] {
+        let blank = sheet(&format!(
+            "<sheetData><row r='1'><c r='A1' {attribute}/></row></sheetData>"
+        ));
+        assert_eq!(edit(&blank, "A1", CellValue::Blank).unwrap(), blank);
+        assert!(matches!(
+            edit(&blank, "A1", CellValue::from("new")),
+            Err(Error::ProtectedCell { reason, .. }) if reason == protection::CELL_METADATA
+        ));
+        // Clearing an existing empty payload still changes its representation.
+        let payload = blank.replace("/></row>", "><v/></c></row>");
+        assert!(matches!(
+            edit(&payload, "A1", CellValue::Blank),
+            Err(Error::ProtectedCell { reason, .. }) if reason == protection::CELL_METADATA
+        ));
+    }
+    let vendor = sheet(
+        "<sheetData><row r='1'><c r='A1' xmlns:x='urn:custom' x:cm='1'><v>1</v></c></row></sheetData>",
+    );
+    assert_eq!(
+        edit(&vendor, "A1", CellValue::Number(2.0)).unwrap(),
+        vendor.replace("<v>1</v>", "<v>2</v>")
+    );
 }
 
 #[test]
@@ -455,7 +491,7 @@ fn clearing_empty_typed_cells_removes_type_and_retains_unknown_content() {
 fn escapes_excel_tokens_and_carriage_returns() {
     assert_eq!(
         text_escaped("_x0041_\r&_Xabcd_"),
-        "_x005F_x0041_&#13;&amp;_x005F_Xabcd_"
+        "_x005F_x0041_&#13;&amp;_Xabcd_"
     );
     assert_eq!(
         text_escaped("<\0\u{b}_x000B\u{b}\u{ffff}>"),

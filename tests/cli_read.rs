@@ -27,6 +27,30 @@ fn success(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// Repeat one stored shared string, then append raw worksheet rows. Stored
+/// workbooks can contain text beyond Excel's edit limit, which reads preserve.
+fn shared_text_workbook(value: &str, cells: usize, tail: &str) -> Vec<u8> {
+    let mut parts = common::payloads(&fs::read(FIXTURE).unwrap());
+    let namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let rows: String = (1..=cells)
+        .map(|row| format!("<row r='{row}'><c r='A{row}' t='s'><v>0</v></c></row>"))
+        .collect();
+    parts.insert(
+        "xl/sharedStrings.xml".into(),
+        format!("<sst xmlns='{namespace}'><si><t>{value}</t></si></sst>").into_bytes(),
+    );
+    parts.insert(
+        "xl/worksheets/sheet1.xml".into(),
+        format!("<worksheet xmlns='{namespace}'><sheetData>{rows}{tail}</sheetData></worksheet>")
+            .into_bytes(),
+    );
+    let entries: Vec<_> = parts
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.as_slice()))
+        .collect();
+    common::stored_archive(&entries)
+}
+
 #[test]
 fn batch_reads_preserve_order_duplicates_and_single_value_behavior() {
     assert_eq!(success(&["get", FIXTURE, "Data", "D1"]), "25\n");
@@ -169,6 +193,131 @@ fn failed_batch_reads_emit_no_partial_results() {
 }
 
 #[test]
+fn malformed_late_values_emit_nothing_after_many_shared_strings() {
+    let directory = TempDir::new();
+    let path = directory.join("late-error.xlsx");
+    let mut parts = common::payloads(&fs::read(FIXTURE).unwrap());
+    let namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let shared = "repeated value ".repeat(128);
+    parts.insert(
+        "xl/sharedStrings.xml".into(),
+        format!("<sst xmlns='{namespace}'><si><t>{shared}</t></si></sst>").into_bytes(),
+    );
+    let rows: String = (1..=1024)
+        .map(|row| format!("<row r='{row}'><c r='A{row}' t='s'><v>0</v></c></row>"))
+        .collect();
+    for last in [
+        "<c r='A1025'><v>not-a-number</v></c>",
+        "<c r='A1025' t='s'><v>1</v></c>",
+    ] {
+        parts.insert(
+            "xl/worksheets/sheet1.xml".into(),
+            format!(
+                "<worksheet xmlns='{namespace}'><sheetData>{rows}<row r='1025'>{last}</row></sheetData></worksheet>"
+            )
+            .into_bytes(),
+        );
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        fs::write(&path, common::stored_archive(&entries)).unwrap();
+        for command in ["get", "cells"] {
+            for json in [false, true] {
+                let mut args = vec![command];
+                if json {
+                    args.push("--json");
+                }
+                args.extend([path.to_str().unwrap(), "Data", "A1:A1025"]);
+                let output = cli(&args);
+                assert_eq!(output.status.code(), Some(1), "{args:?}");
+                assert!(output.stdout.is_empty(), "{args:?}");
+                let error = String::from_utf8(output.stderr).unwrap();
+                assert!(error.contains("A1025"), "{error}");
+            }
+        }
+        // The malformed value outside the requested range remains unread.
+        assert_eq!(
+            success(&["get", path.to_str().unwrap(), "Data", "A1:A1024"]),
+            format!("{shared}\n").repeat(1024)
+        );
+    }
+}
+
+#[test]
+fn large_text_reads_validate_in_request_order_before_output() {
+    let directory = TempDir::new();
+    let path = directory.join("large-text-error.xlsx");
+    fs::write(
+        &path,
+        shared_text_workbook(
+            &"x".repeat(1024 * 1024),
+            8,
+            "<row r='9'><c r='A9'><v>not-a-number</v></c></row>\
+             <row r='10'><c r='A10' t='s'><v>1</v></c></row>",
+        ),
+    )
+    .unwrap();
+    for json in [false, true] {
+        for (command, ranges, first_error) in [
+            ("get", vec!["A1:A10"], "A9"),
+            ("get", vec!["A1:A8", "A10", "A9"], "A10"),
+            ("cells", vec!["A1:A10"], "A9"),
+        ] {
+            let mut args = vec![command];
+            if json {
+                args.push("--json");
+            }
+            args.extend([path.to_str().unwrap(), "Data"]);
+            args.extend(ranges);
+            let output = cli(&args);
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            let message = String::from_utf8(output.stderr).unwrap();
+            assert!(message.contains(&format!(": {first_error}:")), "{message}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn large_shared_strings_do_not_accumulate_in_cli_output() {
+    let directory = TempDir::new();
+    let path = directory.join("large-shared-text.xlsx");
+    fs::write(
+        &path,
+        shared_text_workbook(&"x".repeat(1024 * 1024), 512, ""),
+    )
+    .unwrap();
+    for args in [
+        vec!["get", path.to_str().unwrap(), "Data", "A1"],
+        vec!["get", path.to_str().unwrap(), "Data", "A1:A512"],
+        vec!["cells", path.to_str().unwrap(), "Data"],
+    ] {
+        // Confirm the workbook itself fits, then read 512 MiB of logical
+        // output under the same 256 MiB address-space limit. Discard stdout
+        // without capturing the expanded strings in the test process.
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "ulimit -c 0 && ulimit -v 262144 && exec \"$@\"",
+                "sheetpatch-memory-test",
+                env!("CARGO_BIN_EXE_sheetpatch"),
+            ])
+            .args(&args)
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn invalid_read_and_set_arguments_fail_before_opening_the_input() {
     for args in [
         vec!["get", "", "Data", "A1", "A0"],
@@ -199,6 +348,16 @@ fn large_reads_are_complete_and_in_order() {
         args.extend(["A1", "D1", "F3"]);
         expected.push_str("Original text\n25\n\n");
     }
+    assert_eq!(success(&args), expected);
+    let group = success(&["get", "--json", FIXTURE, "Data", "A1", "D1", "F3"]);
+    let objects = &group[1..group.len() - 2];
+    let expected = format!(
+        "[{}]\n",
+        std::iter::repeat_n(objects, 3000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    args.insert(1, "--json");
     assert_eq!(success(&args), expected);
 }
 
