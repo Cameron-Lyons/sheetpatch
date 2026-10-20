@@ -136,6 +136,38 @@ fn strict_workbooks_report_their_date_system() {
 }
 
 #[test]
+fn mixed_spreadsheetml_metadata_is_not_silently_ignored() {
+    for (root, other) in [(MAIN_NS, STRICT_MAIN_NS), (STRICT_MAIN_NS, MAIN_NS)] {
+        let mut parts = parts("", "", "");
+        let workbook = parts["xl/workbook.xml"].replacen(
+            &format!("xmlns='{MAIN_NS}'"),
+            &format!("xmlns='{root}'"),
+            1,
+        );
+        let properties = format!("<workbookPr xmlns='{other}' date1904='1'/>");
+        for mixed in [
+            workbook.replace("<sheets>", &format!("{properties}<sheets>")),
+            workbook.replace("<sheets>", &format!("<sheets xmlns='{other}'>")),
+            workbook.replace(
+                "<sheet name='Data'",
+                &format!("<sheet xmlns='{other}' name='Data'"),
+            ),
+            workbook.replace(
+                "<sheets>",
+                &format!("<workbookPr date1904='0'/>{properties}<sheets>"),
+            ),
+        ] {
+            parts.insert("xl/workbook.xml".into(), mixed.clone());
+            let error = Workbook::from_bytes(stored(&parts)).err();
+            assert!(
+                matches!(&error, Some(Error::Unsupported(message)) if message.contains("strict and transitional")),
+                "{mixed}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn invalid_date_systems_are_rejected_at_open() {
     for properties in [
         "<workbookPr date1904='yes'/>",
@@ -150,6 +182,257 @@ fn invalid_date_systems_are_rejected_at_open() {
             "{properties}: {error:?}"
         );
     }
+}
+
+#[test]
+fn compatibility_branches_cannot_silently_change_the_date_system() {
+    let compatibility = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    for (direct, choice, fallback) in [
+        (
+            "",
+            "<workbookPr date1904='0'/>",
+            "<workbookPr date1904='1'/>",
+        ),
+        (
+            "",
+            "<workbookPr date1904='1'/>",
+            "<workbookPr date1904='0'/>",
+        ),
+        (
+            "<workbookPr date1904='0'/>",
+            "<workbookPr date1904='1'/>",
+            "",
+        ),
+        (
+            "",
+            "",
+            "<mc:AlternateContent><mc:Choice Requires='x'><workbookPr date1904='0'/></mc:Choice><mc:Fallback><workbookPr date1904='1'/></mc:Fallback></mc:AlternateContent>",
+        ),
+    ] {
+        let properties = format!(
+            "{direct}<mc:AlternateContent xmlns:mc='{compatibility}' xmlns:x='urn:vendor'><mc:Choice Requires='x'>{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>"
+        );
+        let error = Workbook::from_bytes(archive(&properties, "", "")).err();
+        assert!(
+            matches!(&error, Some(Error::Unsupported(message)) if message.contains("workbookPr") && message.contains("date system")),
+            "{properties}: {error:?}"
+        );
+    }
+
+    // Alternate data within ordinary opaque workbook extensions does not
+    // substitute workbook properties; unrelated root alternatives are opaque.
+    for properties in [
+        format!(
+            "<extension><mc:AlternateContent xmlns:mc='{compatibility}'><mc:Fallback><workbookPr date1904='1'/></mc:Fallback></mc:AlternateContent></extension>"
+        ),
+        format!(
+            "<mc:AlternateContent xmlns:mc='{compatibility}'><mc:Fallback><extension><workbookPr date1904='1'/></extension></mc:Fallback></mc:AlternateContent>"
+        ),
+        format!(
+            "<mc:AlternateContent xmlns:mc='{compatibility}'><mc:Fallback><bookViews/></mc:Fallback></mc:AlternateContent>"
+        ),
+    ] {
+        let original = archive(&properties, "", "");
+        let book = Workbook::from_bytes(original.clone()).unwrap();
+        assert!(!book.uses_1904_dates());
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+}
+
+#[test]
+fn process_content_cannot_promote_hidden_workbook_date_properties() {
+    let compatibility = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    for (directives, properties) in [
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "",
+            "<x:wrapper mc:ProcessContent='x:wrapper' mc:Ignorable='x'><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='alias' mc:ProcessContent='alias:wrapper'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:*'",
+            "<x:outer><x:inner><workbookPr date1904='1'/></x:inner></x:outer>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:outer'",
+            "<x:outer mc:ProcessContent='x:inner'><x:inner><workbookPr date1904='1'/></x:inner></x:outer>",
+        ),
+        // Prefix rebinding does not change the expanded inherited rule.
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<alias:wrapper xmlns:x='urn:other'><workbookPr date1904='1'/></alias:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<mc:AlternateContent><mc:Choice Requires='x'><mc:AlternateContent><mc:Fallback><x:wrapper><workbookPr date1904='1'/></x:wrapper></mc:Fallback></mc:AlternateContent></mc:Choice></mc:AlternateContent>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<x:wrapper><mc:AlternateContent><mc:Fallback><workbookPr date1904='1'/></mc:Fallback></mc:AlternateContent></x:wrapper>",
+        ),
+        // Repeating an inherited rule in a child must not erase it on exit.
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<x:wrapper mc:Ignorable='x' mc:ProcessContent='x:wrapper'/><x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        // PreserveElements does not prevent unwrapping under current ECMA
+        // markup-compatibility rules, even though some SDKs preserve it.
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:*' mc:PreserveElements='alias:wrapper'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper' mc:PreserveElements='x:*'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+    ] {
+        for main in [MAIN_NS, STRICT_MAIN_NS] {
+            let mut parts = parts(properties, "", "");
+            let workbook = parts.get_mut("xl/workbook.xml").unwrap();
+            *workbook = workbook.replace(MAIN_NS, main).replacen(
+                "<workbook ",
+                &format!(
+                    "<workbook xmlns:mc='{compatibility}' xmlns:x='urn:vend&#111;r' xmlns:alias='urn:vendor' {directives} "
+                ),
+                1,
+            );
+            let error = Workbook::from_bytes(stored(&parts)).err();
+            assert!(
+                matches!(&error, Some(Error::Unsupported(message)) if message.contains("ProcessContent") && message.contains("date system")),
+                "{directives}, {properties}, {main}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn process_content_preserves_opaque_paths_and_rule_scopes() {
+    let compatibility = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    for (directives, properties) in [
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<x:wrapper><bookViews/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:other'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:ProcessContent='x:wrapper'",
+            "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:*'",
+            "<extension><x:wrapper><workbookPr date1904='1'/></x:wrapper></extension>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:wrapper'",
+            "<x:wrapper xmlns:x='urn:other'><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x'",
+            "<x:wrapper mc:ProcessContent='x:*'/><x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:ProcessContent='x:*'",
+            "<x:wrapper mc:Ignorable='x'></x:wrapper><x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "",
+            "<extension mc:Ignorable='x' mc:ProcessContent='x:*'></extension><x:wrapper><workbookPr date1904='1'/></x:wrapper>",
+        ),
+        (
+            "mc:Ignorable='x' mc:ProcessContent='x:outer'",
+            "<x:outer mc:ProcessContent='x:inner'/><x:inner><workbookPr date1904='1'/></x:inner>",
+        ),
+    ] {
+        let mut parts = parts(properties, "", "");
+        let workbook = parts.get_mut("xl/workbook.xml").unwrap();
+        *workbook = workbook.replacen(
+            "<workbook ",
+            &format!(
+                "<workbook xmlns:mc='{compatibility}' xmlns:x='urn:vendor' xmlns:alias='urn:vendor' {directives} "
+            ),
+            1,
+        );
+        let original = stored(&parts);
+        let book = Workbook::from_bytes(original.clone())
+            .unwrap_or_else(|error| panic!("{directives}, {properties}: {error}"));
+        assert!(!book.uses_1904_dates());
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+}
+
+#[test]
+fn package_metadata_accepts_character_references_in_the_reserved_xml_namespace() {
+    let mut parts = parts("<workbookPr date1904='1'/>", "", "");
+    for (name, xml) in &mut parts {
+        if !name.starts_with("xl/worksheets/") {
+            *xml = xml.replacen(
+                " xmlns=",
+                " xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;' xml:space='preserve' xmlns=",
+                1,
+            );
+        }
+    }
+    let original = stored(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert!(book.uses_1904_dates());
+    assert_eq!(book.sheets()[0].name(), "Data");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B1", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B1").unwrap().value, 7.into());
+}
+
+#[test]
+fn namespace_binding_caches_follow_shadowing_and_empty_element_scopes() {
+    let properties = "\
+        <p:workbookPr p:date1904='false' date1904='true'/>\
+        <p:workbookPr xmlns:p='urn:vendor' date1904='false'/>\
+        <extension xmlns:p='urn:vendor' xmlns:r='urn:other'>\
+          <p:workbookPr date1904='false' r:id='ignored'/>\
+          <workbookPr xmlns='' date1904='false'/>\
+        </extension>\
+        <workbookPr xmlns='' date1904='false'/>";
+    let mut parts = parts(properties, " state='hidden'", " state='veryHidden'");
+    let workbook = parts.get_mut("xl/workbook.xml").unwrap();
+    *workbook = workbook
+        .replacen("<workbook ", &format!("<workbook xmlns:p='{MAIN_NS}' "), 1)
+        .replace("<sheets>", "<p:sheets>")
+        .replace("</sheets>", "</p:sheets>")
+        .replace("<sheet ", "<p:sheet ");
+    parts.insert(
+        "xl/_rels/workbook.xml.rels".into(),
+        format!(
+            "<Relationships xmlns='{PACKAGE_NS}' xmlns:p='{PACKAGE_NS}'>\
+              <p:Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/>\
+              <p:Relationship xmlns:p='urn:vendor' Id='one' Type='ignored' Target='ignored'/>\
+              <extension xmlns:p='urn:vendor'>\
+                <p:Relationship Id='one' Type='ignored' Target='ignored'/>\
+                <Relationship xmlns='' Id='one' Type='ignored' Target='ignored'/>\
+              </extension>\
+              <Relationship xmlns='' Id='one' Type='ignored' Target='ignored'/>\
+              <p:Relationship Id='two' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/>\
+            </Relationships>"
+        ),
+    );
+    let original = stored(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert!(book.uses_1904_dates());
+    assert_eq!(book.sheets().len(), 2);
+    assert_eq!(book.sheets()[0].visibility(), SheetVisibility::Hidden);
+    assert_eq!(book.sheets()[1].visibility(), SheetVisibility::VeryHidden);
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Other", "B1", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Other", "B1").unwrap().value, 7.into());
 }
 
 #[test]

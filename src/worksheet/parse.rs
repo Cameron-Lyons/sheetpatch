@@ -1,13 +1,12 @@
-use super::{STRICT, TRANSITIONAL, decoded, decoded_namespace, unsupported, xml_error};
+use super::{STRICT, TRANSITIONAL, decoded_namespace, unsupported, xml_error};
 use crate::xml::{
-    MAX_DEPTH, is_space, valid_char as valid_xml_char, valid_name, valid_qname,
-    validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
+    MAX_DEPTH, NamespaceCache, NamespaceReader, is_space, valid_char as valid_xml_char, valid_name,
+    valid_qname, validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
 };
 use crate::{Error, Result};
 use quick_xml::{
     events::{Event, attributes::Attribute as XmlAttribute},
-    name::{NamespaceResolver, QName, ResolveResult},
-    reader::NsReader,
+    name::{QName, ResolveResult},
 };
 use std::{
     borrow::Cow,
@@ -30,9 +29,9 @@ impl NamespaceId {
 }
 
 struct NamespacePool {
-    // Consecutive elements nearly always share a namespace, so the latest
-    // raw URI is compared before hashing it.
-    last: (String, NamespaceId),
+    // Resolve inherited bindings by prefix without revisiting a potentially
+    // large URI. Nested declarations retain the surrounding scope's cache.
+    prefixes: NamespaceCache<NamespaceId>,
     raw: HashMap<String, NamespaceId>,
     canonical: HashMap<Arc<str>, NamespaceId>,
     values: Vec<Arc<str>>,
@@ -41,24 +40,29 @@ struct NamespacePool {
 impl NamespacePool {
     fn new() -> Self {
         Self {
-            last: (String::new(), NamespaceId::NONE),
+            prefixes: NamespaceCache::default(),
             raw: HashMap::new(),
             canonical: HashMap::new(),
             values: vec![Arc::from("")],
         }
     }
 
-    fn resolve(&mut self, result: ResolveResult<'_>) -> Result<NamespaceId> {
-        let ResolveResult::Bound(namespace) = result else {
-            return self.resolve_uncached(result);
-        };
-        if !self.last.0.is_empty() && namespace.as_ref() == self.last.0 {
-            return Ok(self.last.1);
+    fn resolve(
+        &mut self,
+        reader: &NamespaceReader<'_>,
+        name: QName<'_>,
+        attribute: bool,
+    ) -> Result<NamespaceId> {
+        if let Some(id) = self.prefixes.get(reader, name, attribute) {
+            return Ok(id);
         }
-        let id = self.resolve_uncached(ResolveResult::Bound(namespace))?;
-        self.last.0.clear();
-        self.last.0.push_str(namespace.as_ref());
-        self.last.1 = id;
+        let (namespace, _) = if attribute {
+            reader.resolver().resolve_attribute(name)
+        } else {
+            reader.resolver().resolve_element(name)
+        };
+        let id = self.resolve_uncached(namespace)?;
+        self.prefixes.insert(reader, name, attribute, id);
         Ok(id)
     }
 
@@ -291,7 +295,7 @@ fn attribute_spans<'xml>(
     mut position: usize,
     open_end: usize,
     document: &mut XmlDocument<'xml>,
-    resolver: &NamespaceResolver,
+    reader: &NamespaceReader<'_>,
     checks: &mut AttributeChecks<'xml>,
 ) -> Result<Range<usize>> {
     let xml = source.as_bytes();
@@ -371,8 +375,11 @@ fn attribute_spans<'xml>(
         } else if name.contains(':') {
             // Different prefixes bound to one namespace can still repeat an
             // expanded name. Unprefixed attributes have no namespace.
-            let (namespace, local) = resolver.resolve_attribute(QName(name));
-            let expanded = (document.namespaces.resolve(namespace)?, local.into_inner());
+            let qualified = QName(name);
+            let expanded = (
+                document.namespaces.resolve(reader, qualified, true)?,
+                qualified.local_name().into_inner(),
+            );
             if repeated(
                 checks.expanded.iter().copied(),
                 &mut checks.expanded_names,
@@ -409,6 +416,16 @@ impl<'xml> XmlDocument<'xml> {
             self.namespaces.values[id.0 as usize].as_ref(),
             TRANSITIONAL | STRICT
         )
+    }
+
+    pub(super) fn other_spreadsheet_namespace(
+        &self,
+        namespace: NamespaceId,
+    ) -> Option<NamespaceId> {
+        [TRANSITIONAL, STRICT]
+            .into_iter()
+            .filter_map(|uri| self.namespaces.canonical.get(uri).copied())
+            .find(|&candidate| candidate != namespace)
     }
 
     // Offers a completed child of the root to `release`, which may discard
@@ -455,7 +472,7 @@ pub(super) fn parse_with<'xml>(
     if xml[bom..].starts_with(&[0xef, 0xbb, 0xbf]) {
         return Err(xml_error("text outside the XML root"));
     }
-    let mut reader = NsReader::from_reader(&xml[bom..]);
+    let mut reader = NamespaceReader::from_reader(&xml[bom..]);
     reader.config_mut().check_comments = true;
     let mut document = XmlDocument {
         elements: Vec::new(),
@@ -492,16 +509,9 @@ pub(super) fn parse_with<'xml>(
                 if name.starts_with("xmlns:") {
                     return Err(xml_error("xmlns cannot be an element prefix"));
                 }
-                let (namespace, _) = reader.resolver().resolve_element(tag.name());
-                let namespace = document.namespaces.resolve(namespace)?;
-                let attributes = attribute_spans(
-                    source,
-                    name_end,
-                    end,
-                    &mut document,
-                    reader.resolver(),
-                    &mut checks,
-                )?;
+                let namespace = document.namespaces.resolve(&reader, tag.name(), false)?;
+                let attributes =
+                    attribute_spans(source, name_end, end, &mut document, &reader, &mut checks)?;
                 let empty = matches!(event, Event::Empty(_));
                 let index = document.elements.len();
                 arena_push(
@@ -554,8 +564,7 @@ pub(super) fn parse_with<'xml>(
                 if stack.is_empty() {
                     return Err(xml_error("entity reference outside the XML root"));
                 }
-                let name = reference.as_ref();
-                decoded(&format!("&{name};"))?;
+                crate::xml::reference(&reference)?;
             }
             Event::CData(_) if stack.is_empty() => {
                 return Err(xml_error("CDATA outside the XML root"));

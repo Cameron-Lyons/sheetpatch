@@ -33,7 +33,7 @@ pub enum Error {
     /// An edit would change a cell the crate protects: a formula cell, a cell
     /// in a shared, array, or data-table formula's range, a merged cell other
     /// than its range's top-left anchor, an Excel table header cell, or a cell
-    /// with value metadata. Pending edits are unchanged.
+    /// with cell or value metadata. Pending edits are unchanged.
     ///
     /// See the [edit restrictions](crate::Workbook#edit-restrictions) for when
     /// each kind of cell is protected.

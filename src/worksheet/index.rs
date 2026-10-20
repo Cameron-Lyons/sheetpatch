@@ -287,6 +287,7 @@ fn merged_ranges(
 fn hidden_containers(
     elements: &[Element],
     namespace: NamespaceId,
+    other_namespace: Option<NamespaceId>,
     data_index: usize,
 ) -> Result<bool> {
     let parent_named = |element: &Element, name| {
@@ -297,6 +298,14 @@ fn hidden_containers(
     };
     let mut hidden_columns = false;
     for element in elements {
+        // Spreadsheet consumers can recognize both dialects within one part.
+        // Treating the other dialect as a vendor extension would hide values,
+        // formulas, merged ranges, or column defaults from this index.
+        if Some(element.namespace) == other_namespace {
+            return Err(unsupported(
+                "worksheet mixes strict and transitional SpreadsheetML namespaces",
+            ));
+        }
         if element.namespace != namespace {
             continue;
         }
@@ -360,6 +369,7 @@ impl<'a> WorksheetIndex<'a> {
     pub(super) fn parse(xml: &'a [u8]) -> Result<Self> {
         let document = parse(xml)?;
         let namespace = worksheet_namespace(&document)?;
+        let other_namespace = document.other_spreadsheet_namespace(namespace);
         let XmlDocument {
             elements,
             attributes,
@@ -377,7 +387,7 @@ impl<'a> WorksheetIndex<'a> {
             index_rows(&elements, &attributes, namespace, data_index, &mut formulas)?;
         let mut column_styles = column_styles(&elements, &attributes, namespace);
         let merged_ranges = merged_ranges(&elements, &attributes, namespace)?;
-        if hidden_containers(&elements, namespace, data_index)? {
+        if hidden_containers(&elements, namespace, other_namespace, data_index)? {
             column_styles = Err("column definitions inside an unsupported XML container");
         }
         let incomplete_formula_group = formulas.first_incomplete_group();

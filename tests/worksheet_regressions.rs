@@ -85,7 +85,11 @@ fn payloads(archive: &[u8]) -> BTreeMap<String, Vec<u8>> {
 
 /// A one-sheet workbook named `Data`, optionally with a shared-string table.
 fn workbook(body: &str, shared_strings: Option<&str>) -> Workbook {
-    let sheet = format!("<worksheet xmlns='{MAIN_NS}'>{body}</worksheet>");
+    workbook_in_namespace(body, shared_strings, MAIN_NS)
+}
+
+fn workbook_in_namespace(body: &str, shared_strings: Option<&str>, namespace: &str) -> Workbook {
+    let sheet = format!("<worksheet xmlns='{namespace}'>{body}</worksheet>");
     let workbook = format!(
         "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"
     );
@@ -100,7 +104,7 @@ fn workbook(body: &str, shared_strings: Option<&str>) -> Workbook {
         "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='data' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/>{strings_relationship}</Relationships>"
     );
     let strings = shared_strings
-        .map(|items| format!("<sst xmlns='{MAIN_NS}'>{items}</sst>"))
+        .map(|items| format!("<sst xmlns='{namespace}'>{items}</sst>"))
         .unwrap_or_default();
     let mut parts: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/></Types>"),
@@ -144,6 +148,135 @@ fn unsupported_message(result: sheetpatch::Result<()>) -> String {
             .unwrap_or_else(|| panic!("expected the worksheet's name: {message}"))
             .to_owned(),
         other => panic!("expected an unsupported edit, got {other:?}"),
+    }
+}
+
+#[test]
+fn xml_references_decode_consistently_across_cell_values_and_no_ops() {
+    let escaped = "&amp;&lt;&gt;&apos;&quot;&#9;&#10;&#13;&#x1F600;&#xFEFF;&#95;x0041_";
+    let expected_text = "&<>'\"\t\n\r😀\u{feff}A";
+    let cells = format!(
+        "<c r='A1' t='inlineStr'><is><t>{escaped}</t></is></c>\
+         <c r='B1' t='s'><v>&#48;</v></c>\
+         <c r='C1'><v>&#49;&#46;&#50;&#53;</v></c>\
+         <c r='D1' t='b'><v>t&#114;ue</v></c>\
+         <c r='E1' t='e'><v>#V&#65;LUE!</v></c>\
+         <c r='F1' t='d'><v>2024-01-&#49;5T12:00:00</v></c>\
+         <c r='G1'><f>IF(A1=&quot;&amp;&quot;,&#49;,0)</f><v>1</v></c>"
+    );
+    let strings = format!("<si><r><t>{escaped}</t></r></si>");
+    let mut book = workbook(&row(&cells), Some(&strings));
+    let original = book.to_bytes().unwrap();
+    let expected = [
+        ("A1", CellValue::from(expected_text)),
+        ("B1", CellValue::from(expected_text)),
+        ("C1", CellValue::Number(1.25)),
+        ("D1", CellValue::Bool(true)),
+        ("E1", CellValue::Error("#VALUE!".into())),
+        ("F1", CellValue::Number(45_306.5)),
+    ];
+    for (address, expected) in &expected {
+        assert_eq!(value(&book, address), *expected);
+    }
+    let formula = book.get_cell("Data", "G1").unwrap();
+    assert_eq!(formula.value, CellValue::Number(1.0));
+    assert_eq!(formula.formula.as_deref(), Some("IF(A1=\"&\",1,0)"));
+    book.set_cells("Data", expected).unwrap();
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cells(
+        "Data",
+        [
+            ("A1", CellValue::from("&<>\r😀")),
+            ("C1", CellValue::Number(-3.5)),
+        ],
+    )
+    .unwrap();
+    let reopened = reopened(&book);
+    assert_eq!(value(&reopened, "A1"), CellValue::from("&<>\r😀"));
+    assert_eq!(value(&reopened, "B1"), CellValue::from(expected_text));
+    assert_eq!(value(&reopened, "C1"), CellValue::Number(-3.5));
+}
+
+#[test]
+fn uppercase_x_in_stored_text_is_literal_for_reads_edits_and_no_ops() {
+    for (cell, strings) in [
+        ("<c r='A1' t='inlineStr'><is><t>_X0041_</t></is></c>", None),
+        (
+            "<c r='A1' t='inlineStr'><is><r><t>_X0041_</t></r></is></c>",
+            None,
+        ),
+        ("<c r='A1' t='str'><v>_X0041_</v></c>", None),
+        (
+            "<c r='A1' t='s'><v>0</v></c>",
+            Some("<si><t>_X0041_</t></si>"),
+        ),
+        (
+            "<c r='A1' t='s'><v>0</v></c>",
+            Some("<si><r><t>_X0041_</t></r></si>"),
+        ),
+    ] {
+        let mut book = workbook(&row(cell), strings);
+        let original = book.to_bytes().unwrap();
+        assert_eq!(value(&book, "A1"), CellValue::from("_X0041_"));
+        book.set_cell("Data", "A1", "_X0041_").unwrap();
+        assert!(!book.has_changes());
+        assert_eq!(book.to_bytes().unwrap(), original);
+
+        book.set_cell("Data", "A1", "A").unwrap();
+        assert!(book.has_changes());
+        assert_eq!(value(&reopened(&book), "A1"), CellValue::from("A"));
+        if strings.is_some() {
+            assert_eq!(
+                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+                payloads(&original)["xl/sharedStrings.xml"]
+            );
+        }
+
+        book.set_cell("Data", "A1", "_X0041_").unwrap();
+        assert!(sheet_xml(&book).contains(">_X0041_</t>"));
+        assert_eq!(value(&reopened(&book), "A1"), CellValue::from("_X0041_"));
+    }
+}
+
+#[test]
+fn uppercase_x_in_sheet_names_is_literal() {
+    let original = workbook(&row("<c r='A1'><v>1</v></c>"), None)
+        .to_bytes()
+        .unwrap();
+    for (stored_name, decoded_name) in [
+        ("_X0041_", "_X0041_"),
+        ("_x0041_", "A"),
+        ("_x005F_X0041_", "_X0041_"),
+    ] {
+        let mut parts = payloads(&original);
+        let metadata = String::from_utf8(parts["xl/workbook.xml"].clone())
+            .unwrap()
+            .replace("name='Data'", &format!("name='{stored_name}'"));
+        parts.insert("xl/workbook.xml".into(), metadata.as_bytes().to_vec());
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+            .collect();
+        let original = stored_archive(&entries);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(book.sheets()[0].name(), decoded_name);
+        assert_eq!(
+            book.get_cell(decoded_name, "A1").unwrap().value,
+            CellValue::Number(1.0)
+        );
+        book.set_cell(decoded_name, "A1", 1).unwrap();
+        assert!(!book.has_changes());
+        assert_eq!(book.to_bytes().unwrap(), original);
+
+        book.set_cell(decoded_name, "A1", 2).unwrap();
+        let saved = book.to_bytes().unwrap();
+        assert_eq!(payloads(&saved)["xl/workbook.xml"], metadata.as_bytes());
+        let book = Workbook::from_bytes(saved).unwrap();
+        assert_eq!(book.sheets()[0].name(), decoded_name);
+        assert_eq!(
+            book.get_cell(decoded_name, "A1").unwrap().value,
+            CellValue::Number(2.0)
+        );
     }
 }
 
@@ -419,6 +552,55 @@ fn new_cells_inherit_row_then_column_default_styles() {
 }
 
 #[test]
+fn bulk_insertions_keep_each_rows_custom_or_column_style() {
+    let padding = (0..512)
+        .map(|index| format!(" v:a{index}='keep'"))
+        .collect::<String>();
+    let row_attributes = format!(
+        "r='1' xmlns:v='urn:vendor'{padding} customFormat=' 1 ' s='{}7'",
+        "0".repeat(32_768)
+    );
+    let body = format!(
+        "<cols><col min='2' max='3' style='4'/><col min='4' max='5' style='5'/></cols>\
+         <sheetData><row {row_attributes}><c r='A1' s='3'><v>1</v></c></row>\
+         <row r='2' customFormat='true' s='0000'/>\
+         <row r='3' customFormat='1'/>\
+         <row r='4' customFormat='false' s='ignored'/></sheetData>"
+    );
+    let mut book = workbook(&body, None);
+    let mut edits = (1..=128)
+        .map(|column| (sheetpatch::CellRef::new(1, column).unwrap(), 2))
+        .collect::<Vec<_>>();
+    for row in 2..=4 {
+        for column in [3, 4] {
+            edits.push((sheetpatch::CellRef::new(row, column).unwrap(), 2));
+        }
+    }
+    book.set_cells_at("Data", edits).unwrap();
+    let book = reopened(&book);
+    let view = book.prepare_sheet("Data").unwrap();
+    assert_eq!(view.get_cell("A1").unwrap().style_index, Some(3));
+    for column in 2..=128 {
+        assert_eq!(
+            view.get_cell_at(sheetpatch::CellRef::new(1, column).unwrap())
+                .unwrap()
+                .style_index,
+            Some(7)
+        );
+    }
+    for address in ["C2", "D2", "C3", "D3"] {
+        assert_eq!(
+            view.get_cell(address).unwrap().style_index,
+            None,
+            "{address}"
+        );
+    }
+    assert_eq!(view.get_cell("C4").unwrap().style_index, Some(4));
+    assert_eq!(view.get_cell("D4").unwrap().style_index, Some(5));
+    assert!(sheet_xml(&book).contains(&format!("<row {row_attributes}>")));
+}
+
+#[test]
 fn malformed_default_styles_only_block_new_cells_that_need_them() {
     for (body, message) in [
         (
@@ -457,6 +639,38 @@ fn malformed_default_styles_only_block_new_cells_that_need_them() {
         "B2: invalid row format flag"
     );
     book.set_cells("Data", [("A1", 2), ("C3", 3)]).unwrap();
+    // Existing cells and clears of missing cells never need row defaults.
+    book.set_cells(
+        "Data",
+        [
+            ("A1", CellValue::Number(3.0)),
+            ("B1", CellValue::Blank),
+            ("A2", CellValue::Blank),
+        ],
+    )
+    .unwrap();
+    let pending = book.to_bytes().unwrap();
+    for (edits, expected) in [
+        (
+            [
+                ("A1", CellValue::Number(4.0)),
+                ("B1", CellValue::Blank),
+                ("C1", CellValue::Number(5.0)),
+            ],
+            "C1: invalid row style index",
+        ),
+        (
+            [
+                ("A1", CellValue::Number(4.0)),
+                ("A2", CellValue::Blank),
+                ("B2", CellValue::Number(5.0)),
+            ],
+            "B2: invalid row format flag",
+        ),
+    ] {
+        assert_eq!(unsupported_message(book.set_cells("Data", edits)), expected);
+        assert_eq!(book.to_bytes().unwrap(), pending);
+    }
 }
 
 #[test]
@@ -572,6 +786,162 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
 }
 
 #[test]
+fn duplicate_text_in_one_rich_text_run_cannot_produce_false_no_ops() {
+    let duplicate = "<r><t>first</t><t>second</t></r>";
+    let mut book = workbook(
+        &row(&format!(
+            "<c r='A1' t='inlineStr'><is>{duplicate}</is></c><c r='B1'><v>9</v></c>"
+        )),
+        None,
+    );
+    let original = book.to_bytes().unwrap();
+    assert!(matches!(
+        book.get_cell("Data", "A1"),
+        Err(Error::Unsupported(message))
+            if message == "worksheet \"Data\": A1: rich text run has multiple text elements"
+    ));
+    for replacement in [
+        CellValue::from("firstsecond"),
+        CellValue::from("second"),
+        CellValue::Number(1.0),
+        CellValue::Blank,
+    ] {
+        assert!(matches!(
+            book.set_cell("Data", "A1", replacement),
+            Err(Error::Unsupported(message))
+                if message == "worksheet \"Data\": A1: rich text run has multiple text elements"
+        ));
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+    book.set_cell("Data", "B1", 8).unwrap();
+    assert!(sheet_xml(&book).contains(duplicate));
+
+    let mut book = workbook(
+        &row("<c r='A1' t='s'><v>0</v></c>"),
+        Some(&format!("<si>{duplicate}</si>")),
+    );
+    let original = book.to_bytes().unwrap();
+    assert!(matches!(
+        book.get_cell("Data", "A1"),
+        Err(Error::Unsupported(message))
+            if message == "part \"xl/sharedStrings.xml\": rich text run has multiple text elements"
+    ));
+    // Explicit replacement repairs an unreadable shared-string cell without
+    // rewriting the shared table or mistaking the concatenation for a no-op.
+    book.set_cell("Data", "A1", "firstsecond").unwrap();
+    assert!(book.has_changes());
+    assert_eq!(
+        value(&reopened(&book), "A1"),
+        CellValue::from("firstsecond")
+    );
+    assert_eq!(
+        payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+        payloads(&original)["xl/sharedStrings.xml"]
+    );
+
+    for content in [
+        "<r><t>first</t></r><r><t>second</t></r>",
+        "<t>first</t><t>second</t>",
+        "<t>first</t><r><t>second</t></r>",
+        "<r><t>first</t></r><t>second</t>",
+        "<r/><t>firstsecond</t>",
+    ] {
+        let mut book = workbook(
+            &row(&format!("<c r='A1' t='inlineStr'><is>{content}</is></c>")),
+            None,
+        );
+        let original = book.to_bytes().unwrap();
+        assert_eq!(value(&book, "A1"), CellValue::from("firstsecond"));
+        book.set_cell("Data", "A1", "firstsecond").unwrap();
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+    let book = workbook(
+        &row(
+            "<c r='A1' t='inlineStr'><is><r><t>visible</t><x:t xmlns:x='urn:custom'>opaque</x:t></r></is></c>",
+        ),
+        None,
+    );
+    assert_eq!(value(&book, "A1"), CellValue::from("visible"));
+}
+
+#[test]
+fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
+    // Metadata operation flags apply to cell metadata as well as value metadata.
+    // ECMA-376 18.9.10 requires disassociation on edit/clear when these are false.
+    let metadata = format!(
+        "<metadata xmlns='{MAIN_NS}'><metadataTypes count='1'><metadataType name='custom' minSupportedVersion='1' cellMeta='1' edit='0' delete='0' clearContents='0'/></metadataTypes><futureMetadata name='custom' count='1'><bk><extLst><ext uri='urn:custom'><stamp xmlns='urn:custom' originalValue='1'/></ext></extLst></bk></futureMetadata><cellMetadata count='2'><bk><rc t='1' v='0'/></bk><bk><rc t='1' v='0'/></bk></cellMetadata></metadata>"
+    );
+    for index in ["0", "1"] {
+        let original = workbook(
+            &row(&format!(
+                "<c r='A1' cm='{index}'><v>1</v></c><c r='B1'><v>9</v></c>"
+            )),
+            None,
+        )
+        .to_bytes()
+        .unwrap();
+        let mut parts = payloads(&original);
+        let relationships = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone())
+            .unwrap()
+            .replace(
+                "</Relationships>",
+                &format!("<Relationship Id='metadata' Type='{OFFICE_NS}/sheetMetadata' Target='metadata.xml'/></Relationships>"),
+            );
+        parts.insert(
+            "xl/_rels/workbook.xml.rels".into(),
+            relationships.into_bytes(),
+        );
+        let types = String::from_utf8(parts["[Content_Types].xml"].clone())
+            .unwrap()
+            .replace(
+                "</Types>",
+                "<Override PartName='/xl/metadata.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml'/></Types>",
+            );
+        parts.insert("[Content_Types].xml".into(), types.into_bytes());
+        parts.insert("xl/metadata.xml".into(), metadata.as_bytes().to_vec());
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+            .collect();
+        let original = stored_archive(&entries);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(value(&book, "A1"), CellValue::Number(1.0));
+        book.set_cell("Data", "A1", 1).unwrap();
+        assert!(!book.has_changes());
+        assert_eq!(book.to_bytes().unwrap(), original);
+
+        for value in [
+            CellValue::Number(2.0),
+            CellValue::from("replacement"),
+            CellValue::Bool(true),
+            CellValue::Error("#N/A".into()),
+            CellValue::Blank,
+        ] {
+            let error = book
+                .set_cells("Data", [("B1", CellValue::Number(8.0)), ("A1", value)])
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "protected cell: worksheet \"Data\": A1 has cell metadata with unsupported edit semantics"
+            );
+            assert!(!book.has_changes());
+            assert_eq!(book.to_bytes().unwrap(), original);
+        }
+        book.set_cell("Data", "B1", 8).unwrap();
+        let saved = book.to_bytes().unwrap();
+        let after = payloads(&saved);
+        for (name, bytes) in &parts {
+            if name != SHEET_PATH {
+                assert_eq!(&after[name], bytes);
+            }
+        }
+        let reopened = Workbook::from_bytes(saved).unwrap();
+        assert_eq!(value(&reopened, "A1"), CellValue::Number(1.0));
+        assert_eq!(value(&reopened, "B1"), CellValue::Number(8.0));
+    }
+}
+
+#[test]
 fn edit_refusals_name_the_cell() {
     let mut book = workbook(
         &row(concat!(
@@ -610,4 +980,246 @@ fn edit_refusals_name_the_cell() {
         unsupported_message(book.set_cell("Data", "B1", 5)),
         "row 1: invalid row spans"
     );
+}
+
+#[test]
+fn namespace_prefix_caches_follow_shadowing_and_empty_element_scopes() {
+    let escaped_main = MAIN_NS.replace("/main", "/ma&#105;n");
+    let body = format!(
+        "<sheetData xmlns:s='{MAIN_NS}' xmlns:t='{escaped_main}' xmlns:a='urn:first' xmlns:b='urn:second'><row r='1' xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'><s:c r='A1' a:flag='1' b:flag='2'><s:v>1</s:v></s:c><s:c xmlns:s='urn:vendor' r='Z1'/><marker xmlns=''><c r='Z2'/></marker><holder xmlns='urn:vendor' xmlns:s='urn:vendor'><s:c r='Z3'/></holder><t:c r='B1' a:flag='1' b:flag='2'><t:v>2</t:v></t:c><a:marker xmlns:a='urn:second' a:flag='x'/><c r='C1' a:flag='1' b:flag='2'><v>3</v></c></row></sheetData>"
+    );
+    let mut book = workbook(&body, None);
+    let original = book.to_bytes().unwrap();
+    for (address, expected) in [("A1", 1), ("B1", 2), ("C1", 3)] {
+        assert_eq!(value(&book, address), CellValue::from(expected));
+        book.set_cell("Data", address, expected).unwrap();
+    }
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cells("Data", [("A1", 4), ("D1", 5), ("C2", 6)])
+        .unwrap();
+    let saved = reopened(&book);
+    for (address, expected) in [("A1", 4), ("B1", 2), ("C1", 3), ("D1", 5), ("C2", 6)] {
+        assert_eq!(value(&saved, address), CellValue::from(expected));
+    }
+    for opaque in [
+        "<s:c xmlns:s='urn:vendor' r='Z1'/>",
+        "<marker xmlns=''><c r='Z2'/></marker>",
+        "<holder xmlns='urn:vendor' xmlns:s='urn:vendor'><s:c r='Z3'/></holder>",
+        "<a:marker xmlns:a='urn:second' a:flag='x'/>",
+    ] {
+        assert!(sheet_xml(&saved).contains(opaque));
+    }
+
+    // The two prefixes become aliases only on this final cell, after their
+    // distinct outer bindings have already been used and cached.
+    let duplicate = body.replace("<c r='C1'", "<c r='C1' xmlns:b='urn:first'");
+    assert!(matches!(
+        workbook(&duplicate, None).get_cell("Data", "A1"),
+        Err(Error::Xml(message)) if message.contains("duplicate expanded attribute name")
+    ));
+    // A prefix declared on an empty element is unbound again afterward.
+    for following in ["<x:c r='B1'/>", "<c r='B1' x:flag='unbound'/>"] {
+        let body = row(&format!(
+            "<c r='A1'><v>1</v></c><x:marker xmlns:x='urn:vendor' x:flag='cached'/>{following}"
+        ));
+        assert!(matches!(
+            workbook(&body, None).get_cell("Data", "A1"),
+            Err(Error::Xml(message)) if message.contains("unbound namespace prefix")
+        ));
+    }
+}
+
+#[test]
+fn escaped_reserved_namespace_bindings_preserve_text_and_namespace_scopes() {
+    let xml_namespace = "http://www.w3.org/XML/1998/namespac&#101;";
+    let body = format!(
+        "<sheetData xmlns:s='{MAIN_NS}'><row r='1' vendor='a\"b' xmlns:before='urn:first' xmlns:xml='{xml_namespace}' xmlns:after='urn:last' before:flag='keep' after:flag='keep'><s:c r='A1' t='inlineStr'><s:is><s:t xmlns:xml='{xml_namespace}' xml:space='preserve'> old </s:t></s:is></s:c><c r='B1' xmlns:s='urn:foreign' xmlns:xml='{xml_namespace}'/><s:c r='C1' t='s'><s:v>0</s:v></s:c></row></sheetData>"
+    );
+    let strings =
+        format!("<si xmlns:xml='{xml_namespace}'><t xml:space='preserve'> shared </t></si>");
+    let mut book = workbook(&body, Some(&strings));
+    assert_eq!(value(&book, "A1"), CellValue::from(" old "));
+    assert_eq!(value(&book, "B1"), CellValue::Blank);
+    assert_eq!(value(&book, "C1"), CellValue::from(" shared "));
+
+    // A no-op keeps even the namespace's escaped spelling byte for byte.
+    let original = book.to_bytes().unwrap();
+    book.set_cells("Data", [("A1", " old "), ("C1", " shared ")])
+        .unwrap();
+    assert_eq!(book.to_bytes().unwrap(), original);
+
+    // A real edit uses original offsets despite declarations on the value,
+    // and an empty element's declarations cannot leak into following cells.
+    book.set_cells("Data", [("A1", " changed "), ("C1", "replacement")])
+        .unwrap();
+    let saved = reopened(&book);
+    assert_eq!(value(&saved, "A1"), CellValue::from(" changed "));
+    assert_eq!(value(&saved, "C1"), CellValue::from("replacement"));
+    let xml = sheet_xml(&saved);
+    assert!(xml.contains(&format!(
+        "vendor='a\"b' xmlns:before='urn:first' xmlns:xml='{xml_namespace}' xmlns:after='urn:last' before:flag='keep' after:flag='keep'"
+    )));
+    assert!(xml.contains(&format!(
+        "<c r='B1' xmlns:s='urn:foreign' xmlns:xml='{xml_namespace}'/>"
+    )));
+}
+
+#[test]
+fn escaped_reserved_namespace_bindings_cannot_bypass_xml_validation() {
+    let xml_namespace = "http://www.w3.org/XML/1998/namespac&#101;";
+    for attributes in [
+        format!("xmlns:xml='{xml_namespace}' xmlns:xml='{xml_namespace}'"),
+        format!("xmlns:xml='{xml_namespace}' xmlns:xml='urn:invalid'"),
+        format!("xmlns:xml='{xml_namespace}' xmlns:other='{xml_namespace}'"),
+        format!("xmlns:xml='{xml_namespace}' xmlns:other=''"),
+        format!("xmlns:xml='{xml_namespace}' unbound:flag='x'"),
+        format!(
+            "xmlns:xml='{xml_namespace}' xmlns:a='urn:a' xmlns:b='urn:a' a:flag='x' b:flag='y'"
+        ),
+        "xmlns:xml='http://www.w3.org/XML/1998/namespace&#32;'".to_owned(),
+    ] {
+        let mut book = workbook(&format!("<sheetData {attributes}/>"), None);
+        assert!(
+            matches!(book.get_cell("Data", "A1"), Err(Error::Xml(_))),
+            "{attributes}"
+        );
+        assert!(
+            matches!(book.set_cell("Data", "A1", 1), Err(Error::Xml(_))),
+            "{attributes}"
+        );
+        assert!(!book.has_changes(), "{attributes}");
+    }
+}
+
+#[test]
+fn hidden_rich_text_cannot_be_discarded_by_a_replacement() {
+    for payload in [
+        "<t>visible</t><rPr><t>hidden</t></rPr>",
+        "<r><t>visible</t><rPr><t>hidden</t></rPr></r>",
+        "<rPr><r><t>hidden</t></r></rPr>",
+        "<rPh sb='0' eb='1'><r><t>hidden</t></r></rPh>",
+    ] {
+        let mut book = workbook(
+            &row(&format!(
+                "<c r='A1' t='inlineStr'><is>{payload}</is></c><c r='B1'><v>1</v></c>"
+            )),
+            None,
+        );
+        assert!(
+            matches!(book.get_cell("Data", "A1"), Err(Error::Unsupported(_))),
+            "{payload}"
+        );
+        let original = book.to_bytes().unwrap();
+        for replacement in [CellValue::from("replacement"), 2.into(), CellValue::Blank] {
+            assert!(
+                matches!(
+                    book.set_cell("Data", "A1", replacement),
+                    Err(Error::Unsupported(_))
+                ),
+                "{payload}"
+            );
+            assert_eq!(book.to_bytes().unwrap(), original, "{payload}");
+        }
+        // Another cell remains editable without discarding the hidden text.
+        book.set_cell("Data", "B1", 2).unwrap();
+        assert!(sheet_xml(&book).contains(payload), "{payload}");
+        assert_eq!(value(&book, "B1"), CellValue::Number(2.0));
+    }
+}
+
+#[test]
+fn mixed_spreadsheet_namespaces_cannot_hide_worksheet_semantics() {
+    const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+    for (namespace, other) in [(MAIN_NS, STRICT), (STRICT, MAIN_NS)] {
+        // Namespace comparison uses decoded URIs, including escaped spellings.
+        let other = other.replace('/', "&#47;");
+        for body in [
+            row(&format!(
+                "<c r='A1'><s:f xmlns:s='{other}'>1+1</s:f><v>2</v></c>"
+            )),
+            row(&format!("<c r='A1'><s:v xmlns:s='{other}'>2</s:v></c>")),
+            row(&format!(
+                "<c r='A1' t='inlineStr'><is><t>visible</t><s:t xmlns:s='{other}'>hidden</s:t></is></c>"
+            )),
+            format!(
+                "<sheetData><s:row xmlns:s='{other}' r='1'><s:c r='A1'><s:v>2</s:v></s:c></s:row></sheetData>"
+            ),
+            format!(
+                "<sheetData/><s:mergeCells xmlns:s='{other}'><s:mergeCell ref='A1:B2'/></s:mergeCells>"
+            ),
+            format!(
+                "<s:cols xmlns:s='{other}'><s:col min='2' max='2' style='4'/></s:cols><sheetData/>"
+            ),
+        ] {
+            let mut book = workbook_in_namespace(&body, None, namespace);
+            assert!(
+                matches!(
+                    book.get_cell("Data", "A1"),
+                    Err(Error::Unsupported(message))
+                        if message == "worksheet \"Data\": worksheet mixes strict and transitional SpreadsheetML namespaces"
+                ),
+                "{body}"
+            );
+            let original = book.to_bytes().unwrap();
+            assert!(
+                matches!(book.set_cell("Data", "B2", 7), Err(Error::Unsupported(_))),
+                "{body}"
+            );
+            assert_eq!(book.to_bytes().unwrap(), original, "{body}");
+        }
+
+        // Vendor extensions remain opaque even when they reuse core names.
+        let body = row(&format!(
+            "<c r='A1' xmlns:other='{other}'><v>1</v><s:f xmlns:s='urn:vendor'>extension</s:f></c>"
+        ));
+        let mut book = workbook_in_namespace(&body, None, namespace);
+        book.set_cell("Data", "A1", 2).unwrap();
+        assert_eq!(value(&book, "A1"), CellValue::Number(2.0));
+        assert!(sheet_xml(&book).contains("<s:f xmlns:s='urn:vendor'>extension</s:f>"));
+    }
+}
+
+#[test]
+fn mixed_spreadsheet_namespaces_cannot_shift_or_truncate_shared_strings() {
+    const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+    for (namespace, other) in [(MAIN_NS, STRICT), (STRICT, MAIN_NS)] {
+        for strings in [
+            format!("<s:si xmlns:s='{other}'><s:t>hidden entry</s:t></s:si><si><t>next</t></si>"),
+            format!("<si><t>visible</t><s:t xmlns:s='{other}'>hidden text</s:t></si>"),
+            format!("<si><s:r xmlns:s='{other}'><s:t>hidden run</s:t></s:r></si>"),
+        ] {
+            let mut book = workbook_in_namespace(
+                &row("<c r='A1' t='s'><v>0</v></c>"),
+                Some(&strings),
+                namespace,
+            );
+            assert!(
+                matches!(
+                    book.get_cell("Data", "A1"),
+                    Err(Error::Unsupported(message))
+                        if message == "part \"xl/sharedStrings.xml\": shared-string table mixes strict and transitional SpreadsheetML namespaces"
+                ),
+                "{strings}"
+            );
+            // Like any unreadable table, this still permits an explicit
+            // replacement of an ordinary cell without changing that table.
+            let original_table =
+                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"].clone();
+            book.set_cell("Data", "A1", "replacement").unwrap();
+            assert_eq!(value(&book, "A1"), CellValue::from("replacement"));
+            assert_eq!(
+                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+                original_table
+            );
+        }
+        let book = workbook_in_namespace(
+            &row("<c r='A1' t='s'><v>0</v></c>"),
+            Some(
+                "<vendor:si xmlns:vendor='urn:vendor'/><si><t>visible</t><vendor:t xmlns:vendor='urn:vendor'>extension</vendor:t></si>",
+            ),
+            namespace,
+        );
+        assert_eq!(value(&book, "A1"), CellValue::from("visible"));
+    }
 }

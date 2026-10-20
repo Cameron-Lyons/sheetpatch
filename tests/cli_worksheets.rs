@@ -218,6 +218,36 @@ fn cells_of_sheets_without_values_are_empty() {
 }
 
 #[test]
+fn large_cell_listings_skip_empty_batches_and_keep_json_separators_correct() {
+    let directory = TempDir::new();
+    let rows: String = (1..=2048)
+        .map(|row| {
+            let content = match row {
+                513 => "<v>17</v>",
+                1537 => "<f>1+2</f>",
+                _ => "",
+            };
+            format!("<row r='{row}'><c r='A{row}' s='1'>{content}</c></row>")
+        })
+        .collect();
+    let data = format!("<sheetData>{rows}</sheetData>");
+    let path = saved(&directory, "large-sparse.xlsx", &[("Data", "", &data)]);
+    let path = text(&path);
+    assert_eq!(
+        success(&["cells", path, "Data"]),
+        "A513\tnumber\t17\nA1537\tblank\t\n"
+    );
+    assert_eq!(
+        success(&["cells", "--json", path, "Data"]),
+        success(&["get", "--json", path, "Data", "A513", "A1537"])
+    );
+    assert_eq!(
+        success(&["cells", "--json", path, "Data", "A1:A512"]),
+        "[]\n"
+    );
+}
+
+#[test]
 fn cells_lines_prefixed_with_a_sheet_name_are_patch_rows() {
     let directory = TempDir::new();
     let values = "<sheetData><row r='1'>\

@@ -261,7 +261,7 @@ fn literal_ooxml_escape_sequences_and_carriage_returns_keep_their_text_meaning()
         .unwrap();
     let xml = worksheet_xml(&workbook.to_bytes().unwrap());
     assert!(xml.contains("_x005F_x000A_"), "{xml}");
-    assert!(xml.contains("_x005F_Xabcd_"), "{xml}");
+    assert!(xml.contains(" _Xabcd_ "), "{xml}");
     assert!(xml.contains("_x005F_x005F_"), "{xml}");
     assert!(xml.contains("&#13;\nend"), "{xml}");
 }

@@ -55,7 +55,7 @@ impl Temporary {
 }
 
 /// What a new save destination inherits from the regular file a workbook was
-/// read from, so that a copy is never more permissive than its source.
+/// read from: Unix mode bits and group, without its owner or ACL.
 #[derive(Clone, Copy)]
 pub(crate) struct SourcePermissions {
     #[cfg(unix)]
@@ -85,8 +85,8 @@ impl SourcePermissions {
 }
 
 /// Create a new, exclusively named file in `parent`. On Unix `mode` supplies
-/// the creation mode's permission bits, which the process umask still
-/// restricts.
+/// the creation mode's permission bits. The OS applies the parent directory's
+/// default ACL or, without one, the process umask.
 fn create_temporary(parent: &Path, mode: Option<u32>) -> Result<Temporary> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {
@@ -146,10 +146,11 @@ fn existing_destination(path: &Path) -> io::Result<Option<fs::Metadata>> {
 ///
 /// The replacement is a new file, so its group is the one new files receive in
 /// that directory unless it can be changed to the destination's group. Group
-/// permission bits belong to the destination's group and are never granted to
-/// a different one. Other permissions cannot exceed the old group's access:
-/// its members now fall into that class. Setuid, setgid and sticky bits are
-/// never carried over: writing the contents would clear setuid and setgid anyway.
+/// permission bits are kept only for that group. Other bits are restricted by
+/// the old group bits because its members now fall into that class. These mode
+/// checks do not preserve ACLs or prevent inherited ACL access. Setuid, setgid
+/// and sticky bits are never carried over: writing the contents would clear
+/// setuid and setgid anyway.
 #[cfg(unix)]
 fn replacement_mode(destination_mode: u32, same_group: bool) -> u32 {
     let mode = destination_mode & 0o777;
@@ -172,7 +173,7 @@ fn assign_group(file: &File, gid: u32) -> io::Result<bool> {
 }
 
 /// Create an existing destination's replacement with the destination's group
-/// and permissions, before any contents are written.
+/// and mode bits, before any contents are written.
 #[cfg(unix)]
 fn create_replacement(parent: &Path, destination: &fs::Metadata) -> Result<Temporary> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -198,10 +199,10 @@ fn create_replacement(parent: &Path, destination: &fs::Metadata) -> Result<Tempo
 
 /// Create a new destination's temporary file.
 ///
-/// On Unix, a file created from a source gets the source's permission bits,
-/// restricted by the umask, without setuid, setgid or sticky bits. Like a
-/// replacement, it keeps group permission bits only when it has the source's
-/// group, assigning that group when the process may.
+/// On Unix, the source's mode bits supply the creation mode, subject to the
+/// OS's default ACL or umask rules, without setuid, setgid or sticky bits. Like
+/// a replacement, it keeps group mode bits only when it has the source's group,
+/// assigning that group when the process may.
 #[cfg(unix)]
 fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Temporary> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -217,7 +218,8 @@ fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Tempor
     // The file was created in another group, such as the group of a setgid
     // directory. Group or other permissions may already have let someone
     // open it who cannot access the source. Discard it unwritten and start
-    // owner-only before assigning the group. Its mode still shows the umask.
+    // owner-only before assigning the group. Its mode reflects the OS's
+    // default ACL or umask restrictions.
     let mode = created.mode() & 0o777;
     let temp = if mode & 0o077 == 0 {
         temp
@@ -257,12 +259,13 @@ fn sync_directory(_: &Path) {}
 
 /// Replace `path` with the output of `serialize`, or leave it untouched.
 ///
-/// An existing destination's permissions are applied to its replacement
+/// An existing destination's mode bits are applied to its replacement
 /// before contents are written; on Unix its group is kept too when the process
-/// may assign it, and otherwise group access is removed and other access is
-/// limited to what both the original group and others had. On Unix a new
-/// destination gets the `source` file's permission bits, restricted by the
-/// umask, under the same group rule, or the default mode when it is `None`.
+/// may assign it, and otherwise group bits are cleared and other bits are
+/// limited to those shared by the original group and others. On Unix a new
+/// destination uses the `source` file's mode bits, under the OS's default ACL
+/// or umask rules and the same group rule, or the default mode when it is
+/// `None`. ACLs are not preserved; inherited ACLs can grant additional access.
 /// Setuid, setgid and sticky bits are never applied.
 pub(crate) fn write(
     path: &Path,

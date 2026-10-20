@@ -1,5 +1,6 @@
 use super::index::Range;
 use super::parse::{Attribute, Element, NamespaceId};
+use super::read::validate_rich_text_structure;
 use super::{protected, protection, unsupported};
 use crate::{CellRef, CellValue, Result};
 use std::collections::BTreeMap;
@@ -7,6 +8,24 @@ use std::collections::BTreeMap;
 // Known rich text is the old value and may be replaced. Unfamiliar markup
 // within that value could carry other meaning: refuse to discard it.
 pub(super) fn validate_payload(
+    elements: &[Element],
+    attributes: &[Attribute],
+    index: usize,
+    namespace: NamespaceId,
+) -> Result<()> {
+    let element = &elements[index];
+    if element.namespace != namespace || element.opaque_markup {
+        return Err(unsupported("unfamiliar XML inside the cell value payload"));
+    }
+    if element.local_name() == "is" {
+        // The same hidden text that makes a scalar read ambiguous must not be
+        // discarded by an edit, even when each individual tag is familiar.
+        validate_rich_text_structure(elements, index, namespace)?;
+    }
+    validate_payload_element(elements, attributes, index, namespace)
+}
+
+fn validate_payload_element(
     elements: &[Element],
     attributes: &[Attribute],
     index: usize,
@@ -39,7 +58,7 @@ pub(super) fn validate_payload(
         return Err(unsupported("elements inside a simple cell value payload"));
     }
     for child in element.children(elements) {
-        validate_payload(elements, attributes, child, namespace)?;
+        validate_payload_element(elements, attributes, child, namespace)?;
     }
     Ok(())
 }

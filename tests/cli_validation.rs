@@ -72,6 +72,121 @@ fn stdin_checks_accept_empty_patches_and_report_raw_edit_counts() {
 }
 
 #[test]
+fn duplicate_patch_targets_keep_the_last_value_and_count_every_row() {
+    let directory = TempDir::new();
+    let patch = directory.join("duplicates.tsv");
+    let output = directory.join("output.xlsx");
+    let rows = b"Data\tA1\ttext\tfirst\nNotes\tA1\ttext\tother sheet\n\
+        # comment\n\nData\ta1\tnumber\t7\nData\tA1\ttext\tlast\nNotes\ta1\tbool\tfalse\n";
+    fs::write(&patch, rows).unwrap();
+    let checked = check_stdin(FIXTURE, rows);
+    assert!(checked.status.success(), "{:?}", checked.stderr);
+    assert_eq!(checked.stdout, b"Validated 5 patch rows.\n");
+    assert!(checked.stderr.is_empty());
+    let applied = cli(&[
+        "patch",
+        FIXTURE,
+        output.to_str().unwrap(),
+        patch.to_str().unwrap(),
+    ]);
+    assert!(applied.status.success(), "{:?}", applied.stderr);
+    assert!(applied.stdout.is_empty());
+    assert!(applied.stderr.is_empty());
+    let workbook = sheetpatch::Workbook::open(&output).unwrap();
+    assert_eq!(
+        workbook.get_cell("Data", "A1").unwrap().value,
+        sheetpatch::CellValue::from("last")
+    );
+    assert_eq!(
+        workbook.get_cell("Notes", "A1").unwrap().value,
+        sheetpatch::CellValue::Bool(false)
+    );
+}
+
+#[test]
+fn duplicate_rows_preserve_missing_sheet_and_invalid_value_error_precedence() {
+    // The missing sheet is reported at its first occurrence even when its
+    // target is repeated, ahead of both a later missing sheet and an earlier
+    // protected-cell edit. Names deliberately oppose alphabetical order.
+    let missing = check_stdin(
+        FIXTURE,
+        b"Data\tD1\tnumber\t1\nZMissing\tA1\ttext\tfirst\n\
+          AMissing\tA1\ttext\tother\nZMissing\ta1\ttext\tlast\n",
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        missing.stderr,
+        b"sheetpatch: Patch line 2: worksheet not found: \"ZMissing\"\n"
+    );
+    // A later valid value cannot hide an invalid overwritten value. Patch
+    // syntax still takes precedence over opening the missing workbook.
+    for (rows, line) in [
+        ("Data\tA1\tnumber\tNaN\nData\ta1\ttext\tvalid\n", 1),
+        (
+            "Data\tA1\ttext\tfirst\nData\ta1\tnumber\tNaN\nData\tA1\ttext\tlast\n",
+            2,
+        ),
+    ] {
+        let invalid = check_stdin("", rows.as_bytes());
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+        let message = String::from_utf8(invalid.stderr).unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "sheetpatch: Patch line {line}: Invalid finite number:"
+            )),
+            "{message}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repeated_patch_values_do_not_accumulate_in_memory() {
+    let row = format!("Data\tA1\ttext\t{}\n", "x".repeat(32_767));
+    for count in [1, 8192] {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "ulimit -c 0 && ulimit -v 262144 && exec \"$@\"",
+                "sheetpatch-patch-memory-test",
+                env!("CARGO_BIN_EXE_sheetpatch"),
+                "patch",
+                "--check",
+                FIXTURE,
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Stream over 256 MiB of valid repeated edits without retaining the
+        // patch in this test process. Only one final cell value is needed.
+        for _ in 0..count {
+            if stdin.write_all(row.as_bytes()).is_err() {
+                break;
+            }
+        }
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{count} rows: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let noun = if count == 1 { "row" } else { "rows" };
+        assert_eq!(
+            output.stdout,
+            format!("Validated {count} patch {noun}.\n").as_bytes()
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn checks_use_actual_workbook_guards_and_leave_inputs_unchanged_on_failure() {
     let directory = TempDir::new();
     let workbook = directory.join("input.xlsx");
