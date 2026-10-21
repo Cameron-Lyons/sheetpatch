@@ -165,8 +165,9 @@ impl SheetVisibility {
 ///   row's custom format or the worksheet's column definitions are malformed,
 ///   overlapping, or inside an unsupported container. Existing cells stay
 ///   editable.
-/// - Changing a cell in a row whose `spans` hint, or in a worksheet whose
-///   `dimension` reference, is malformed, since the edit may need to widen it.
+/// - Changing a cell in a row whose `spans` hint is malformed, or in a
+///   worksheet whose `dimension` is repeated or lacks a valid reference,
+///   since the edit may need to widen it. Reads ignore both hints.
 /// - Replacing a value whose payload holds markup the crate does not
 ///   recognize, which the replacement would discard.
 ///
