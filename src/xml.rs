@@ -70,8 +70,11 @@ impl<'xml> NamespaceReader<'xml> {
                 for attribute in tag.attributes().with_checks(false) {
                     let attribute = attribute?;
                     if attribute.key.as_ref() == "xmlns:xml" {
-                        let value =
-                            attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+                        let value = attribute.normalized_value_with(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            1,
+                            quick_xml::escape::resolve_xml_entity,
+                        )?;
                         if value != "http://www.w3.org/XML/1998/namespace" {
                             return Err(error.into());
                         }
@@ -316,46 +319,50 @@ fn valid_text_in_chunks<const CHUNK: usize>(text: &str) -> bool {
     !invalid(start, rest)
 }
 
-pub(crate) enum Reference {
-    Character(char),
-    Text(String),
-}
-
-impl Reference {
-    pub(crate) fn append_to(self, text: &mut String) {
-        match self {
-            Self::Character(character) => text.push(character),
-            Self::Text(value) => text.push_str(&value),
-        }
-    }
-}
-
-/// Resolve an XML text reference without allocating for numeric references or
-/// the five predefined entities. The fallback retains unescape's diagnostics
-/// and any extra entity support enabled through dependency feature unification.
-pub(crate) fn reference(reference: &BytesRef<'_>) -> Result<Reference> {
+/// Resolves a reference in XML text: a character reference, or one of the
+/// five entities XML 1.0 predefines. Documents with a DTD are refused, so no
+/// other entity can be declared. None is recognized either, whatever entity
+/// support quick-xml's features gain through dependency feature unification.
+pub(crate) fn reference(reference: &BytesRef<'_>) -> Result<char> {
     let character = match reference.as_ref() {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "apos" => Some('\''),
-        "quot" => Some('"'),
-        _ => reference.resolve_char_ref().ok().flatten(),
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "apos" => '\'',
+        "quot" => '"',
+        name => match reference.resolve_char_ref() {
+            Ok(Some(character)) => character,
+            Ok(None) => return Err(Error::Xml(format!("undefined XML entity &{name};"))),
+            Err(_) => return Err(Error::Xml("invalid XML character reference".into())),
+        },
     };
-    if let Some(character) = character {
-        return if valid_char(character) {
-            Ok(Reference::Character(character))
-        } else {
-            Err(Error::Xml("invalid XML character reference".into()))
-        };
+    if valid_char(character) {
+        Ok(character)
+    } else {
+        Err(Error::Xml("invalid XML character reference".into()))
     }
-    let spelling = format!("&{};", reference.as_ref());
-    let text =
-        quick_xml::escape::unescape(&spelling).map_err(|error| Error::Xml(error.to_string()))?;
-    if !valid_text(&text) {
+}
+
+/// An attribute's normalized value, resolving only XML 1.0's predefined
+/// entities and character references, as `reference` does in text.
+///
+/// Every caller has already checked the document's literal characters with
+/// `valid_text`. Only a value that normalization changed can therefore hold
+/// a character that XML forbids, which a character reference introduced.
+pub(crate) fn attribute_value<'a>(attribute: &Attribute<'a>) -> Result<Cow<'a, str>> {
+    let value = attribute
+        .normalized_value_with(
+            quick_xml::XmlVersion::Implicit1_0,
+            1,
+            quick_xml::escape::resolve_xml_entity,
+        )
+        .map_err(Error::xml)?;
+    if let Cow::Owned(value) = &value
+        && !valid_text(value)
+    {
         return Err(Error::Xml("invalid XML character reference".into()));
     }
-    Ok(Reference::Text(text.into_owned()))
+    Ok(value)
 }
 
 fn name_start(c: char) -> bool {
@@ -451,12 +458,7 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
         } else {
             continue;
         };
-        let value = attribute
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-            .map_err(Error::xml)?;
-        if !valid_text(&value) {
-            return Err(Error::Xml("invalid XML namespace character".into()));
-        }
+        let value = attribute_value(&attribute)?;
         validate_namespace_binding(prefix, &value)?;
     }
     Ok(())
@@ -528,13 +530,7 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
                 key: QName("xmlns"),
                 value: Cow::Borrowed(ns.as_ref()),
             };
-            let value = attribute
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map_err(Error::xml)?;
-            if !valid_text(&value) {
-                return Err(Error::Xml("invalid XML namespace character".into()));
-            }
-            Ok(value.into_owned())
+            Ok(attribute_value(&attribute)?.into_owned())
         }
         ResolveResult::Unbound => Ok(String::new()),
         ResolveResult::Unknown(prefix) => {
@@ -742,55 +738,58 @@ mod tests {
     }
 
     #[test]
-    fn references_match_unescape_values_and_diagnostics() {
-        let check = |name: &str| {
-            let spelling = format!("&{name};");
-            let expected = quick_xml::escape::unescape(&spelling)
-                .map_err(|error| Error::Xml(error.to_string()))
-                .and_then(|text| {
-                    if text.chars().all(valid_char) {
-                        Ok(text.into_owned())
-                    } else {
-                        Err(Error::Xml("invalid XML character reference".into()))
-                    }
-                })
-                .map_err(|error| error.to_string());
-            let actual = reference(&BytesRef::new(name))
-                .map(|value| {
-                    let mut text = String::new();
-                    value.append_to(&mut text);
-                    text
-                })
-                .map_err(|error| error.to_string());
-            assert_eq!(actual, expected, "{name:?}");
+    fn references_resolve_only_xml_10_entities_and_legal_characters() {
+        let resolve = |name: &str| match reference(&BytesRef::new(name)) {
+            Ok(character) => Ok(character),
+            Err(Error::Xml(message)) => Err(message),
+            Err(error) => panic!("{name:?}: {error:?}"),
         };
-        for codepoint in 0..=u16::MAX {
-            check(&format!("#{codepoint}"));
-            check(&format!("#x{codepoint:X}"));
+        let invalid = || Err("invalid XML character reference".to_owned());
+        let mut name = String::new();
+        for codepoint in (0..=0x11_0000).chain([u32::MAX]) {
+            let expected = char::from_u32(codepoint)
+                .filter(|&c| c != '\0' && valid_char(c))
+                .map_or_else(invalid, Ok);
+            for spelling in [
+                format_args!("#{codepoint}"),
+                format_args!("#x{codepoint:x}"),
+                format_args!("#x{codepoint:X}"),
+            ] {
+                name.clear();
+                write!(name, "{spelling}").unwrap();
+                assert_eq!(resolve(&name), expected, "{name}");
+            }
         }
-        for codepoint in [
-            0x10000,
-            0x1f600,
-            0xeffff,
-            0xfffff,
-            0x10ffff,
-            0x110000,
-            u32::MAX,
+        for (name, character) in [
+            ("amp", '&'),
+            ("lt", '<'),
+            ("gt", '>'),
+            ("apos", '\''),
+            ("quot", '"'),
+            ("#00000065", 'A'),
+            ("#x00000041", 'A'),
         ] {
-            check(&format!("#{codepoint}"));
-            check(&format!("#x{codepoint:x}"));
+            assert_eq!(resolve(name), Ok(character), "{name}");
+        }
+        // HTML and differently spelled names are undefined in XML, whatever
+        // quick-xml's escape-html feature adds.
+        for name in [
+            "nbsp",
+            "NotEqualTilde",
+            "eacute",
+            "AMP",
+            "Amp",
+            "unknown",
+            "雪",
+            "",
+        ] {
+            assert_eq!(
+                resolve(name),
+                Err(format!("undefined XML entity &{name};")),
+                "{name}"
+            );
         }
         for name in [
-            "amp",
-            "lt",
-            "gt",
-            "apos",
-            "quot",
-            "",
-            "AMP",
-            "unknown",
-            "NotEqualTilde",
-            "nbsp",
             "#",
             "#x",
             "#X41",
@@ -800,19 +799,16 @@ mod tests {
             "#x-41",
             "# 65",
             "#65 ",
-            "#00000065",
-            "#x00000041",
             "#999999999999999999999999999999",
             "#xFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
             "#xD800",
+            "#xDFFF",
             "#0",
+            "#x0",
             "#x1",
-            "amp;&lt",
-            "amp&",
-            "#65;&lt",
-            "雪",
+            "#xFFFE",
         ] {
-            check(name);
+            assert_eq!(resolve(name), invalid(), "{name}");
         }
     }
 

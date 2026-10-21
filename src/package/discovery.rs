@@ -654,12 +654,7 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                     {
                         return Err(Error::Xml("duplicate XML attribute".into()));
                     }
-                    let value = attr
-                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                        .map_err(Error::xml)?;
-                    if !crate::xml::valid_text(&value) {
-                        return Err(Error::Xml("invalid XML attribute character".into()));
-                    }
+                    let value = crate::xml::attribute_value(&attr)?;
                     has_process_content |= &*attribute_namespace == COMPATIBILITY_NS
                         && attribute_local.as_ref() == "ProcessContent"
                         && !trim_whitespace(&value).is_empty();
@@ -818,9 +813,7 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
                             "ProcessContent" => 1,
                             _ => continue,
                         };
-                        let value = attr
-                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                            .map_err(Error::xml)?;
+                        let value = crate::xml::attribute_value(&attr)?;
                         for token in value
                             .split([' ', '\t', '\r', '\n'])
                             .filter(|v| !v.is_empty())
@@ -1459,6 +1452,33 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    // As in worksheets, whatever entities quick-xml's features recognize.
+    #[test]
+    fn package_xml_resolves_only_xml_10_entities() {
+        let nodes = xml_nodes(b"<a x='&amp;&#160;&quot;'>&lt;&#xA0;</a>", root_only).unwrap();
+        assert_eq!(nodes[0].attr("", "x"), Some("&\u{a0}\""));
+        for (xml, entity) in [
+            ("<a x='&nbsp;'/>", "nbsp"),
+            ("<a><b x='&nbsp;'/></a>", "nbsp"),
+            ("<a xmlns:p='urn:&nbsp;'/>", "nbsp"),
+            (
+                "<a xmlns:xml='http:&sol;&sol;www.w3.org/XML/1998/namespace'/>",
+                "sol",
+            ),
+            ("<a>&nbsp;</a>", "nbsp"),
+        ] {
+            let error = xml_nodes(xml.as_bytes(), root_only).err();
+            assert!(
+                matches!(&error, Some(Error::Xml(message)) if message.contains(entity)),
+                "{xml}: {error:?}"
+            );
+        }
+        assert!(matches!(
+            xml_nodes(b"<a>&nbsp;</a>", root_only),
+            Err(Error::Xml(message)) if message == "undefined XML entity &nbsp;"
+        ));
     }
 
     #[test]

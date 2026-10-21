@@ -42,7 +42,7 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
                 text.push_str(&value.xml10_content());
             }
             Event::GeneralRef(reference) => {
-                crate::xml::reference(&reference)?.append_to(&mut text);
+                text.push(crate::xml::reference(&reference)?);
             }
             Event::Comment(_) | Event::PI(_) => {}
             Event::Eof => return Ok(text),

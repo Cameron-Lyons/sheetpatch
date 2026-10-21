@@ -1195,6 +1195,50 @@ fn rejects_illegal_namespace_declarations_even_when_unused_or_escaped() {
     }
 }
 
+// quick-xml's escape-html feature, which another dependency can enable,
+// makes its default resolver accept HTML entities. XML 1.0 predefines five.
+#[test]
+fn only_xml_10_entities_are_resolved_whatever_quick_xml_features_are_enabled() {
+    let a1 = "A1".parse().unwrap();
+    let cell = |attributes: &str, text: &str| {
+        sheet(&format!(
+            "<sheetData><row r='1'><c r='A1' t='inlineStr'{attributes}><is><t>{text}</t></is></c></row></sheetData>"
+        ))
+    };
+    let input = cell(" x:flag='&amp;&#160;'", "a&#160;b&amp;&quot;");
+    assert_eq!(
+        read_cell(input.as_bytes(), a1, None).unwrap().value,
+        CellValue::Text("a\u{a0}b&\"".into())
+    );
+    for (input, entity) in [
+        (cell("", "a&nbsp;b"), "nbsp"),
+        (cell(" x:flag='&nbsp;'", "a"), "nbsp"),
+        (sheet("<sheetData xmlns:p='urn:&nbsp;'/>"), "nbsp"),
+        (
+            sheet("<sheetData xmlns:xml='http:&sol;&sol;www.w3.org/XML/1998/namespace'/>"),
+            "sol",
+        ),
+    ] {
+        let read = read_cell(input.as_bytes(), a1, None).map(|_| ());
+        let edited = edit(&input, "A1", 2.0.into()).map(|_| ());
+        for result in [read, edited] {
+            assert!(
+                matches!(&result, Err(Error::Xml(message)) if message.contains(entity)),
+                "{input}: {result:?}"
+            );
+        }
+    }
+    // A reference in text is reported by name, in cells and shared strings.
+    const UNDEFINED: &str = "undefined XML entity &nbsp;";
+    let undefined =
+        |result: Result<()>| matches!(result, Err(Error::Xml(message)) if message == UNDEFINED);
+    assert!(undefined(
+        read_cell(cell("", "&nbsp;").as_bytes(), a1, None).map(|_| ())
+    ));
+    let table = format!("<sst xmlns='{TRANSITIONAL}'><si><t>a&nbsp;b</t></si></sst>");
+    assert!(undefined(read_shared_strings(table.as_bytes()).map(|_| ())));
+}
+
 #[test]
 fn validates_xml_declarations_and_retains_valid_unicode_names() {
     for declaration in [

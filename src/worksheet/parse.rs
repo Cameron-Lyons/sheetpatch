@@ -1,7 +1,7 @@
 use super::{STRICT, TRANSITIONAL, decoded_namespace, unsupported, xml_error};
 use crate::xml::{
-    MAX_DEPTH, NamespaceCache, NamespaceReader, is_space, valid_name, valid_qname, valid_text,
-    validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
+    MAX_DEPTH, NamespaceCache, NamespaceReader, attribute_value, is_space, valid_name, valid_qname,
+    valid_text, validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
 };
 use crate::{Error, Result};
 use quick_xml::{
@@ -432,20 +432,12 @@ fn attribute_spans<'xml>(
             return Err(xml_error("less-than sign in an XML attribute"));
         }
         // XML normalizes literal attribute whitespace before expanding entity
-        // references; referenced whitespace keeps its actual value.
-        let value = XmlAttribute {
+        // references; referenced whitespace keeps its actual value. Literal
+        // characters were validated with the whole document.
+        let value = attribute_value(&XmlAttribute {
             key: QName(name),
             value: Cow::Borrowed(raw),
-        }
-        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-        .map_err(Error::xml)?;
-        // Literal characters were validated with the whole document; only
-        // normalization or expanded references can produce new ones.
-        if let Cow::Owned(value) = &value
-            && !valid_text(value)
-        {
-            return Err(xml_error("invalid XML character reference"));
-        }
+        })?;
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {

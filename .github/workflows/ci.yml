@@ -77,6 +77,11 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - name: Unit, preservation, CLI, and documentation tests
         run: cargo test --locked --all-targets --all-features
+      # Another dependency can enable quick-xml's escape-html feature, which
+      # makes its default entity resolver accept HTML entities. Parsing must
+      # resolve only XML's own either way.
+      - name: Unit tests with quick-xml's escape-html feature
+        run: cargo test --locked --lib --features quick-xml/escape-html
       - name: Documentation examples
         run: cargo test --locked --doc --all-features
 
