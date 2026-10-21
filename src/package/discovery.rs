@@ -581,7 +581,7 @@ impl Namespaces {
 fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     let xml = std::str::from_utf8(bytes)
         .map_err(|e| Error::Xml(format!("package XML must be UTF-8: {e}")))?;
-    if !xml.chars().all(crate::xml::valid_char) {
+    if !crate::xml::valid_text(xml) {
         return Err(Error::Xml("invalid XML character".into()));
     }
     // After the first byte order mark, U+FEFF is text outside the root. The
@@ -657,7 +657,7 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
                     let value = attr
                         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(Error::xml)?;
-                    if !value.chars().all(crate::xml::valid_char) {
+                    if !crate::xml::valid_text(&value) {
                         return Err(Error::Xml("invalid XML attribute character".into()));
                     }
                     has_process_content |= &*attribute_namespace == COMPATIBILITY_NS

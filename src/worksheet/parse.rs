@@ -1,7 +1,7 @@
 use super::{STRICT, TRANSITIONAL, decoded_namespace, unsupported, xml_error};
 use crate::xml::{
-    MAX_DEPTH, NamespaceCache, NamespaceReader, is_space, valid_char as valid_xml_char, valid_name,
-    valid_qname, validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
+    MAX_DEPTH, NamespaceCache, NamespaceReader, is_space, valid_name, valid_qname, valid_text,
+    validate_declaration, validate_namespace_binding, whitespace as xml_whitespace,
 };
 use crate::{Error, Result};
 use quick_xml::{
@@ -442,7 +442,7 @@ fn attribute_spans<'xml>(
         // Literal characters were validated with the whole document; only
         // normalization or expanded references can produce new ones.
         if let Cow::Owned(value) = &value
-            && !value.chars().all(valid_xml_char)
+            && !valid_text(value)
         {
             return Err(xml_error("invalid XML character reference"));
         }
@@ -557,7 +557,7 @@ pub(super) fn parse_with<'xml>(
     }
     let source =
         std::str::from_utf8(xml).map_err(|e| xml_error(format!("XML must be UTF-8: {e}")))?;
-    if !source.chars().all(valid_xml_char) {
+    if !valid_text(source) {
         return Err(xml_error("invalid XML character"));
     }
     let bom = if xml.starts_with(&[0xef, 0xbb, 0xbf]) {

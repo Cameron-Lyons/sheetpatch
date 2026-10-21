@@ -259,6 +259,63 @@ pub(crate) fn valid_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
+/// Whether XML 1.0 allows every character of `text`: exactly
+/// `text.chars().all(valid_char)`, decided from the UTF-8 bytes without
+/// decoding them.
+///
+/// A `str` holds no surrogates and nothing above U+10FFFF, so the characters
+/// left to refuse are the C0 controls other than tab, LF and CR, and U+FFFE
+/// and U+FFFF. UTF-8 encodes each control as one byte below 0x20, a value no
+/// multibyte sequence contains, and the two noncharacters as EF BF BE and
+/// EF BF BF. Each chunk is first folded, without branching so that the fold
+/// vectorizes, into whether it holds such a control or any EF byte. ASCII and
+/// most other text holds neither; a chunk that does, such as one of
+/// full-width forms, takes a second look.
+pub(crate) fn valid_text(text: &str) -> bool {
+    valid_text_in_chunks::<128>(text)
+}
+
+// `valid_text` with `CHUNK` bytes tested together. Tests use small chunks to
+// place every character across a chunk boundary cheaply.
+fn valid_text_in_chunks<const CHUNK: usize>(text: &str) -> bool {
+    fn any(bytes: &[u8], test: impl Fn(u8) -> bool) -> bool {
+        bytes.iter().fold(false, |any, &byte| any | test(byte))
+    }
+    fn control(byte: u8) -> bool {
+        (byte < 0x20) & !matches!(byte, b'\t' | b'\n' | b'\r')
+    }
+    let bytes = text.as_bytes();
+    // Whether EF BF BE or EF BF BF begins at one of the `length` bytes from
+    // `start`. Such a sequence can cross into the next chunk, so the bytes
+    // after each come from the whole text. Only the last two bytes of a
+    // `str` lack two successors, and no three-byte sequence begins there.
+    let noncharacter = |start: usize, length: usize| {
+        let second = bytes.get(start + 1..).unwrap_or_default();
+        let third = bytes.get(start + 2..).unwrap_or_default();
+        bytes[start..start + length]
+            .iter()
+            .zip(second)
+            .zip(third)
+            .fold(false, |any, ((&first, &second), &third)| {
+                // `third | 1` is 0xBF exactly for 0xBE and 0xBF.
+                any | ((first == 0xef) & (second == 0xbf) & ((third | 1) == 0xbf))
+            })
+    };
+    let invalid = |start: usize, chunk: &[u8]| {
+        any(chunk, |byte| control(byte) | (byte == 0xef))
+            && (any(chunk, control) || noncharacter(start, chunk.len()))
+    };
+    let (chunks, rest) = bytes.as_chunks::<CHUNK>();
+    let mut start = 0;
+    for chunk in chunks {
+        if invalid(start, chunk) {
+            return false;
+        }
+        start += CHUNK;
+    }
+    !invalid(start, rest)
+}
+
 pub(crate) enum Reference {
     Character(char),
     Text(String),
@@ -295,7 +352,7 @@ pub(crate) fn reference(reference: &BytesRef<'_>) -> Result<Reference> {
     let spelling = format!("&{};", reference.as_ref());
     let text =
         quick_xml::escape::unescape(&spelling).map_err(|error| Error::Xml(error.to_string()))?;
-    if !text.chars().all(valid_char) {
+    if !valid_text(&text) {
         return Err(Error::Xml("invalid XML character reference".into()));
     }
     Ok(Reference::Text(text.into_owned()))
@@ -397,7 +454,7 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
         let value = attribute
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(Error::xml)?;
-        if !value.chars().all(valid_char) {
+        if !valid_text(&value) {
             return Err(Error::Xml("invalid XML namespace character".into()));
         }
         validate_namespace_binding(prefix, &value)?;
@@ -474,7 +531,7 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
             let value = attribute
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(Error::xml)?;
-            if !value.chars().all(valid_char) {
+            if !valid_text(&value) {
                 return Err(Error::Xml("invalid XML namespace character".into()));
             }
             Ok(value.into_owned())
@@ -580,6 +637,109 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_scan_matches_the_character_predicate() {
+        let expected = |text: &str| text.chars().all(valid_char);
+        // Every scalar value alone, which the scan reads as a remainder, and
+        // across a boundary between full chunks. One prefix leaves its chunk
+        // to be flagged by the character alone; the other flags it anyway.
+        let mut text = String::new();
+        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            for prefix in ["", "abc", "\u{fffd}"] {
+                text.clear();
+                text.push_str(prefix);
+                text.push(character);
+                text.push_str(&"abcdefg"[prefix.len()..]);
+                assert_eq!(
+                    valid_text_in_chunks::<4>(&text),
+                    expected(&text),
+                    "{text:?}"
+                );
+                if prefix.is_empty() {
+                    let alone = &text[..character.len_utf8()];
+                    assert_eq!(valid_text(alone), expected(alone), "{alone:?}");
+                }
+            }
+        }
+        // The scan's special cases and their near misses, at every offset of
+        // texts that end in and around each of the first chunk boundaries.
+        let specials = [
+            "\0",
+            "\u{1}",
+            "\u{1f}",
+            "\t",
+            "\n",
+            "\r",
+            " ",
+            "\u{7f}",
+            "\u{ef}",
+            "\u{efbf}",
+            "\u{f000}",
+            "\u{ffbe}",
+            "\u{fffd}",
+            "\u{fffe}",
+            "\u{ffff}",
+            "\u{10ffff}",
+        ];
+        for length in (0..8).chain(124..132).chain(252..260) {
+            for position in 0..=length {
+                for special in specials {
+                    text.clear();
+                    text.extend(std::iter::repeat_n('a', position));
+                    text.push_str(special);
+                    text.extend(std::iter::repeat_n('a', length - position));
+                    assert_eq!(valid_text(&text), expected(&text), "{text:?}");
+                }
+            }
+        }
+        let valid = [
+            "a",
+            " ",
+            "\t",
+            "\n",
+            "\r",
+            "\u{7f}",
+            "\u{80}",
+            "\u{ef}",
+            "雪",
+            "\u{d7ff}",
+            "\u{e000}",
+            "\u{efbf}",
+            "\u{f8ff}",
+            "\u{feff}",
+            "\u{ffbe}",
+            "\u{fffd}",
+            "\u{10000}",
+            "\u{10ffff}",
+        ];
+        let invalid = ["\0", "\u{8}", "\u{1f}", "\u{fffe}", "\u{ffff}"];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            text.clear();
+            // Invalid pieces are rare, so that one often falls in a late chunk.
+            for _ in 0..next() % 160 {
+                let random = next();
+                text.push_str(if random % 64 == 0 {
+                    invalid[(random >> 8) as usize % invalid.len()]
+                } else {
+                    valid[(random >> 8) as usize % valid.len()]
+                });
+            }
+            assert_eq!(valid_text(&text), expected(&text), "{text:?}");
+            assert_eq!(
+                valid_text_in_chunks::<4>(&text),
+                expected(&text),
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn references_match_unescape_values_and_diagnostics() {
