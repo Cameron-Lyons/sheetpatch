@@ -1310,6 +1310,20 @@ mod tests {
     const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
+    #[test]
+    fn batch_reads_collect_exactly_sixteen_whole_columns() {
+        let too_many = |result: Result<Vec<CellRef>>| matches!(result, Err(Error::Unsupported(message)) if message.contains("too many cells"));
+        let columns: CellRange = "A1:P1048576".parse().unwrap();
+        assert_eq!(columns.cell_count(), MAX_READ_CELLS as u64);
+        // With an exact size hint, and with none, whose cells are counted.
+        assert_eq!(collect_cells(columns).unwrap().len(), MAX_READ_CELLS);
+        let unsized_cells = columns.cells().filter(|_| true);
+        assert_eq!(collect_cells(unsized_cells).unwrap().len(), MAX_READ_CELLS);
+        let one_more = || columns.cells().chain([CellRef::new(1, 17).unwrap()]);
+        assert!(too_many(collect_cells(one_more())));
+        assert!(too_many(collect_cells(one_more().filter(|_| true))));
+    }
+
     // A workbook whose Data worksheet's A1 and A2 are shared strings 0 and 1,
     // with `strings` as the body of its shared-string table.
     fn shared_string_book(strings: &str) -> Workbook {
