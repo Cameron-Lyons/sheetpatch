@@ -1,7 +1,6 @@
 //! Write a complete replacement beside the destination before renaming it.
 use crate::Result;
 use std::{
-    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -163,20 +162,32 @@ fn owning_group_entry(acl: &[u8]) -> Option<u32> {
     }
 }
 
-/// Create a new, exclusively named file in `parent`. On Unix `mode` supplies
-/// the creation mode's permission bits. The OS applies the parent directory's
-/// default ACL or, without one, the process umask.
-fn create_temporary(parent: &Path, mode: Option<u32>) -> Result<Temporary> {
+/// Create a new, exclusively named file beside `destination`. On Unix `mode`
+/// supplies the creation mode's permission bits. The OS applies the parent
+/// directory's default ACL or, without one, the process umask.
+///
+/// The hidden name, `.{prefix}.sheetpatch-{pid}-{n}.tmp`, starts with at most
+/// 32 bytes of the destination's file name, so a file left behind by a killed
+/// process can be traced to its workbook.
+fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Bound the prefix to keep the temporary name short: a valid destination
+    // can already use the filesystem's full name limit.
+    let name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let mut end = name.len().min(32);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &name[..end];
     loop {
-        // Keep the temporary name independent of the destination's length.
-        // A valid destination can already use the filesystem's full name limit.
-        let name = OsString::from(format!(
-            ".sheetpatch-{}-{}.tmp",
+        let candidate = destination.with_file_name(format!(
+            ".{prefix}.sheetpatch-{}-{}.tmp",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let candidate = parent.join(name);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -255,7 +266,7 @@ fn assign_group(file: &File, gid: u32) -> io::Result<bool> {
 /// metadata `destination`, with the destination's group and mode bits before
 /// any contents are written.
 #[cfg(unix)]
-fn create_replacement(parent: &Path, path: &Path, destination: &fs::Metadata) -> Result<Temporary> {
+fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Temporary> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Like the metadata, the ACL is read through symlinks.
@@ -270,7 +281,7 @@ fn create_replacement(parent: &Path, path: &Path, destination: &fs::Metadata) ->
     };
     // Owner-only until the replacement has the destination's group, so no
     // group can open it yet.
-    let temp = create_temporary(parent, Some(mode & 0o700))?;
+    let temp = create_temporary(path, Some(mode & 0o700))?;
     let same_group = assign_group(temp.file(), destination.gid())?;
     temp.file()
         .set_permissions(fs::Permissions::from_mode(replacement_mode(
@@ -280,26 +291,26 @@ fn create_replacement(parent: &Path, path: &Path, destination: &fs::Metadata) ->
 }
 
 #[cfg(not(unix))]
-fn create_replacement(parent: &Path, _: &Path, destination: &fs::Metadata) -> Result<Temporary> {
-    let temp = create_temporary(parent, None)?;
+fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Temporary> {
+    let temp = create_temporary(path, None)?;
     temp.file().set_permissions(destination.permissions())?;
     Ok(temp)
 }
 
-/// Create a new destination's temporary file.
+/// Create the temporary file of `path`, a new destination.
 ///
 /// On Unix, the source's mode bits supply the creation mode, subject to the
 /// OS's default ACL or umask rules, without setuid, setgid or sticky bits. Like
 /// a replacement, it keeps group mode bits only when it has the source's group,
 /// assigning that group when the process may.
 #[cfg(unix)]
-fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Temporary> {
+fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporary> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let Some(source) = source else {
-        return create_temporary(parent, None);
+        return create_temporary(path, None);
     };
-    let temp = create_temporary(parent, Some(source.mode & 0o777))?;
+    let temp = create_temporary(path, Some(source.mode & 0o777))?;
     let created = temp.file().metadata()?;
     if created.gid() == source.gid {
         return Ok(temp);
@@ -314,7 +325,7 @@ fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Tempor
         temp
     } else {
         drop(temp);
-        create_temporary(parent, Some(mode & 0o700))?
+        create_temporary(path, Some(mode & 0o700))?
     };
     let same_group = assign_group(temp.file(), source.gid)?;
     temp.file()
@@ -325,8 +336,8 @@ fn create_new(parent: &Path, source: Option<SourcePermissions>) -> Result<Tempor
 }
 
 #[cfg(not(unix))]
-fn create_new(parent: &Path, _: Option<SourcePermissions>) -> Result<Temporary> {
-    create_temporary(parent, None)
+fn create_new(path: &Path, _: Option<SourcePermissions>) -> Result<Temporary> {
+    create_temporary(path, None)
 }
 
 /// Make a completed rename durable.
@@ -376,8 +387,8 @@ pub(crate) fn write(
     // are written; applying permissions afterward would expose a temporary
     // copy under the process's default creation permissions.
     let mut temp = match existing_destination(path)? {
-        Some(existing) => create_replacement(parent, path, &existing)?,
-        None => create_new(parent, source)?,
+        Some(existing) => create_replacement(path, &existing)?,
+        None => create_new(path, source)?,
     };
     let file = temp.file.as_ref().expect("temporary file is open");
     {
@@ -675,7 +686,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new("created-private");
-        let temporary = create_temporary(&directory.0, Some(0o600)).unwrap();
+        let temporary = create_temporary(&directory.join("book.xlsx"), Some(0o600)).unwrap();
         // Check immediately after opening, before write() restores the mode.
         // No group or other reader can open an existing private replacement.
         assert_eq!(
@@ -1104,6 +1115,43 @@ mod tests {
             Ok(acl.len())
         };
         assert_eq!(file_mode(&metadata, read) & 0o777, 0o644);
+    }
+
+    #[test]
+    fn temporary_files_are_hidden_and_named_after_their_destination() {
+        let directory = TempDir::new("temporary-name");
+        let long = format!("{}.xlsx", "x".repeat(40));
+        // 33 bytes, so the cut at 32 bytes falls inside the last character.
+        let euros = "€".repeat(11);
+        for (name, prefix) in [
+            ("book.xlsx", "book.xlsx".to_owned()),
+            (".hidden.xlsx", ".hidden.xlsx".to_owned()),
+            (&long, "x".repeat(32)),
+            (&euros, "€".repeat(10)),
+        ] {
+            let destination = directory.join(name);
+            let mut temporary = None;
+            write(&destination, None, |writer| {
+                temporary = fs::read_dir(&directory.0)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .find(|entry| entry.to_string_lossy().ends_with(".tmp"));
+                writer.write_all(b"new")?;
+                Ok(())
+            })
+            .unwrap();
+            let temporary = temporary.expect("temporary file exists while serializing");
+            let temporary = temporary.to_str().unwrap();
+            let counter = temporary
+                .strip_prefix(&format!(".{prefix}.sheetpatch-{}-", std::process::id()))
+                .and_then(|rest| rest.strip_suffix(".tmp"));
+            assert!(
+                counter.is_some_and(|counter| counter.parse::<u64>().is_ok()),
+                "{temporary}"
+            );
+        }
+        assert_eq!(directory.entries(), 4);
     }
 
     #[cfg(unix)]

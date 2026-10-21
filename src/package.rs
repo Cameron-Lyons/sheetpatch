@@ -1036,7 +1036,11 @@ impl Workbook {
 
     /// Save through a temporary file in the destination directory, then rename.
     /// The original destination is retained if generation or writing fails.
-    /// Using the input path as destination is supported.
+    /// Using the input path as destination is supported. The temporary file is
+    /// hidden and named after the destination: `.{name}.sheetpatch-{pid}-{n}.tmp`,
+    /// where `{name}` is at most 32 bytes of the destination's file name. If the
+    /// process is killed while saving, the destination is untouched, but this
+    /// incomplete copy can remain beside it and is safe to delete.
     /// Saving does not clear pending edits or replace the retained original.
     ///
     /// The destination must name a file. An existing destination must resolve
