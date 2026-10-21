@@ -6,7 +6,14 @@ use crate::{
         PreparedWorksheet, ReadError, patch_cells, protection, read_cells, read_shared_strings,
     },
 };
-use std::{borrow::Cow, collections::BTreeMap, fmt, fs, io::Write, path::Path, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    fmt, fs,
+    io::Write,
+    path::Path,
+    sync::{Mutex, OnceLock, PoisonError},
+};
 
 mod discovery;
 
@@ -193,12 +200,14 @@ pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
     sheet_xml: Vec<SheetXml>,
-    changed_sheets: BTreeMap<String, usize>,
     signed: bool,
     date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
+    // Header rows of the table parts read so far, by ZIP member name. Several
+    // worksheets can relate to one table part, which is then parsed only once.
+    table_parts: Mutex<HashMap<String, Option<CellRange>>>,
     // Permission bits and group of the file this workbook was opened from,
     // used as the basis for new save destinations. ACLs are not copied.
     source_permissions: Option<SourcePermissions>,
@@ -211,7 +220,14 @@ impl fmt::Debug for Workbook {
             .field("sheets", &self.sheets)
             .field("signed", &self.signed)
             .field("date1904", &self.date1904)
-            .field("changed_parts", &self.changed_sheets.keys())
+            .field(
+                "changed_parts",
+                &self
+                    .changed_parts()
+                    .parts()
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -221,33 +237,25 @@ struct SheetXml {
     // The part URI can differ from its ZIP name in legacy decoded archives.
     uri: String,
     original: OnceLock<Vec<u8>>,
-    // Present only when the XML differs from the original. Transactions update
-    // this value and the workbook's changed-path index together at commit.
+    // Present only when the XML differs from the original, and the only record
+    // that the worksheet has a pending change.
     current: Option<Vec<u8>>,
     // Header rows of the worksheet's Excel tables, resolved on its first edit.
     table_headers: OnceLock<Vec<CellRange>>,
 }
 
+// Discovery rejects sheets that share a worksheet part, so names are unique.
 struct ChangedParts<'a> {
-    sheets: &'a BTreeMap<String, usize>,
+    sheets: &'a [Sheet],
     sheet_xml: &'a [SheetXml],
 }
 
 impl PartChanges for ChangedParts<'_> {
     fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.sheets.iter().map(|(path, &index)| {
-            (
-                path.as_str(),
-                self.sheet_xml[index]
-                    .current
-                    .as_deref()
-                    .expect("changed worksheet has pending XML"),
-            )
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.sheets.is_empty()
+        self.sheets
+            .iter()
+            .zip(self.sheet_xml)
+            .filter_map(|(sheet, xml)| Some((sheet.path.as_str(), xml.current.as_deref()?)))
     }
 }
 
@@ -308,13 +316,22 @@ impl WorksheetView<'_> {
     /// It is computed from the cells themselves rather than the worksheet's
     /// stored `<dimension>`, which other tools can leave stale.
     ///
+    /// A single formatted cell far from the data, such as a style-only cell
+    /// at `XFD1048576`, can make the range cover the whole grid of
+    /// 17,179,869,184 cells. Reading a range returns one result for each of
+    /// its cells, so check [`CellRange::cell_count`] before reading one, or
+    /// read the cells that exist with [`Self::cells`].
+    ///
     /// ```
     /// # let bytes = include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec();
     /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
-    /// let range = book.prepare_sheet("Data")?.used_range().unwrap();
+    /// let sheet = book.prepare_sheet("Data")?;
+    /// let range = sheet.used_range().unwrap();
     /// assert_eq!(range.to_string(), "A1:E1");
-    /// let values = book.get_cells_at("Data", range.cells())?;
-    /// assert_eq!(values.len(), 5);
+    /// if range.cell_count() <= 10_000 {
+    ///     let values = sheet.get_cells_at(range)?;
+    ///     assert_eq!(values.len(), 5);
+    /// }
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
     pub fn used_range(&self) -> Option<CellRange> {
@@ -371,7 +388,9 @@ impl WorksheetView<'_> {
     ///
     /// Returns [`Error::InvalidCellReference`] for the first invalid address,
     /// before reading any cell, and otherwise fails like [`Self::get_cell`]
-    /// for the first cell that cannot be read.
+    /// for the first cell that cannot be read. Results that cannot be
+    /// allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -381,16 +400,21 @@ impl WorksheetView<'_> {
     }
 
     /// Read typed addresses, retaining input order and duplicate requests.
-    /// A [`CellRange`] reads its cells in row-major order.
+    /// A [`CellRange`] reads its cells in row-major order, one result for
+    /// each cell, and one read returns at most 16,777,216 (2²⁴) cells.
     ///
     /// # Errors
     ///
-    /// Fails like [`Self::get_cell`] for the first cell that cannot be read.
+    /// Returns [`Error::Unsupported`] when more than 16,777,216 cells are
+    /// requested, before reading any cell, and otherwise fails like
+    /// [`Self::get_cell`] for the first cell that cannot be read. Results
+    /// that cannot be allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells_at(
         &self,
         cells: impl IntoIterator<Item = CellRef>,
     ) -> Result<Vec<CellContent>> {
-        self.read_cells(&cells.into_iter().collect::<Vec<_>>())
+        self.read_cells(&collect_cells(cells)?)
     }
 
     fn read_cells(&self, cells: &[CellRef]) -> Result<Vec<CellContent>> {
@@ -409,6 +433,41 @@ fn parse_addresses<S: AsRef<str>>(addresses: impl IntoIterator<Item = S>) -> Res
         .into_iter()
         .map(|address| address.as_ref().parse())
         .collect()
+}
+
+// The most cells one typed batch read returns: sixteen whole columns, and
+// sixteen times the CLI's `get` limit. A worksheet part is read only up to
+// 64 MiB, and each cell element needs an explicit reference of its own, so
+// every cell of a worksheet as read fits. The addresses and results of a full
+// read take a little over 1 GiB besides their text, where a range over the
+// whole grid would need more than a terabyte.
+const MAX_READ_CELLS: usize = 1 << 24;
+
+// Collects typed addresses for a batch read, refusing a request over the limit
+// before reading any cell. A range's exact size hint is checked before any
+// address is stored, and other iterators are cut off at the limit.
+fn collect_cells(cells: impl IntoIterator<Item = CellRef>) -> Result<Vec<CellRef>> {
+    let too_many = || {
+        Error::Unsupported(format!(
+            "too many cells: one read returns at most {MAX_READ_CELLS}"
+        ))
+    };
+    let cells = cells.into_iter();
+    let (expected, _) = cells.size_hint();
+    if expected > MAX_READ_CELLS {
+        return Err(too_many());
+    }
+    let mut collected = Vec::new();
+    collected
+        .try_reserve_exact(expected)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+    for cell in cells {
+        if collected.len() == MAX_READ_CELLS {
+            return Err(too_many());
+        }
+        collected.push(cell);
+    }
+    Ok(collected)
 }
 
 impl Workbook {
@@ -505,12 +564,12 @@ impl Workbook {
             archive,
             sheets,
             sheet_xml,
-            changed_sheets: BTreeMap::new(),
             signed,
             date1904,
             sheet_indexes,
             shared_strings_path,
             shared_strings: OnceLock::new(),
+            table_parts: Mutex::default(),
             source_permissions: None,
         })
     }
@@ -602,8 +661,12 @@ impl Workbook {
     ///
     /// Returns [`Error::SheetNotFound`] before reading the batch if no
     /// worksheet has this name, then the first invalid address or value, and
-    /// otherwise fails like [`Self::set_cell`] for the first edit refused.
-    /// No edit of a failed batch is applied.
+    /// otherwise fails like [`Self::set_cell`] for one refused edit, which
+    /// need not be the batch's first. Formula cells, then cells in formula
+    /// ranges, then merged cells are checked across the whole batch, each in
+    /// row-major order. The cells are then patched in row-major order, where
+    /// metadata and payload refusals arise, and Excel table headers are
+    /// checked last. No edit of a failed batch is applied.
     pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -663,8 +726,10 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::SheetNotFound`] for the first edit that names no
-    /// worksheet, and otherwise fails like [`Self::set_cell`] for the first
-    /// edit refused. No edit of a failed transaction is applied.
+    /// worksheet, and otherwise fails like [`Self::set_cell`] for one refused
+    /// edit. Worksheets are checked in the order of [`Self::sheets`], not of
+    /// the edits, and each worksheet's edits in the order described for
+    /// [`Self::set_cells`]. No edit of a failed transaction is applied.
     pub fn apply_edits(&mut self, edits: impl IntoIterator<Item = CellEdit>) -> Result<()> {
         let mut grouped: BTreeMap<usize, BTreeMap<CellRef, CellValue>> = BTreeMap::new();
         for edit in edits {
@@ -713,12 +778,6 @@ impl Workbook {
             staged.push((index, changed));
         }
         for (index, changed) in staged {
-            if changed.is_some() {
-                self.changed_sheets
-                    .insert(self.sheets[index].path.clone(), index);
-            } else {
-                self.changed_sheets.remove(&self.sheets[index].path);
-            }
             self.sheet_xml[index].current = changed;
         }
         Ok(())
@@ -735,20 +794,8 @@ impl Workbook {
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
-        let headers = self.table_headers(index)?;
-        // Edits are ordered by row and column. Search only the rows occupied
-        // by each header instead of testing every edit against every table.
-        // Keep one sorted entry per cell so overlapping headers retain the
-        // same read and refusal order as ordinary worksheet batches.
-        let mut header_cells = BTreeMap::new();
-        for header in headers {
-            header_cells.extend(
-                cells
-                    .range(header.first()..=header.last())
-                    .filter(|(cell, _)| header.contains(**cell)),
-            );
-        }
-        if header_cells.is_empty() {
+        let edits = header_cells(cells, self.table_headers(index)?);
+        if edits.is_empty() {
             return Ok(());
         }
         let worksheet = PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?;
@@ -756,7 +803,7 @@ impl Workbook {
         // Keep one value at a time: many headers can refer to the same long
         // shared string. Validate all reads before reporting the first changed
         // header, preserving read-error precedence without retaining copies.
-        for (&cell, value) in header_cells {
+        for (cell, value) in edits {
             let current = worksheet
                 .read_cell(cell, || self.shared_strings(), self.date1904)
                 .map_err(|error| sheet.read_context(error))?;
@@ -812,7 +859,8 @@ impl Workbook {
     /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
     /// [`Error::InvalidCellReference`] for the first invalid address, before
     /// reading any cell, and otherwise fails like [`Self::get_cell`] for the
-    /// first cell that cannot be read.
+    /// first cell that cannot be read. Results that cannot be allocated
+    /// return [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, sheet: &str, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -827,21 +875,24 @@ impl Workbook {
     /// Input order and duplicates are retained; missing cells return blanks.
     /// An empty batch still requires an existing worksheet. No A1 string
     /// conversions are needed, and a [`CellRange`] reads its cells in
-    /// row-major order.
+    /// row-major order, one result for each cell. One read returns at most
+    /// 16,777,216 (2²⁴) cells.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, and
-    /// otherwise fails like [`Self::get_cell`] for the first cell that cannot
-    /// be read.
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
+    /// [`Error::Unsupported`] when more than 16,777,216 cells are requested,
+    /// before reading any cell, and otherwise fails like [`Self::get_cell`]
+    /// for the first cell that cannot be read. Results that cannot be
+    /// allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells_at(
         &self,
         sheet: &str,
         cells: impl IntoIterator<Item = CellRef>,
     ) -> Result<Vec<CellContent>> {
         let index = self.sheet_index(sheet)?;
-        let cells: Vec<CellRef> = cells.into_iter().collect();
-        self.read_cells_in_sheet(index, &cells)
+        self.read_cells_in_sheet(index, &collect_cells(cells)?)
     }
 
     fn read_cells_in_sheet(&self, index: usize, cells: &[CellRef]) -> Result<Vec<CellContent>> {
@@ -896,15 +947,14 @@ impl Workbook {
 
     /// Whether any package parts have pending edits.
     pub fn has_changes(&self) -> bool {
-        !self.changed_sheets.is_empty()
+        self.sheet_xml.iter().any(|xml| xml.current.is_some())
     }
 
     /// Discard every pending edit, restoring byte-identical original output.
     pub fn reset_changes(&mut self) {
-        for &index in self.changed_sheets.values() {
-            self.sheet_xml[index].current = None;
+        for xml in &mut self.sheet_xml {
+            xml.current = None;
         }
-        self.changed_sheets.clear();
     }
 
     fn current_sheet(&self, index: usize) -> Result<&[u8]> {
@@ -917,7 +967,7 @@ impl Workbook {
 
     fn changed_parts(&self) -> ChangedParts<'_> {
         ChangedParts {
-            sheets: &self.changed_sheets,
+            sheets: &self.sheets,
             sheet_xml: &self.sheet_xml,
         }
     }
@@ -946,7 +996,14 @@ impl Workbook {
         if let Some(headers) = cache.get() {
             return Ok(headers);
         }
-        let headers = discovery::table_headers(&self.archive, &self.sheet_xml[index].uri)?;
+        // Poisoning is harmless: entries are inserted whole, never partially.
+        let mut parts = self
+            .table_parts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let headers =
+            discovery::table_headers(&self.archive, &self.sheet_xml[index].uri, &mut parts)?;
+        drop(parts);
         Ok(cache.get_or_init(|| headers))
     }
 
@@ -1098,5 +1155,173 @@ impl Workbook {
         crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_compact_to(writer)
         })
+    }
+}
+
+// The edits inside any table header, once each and in edit order, so that
+// overlapping headers keep the read and refusal order of ordinary worksheet
+// batches. A package can relate many tables with overlapping headers, and the
+// work must not repeat for each table. The rows spanned by headers are
+// coalesced, so each edit is visited at most once, and the edits in those rows
+// are then tested against every header in one row sweep.
+fn header_cells<'a>(
+    cells: &'a BTreeMap<CellRef, CellValue>,
+    headers: &[CellRange],
+) -> Vec<(CellRef, &'a CellValue)> {
+    let mut spans: Vec<(u32, u32)> = headers
+        .iter()
+        .map(|header| (header.first().row, header.last().row))
+        .collect();
+    spans.sort_unstable();
+    let mut spans = spans.into_iter();
+    let Some(mut span) = spans.next() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    let mut search = |(first, last): (u32, u32)| {
+        let first = CellRef {
+            row: first,
+            column: 1,
+        };
+        let last = CellRef {
+            row: last,
+            column: CellRef::MAX_COLUMN,
+        };
+        candidates.extend(
+            cells
+                .range(first..=last)
+                .map(|(&cell, value)| (cell, value)),
+        );
+    };
+    for (first, last) in spans {
+        // Spans that overlap or touch form one run of rows.
+        if first > span.1 + 1 {
+            search(span);
+            span = (first, last);
+        } else {
+            span.1 = span.1.max(last);
+        }
+    }
+    search(span);
+    // With either collection small, direct membership checks cost less than
+    // sorting events and allocating a column index.
+    if candidates.len() <= 8
+        || headers.len() <= 8
+        || candidates.len().saturating_mul(headers.len()) <= 256
+    {
+        candidates.retain(|&(cell, _)| headers.iter().any(|header| header.contains(cell)));
+        return candidates;
+    }
+    // Each header counts once in its columns, from its first row to its last.
+    let mut events: Vec<(u32, u16, u16, i32)> = Vec::with_capacity(headers.len() * 2);
+    for header in headers {
+        let (first, last) = (header.first(), header.last());
+        events.push((first.row, first.column, last.column, 1));
+        events.push((last.row + 1, first.column, last.column, -1));
+    }
+    events.sort_unstable_by_key(|&(row, ..)| row);
+    // Fenwick indexes are one-based columns. A header also updates the slot
+    // after its last column, which is one past the grid's final column.
+    let mut active = vec![0i32; usize::from(CellRef::MAX_COLUMN) + 2];
+    let mut position = 0;
+    // Candidates are visited in edit order. The events of every row up to a
+    // candidate's own are applied before its column is counted.
+    candidates.retain(|&(cell, _)| {
+        while position < events.len() && events[position].0 <= cell.row {
+            let (_, first_column, last_column, delta) = events[position];
+            for (column, delta) in [
+                (usize::from(first_column), delta),
+                (usize::from(last_column) + 1, -delta),
+            ] {
+                let mut index = column;
+                while index < active.len() {
+                    active[index] += delta;
+                    index += index & index.wrapping_neg();
+                }
+            }
+            position += 1;
+        }
+        let mut count = 0;
+        let mut index = usize::from(cell.column);
+        while index > 0 {
+            count += active[index];
+            index &= index - 1;
+        }
+        count > 0
+    });
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The search before header rows were coalesced: every header's rows, one
+    // header at a time.
+    fn reference_header_cells<'a>(
+        cells: &'a BTreeMap<CellRef, CellValue>,
+        headers: &[CellRange],
+    ) -> Vec<(CellRef, &'a CellValue)> {
+        let mut header_cells = BTreeMap::new();
+        for header in headers {
+            header_cells.extend(
+                cells
+                    .range(header.first()..=header.last())
+                    .filter(|(cell, _)| header.contains(**cell)),
+            );
+        }
+        header_cells
+            .into_iter()
+            .map(|(&cell, value)| (cell, value))
+            .collect()
+    }
+
+    #[test]
+    fn header_cells_match_a_search_of_each_header() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..3_000 {
+            // Mostly small grids, so headers overlap and edits fall inside
+            // them, with occasional cells on the grid's last rows and columns.
+            let rows = 1 + next(if round % 3 == 0 { 40 } else { 8 }) as u32;
+            let columns = 1 + next(if round % 5 == 0 { 40 } else { 10 }) as u16;
+            let (header_count, edit_count) = (next(30), next(60));
+            let mut cell = || CellRef {
+                row: if next(20) == 0 {
+                    CellRef::MAX_ROW - next(2) as u32
+                } else {
+                    1 + next(rows.into()) as u32
+                },
+                column: if next(20) == 0 {
+                    CellRef::MAX_COLUMN - next(2) as u16
+                } else {
+                    1 + next(columns.into()) as u16
+                },
+            };
+            // Excel's headers span one row; crafted ones can span several.
+            let headers: Vec<CellRange> = (0..header_count)
+                .map(|index| {
+                    let first = cell();
+                    let mut last = cell();
+                    if index % 2 == 0 {
+                        last.row = first.row;
+                    }
+                    CellRange::new(first, last)
+                })
+                .collect();
+            let cells: BTreeMap<CellRef, CellValue> = (0..edit_count)
+                .map(|value| (cell(), CellValue::Number(value as f64)))
+                .collect();
+            assert_eq!(
+                header_cells(&cells, &headers),
+                reference_header_cells(&cells, &headers),
+                "round {round}"
+            );
+        }
     }
 }

@@ -423,6 +423,54 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
 }
 
 #[test]
+fn a_table_part_shared_by_worksheets_protects_each_of_them() {
+    let mut shared = parts("ref='A1:B3'");
+    let data = shared["xl/worksheets/sheet1.xml"].clone();
+    shared.insert("xl/worksheets/sheet2.xml".into(), data);
+    let rels = shared[SHEET_RELS].clone();
+    shared.insert("xl/worksheets/_rels/sheet2.xml.rels".into(), rels);
+
+    // In separate calls, the second worksheet reuses the first one's table.
+    let mut separate = book(&shared);
+    assert_refused(separate.set_cell("Data", "A1", "Changed"), "A1");
+    assert_refused_in("Notes", separate.set_cell("Notes", "B1", "Changed"), "B1");
+    separate.set_cell("Notes", "B2", 1).unwrap();
+    separate.set_cell("Notes", "B1", "Amount").unwrap();
+
+    let mut together = book(&shared);
+    assert_refused_in(
+        "Notes",
+        together.apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "A1", "Changed").unwrap(),
+        ]),
+        "A1",
+    );
+    assert!(!together.has_changes());
+    together
+        .apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "B3", 4).unwrap(),
+        ])
+        .unwrap();
+
+    // A table part that cannot be read is reported again for each worksheet,
+    // naming the part rather than the worksheet.
+    let mut broken = shared.clone();
+    broken.insert(TABLE_PATH.into(), format!("<table xmlns='{MAIN_NS}'/>"));
+    let mut broken = book(&broken);
+    for sheet in ["Data", "Notes", "Data"] {
+        let error = broken.set_cell(sheet, "B2", 1).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message)
+                if message == &format!("part {TABLE_PATH:?}: table lacks a ref")),
+            "{sheet}: {error}"
+        );
+    }
+    assert!(!broken.has_changes());
+}
+
+#[test]
 fn many_repeated_table_targets_share_long_source_uris() {
     let mut parts = parts("ref='A1:B3'");
     let directory = format!("xl/{}", "nested".repeat(10_000));
@@ -460,6 +508,91 @@ fn many_repeated_table_targets_share_long_source_uris() {
     book.set_cell("Data", "B2", 7).unwrap();
     let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
     assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
+fn alternate_table_target_spellings_share_long_source_uris() {
+    let mut parts = parts("ref='A1:B3'");
+    let directory = format!("xl/{}", "nested".repeat(10_000));
+    let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+    parts.insert(format!("{directory}/sheet1.xml"), worksheet);
+    let table = parts.remove(TABLE_PATH).unwrap();
+    parts.insert(format!("{directory}/table1.xml"), table);
+    let relationships = parts.remove(SHEET_RELS).unwrap();
+    // Every alias spells table1.xml differently, by letter case, escapes of
+    // unreserved letters, and dot segments, so none repeats a spelling.
+    let spell = |c: char, choice: usize| match choice {
+        0 => c.to_string(),
+        1 => c.to_ascii_uppercase().to_string(),
+        2 => format!("%{:02x}", c as u32),
+        _ => format!("%{:02X}", c as u32),
+    };
+    let aliases = (0..16_384usize)
+        .map(|index| {
+            let mut rest = index;
+            let name: String = "table1.xml"
+                .chars()
+                .map(|c| {
+                    if !c.is_ascii_alphabetic() {
+                        return c.to_string();
+                    }
+                    let choice = rest % 4;
+                    rest /= 4;
+                    spell(c, choice)
+                })
+                .collect();
+            let prefix = ["", "./", "d/../", "./d/./../"][index % 4];
+            format!(
+                "<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{prefix}{name}'/>"
+            )
+        })
+        .collect::<String>();
+    parts.insert(
+        format!("{directory}/_rels/sheet1.xml.rels"),
+        relationships
+            .replace("../tables/table1.xml", "table1.xml")
+            .replace("</Relationships>", &format!("{aliases}</Relationships>")),
+    );
+    let workbook_relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *workbook_relationships = workbook_relationships.replace(
+        "Target='worksheets/sheet1.xml'",
+        &format!("Target='/{directory}/sheet1.xml'"),
+    );
+
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
+fn table_targets_appending_one_path_to_different_directories_stay_distinct() {
+    // Both targets append tables/table1.xml, one to the worksheet's xl/
+    // directory and one to the package root, so they name different parts.
+    let mut parts = parts("ref='A1:B3'");
+    let rels = parts.get_mut(SHEET_RELS).unwrap();
+    *rels = rels.replace(
+        "</Relationships>",
+        &format!("<Relationship Id='root' Type='{OFFICE_NS}/table' Target='/tables/table1.xml'/></Relationships>"),
+    );
+    let error = book(&parts).set_cell("Data", "B2", 7).unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidWorkbook(message)
+            if message == &format!("part {SHEET_RELS:?}: missing table part tables/table1.xml")),
+        "{error}"
+    );
+
+    parts.insert(
+        "tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' ref='C1:C3'/>"),
+    );
+    let mut both = book(&parts);
+    assert_refused(both.set_cell("Data", "C1", "beside"), "C1");
+    assert_refused(both.set_cell("Data", "B1", "Total"), "B1");
+    both.set_cell("Data", "B2", 7).unwrap();
 }
 
 #[test]

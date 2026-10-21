@@ -1,7 +1,7 @@
 //! Enumerating a worksheet's cells and its used range.
 mod common;
 
-use sheetpatch::{CellRange, CellRef, CellValue, Workbook};
+use sheetpatch::{CellRange, CellRef, CellValue, Error, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -128,4 +128,39 @@ fn pending_edits_are_enumerated() {
     assert_eq!(used_range(&book).as_deref(), Some("A1:Z100"));
     book.reset_changes();
     assert_eq!(addresses(&book), ["B2"]);
+}
+
+#[test]
+fn reads_of_a_whole_grid_range_are_refused_before_allocating() {
+    // One style-only cell in the last row and column stretches the used range
+    // of a two-cell worksheet over all 17,179,869,184 cells of the grid.
+    let book = book(&format!(
+        "<worksheet xmlns='{MAIN_NS}'><sheetData>\
+         <row r='1'><c r='A1'><v>1</v></c></row>\
+         <row r='1048576'><c r='XFD1048576' s='1'/></row>\
+         </sheetData></worksheet>"
+    ));
+    let view = book.prepare_sheet("Data").unwrap();
+    let range = view.used_range().unwrap();
+    assert_eq!(range.to_string(), "A1:XFD1048576");
+    let refused = |result: sheetpatch::Result<Vec<_>>| {
+        assert!(
+            matches!(&result, Err(Error::Unsupported(message)) if message.contains("too many cells")),
+            "{:?}",
+            result.map(|contents| contents.len())
+        );
+    };
+    refused(view.get_cells_at(range));
+    refused(book.get_cells_at("Data", range.cells()));
+    // Seventeen whole columns are just over the limit of 2^24 cells.
+    let columns: CellRange = "A1:Q1048576".parse().unwrap();
+    refused(view.get_cells_at(columns));
+    refused(book.get_cells_at("Data", columns));
+    // An iterator without a size hint is cut off at the limit instead.
+    refused(view.get_cells_at(columns.cells().filter(|_| true)));
+    // The cells that exist can always be read.
+    let contents = view.get_cells_at(view.cells()).unwrap();
+    assert_eq!(contents.len(), 2);
+    assert_eq!(contents[0].value, CellValue::Number(1.0));
+    assert_eq!(contents[1].style_index, Some(1));
 }

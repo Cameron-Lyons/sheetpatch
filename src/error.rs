@@ -12,7 +12,9 @@ use std::{fmt, io};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// Reading, writing, or replacing a file failed.
+    /// Reading, writing, or replacing a file failed, or memory for a file's
+    /// contents or a batch read's results could not be allocated, which is
+    /// reported with kind [`io::ErrorKind::OutOfMemory`].
     ///
     /// The message includes the I/O error's own message, so
     /// [`source`](std::error::Error::source) returns that error's source
