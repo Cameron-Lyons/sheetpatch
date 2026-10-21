@@ -132,6 +132,33 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         book.set_cell("Alpha", "A1", f64::NAN),
         Err(Error::InvalidValue(message)) if !message.contains("worksheet")
     ));
+    // A single-cell edit's caller holds the cell, but a batch's value error
+    // names the cell it concerns.
+    let (a1, b7) = (CellRef::new(1, 1).unwrap(), CellRef::new(7, 2).unwrap());
+    for result in [
+        book.set_cell("Alpha", "B7", f64::NAN),
+        book.set_cell_at("Alpha", b7, f64::NAN),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::InvalidValue(message)) if message == "numbers must be finite"),
+            "{result:?}"
+        );
+    }
+    for result in [
+        book.set_cells("Alpha", [("A1", 1.0), ("B7", f64::NAN)]),
+        book.set_cells_at("Alpha", [(a1, 1.0), (b7, f64::NAN)]),
+    ] {
+        let error = result.unwrap_err();
+        let Error::InvalidValue(m) = &error else {
+            panic!("expected a value error, got {error:?}");
+        };
+        assert!(m.starts_with("B7: ") && !m.contains("worksheet"), "{m}");
+        assert_eq!(
+            error.to_string(),
+            "invalid cell value: B7: numbers must be finite"
+        );
+    }
+    assert!(!book.has_changes());
     book.set_cell("Alpha", "B1", 1).unwrap();
 }
 
@@ -746,6 +773,94 @@ fn shared_string_cells_without_a_table_are_invalid_cells_of_their_worksheet() {
     assert_eq!(
         book.get_cell("Data", "B1").unwrap().value,
         CellValue::Number(2.0)
+    );
+}
+
+#[test]
+fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
+    // An Excel table on A1:B2 whose headers are shared string 0, "Name", and
+    // string 1, an unpaired surrogate escape: valid, but not a Rust string.
+    let data = format!(
+        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData>\
+         <row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c></row>\
+         <row r='2'><c r='A2' t='s'><v>1</v></c><c r='B2'><v>2</v></c></row>\
+         </sheetData><tableParts count='1'><tablePart r:id='t1'/></tableParts></worksheet>"
+    );
+    let mut parts = parts(&[("Data", data.into_bytes())]);
+    add_shared_strings(
+        &mut parts,
+        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
+            .as_bytes(),
+    );
+    parts.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+    );
+    parts.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='A1:B2'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Other'/></tableColumns></table>").into_bytes(),
+    );
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    let expected =
+        "part \"xl/sharedStrings.xml\": string 1: unpaired UTF-16 surrogate in Excel text escape";
+    let view = book.prepare_sheet("Data").unwrap();
+    let a2 = CellRef::new(2, 1).unwrap();
+    for error in [
+        book.get_cell("Data", "A2").unwrap_err(),
+        book.get_cell_at("Data", a2).unwrap_err(),
+        book.get_cells("Data", ["A1", "A2"]).unwrap_err(),
+        book.get_cells_at("Data", [a2]).unwrap_err(),
+        view.get_cell("B1").unwrap_err(),
+        view.get_cells(["A1", "B1"]).unwrap_err(),
+    ] {
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message == expected),
+            "{error:?}"
+        );
+    }
+    // Every other cell reads normally, including the other shared string.
+    assert_eq!(
+        view.get_cells(["A1", "B2"])
+            .unwrap()
+            .into_iter()
+            .map(|content| content.value)
+            .collect::<Vec<_>>(),
+        [CellValue::from("Name"), CellValue::Number(2.0)]
+    );
+    drop(view);
+
+    // Rewriting the header that is string 0 with its value is a no-op, and
+    // changing it is still refused as a header change.
+    book.set_cell("Data", "A1", "Name").unwrap();
+    book.set_cells("Data", [("A1", "Name")]).unwrap();
+    assert!(!book.has_changes());
+    let error = book.set_cell("Data", "A1", "Renamed").unwrap_err();
+    assert_eq!(protected(&error).1, "A1");
+    // The header that is string 1 cannot be compared with any value, so every
+    // edit of it is refused, even one that would match its empty placeholder.
+    for value in ["", "Other"] {
+        let error = book.set_cell("Data", "B1", value).unwrap_err();
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message == expected),
+            "{error:?}"
+        );
+    }
+    assert_eq!(book.to_bytes().unwrap(), original);
+
+    // A body cell that is string 1 can be replaced, and rewriting it counts
+    // as a change.
+    book.set_cells("Data", [("A1", "Name"), ("A2", "")])
+        .unwrap();
+    assert!(book.has_changes());
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        reopened.get_cell("Data", "A2").unwrap().value,
+        CellValue::from("")
+    );
+    assert_eq!(
+        reopened.get_cell("Data", "A1").unwrap().value,
+        CellValue::from("Name")
     );
 }
 

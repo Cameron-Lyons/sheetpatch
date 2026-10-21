@@ -1,9 +1,9 @@
 use super::index::{RowEntry, WorksheetIndex, reference_range};
-use super::parse::{Attributes, Element};
-use super::read::{StoredValue, decode_payload, value_payload};
+use super::parse::Element;
+use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
-use super::{at_cell, protected, protection, unique, unsupported};
-use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
+use super::{protected, protection, unique, unsupported};
+use crate::xml::{Attributes, excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -168,7 +168,8 @@ fn new_cell(
 }
 
 // The workbook-wide inputs that decide whether an edit rewrites a cell's
-// current value: its shared strings, loaded on first use, and date system.
+// current value: its shared strings, loaded only to compare text, and its
+// date system.
 struct CurrentValues<F> {
     shared_strings: F,
     date1904: bool,
@@ -184,7 +185,7 @@ fn unchanged_value<'s>(
     cell: &Element,
     payload: usize,
     value: &CellValue,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> bool {
     // An existing payload, even an empty `<v/>` that reads as blank, is a
     // representation that clearing removes.
@@ -193,11 +194,12 @@ fn unchanged_value<'s>(
     }
     match decode_payload(xml, index, cell, payload, current.date1904) {
         Ok(StoredValue::Value(old)) => old == *value,
-        // The table is loaded only to compare text.
+        // The table is loaded only to compare text. An entry that cannot be
+        // decoded, like a table that cannot be loaded, leaves a change.
         Ok(StoredValue::SharedString(position)) => match value {
             CellValue::Text(text) => (current.shared_strings)()
-                .and_then(|strings| strings.get(position))
-                .is_some_and(|old| old == text),
+                .and_then(|strings| strings.get(position)?.ok())
+                .is_some_and(|old| old == text.as_str()),
             _ => false,
         },
         Err(_) => false,
@@ -211,7 +213,7 @@ fn patched_cell<'s>(
     cell_index: usize,
     value: &CellValue,
     edits: &mut EditPlan,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<bool> {
     let (source, elements, attributes, namespace) = (
         index.source,
@@ -220,10 +222,10 @@ fn patched_cell<'s>(
         index.namespace,
     );
     let cell = &elements[cell_index];
-    let value_child = value_payload(index, cell).map_err(|error| at_cell(address, error))?;
+    let value_child = value_payload(index, cell).map_err(|error| error.context(address))?;
     if let Some(child) = value_child {
         validate_payload(source, elements, attributes, child, namespace)
-            .map_err(|error| at_cell(address, error))?;
+            .map_err(|error| error.context(address))?;
     }
     let unchanged = if let Some(child) = value_child {
         unchanged_value(xml, index, cell, child, value, current)
@@ -371,7 +373,7 @@ fn patch_existing_row<'s>(
     changes: &RowChanges,
     edits: &mut EditPlan,
     changed_cells: &mut Vec<CellRef>,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<()> {
     let (source, elements) = (index.source, &index.elements);
     let element = &elements[row.element];
@@ -528,7 +530,7 @@ pub(super) fn patch_cells<'a, 's>(
     xml: &'a [u8],
     index: &WorksheetIndex,
     cells: &BTreeMap<CellRef, CellValue>,
-    mut shared_strings: impl FnMut() -> Option<&'s [String]>,
+    shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
     date1904: bool,
 ) -> Result<Cow<'a, [u8]>> {
     if cells.is_empty() {
@@ -536,11 +538,10 @@ pub(super) fn patch_cells<'a, 's>(
     }
     index.validate_edits(cells)?;
     // The table is needed only to recognize rewriting a shared string's own
-    // text. Load it at most once; a table that is absent or fails to load
-    // leaves such edits as changes.
-    let mut loaded_strings = None;
+    // text; a table that is absent or fails to load leaves such edits as
+    // changes. The workbook loads it once and keeps it.
     let mut current = CurrentValues {
-        shared_strings: || *loaded_strings.get_or_insert_with(&mut shared_strings),
+        shared_strings,
         date1904,
     };
     let data = &index.elements[index.data_index];

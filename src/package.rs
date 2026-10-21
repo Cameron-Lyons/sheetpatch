@@ -3,7 +3,7 @@ use crate::{
     archive::{self, Archive, PartChanges},
     atomic::SourcePermissions,
     worksheet::{
-        PreparedWorksheet, ReadError, patch_cells, protection, read_cells, read_shared_strings,
+        PreparedWorksheet, ReadError, SharedStrings, protection, read_cells, read_shared_strings,
     },
 };
 use std::{
@@ -50,16 +50,7 @@ impl Sheet {
                 cell,
                 reason,
             },
-            error => prefixed(error, format_args!("worksheet {:?}", self.name)),
-        }
-    }
-
-    // Like `context`, but a failure to load the shared-string table already
-    // names that part and is not the worksheet's.
-    fn read_context(&self, error: ReadError) -> Error {
-        match error {
-            ReadError::Worksheet(error) => self.context(error),
-            ReadError::SharedStrings(error) => error,
+            error => error.context(format_args!("worksheet {:?}", self.name)),
         }
     }
 }
@@ -68,16 +59,7 @@ impl Sheet {
 // or a table part read while serving a worksheet operation, retaining the
 // error's variant. Such errors are never attributed to the worksheet.
 fn in_part(path: &str, error: Error) -> Error {
-    prefixed(error, format_args!("part {path:?}"))
-}
-
-fn prefixed(error: Error, prefix: fmt::Arguments<'_>) -> Error {
-    match error {
-        Error::Xml(message) => Error::Xml(format!("{prefix}: {message}")),
-        Error::InvalidWorkbook(message) => Error::InvalidWorkbook(format!("{prefix}: {message}")),
-        Error::Unsupported(message) => Error::Unsupported(format!("{prefix}: {message}")),
-        error => error,
-    }
+    error.context(format_args!("part {path:?}"))
 }
 
 /// Whether Excel shows a worksheet's tab.
@@ -180,7 +162,9 @@ impl SheetVisibility {
 ///
 /// Values are validated before any worksheet is read: non-finite numbers,
 /// text longer than Excel's 32,767 UTF-16 code units, and error values that
-/// are not Excel error codes return [`Error::InvalidValue`].
+/// are not Excel error codes return [`Error::InvalidValue`]. From
+/// [`Self::set_cells`] or [`Self::set_cells_at`], its message names the cell,
+/// as in `B7: numbers must be finite`, but not the worksheet.
 ///
 /// # Errors while reading
 ///
@@ -196,6 +180,16 @@ impl SheetVisibility {
 /// Messages about a worksheet name it, and messages about another part, such
 /// as a shared-string table that cannot be loaded, name that part's path in
 /// the archive instead.
+///
+/// Text with an unpaired UTF-16 surrogate escape, such as `_xD83D_` alone,
+/// is valid but cannot be returned as a Rust string, so reading it returns
+/// [`Error::Unsupported`]. In the shared-string table this concerns only
+/// that entry: reads of cells that use it fail with a message naming the
+/// part and the entry's index, such as
+/// `part "xl/sharedStrings.xml": string 1: …`, while other cells read
+/// normally. Rewriting such a cell counts as a change, so an edit of an
+/// Excel table header cell that uses it, whose current value must be read,
+/// fails with the same error.
 pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
@@ -204,7 +198,9 @@ pub struct Workbook {
     date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
-    shared_strings: OnceLock<Vec<String>>,
+    // The outcome of the table's first load. Untouched parts never change,
+    // so a table that fails to load fails the same way on every later use.
+    shared_strings: OnceLock<std::result::Result<SharedStrings, Error>>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
@@ -379,7 +375,7 @@ impl WorksheetView<'_> {
                 || self.workbook.shared_strings(),
                 self.workbook.date1904,
             )
-            .map_err(|error| self.sheet.read_context(error))
+            .map_err(|error| self.workbook.read_context(self.sheet, error))
     }
 
     /// Read multiple addresses, retaining input order and duplicate requests.
@@ -424,7 +420,7 @@ impl WorksheetView<'_> {
                 || self.workbook.shared_strings(),
                 self.workbook.date1904,
             )
-            .map_err(|error| self.sheet.read_context(error))
+            .map_err(|error| self.workbook.read_context(self.sheet, error))
     }
 }
 
@@ -531,10 +527,12 @@ impl Workbook {
     ///
     /// Returns [`Error::Unsupported`] for packages outside the supported scope,
     /// such as legacy `.xls` and password-encrypted (OLE compound) files,
-    /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, and encrypted
-    /// ZIP entries. Returns [`Error::InvalidWorkbook`] or [`Error::Xml`] for a
-    /// damaged or ambiguous archive or package metadata. Worksheet XML is
-    /// checked when a worksheet is first read or edited.
+    /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, encrypted
+    /// ZIP entries, and a sheet name with an unpaired UTF-16 surrogate
+    /// escape, which names the sheet's position in the workbook. Returns
+    /// [`Error::InvalidWorkbook`] or [`Error::Xml`] for a damaged or ambiguous
+    /// archive or package metadata. Worksheet XML is checked when a worksheet
+    /// is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::new(bytes)?;
         let discovery::PackageMetadata {
@@ -632,7 +630,7 @@ impl Workbook {
     ) -> Result<()> {
         // The sheet is resolved first, as in the batch and read methods.
         let index = self.sheet_index(sheet)?;
-        self.set_cells_in_sheet(index, [address.parse().map(|cell| (cell, value))])
+        self.set_cell_in_sheet(index, address.parse()?, value.into())
     }
 
     /// Set a scalar value using an already validated, one-based cell address.
@@ -650,7 +648,7 @@ impl Workbook {
         value: impl Into<CellValue>,
     ) -> Result<()> {
         let index = self.sheet_index(sheet)?;
-        self.set_cells_in_sheet(index, [Ok((cell, value))])
+        self.set_cell_in_sheet(index, cell, value.into())
     }
 
     /// Apply edits to a worksheet in one parse and one XML patch.
@@ -660,13 +658,15 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::SheetNotFound`] before reading the batch if no
-    /// worksheet has this name, then the first invalid address or value, and
-    /// otherwise fails like [`Self::set_cell`] for one refused edit, which
-    /// need not be the batch's first. Formula cells, then cells in formula
-    /// ranges, then merged cells are checked across the whole batch, each in
-    /// row-major order. The cells are then patched in row-major order, where
-    /// metadata and payload refusals arise, and Excel table headers are
-    /// checked last. No edit of a failed batch is applied.
+    /// worksheet has this name, then the first invalid address or value, where
+    /// an [`Error::InvalidValue`] message names its cell, as in
+    /// `B7: numbers must be finite`. Otherwise it fails like [`Self::set_cell`]
+    /// for one refused edit, which need not be the batch's first. Formula
+    /// cells, then cells in formula ranges, then merged cells are checked
+    /// across the whole batch, each in row-major order. The cells are then
+    /// patched in row-major order, where metadata and payload refusals arise,
+    /// and Excel table headers are checked last. No edit of a failed batch is
+    /// applied.
     pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -692,7 +692,8 @@ impl Workbook {
     ///
     /// # Errors
     ///
-    /// Fails like [`Self::set_cells`], other than for addresses.
+    /// Fails like [`Self::set_cells`], other than for addresses. An
+    /// [`Error::InvalidValue`] message names its cell.
     pub fn set_cells_at<I, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (CellRef, V)>,
@@ -702,6 +703,14 @@ impl Workbook {
         self.set_cells_in_sheet(index, cells.into_iter().map(Ok))
     }
 
+    // The caller names the one cell, so its value error does not repeat it.
+    fn set_cell_in_sheet(&mut self, index: usize, cell: CellRef, value: CellValue) -> Result<()> {
+        value.validate()?;
+        self.apply_grouped_edits([(index, BTreeMap::from([(cell, value)]))])
+    }
+
+    // A value error names its cell, since a batch can hold many, but not the
+    // worksheet: only errors raised inside a worksheet name it.
     fn set_cells_in_sheet<I, V>(&mut self, index: usize, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = Result<(CellRef, V)>>,
@@ -711,7 +720,7 @@ impl Workbook {
         for cell in cells {
             let (cell, value) = cell?;
             let value = value.into();
-            value.validate()?;
+            value.validate().map_err(|error| error.context(cell))?;
             values.insert(cell, value);
         }
         if values.is_empty() {
@@ -756,24 +765,23 @@ impl Workbook {
             ));
         }
         let mut staged = Vec::with_capacity(grouped.size_hint().0);
-        let mut loaded_shared_strings = None;
         for (index, cells) in grouped {
             let in_sheet = |error| self.sheets[index].context(error);
             let original = self.original_sheet(index).map_err(in_sheet)?;
             let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
+            if cells.is_empty() {
+                continue;
+            }
             // Shared strings only recognize rewriting a cell's current text,
             // so a table that cannot be loaded leaves such an edit a change.
-            // The immutable table can fail only the same way on every sheet;
-            // remember that optional result for this transaction as well.
-            let shared_strings = || {
-                *loaded_shared_strings.get_or_insert_with(|| self.shared_strings().ok().flatten())
-            };
-            let Cow::Owned(patched) =
-                patch_cells(current, &cells, shared_strings, self.date1904).map_err(in_sheet)?
+            let worksheet = PreparedWorksheet::parse(current).map_err(in_sheet)?;
+            let Cow::Owned(patched) = worksheet
+                .patch_cells(&cells, || self.loaded_shared_strings(), self.date1904)
+                .map_err(in_sheet)?
             else {
                 continue;
             };
-            self.check_table_headers(index, current, &cells)?;
+            self.check_table_headers(index, worksheet, &cells)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -786,19 +794,34 @@ impl Workbook {
     // Excel requires each table header cell's text to equal its table column's
     // name, and repairs or removes a table whose header differs. An edit may
     // rewrite a header cell's current value, as it reads, but not change it.
-    // Errors name the worksheet or the package part they concern.
+    // `worksheet` is the edited worksheet as it was before the edits. Errors
+    // name the worksheet or the package part they concern.
     fn check_table_headers(
         &self,
         index: usize,
-        xml: &[u8],
+        worksheet: PreparedWorksheet<'_>,
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
+        // A worksheet's first change resolves its tables, which can read and
+        // parse many relationships. The index is released meanwhile and
+        // rebuilt only for an edit in a header; once the tables are known, it
+        // is kept for the header reads instead.
+        let xml = worksheet.xml();
+        let retained = if self.sheet_xml[index].table_headers.get().is_some() {
+            Some(worksheet)
+        } else {
+            drop(worksheet);
+            None
+        };
         let edits = header_cells(cells, self.table_headers(index)?);
         if edits.is_empty() {
             return Ok(());
         }
-        let worksheet = PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?;
+        let worksheet = match retained {
+            Some(worksheet) => worksheet,
+            None => PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?,
+        };
         let mut changed_header = None;
         // Keep one value at a time: many headers can refer to the same long
         // shared string. Validate all reads before reporting the first changed
@@ -806,7 +829,7 @@ impl Workbook {
         for (cell, value) in edits {
             let current = worksheet
                 .read_cell(cell, || self.shared_strings(), self.date1904)
-                .map_err(|error| sheet.read_context(error))?;
+                .map_err(|error| self.read_context(sheet, error))?;
             if current.value != *value {
                 changed_header.get_or_insert(cell);
             }
@@ -907,7 +930,7 @@ impl Workbook {
             || self.shared_strings(),
             self.date1904,
         )
-        .map_err(|error| sheet.read_context(error))
+        .map_err(|error| self.read_context(sheet, error))
     }
 
     /// Prepare a worksheet for repeated reads using a single validated XML index.
@@ -979,8 +1002,9 @@ impl Workbook {
             .ok_or_else(|| Error::SheetNotFound(name.to_owned()))
     }
 
-    // Each cache is loaded outside `get_or_init`, so a failed load is not
-    // cached. Concurrent first loads can only duplicate the work.
+    // The worksheet caches are loaded outside `get_or_init`, so a failed load
+    // is not cached and fails the call that needed it, which can be retried.
+    // Concurrent first loads can only duplicate the work.
     fn original_sheet(&self, index: usize) -> Result<&[u8]> {
         let cache = &self.sheet_xml[index].original;
         if let Some(xml) = cache.get() {
@@ -1007,21 +1031,50 @@ impl Workbook {
         Ok(cache.get_or_init(|| headers))
     }
 
-    // The shared-string table, or `None` for a workbook without one. Errors
-    // name the table's part, rather than the worksheet that needed it.
-    fn shared_strings(&self) -> Result<Option<&[String]>> {
-        let Some(path) = &self.shared_strings_path else {
-            return Ok(None);
-        };
-        if let Some(strings) = self.shared_strings.get() {
-            return Ok(Some(strings));
+    // Like `Sheet::context`, but the shared-string table's errors are not the
+    // worksheet's. A failure to load the table already names that part; an
+    // entry that cannot be decoded is named with its part and index.
+    fn read_context(&self, sheet: &Sheet, error: ReadError) -> Error {
+        match error {
+            ReadError::Worksheet(error) => sheet.context(error),
+            ReadError::SharedStrings(error) => error,
+            ReadError::UndecodableString { index, error } => {
+                let error = error.context(format_args!("string {index}"));
+                match &self.shared_strings_path {
+                    Some(path) => in_part(path, error),
+                    None => error,
+                }
+            }
         }
-        let strings = self
-            .archive
-            .read(path)
-            .and_then(|xml| read_shared_strings(&xml))
-            .map_err(|error| in_part(path, error))?;
-        Ok(Some(self.shared_strings.get_or_init(|| strings)))
+    }
+
+    // The shared-string table, or `None` for a workbook without one. Errors
+    // name the table's part, rather than the worksheet that needed it, and
+    // every read that needs a table that cannot be loaded gets the same error.
+    fn shared_strings(&self) -> Result<Option<&SharedStrings>> {
+        self.load_shared_strings()
+            .transpose()
+            .map_err(Error::duplicate)
+    }
+
+    // The table if it loads. Edits only compare against it, so a table that
+    // cannot be loaded makes their values changes, not errors.
+    fn loaded_shared_strings(&self) -> Option<&SharedStrings> {
+        self.load_shared_strings()?.ok()
+    }
+
+    // Decompresses and parses the table on first use and keeps the outcome,
+    // so a damaged table is not read again for every call. Concurrent first
+    // uses wait for one load, which never touches this cache.
+    fn load_shared_strings(&self) -> Option<std::result::Result<&SharedStrings, &Error>> {
+        let path = self.shared_strings_path.as_deref()?;
+        let loaded = self.shared_strings.get_or_init(|| {
+            self.archive
+                .read(path)
+                .and_then(|xml| read_shared_strings(&xml))
+                .map_err(|error| in_part(path, error))
+        });
+        Some(loaded.as_ref())
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
@@ -1255,6 +1308,82 @@ fn header_cells<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common;
+
+    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    // A workbook whose Data worksheet's A1 and A2 are shared strings 0 and 1,
+    // with `strings` as the body of its shared-string table.
+    fn shared_string_book(strings: &str) -> Workbook {
+        let parts = [
+            (
+                "[Content_Types].xml",
+                "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/></Types>".to_owned(),
+            ),
+            (
+                "_rels/.rels",
+                format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
+            ),
+            (
+                "xl/workbook.xml",
+                format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='data' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                format!("<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2' t='s'><v>1</v></c></row></sheetData></worksheet>"),
+            ),
+            (
+                "xl/sharedStrings.xml",
+                format!("<sst xmlns='{MAIN_NS}'>{strings}</sst>"),
+            ),
+        ];
+        let entries: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(name, xml)| (*name, xml.as_bytes()))
+            .collect();
+        Workbook::from_bytes(common::stored_archive(&entries)).unwrap()
+    }
+
+    #[test]
+    fn the_shared_string_table_is_loaded_once_whatever_the_outcome() {
+        // A table that cannot be loaded keeps its first error, and each read
+        // that needs the table reports a copy with its variant and message.
+        let mut book = shared_string_book("<si><t>first</t></si><x><si><t>hidden</t></si></x>");
+        assert!(book.shared_strings.get().is_none());
+        let first = book.get_cell("Data", "A1").unwrap_err();
+        assert!(matches!(book.shared_strings.get(), Some(Err(_))));
+        assert_eq!(
+            first.to_string(),
+            "unsupported: part \"xl/sharedStrings.xml\": shared string outside the shared-string table"
+        );
+        let view = book.prepare_sheet("Data").unwrap();
+        for error in [
+            book.get_cell("Data", "A2").unwrap_err(),
+            book.get_cells("Data", ["A1", "A2"]).unwrap_err(),
+            view.get_cell("A1").unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+            assert_eq!(error.to_string(), first.to_string());
+        }
+        drop(view);
+        // Edits only compare against the table, so they are changes.
+        book.set_cell("Data", "A1", "first").unwrap();
+        book.set_cells("Data", [("A2", "second")]).unwrap();
+        assert!(book.has_changes());
+        assert!(matches!(book.shared_strings.get(), Some(Err(_))));
+
+        // A table with an entry that cannot be decoded loads, and is kept.
+        let book = shared_string_book("<si><t>first</t></si><si><t>_xD83D_</t></si>");
+        assert!(book.get_cell("Data", "A2").is_err());
+        assert!(matches!(book.shared_strings.get(), Some(Ok(_))));
+        assert_eq!(book.get_cell("Data", "A1").unwrap().value, "first".into());
+    }
 
     // The search before header rows were coalesced: every header's rows, one
     // header at a time.

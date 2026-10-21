@@ -1658,16 +1658,12 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
     }
 }
 
-// The integration tests' independent ZIP reader.
-#[cfg(test)]
-#[path = "../tests/common/mod.rs"]
-mod common;
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::common;
 
     thread_local! {
         /// Replaces `DEFLATE_SEGMENT` in saves on the current thread, so that

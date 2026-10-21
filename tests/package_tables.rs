@@ -205,6 +205,113 @@ fn edits_that_keep_a_header_value_are_no_ops() {
 }
 
 #[test]
+fn unchanged_headers_leave_the_rest_of_a_batch_on_a_pending_sheet_as_it_is() {
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace("<sheetData>", "<dimension ref='A1:C3'/><sheetData>");
+    let original = archive(&parts);
+    let body = [
+        ("Data", "B2", CellValue::from(8)),
+        ("Data", "A4", CellValue::from("below")),
+        ("Notes", "A1", CellValue::from(true)),
+    ];
+    let headers = [
+        ("Data", "A1", CellValue::from("Name")),
+        ("Data", "B1", CellValue::from("Amount")),
+    ];
+    let edits = |edits: &[(&str, &str, CellValue)]| {
+        edits
+            .iter()
+            .map(|(sheet, cell, value)| CellEdit::new(*sheet, cell, value.clone()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut expected = Workbook::from_bytes(original.clone()).unwrap();
+    let mut book = Workbook::from_bytes(original).unwrap();
+    for book in [&mut expected, &mut book] {
+        // Widening the dimension moves the header cells in the pending XML.
+        book.set_cell("Data", "D9", "pending").unwrap();
+    }
+    expected.apply_edits(edits(&body)).unwrap();
+    let pending = expected.to_bytes().unwrap();
+    book.apply_edits(edits(&[&headers[..], &body[..]].concat()))
+        .unwrap();
+    assert_eq!(book.to_bytes().unwrap(), pending);
+    // A changed header still refuses the whole transaction.
+    let changed = ("Data", "B1", CellValue::from("Total"));
+    assert_refused(
+        book.apply_edits(edits(&[&body[..], std::slice::from_ref(&changed)].concat())),
+        "B1",
+    );
+    assert_refused(
+        book.set_cells("Data", [("B2", CellValue::from(9)), ("B1", changed.2)]),
+        "B1",
+    );
+    assert_eq!(book.to_bytes().unwrap(), pending);
+}
+
+#[test]
+fn header_checks_agree_before_and_after_the_tables_are_resolved() {
+    // A worksheet's first change resolves its tables, which later batches
+    // reuse. Each sequence of batches runs both ways and must agree.
+    let plain = parts("ref='A1:B3'");
+    let mut unreadable = plain.clone();
+    let sheet = unreadable.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace(
+        "<c r='B1' t='inlineStr'>",
+        "<c r='B1' t='inlineStr' s='bad'>",
+    );
+    let batches: [&[(&str, CellValue)]; 4] = [
+        &[
+            ("A1", "Name".into()),
+            ("B1", "Amount".into()),
+            ("B2", 8.into()),
+        ],
+        &[("B3", 9.into()), ("A1", "Label".into())],
+        &[("A1", "Name".into()), ("B1", "Amount".into())],
+        &[("B1", "Amount".into()), ("A3", "z".into())],
+    ];
+    let outcomes = |parts: &BTreeMap<String, String>, resolved: bool| {
+        let mut book = book(parts);
+        if resolved {
+            book.set_cell("Data", "B2", 7).unwrap();
+            book.reset_changes();
+        }
+        batches
+            .iter()
+            .map(|&batch| {
+                let result = book.set_cells("Data", batch.iter().cloned());
+                (
+                    result.map_err(|error| error.to_string()),
+                    book.to_bytes().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let refusal = format!("protected cell: worksheet \"Data\": A1 {REFUSAL}");
+    let unreadable_header = "invalid workbook: worksheet \"Data\": B1: invalid cell style index";
+    for (parts, expected) in [
+        (&plain, [Ok(()), Err(refusal.as_str()), Ok(()), Ok(())]),
+        (
+            &unreadable,
+            [
+                Err(unreadable_header),
+                Err(refusal.as_str()),
+                Ok(()),
+                Err(unreadable_header),
+            ],
+        ),
+    ] {
+        let first = outcomes(parts, false);
+        let results: Vec<_> = first
+            .iter()
+            .map(|(result, _)| result.as_ref().map_err(String::as_str).copied())
+            .collect();
+        assert_eq!(results, expected);
+        assert_eq!(outcomes(parts, true), first);
+    }
+}
+
+#[test]
 fn tables_without_a_header_row_leave_the_first_row_editable() {
     let mut book = book(&parts("ref='A1:B3' headerRowCount='0'"));
     book.set_cell("Data", "A1", "first").unwrap();
