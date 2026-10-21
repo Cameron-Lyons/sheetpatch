@@ -900,6 +900,14 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
             "<mc:AlternateContent xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006'><mc:Choice Requires='x'>{contents}</mc:Choice></mc:AlternateContent>"
         )
     };
+    // The same contents in both branches, so that either one is valid.
+    let both = |contents: &str| {
+        format!(
+            "<mc:AlternateContent xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006'><mc:Choice Requires='x'>{contents}</mc:Choice><mc:Fallback>{contents}</mc:Fallback></mc:AlternateContent>"
+        )
+    };
+    let sheets = "<sheets><sheet name=\"Data\" sheetId='1' r:id='s1'/></sheets>";
+    let sheet_data = "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2'><v>1</v></c></row></sheetData>";
     // Each defect replaces text in one part.
     let malformed: [(&str, &str, &str, String); 21] = [
         ("wrong root", WORKBOOK, "workbook", "document".into()),
@@ -989,7 +997,7 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
             "r='A2' t='inlineStr'".into(),
         ),
     ];
-    let unhandled: [(&str, &str, &str, String); 7] = [
+    let unhandled: [(&str, &str, &str, String); 10] = [
         (
             "mixed dialects",
             WORKBOOK,
@@ -1016,10 +1024,21 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
         ),
         (
             "hidden content",
+            WORKBOOK,
+            "</sheets>",
+            format!(
+                "{}</sheets>",
+                both("<sheet name='Hidden' sheetId='2' r:id='s1'/>")
+            ),
+        ),
+        ("hidden content", WORKBOOK, sheets, both(sheets)),
+        (
+            "hidden content",
             SHEET,
             "</sheetData>",
             format!("{}</sheetData>", branch("<row r='3'/>")),
         ),
+        ("hidden content", SHEET, sheet_data, both(sheet_data)),
         (
             "hidden content",
             STRINGS,

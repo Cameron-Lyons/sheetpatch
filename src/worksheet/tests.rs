@@ -444,6 +444,11 @@ fn markup_compatibility_branches_cannot_bypass_value_or_range_guards() {
             "<sheetData><row r=\"1\">{}</row></sheetData>",
             alternative("<c r=\"A1\"><f>1+6</f><v>7</v></c>")
         ),
+        // A worksheet's only sheetData in a branch hides every cell.
+        alternative("<sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData>"),
+        format!(
+            "<mc:AlternateContent xmlns:mc=\"{mc}\"><mc:Choice Requires=\"x\"><sheetData/></mc:Choice><mc:Fallback><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></mc:Fallback></mc:AlternateContent>"
+        ),
     ] {
         let input = sheet(&body);
         assert!(
@@ -784,6 +789,18 @@ fn malformed_worksheet_structure_makes_the_workbook_invalid() {
                 "{input}: {result:?}"
             );
         }
+    }
+    // A sheetData only inside another element is valid content this crate
+    // does not index.
+    let input = sheet("<x:extension xmlns:x='urn:x'><sheetData/></x:extension>");
+    for result in [
+        edit(&input, "A1", 2.0.into()).map(drop),
+        read_cell(input.as_bytes(), "A1".parse().unwrap(), None).map(drop),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::Unsupported(m)) if m == "sheetData inside an unsupported XML container"),
+            "{input}: {result:?}"
+        );
     }
     // A repeated or malformed dimension only refuses the edits that may need
     // to widen it.

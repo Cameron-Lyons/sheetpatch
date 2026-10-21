@@ -275,6 +275,15 @@ fn workbook_properties(nodes: &[Node]) -> Result<(usize, bool)> {
     }
     let in_workbook =
         |node: &Node, local: &str| node.local == local && node.namespace == root.namespace;
+    // Which sheet list a reader sees would depend on the branch it selects.
+    if nodes
+        .iter()
+        .any(|node| in_workbook(node, "sheets") && in_branch(nodes, node))
+    {
+        return Err(Error::Unsupported(
+            "sheets inside a markup-compatibility branch".into(),
+        ));
+    }
     let mut containers = nodes
         .iter()
         .enumerate()
@@ -353,6 +362,11 @@ fn sheets(
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
     for (position, node) in (1usize..).zip(sheet_nodes(nodes)) {
+        if in_branch(nodes, node) {
+            return Err(Error::Unsupported(
+                "sheet inside a markup-compatibility branch".into(),
+            ));
+        }
         if node.parent != Some(sheets_index) {
             return Err(Error::InvalidWorkbook(
                 "sheet outside workbook sheets".into(),
@@ -456,15 +470,28 @@ fn compatibility_branch(node: &Node) -> bool {
     &*node.namespace == COMPATIBILITY_NS && matches!(node.local.as_str(), "Choice" | "Fallback")
 }
 
+// Whether a retained node's parent is a retained compatibility branch.
+fn in_branch(nodes: &[Node], node: &Node) -> bool {
+    node.parent
+        .is_some_and(|parent| compatibility_branch(&nodes[parent]))
+}
+
 // Misplaced sheet lists and sheets are kept so that they can be rejected;
 // unrelated elements, wherever they occur, are not.
 fn workbook_node(depth: usize, namespace: &str, local: &str, parent: Option<&Node>) -> bool {
     // Retain only compatibility branches that can substitute direct workbook
-    // children, including nested AlternateContent. Ordinary opaque extensions
-    // and their unrelated workbookPr elements stay outside discovery.
+    // children or sheets, including nested AlternateContent. Ordinary opaque
+    // extensions and their unrelated workbookPr elements stay outside
+    // discovery.
     if namespace == COMPATIBILITY_NS {
         return match local {
-            "AlternateContent" => depth == 1 || parent.is_some_and(compatibility_branch),
+            "AlternateContent" => {
+                depth == 1
+                    || parent.is_some_and(|node| {
+                        compatibility_branch(node)
+                            || (node.local == "sheets" && main_namespace(&node.namespace))
+                    })
+            }
             "Choice" | "Fallback" => parent.is_some_and(|node| {
                 &*node.namespace == COMPATIBILITY_NS && node.local == "AlternateContent"
             }),
