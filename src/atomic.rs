@@ -1011,6 +1011,29 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn symlinked_destinations_use_the_access_acl_of_their_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TempDir::new("acl-symlink");
+        let target = directory.join("target.xlsx");
+        fs::write(&target, b"original").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        if !share_with_one_user(&target) {
+            return;
+        }
+        // The link has no ACL of its own. Like the mode bits, the owning
+        // group's entry comes from the target, so the group gets no access.
+        let link = directory.join("link.xlsx");
+        symlink(&target, &link).unwrap();
+        replace(&link, b"replacement").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(mode(&link), 0o600);
+        assert_eq!(mode(&target), 0o660);
+        assert_eq!(directory.entries(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn access_acls_limit_group_bits_to_the_owning_group_entry() {
         const USER_OBJ: u16 = 0x01;
         const USER: u16 = 0x02;
