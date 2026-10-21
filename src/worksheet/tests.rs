@@ -870,7 +870,7 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
             .map(|(address, value)| (address.parse().unwrap(), value.clone()))
             .collect()
     };
-    let strings = ["first".to_owned(), "second".to_owned()];
+    let strings = SharedStrings::from_iter(["first", "second"]);
     let mut loads = 0;
     let unchanged = patch_cells(
         input.as_bytes(),
@@ -1365,7 +1365,7 @@ fn reads_values_formulas_styles_and_preserves_requested_order() {
         .iter()
         .map(|address| address.parse().unwrap())
         .collect();
-    let strings = ["first".into(), "second".into()];
+    let strings = SharedStrings::from_iter(["first", "second"]);
     let cells = read_cells(input.as_bytes(), &addresses, || Ok(Some(&strings)), false).unwrap();
     assert_eq!(
         cells
@@ -1404,7 +1404,7 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
     .unwrap();
     assert_eq!(numeric[0].value, CellValue::Number(7.0));
 
-    let strings = ["first".into(), "second".into()];
+    let strings = SharedStrings::from_iter(["first", "second"]);
     let mut loads = 0;
     let contents = read_cells(
         input.as_bytes(),
@@ -1428,6 +1428,57 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
             .collect::<Vec<_>>(),
         vec!["first".into(), "second".into(), "first".into()]
     );
+}
+
+#[test]
+fn shared_string_tables_return_each_decoded_string_exactly() {
+    // Empty, multi-byte and escaped text, split into runs at varying points,
+    // so that strings of every length meet at every kind of boundary.
+    let pieces = [
+        "",
+        "a",
+        "雪",
+        "😀",
+        "_x0041_",
+        "&<>",
+        "\r\n",
+        " ",
+        "\u{1}",
+        "_xD83D__xDE00_",
+    ];
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let mut expected = Vec::new();
+    let mut body = String::new();
+    for _ in 0..2_000 {
+        let runs: Vec<String> = (0..next(4))
+            .map(|_| (0..next(4)).map(|_| pieces[next(pieces.len())]).collect())
+            .collect();
+        let t = |text: &str| format!("<t xml:space='preserve'>{}</t>", text_escaped(text));
+        body.push_str(&match runs.as_slice() {
+            [] => "<si/>".to_owned(),
+            [text] if next(2) == 0 => format!("<si>{}</si>", t(text)),
+            runs => format!(
+                "<si>{}</si>",
+                runs.iter()
+                    .map(|text| format!("<r>{}</r>", t(text)))
+                    .collect::<String>()
+            ),
+        });
+        expected.push(runs.concat());
+    }
+    let table = read_shared_strings(format!("<sst xmlns='{TRANSITIONAL}'>{body}</sst>").as_bytes())
+        .unwrap();
+    for (index, text) in expected.iter().enumerate() {
+        assert_eq!(table.get(index), Some(text.as_str()), "{index}");
+    }
+    assert_eq!(table.get(expected.len()), None);
+    assert_eq!(table, expected);
 }
 
 #[test]
@@ -1472,7 +1523,7 @@ fn hidden_shared_strings_cannot_shift_visible_string_indices() {
         );
         assert_eq!(
             read_shared_strings(foreign.as_bytes()).unwrap(),
-            ["first", "second"]
+            vec!["first", "second"]
         );
     }
 }
@@ -1518,7 +1569,14 @@ fn rejects_invalid_read_values_and_missing_shared_strings() {
         let input = sheet(&format!(
             r#"<sheetData><row r="1"><c r="A1" t="{kind}"><v>{payload}</v></c></row></sheetData>"#
         ));
-        assert!(read_cell(input.as_bytes(), "A1".parse().unwrap(), Some(&[])).is_err());
+        assert!(
+            read_cell(
+                input.as_bytes(),
+                "A1".parse().unwrap(),
+                Some(&SharedStrings::default())
+            )
+            .is_err()
+        );
     }
     let input = sheet(r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>"#);
     assert!(matches!(
@@ -1527,7 +1585,11 @@ fn rejects_invalid_read_values_and_missing_shared_strings() {
             if message == "A1: shared-string cell, but the workbook has no shared-string table"
     ));
     assert!(matches!(
-        read_cell(input.as_bytes(), "A1".parse().unwrap(), Some(&[])),
+        read_cell(
+            input.as_bytes(),
+            "A1".parse().unwrap(),
+            Some(&SharedStrings::default())
+        ),
         Err(Error::InvalidWorkbook(_))
     ));
 }
@@ -1587,7 +1649,7 @@ fn no_op_patches_borrow_the_original_xml() {
 fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
     // Clearing an existing payload is a change even when it reads as blank;
     // every other edit is a no-op only if a read returns the same value.
-    let strings = ["first".to_owned(), " 2".to_owned()];
+    let strings = SharedStrings::from_iter(["first", " 2"]);
     let address: CellRef = "A1".parse().unwrap();
     let values = [
         CellValue::Blank,
@@ -2043,7 +2105,12 @@ fn read_errors_name_the_cell() {
         let input = sheet(&format!(
             "<sheetData><row r='2'><c r='B2' t='{kind}'><v>{payload}</v></c></row></sheetData>"
         ));
-        let error = read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&[])).unwrap_err();
+        let error = read_cell(
+            input.as_bytes(),
+            "B2".parse().unwrap(),
+            Some(&SharedStrings::default()),
+        )
+        .unwrap_err();
         assert!(
             matches!(&error, Error::InvalidWorkbook(error) if error == message),
             "{message}: {error:?}"
@@ -2116,7 +2183,7 @@ fn read_errors_name_the_cell() {
     ));
     let input = sheet("<sheetData><row r='2'><c r='B2' t='s'><v>5</v></c></row></sheetData>");
     assert!(matches!(
-        read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&["only".into()])),
+        read_cell(input.as_bytes(), "B2".parse().unwrap(), Some(&SharedStrings::from_iter(["only"]))),
         Err(Error::InvalidWorkbook(error)) if error == "B2: shared-string index 5 is out of bounds"
     ));
     // A failure to load the table concerns that part, not the cell.
@@ -2267,7 +2334,7 @@ fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
     let input = sheet(
         "<dimension ref='A2:B2'/><sheetData><row r='2'><c r='A2' t='s'><v>0</v></c><c r='B2'><v>5</v></c></row></sheetData>",
     );
-    let strings = ["Name".to_owned()];
+    let strings = SharedStrings::from_iter(["Name"]);
     let cells = |worksheet: &PreparedWorksheet<'_>| {
         let addresses = ["A1", "A2", "B2"].map(|address| address.parse().unwrap());
         worksheet

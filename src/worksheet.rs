@@ -14,7 +14,7 @@ mod read;
 mod validation;
 
 use index::WorksheetIndex;
-pub(crate) use read::read_shared_strings;
+pub(crate) use read::{SharedStrings, read_shared_strings};
 
 /// A validated worksheet index retained only for the lifetime of an explicit
 /// view or of one worksheet's edits. All spans borrow the immutable XML
@@ -47,7 +47,7 @@ impl<'xml> PreparedWorksheet<'xml> {
     pub(crate) fn read_cell<'strings>(
         &self,
         cell: CellRef,
-        mut shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+        mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> std::result::Result<CellContent, ReadError> {
         read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
@@ -60,7 +60,7 @@ impl<'xml> PreparedWorksheet<'xml> {
     pub(crate) fn read_cells<'strings>(
         &self,
         cells: &[CellRef],
-        shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+        shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> std::result::Result<Vec<CellContent>, ReadError> {
         read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
@@ -79,7 +79,7 @@ impl<'xml> PreparedWorksheet<'xml> {
     pub(crate) fn patch_cells<'strings>(
         &self,
         cells: &BTreeMap<CellRef, CellValue>,
-        shared_strings: impl FnMut() -> Option<&'strings [String]>,
+        shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
         date1904: bool,
     ) -> Result<Cow<'xml, [u8]>> {
         debug_assert!(cells.values().all(|value| value.validate().is_ok()));
@@ -106,7 +106,7 @@ impl From<Error> for ReadError {
 pub(crate) fn read_cells<'strings>(
     xml: &[u8],
     cells: &[CellRef],
-    shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+    shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
     date1904: bool,
 ) -> std::result::Result<Vec<CellContent>, ReadError> {
     if cells.is_empty() {
@@ -174,7 +174,7 @@ fn unique<T>(
 fn patch_cells<'xml, 'strings>(
     xml: &'xml [u8],
     cells: &BTreeMap<CellRef, CellValue>,
-    shared_strings: impl FnMut() -> Option<&'strings [String]>,
+    shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
     date1904: bool,
 ) -> Result<Cow<'xml, [u8]>> {
     PreparedWorksheet::parse(xml)?.patch_cells(cells, shared_strings, date1904)
@@ -192,7 +192,11 @@ fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-fn read_cell(xml: &[u8], cell: CellRef, shared_strings: Option<&[String]>) -> Result<CellContent> {
+fn read_cell(
+    xml: &[u8],
+    cell: CellRef,
+    shared_strings: Option<&SharedStrings>,
+) -> Result<CellContent> {
     read_cells(xml, &[cell], || Ok(shared_strings), false)
         .map(|mut cells| cells.remove(0))
         .map_err(|error| match error {

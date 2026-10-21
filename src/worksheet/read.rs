@@ -143,8 +143,8 @@ fn is_string_table(document: &XmlDocument) -> bool {
 /// table while still validating every event. Decoding errors are reported
 /// only after the rest of the part is known to be valid, giving them the same
 /// precedence as when the full table was indexed first.
-pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
-    let mut strings = Vec::new();
+pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
+    let mut strings = SharedStrings::default();
     let mut hidden_string = false;
     let mut mixed_namespace = false;
     let mut decode_error = None;
@@ -167,11 +167,10 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
             && !mixed_namespace
             && decode_error.is_none()
             && elements[index].is(source, namespace, "si")
+            && let Err(error) =
+                rich_text(source, elements, index, namespace).and_then(|text| strings.push(&text))
         {
-            match rich_text(source, elements, index, namespace) {
-                Ok(text) => strings.push(text),
-                Err(error) => decode_error = Some(error),
-            }
+            decode_error = Some(error);
         }
         true
     })?;
@@ -186,7 +185,66 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     if hidden_string {
         return Err(unsupported("shared string outside the shared-string table"));
     }
-    decode_error.map_or(Ok(strings), Err)
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
+    strings.text.shrink_to_fit();
+    strings.ends.shrink_to_fit();
+    Ok(strings)
+}
+
+/// A decoded shared-string table: the text of every string, concatenated,
+/// and the offset where each string ends. One buffer and four bytes per string
+/// replace a separately allocated `String` for each, which costs more than the
+/// XML of a short or empty entry. Decoded text is never longer than its XML,
+/// which `parse_with` limits to less than 4 GiB, so offsets fit in 32 bits.
+#[derive(Debug, Default)]
+pub(crate) struct SharedStrings {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl SharedStrings {
+    /// The string at `index`, or `None` past the end of the table.
+    pub(crate) fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.ends.get(index)? as usize;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        // Each offset ends a whole string, so it is a character boundary.
+        Some(&self.text[start..end])
+    }
+
+    fn push(&mut self, text: &str) -> Result<()> {
+        let end = u32::try_from(self.text.len() + text.len())
+            .map_err(|_| unsupported("shared-string text exceeds the 4 GiB index limit"))?;
+        self.text.push_str(text);
+        self.ends.push(end);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> FromIterator<&'a str> for SharedStrings {
+    fn from_iter<I: IntoIterator<Item = &'a str>>(strings: I) -> Self {
+        let mut table = Self::default();
+        for text in strings {
+            table.push(text).unwrap();
+        }
+        table
+    }
+}
+
+// Tests compare a table with the strings it should hold.
+#[cfg(test)]
+impl<S: AsRef<str>> PartialEq<Vec<S>> for SharedStrings {
+    fn eq(&self, strings: &Vec<S>) -> bool {
+        self.ends.len() == strings.len()
+            && strings
+                .iter()
+                .enumerate()
+                .all(|(index, text)| self.get(index) == Some(text.as_ref()))
+    }
 }
 
 // A cell's stored value. A shared string is resolved separately: failing to
@@ -323,7 +381,7 @@ pub(super) fn cell_content<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
-    shared_strings: &mut impl FnMut() -> Result<Option<&'a [String]>>,
+    shared_strings: &mut impl FnMut() -> Result<Option<&'a SharedStrings>>,
     date1904: bool,
 ) -> std::result::Result<CellContent, ReadError> {
     let Some(cell_index) = index.cell(address) else {
@@ -353,7 +411,7 @@ pub(super) fn cell_content<'a>(
                     "{address}: shared-string index {position} is out of bounds"
                 ))
             })?;
-            CellValue::Text(text.clone())
+            CellValue::Text(text.to_owned())
         }
     };
     Ok(CellContent {
@@ -367,7 +425,7 @@ pub(super) fn read_cells<'a>(
     xml: &[u8],
     index: &WorksheetIndex,
     cells: &[CellRef],
-    mut shared_strings: impl FnMut() -> Result<Option<&'a [String]>>,
+    mut shared_strings: impl FnMut() -> Result<Option<&'a SharedStrings>>,
     date1904: bool,
 ) -> std::result::Result<Vec<CellContent>, ReadError> {
     if cells.is_empty() {

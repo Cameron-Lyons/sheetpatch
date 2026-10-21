@@ -2,7 +2,9 @@ use crate::{
     CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result,
     archive::{self, Archive, PartChanges},
     atomic::SourcePermissions,
-    worksheet::{PreparedWorksheet, ReadError, protection, read_cells, read_shared_strings},
+    worksheet::{
+        PreparedWorksheet, ReadError, SharedStrings, protection, read_cells, read_shared_strings,
+    },
 };
 use std::{
     borrow::Cow,
@@ -202,7 +204,7 @@ pub struct Workbook {
     date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
-    shared_strings: OnceLock<Vec<String>>,
+    shared_strings: OnceLock<SharedStrings>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
@@ -1027,7 +1029,7 @@ impl Workbook {
 
     // The shared-string table, or `None` for a workbook without one. Errors
     // name the table's part, rather than the worksheet that needed it.
-    fn shared_strings(&self) -> Result<Option<&[String]>> {
+    fn shared_strings(&self) -> Result<Option<&SharedStrings>> {
         let Some(path) = &self.shared_strings_path else {
             return Ok(None);
         };

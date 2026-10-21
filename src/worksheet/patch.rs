@@ -1,6 +1,6 @@
 use super::index::{RowEntry, WorksheetIndex, reference_range};
 use super::parse::{Attributes, Element};
-use super::read::{StoredValue, decode_payload, value_payload};
+use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
 use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
@@ -184,7 +184,7 @@ fn unchanged_value<'s>(
     cell: &Element,
     payload: usize,
     value: &CellValue,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> bool {
     // An existing payload, even an empty `<v/>` that reads as blank, is a
     // representation that clearing removes.
@@ -197,7 +197,7 @@ fn unchanged_value<'s>(
         Ok(StoredValue::SharedString(position)) => match value {
             CellValue::Text(text) => (current.shared_strings)()
                 .and_then(|strings| strings.get(position))
-                .is_some_and(|old| old == text),
+                .is_some_and(|old| old == text.as_str()),
             _ => false,
         },
         Err(_) => false,
@@ -211,7 +211,7 @@ fn patched_cell<'s>(
     cell_index: usize,
     value: &CellValue,
     edits: &mut EditPlan,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<bool> {
     let (source, elements, attributes, namespace) = (
         index.source,
@@ -371,7 +371,7 @@ fn patch_existing_row<'s>(
     changes: &RowChanges,
     edits: &mut EditPlan,
     changed_cells: &mut Vec<CellRef>,
-    current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
+    current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<()> {
     let (source, elements) = (index.source, &index.elements);
     let element = &elements[row.element];
@@ -528,7 +528,7 @@ pub(super) fn patch_cells<'a, 's>(
     xml: &'a [u8],
     index: &WorksheetIndex,
     cells: &BTreeMap<CellRef, CellValue>,
-    mut shared_strings: impl FnMut() -> Option<&'s [String]>,
+    mut shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
     date1904: bool,
 ) -> Result<Cow<'a, [u8]>> {
     if cells.is_empty() {

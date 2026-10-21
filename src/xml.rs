@@ -569,8 +569,8 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
         }
     }
     output.push_str(&text[start..]);
-    // Escapes can shorten text considerably. Shared-string caches should not
-    // retain the extra capacity needed for their encoded spelling.
+    // Escapes can shorten text considerably. Decoded text, such as a cell's
+    // value or a sheet name, should not retain the capacity of its spelling.
     output.shrink_to_fit();
     Ok(output)
 }
