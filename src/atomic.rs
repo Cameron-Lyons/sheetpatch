@@ -763,21 +763,9 @@ mod tests {
 
         // When the user belongs to another group, a destination in that group
         // keeps it, along with its group permission bits.
-        let output = std::process::Command::new("id").arg("-G").output();
-        let other_group = output
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
+        let other_group = other_groups(default_gid)
             .into_iter()
-            .flat_map(|groups| {
-                groups
-                    .split_whitespace()
-                    .filter_map(|gid| gid.parse::<u32>().ok())
-                    .collect::<Vec<_>>()
-            })
-            .find(|&gid| {
-                gid != default_gid
-                    && std::os::unix::fs::chown(&destination, None, Some(gid)).is_ok()
-            });
+            .find(|&gid| std::os::unix::fs::chown(&destination, None, Some(gid)).is_ok());
         if let Some(gid) = other_group {
             assert_eq!(fs::metadata(&destination).unwrap().gid(), gid);
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
