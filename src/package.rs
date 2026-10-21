@@ -194,7 +194,6 @@ pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
     sheet_xml: Vec<SheetXml>,
-    changed_sheets: BTreeMap<String, usize>,
     signed: bool,
     date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
@@ -215,7 +214,14 @@ impl fmt::Debug for Workbook {
             .field("sheets", &self.sheets)
             .field("signed", &self.signed)
             .field("date1904", &self.date1904)
-            .field("changed_parts", &self.changed_sheets.keys())
+            .field(
+                "changed_parts",
+                &self
+                    .changed_parts()
+                    .parts()
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -225,33 +231,25 @@ struct SheetXml {
     // The part URI can differ from its ZIP name in legacy decoded archives.
     uri: String,
     original: OnceLock<Vec<u8>>,
-    // Present only when the XML differs from the original. Transactions update
-    // this value and the workbook's changed-path index together at commit.
+    // Present only when the XML differs from the original, and the only record
+    // that the worksheet has a pending change.
     current: Option<Vec<u8>>,
     // Header rows of the worksheet's Excel tables, resolved on its first edit.
     table_headers: OnceLock<Vec<CellRange>>,
 }
 
+// Discovery rejects sheets that share a worksheet part, so names are unique.
 struct ChangedParts<'a> {
-    sheets: &'a BTreeMap<String, usize>,
+    sheets: &'a [Sheet],
     sheet_xml: &'a [SheetXml],
 }
 
 impl PartChanges for ChangedParts<'_> {
     fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.sheets.iter().map(|(path, &index)| {
-            (
-                path.as_str(),
-                self.sheet_xml[index]
-                    .current
-                    .as_deref()
-                    .expect("changed worksheet has pending XML"),
-            )
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.sheets.is_empty()
+        self.sheets
+            .iter()
+            .zip(self.sheet_xml)
+            .filter_map(|(sheet, xml)| Some((sheet.path.as_str(), xml.current.as_deref()?)))
     }
 }
 
@@ -521,7 +519,6 @@ impl Workbook {
             archive,
             sheets,
             sheet_xml,
-            changed_sheets: BTreeMap::new(),
             signed,
             date1904,
             sheet_indexes,
@@ -730,12 +727,6 @@ impl Workbook {
             staged.push((index, changed));
         }
         for (index, changed) in staged {
-            if changed.is_some() {
-                self.changed_sheets
-                    .insert(self.sheets[index].path.clone(), index);
-            } else {
-                self.changed_sheets.remove(&self.sheets[index].path);
-            }
             self.sheet_xml[index].current = changed;
         }
         Ok(())
@@ -901,15 +892,14 @@ impl Workbook {
 
     /// Whether any package parts have pending edits.
     pub fn has_changes(&self) -> bool {
-        !self.changed_sheets.is_empty()
+        self.sheet_xml.iter().any(|xml| xml.current.is_some())
     }
 
     /// Discard every pending edit, restoring byte-identical original output.
     pub fn reset_changes(&mut self) {
-        for &index in self.changed_sheets.values() {
-            self.sheet_xml[index].current = None;
+        for xml in &mut self.sheet_xml {
+            xml.current = None;
         }
-        self.changed_sheets.clear();
     }
 
     fn current_sheet(&self, index: usize) -> Result<&[u8]> {
@@ -922,7 +912,7 @@ impl Workbook {
 
     fn changed_parts(&self) -> ChangedParts<'_> {
         ChangedParts {
-            sheets: &self.changed_sheets,
+            sheets: &self.sheets,
             sheet_xml: &self.sheet_xml,
         }
     }
