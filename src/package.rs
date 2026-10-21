@@ -422,21 +422,9 @@ impl Workbook {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = fs::File::open(path)?;
         let metadata = file.metadata()?;
-        let mut bytes = Vec::new();
-        if metadata.is_file() {
-            if metadata.len() > archive::MAX_ARCHIVE_LEN {
-                return Err(archive::archive_too_large());
-            }
-            // Fall back to an unsized read on targets where the length does
-            // not fit in memory; reading then reports the allocation failure.
-            if let Ok(len) = usize::try_from(metadata.len()) {
-                bytes
-                    .try_reserve_exact(len)
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-            }
-        }
         // Devices and pipes have no useful length; reading stops at the limit.
-        let mut workbook = Self::from_bytes(archive::read_archive(file, bytes)?)?;
+        let file_len = metadata.is_file().then_some(metadata.len());
+        let mut workbook = Self::from_bytes(archive::read_archive(file, file_len)?)?;
         // Pipes and devices carry no meaningful file permissions to inherit.
         workbook.source_permissions = metadata
             .is_file()
@@ -468,7 +456,7 @@ impl Workbook {
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
     pub fn from_reader(reader: impl std::io::Read) -> Result<Self> {
-        Self::from_bytes(archive::read_archive(reader, Vec::new())?)
+        Self::from_bytes(archive::read_archive(reader, None)?)
     }
 
     /// Open an in-memory workbook, retaining its original archive bytes.

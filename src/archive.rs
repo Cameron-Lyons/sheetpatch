@@ -52,7 +52,7 @@ const MAX_READ: usize = 64 * 1024 * 1024;
 /// The length of the largest possible ZIP32 archive: the central directory's
 /// offset and size are each below `u32::MAX`, and only a 22-byte end record
 /// and a comment of at most 64 KiB follow it.
-pub(crate) const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
+const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
 // Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
 // produces archives about as small as the default level 6, several times faster.
 const DEFLATE_LEVEL: u32 = 4;
@@ -198,21 +198,35 @@ fn over_read_limit(member: impl Display) -> Error {
     ))
 }
 
-pub(crate) fn archive_too_large() -> Error {
+fn archive_too_large() -> Error {
     unsupported("input exceeds the largest possible ZIP32 archive")
 }
 
-/// Append everything `reader` yields to `bytes`, refusing input longer than
-/// any ZIP32 archive once that much has been read.
-pub(crate) fn read_archive(reader: impl Read, bytes: Vec<u8>) -> Result<Vec<u8>> {
-    read_at_most(reader, bytes, MAX_ARCHIVE_LEN)
+/// Read everything `reader` yields, refusing input longer than any ZIP32
+/// archive. A regular file's length, `file_len`, is refused before reading
+/// when too large and otherwise reserved exactly; other input is refused once
+/// that much has been read.
+pub(crate) fn read_archive(reader: impl Read, file_len: Option<u64>) -> Result<Vec<u8>> {
+    read_at_most(reader, file_len, MAX_ARCHIVE_LEN)
 }
 
-fn read_at_most(reader: impl Read, mut bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
-    let start = bytes.len();
+fn read_at_most(reader: impl Read, file_len: Option<u64>, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Some(len) = file_len {
+        if len > limit {
+            return Err(archive_too_large());
+        }
+        // Fall back to an unsized read on targets where the length does not
+        // fit in memory; reading then reports the allocation failure.
+        if let Ok(len) = usize::try_from(len) {
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        }
+    }
     // One byte past the limit shows that the input is too long.
     reader.take(limit + 1).read_to_end(&mut bytes)?;
-    if (bytes.len() - start) as u64 > limit {
+    if bytes.len() as u64 > limit {
         return Err(archive_too_large());
     }
     Ok(bytes)
@@ -2692,7 +2706,7 @@ mod tests {
     #[test]
     fn stream_reads_stop_one_byte_past_the_limit() {
         let input = b"0123456789";
-        assert_eq!(read_at_most(&input[..], Vec::new(), 10).unwrap(), input);
+        assert_eq!(read_at_most(&input[..], None, 10).unwrap(), input);
         let too_long = |result: Result<Vec<u8>>| {
             matches!(
                 result,
@@ -2700,16 +2714,16 @@ mod tests {
                     if message == "input exceeds the largest possible ZIP32 archive"
             )
         };
-        assert!(too_long(read_at_most(&input[..], Vec::new(), 9)));
+        assert!(too_long(read_at_most(&input[..], None, 9)));
         // An endless stream is not read beyond the limit.
-        assert!(too_long(read_at_most(
-            std::io::repeat(0),
-            Vec::new(),
-            1 << 16
-        )));
-        // Reserved capacity in the buffer does not count as input.
-        let reserved = Vec::with_capacity(64);
-        assert_eq!(read_at_most(&input[..], reserved, 10).unwrap(), input);
+        assert!(too_long(read_at_most(std::io::repeat(0), None, 1 << 16)));
+        // A file length over the limit is refused before reading, although
+        // these 10 bytes would fit. One within the limit only reserves
+        // capacity, so a stale length changes neither the result nor the limit.
+        assert!(too_long(read_at_most(&input[..], Some(11), 10)));
+        assert_eq!(read_at_most(&input[..], Some(10), 10).unwrap(), input);
+        assert_eq!(read_at_most(&input[..], Some(4), 10).unwrap(), input);
+        assert!(too_long(read_at_most(std::io::repeat(0), Some(4), 10)));
         assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
     }
 
