@@ -61,8 +61,6 @@ enum Failure {
     /// A workbook error, prefixed with what failed: an operation and its path
     /// or stream, or the patch line whose edit was refused.
     Context(String, sheetpatch::Error),
-    /// A request names something the workbook does not contain.
-    Rejected(String),
     /// Writing text to standard output failed. A workbook that cannot be
     /// written to standard output is a `Context` failure instead, so a closed
     /// pipe is never mistaken for a complete archive.
@@ -80,7 +78,7 @@ impl Failure {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Usage(_) | Self::Invalid { .. } => 2,
-            Self::Workbook(_) | Self::Context(..) | Self::Rejected(_) | Self::Output(_) => 1,
+            Self::Workbook(_) | Self::Context(..) | Self::Output(_) => 1,
         }
     }
 }
@@ -101,7 +99,6 @@ impl fmt::Display for Failure {
             // The context already says what failed; print the bare OS message.
             Self::Context(context, sheetpatch::Error::Io(error)) => write!(f, "{context}: {error}"),
             Self::Context(context, error) => write!(f, "{context}: {error}"),
-            Self::Rejected(message) => f.write_str(message),
             Self::Output(error) => write!(f, "cannot write output: {error}"),
         }
     }
@@ -483,55 +480,49 @@ fn parse_range(command: &'static str, range: &str) -> Result<CellRange, Failure>
     })
 }
 
-fn sheet_not_found(sheet: &str) -> String {
-    format!("worksheet not found: {sheet:?}")
+/// The patch lines of each unique edit, kept for diagnostics after the
+/// edits move into the transaction.
+#[derive(Debug, Default)]
+struct PatchLines {
+    /// The first and last line of each edit, by edit index.
+    lines: Vec<(usize, usize)>,
+    /// The index of each edit by worksheet name and cell.
+    targets: HashMap<String, HashMap<CellRef, usize>>,
 }
 
-fn require_sheet(workbook: &Workbook, sheet: &str) -> Result<(), Failure> {
-    match workbook.sheet(sheet) {
-        Some(_) => Ok(()),
-        None => Err(Failure::Rejected(sheet_not_found(sheet))),
+impl PatchLines {
+    /// The line to report with a refused transaction: the first line naming a
+    /// missing worksheet, or the last line supplying a protected cell's value.
+    fn line_for(&self, error: &sheetpatch::Error) -> Option<usize> {
+        match error {
+            // Edits are indexed in first-occurrence order, so a worksheet's
+            // lowest edit index began on the first line naming it.
+            sheetpatch::Error::SheetNotFound(sheet) => {
+                let first = self.targets.get(sheet)?.values().min()?;
+                Some(self.lines[*first].0)
+            }
+            sheetpatch::Error::ProtectedCell { sheet, cell, .. } => {
+                let index = self.targets.get(sheet)?.get(cell)?;
+                Some(self.lines[*index].1)
+            }
+            _ => None,
+        }
     }
-}
-
-/// The source of a patch edit, without retaining its value.
-struct PatchLocation {
-    line: usize,
-    sheet: String,
-    cell: CellRef,
-}
-
-#[derive(Debug)]
-struct PatchEdit {
-    first_line: usize,
-    last_line: usize,
-    edit: CellEdit,
 }
 
 #[derive(Debug, Default)]
 struct Patch {
     // Retain unique targets in their first occurrence's order, with the last
-    // value and both diagnostic line numbers.
-    edits: Vec<PatchEdit>,
+    // value; `lines` holds both diagnostic line numbers.
+    edits: Vec<CellEdit>,
+    lines: PatchLines,
     row_count: usize,
-}
-
-/// Find the last patch line that supplied a refused cell's value.
-fn protected_line(rows: &[PatchLocation], error: &sheetpatch::Error) -> Option<usize> {
-    let sheetpatch::Error::ProtectedCell { sheet, cell, .. } = error else {
-        return None;
-    };
-    rows.iter()
-        .rev()
-        .find(|row| row.sheet == *sheet && row.cell == *cell)
-        .map(|row| row.line)
 }
 
 /// Validate every patch row, retaining only each target's final value.
 /// `origin` names the source in I/O error messages.
 fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch, Failure> {
     let mut patch = Patch::default();
-    let mut targets: HashMap<String, HashMap<CellRef, usize>> = HashMap::new();
     let mut line = String::new();
     let mut line_number = 0usize;
     loop {
@@ -594,20 +585,18 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch, Failure> 
         })?;
         let edit = CellEdit::at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
         patch.row_count += 1;
-        if let Some(&index) = targets.get(sheet).and_then(|cells| cells.get(&cell)) {
-            let previous = &mut patch.edits[index];
-            previous.last_line = line_number;
-            previous.edit = edit;
+        let lines = &mut patch.lines;
+        if let Some(&index) = lines.targets.get(sheet).and_then(|cells| cells.get(&cell)) {
+            lines.lines[index].1 = line_number;
+            patch.edits[index] = edit;
         } else {
-            targets
+            lines
+                .targets
                 .entry(sheet.to_owned())
                 .or_default()
                 .insert(cell, patch.edits.len());
-            patch.edits.push(PatchEdit {
-                first_line: line_number,
-                last_line: line_number,
-                edit,
-            });
+            lines.lines.push((line_number, line_number));
+            patch.edits.push(edit);
         }
     }
     Ok(patch)
@@ -921,7 +910,6 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     let mut cells = Vec::with_capacity(count as usize);
     cells.extend(ranges.into_iter().flat_map(CellRange::cells));
     let workbook = Source::new(line.command, &args[0])?.open()?;
-    require_sheet(&workbook, sheet)?;
     let view = workbook.prepare_sheet(sheet)?;
     write_read_cells(
         &view,
@@ -948,7 +936,6 @@ fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
         .map(|_| parse_range("cells", line.text(2)?))
         .transpose()?;
     let workbook = Source::new(line.command, &args[0])?.open()?;
-    require_sheet(&workbook, sheet)?;
     let view = workbook.prepare_sheet(sheet)?;
     // Filter the worksheet's own cells; a large range is never expanded.
     let cells: Vec<CellRef> = view
@@ -995,7 +982,6 @@ fn cmd_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     let source = Source::new(line.command, &args[0])?;
     let destination = Destination::new(line.command, &args[1], terminal)?;
     let mut workbook = source.open()?;
-    require_sheet(&workbook, sheet)?;
     workbook.apply_edits([edit])?;
     destination.save(&workbook, false, output)
 }
@@ -1029,34 +1015,17 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     let destination = destination
         .map(|arg| Destination::new(line.command, arg, terminal))
         .transpose()?;
-    let patch = read_patch_arg(patch)?;
+    let Patch {
+        edits,
+        lines,
+        row_count: count,
+    } = read_patch_arg(patch)?;
     let mut workbook = source.open()?;
-    if let Some(row) = patch
-        .edits
-        .iter()
-        .find(|row| workbook.sheet(row.edit.sheet()).is_none())
-    {
-        return Err(Failure::Rejected(format!(
-            "Patch line {}: {}",
-            row.first_line,
-            sheet_not_found(row.edit.sheet())
-        )));
-    }
-    let count = patch.row_count;
-    // Retain only locations for diagnostics; move values into the transaction
-    // instead of keeping a second copy of every text value in a large patch.
-    let mut locations = Vec::with_capacity(patch.edits.len());
+    // Move the values into the transaction instead of keeping a second copy
+    // of every text value in a large patch; only targets and lines remain.
     workbook
-        .apply_edits(patch.edits.into_iter().map(|row| {
-            let edit = row.edit;
-            locations.push(PatchLocation {
-                line: row.last_line,
-                sheet: edit.sheet().to_owned(),
-                cell: edit.cell(),
-            });
-            edit
-        }))
-        .map_err(|error| match protected_line(&locations, &error) {
+        .apply_edits(edits)
+        .map_err(|error| match lines.line_for(&error) {
             Some(line_number) => Failure::Context(format!("Patch line {line_number}"), error),
             None => Failure::Workbook(error),
         })?;
@@ -1237,7 +1206,7 @@ mod tests {
             .unwrap()
             .edits
             .into_iter()
-            .map(|row| row.edit.value().clone())
+            .map(|edit| edit.value().clone())
             .collect()
     }
 
@@ -1581,19 +1550,8 @@ mod tests {
             ),
             "{protected:?}"
         );
-        let locations = |patch: &str| {
-            read_patch(patch.as_bytes(), "test")
-                .unwrap()
-                .edits
-                .into_iter()
-                .map(|row| PatchLocation {
-                    line: row.last_line,
-                    sheet: row.edit.sheet().to_owned(),
-                    cell: row.edit.cell(),
-                })
-                .collect::<Vec<_>>()
-        };
-        let line = |patch: &str| protected_line(&locations(patch), &protected);
+        let locations = |patch: &str| read_patch(patch.as_bytes(), "test").unwrap().lines;
+        let line = |patch: &str| locations(patch).line_for(&protected);
         // The last line for the worksheet and cell supplied the applied value.
         assert_eq!(
             line(
@@ -1613,10 +1571,19 @@ mod tests {
             ),
             sheetpatch::Error::InvalidWorkbook("worksheet \"Data\": A1: invalid".into()),
             sheetpatch::Error::InvalidValue("worksheet \"Data\": A1 is invalid".into()),
-            sheetpatch::Error::SheetNotFound("Data".into()),
         ] {
-            assert_eq!(protected_line(&rows, &error), None, "{error}");
+            assert_eq!(rows.line_for(&error), None, "{error}");
         }
+        // A missing worksheet is reported at the first line naming it, even
+        // when a later line repeats its first target.
+        let rows = locations(
+            "Data\tD1\tnumber\t1\nZ\tA1\ttext\tx\nA\tB2\tblank\nZ\ta1\tblank\nZ\tC3\tblank\n",
+        );
+        let missing = |name: &str| rows.line_for(&sheetpatch::Error::SheetNotFound(name.into()));
+        assert_eq!(
+            (missing("Z"), missing("A"), missing("Other")),
+            (Some(2), Some(3), None)
+        );
     }
 
     #[test]
@@ -1625,15 +1592,13 @@ mod tests {
         let patch = read_patch(source.as_bytes(), "test").unwrap();
         assert_eq!(patch.row_count, 2);
         assert_eq!(patch.edits.len(), 2);
-        let row = &patch.edits[0];
-        let edit = &row.edit;
-        assert_eq!((row.first_line, row.last_line), (3, 3));
+        let edit = &patch.edits[0];
+        assert_eq!(patch.lines.lines[0], (3, 3));
         assert_eq!(edit.sheet(), "Data & Notes");
         assert_eq!(edit.cell().to_string(), "B2");
         assert_eq!(edit.value(), &CellValue::Text("  left\tright  ".into()));
-        let row = &patch.edits[1];
-        let edit = &row.edit;
-        assert_eq!((row.first_line, row.last_line), (4, 4));
+        let edit = &patch.edits[1];
+        assert_eq!(patch.lines.lines[1], (4, 4));
         assert_eq!(edit.sheet(), "#Data");
         assert_eq!(edit.value(), &CellValue::Text(String::new()));
     }
@@ -1656,10 +1621,7 @@ mod tests {
     #[test]
     fn patch_preserves_a_carriage_return_without_a_line_feed() {
         let edits = read_patch("Data\tA1\ttext\tvalue\r".as_bytes(), "test").unwrap();
-        assert_eq!(
-            edits.edits[0].edit.value(),
-            &CellValue::Text("value\r".into())
-        );
+        assert_eq!(edits.edits[0].value(), &CellValue::Text("value\r".into()));
         assert_eq!(
             patch_values("Data\tA1\ttext\tfirst\r\nData\tA2\ttext\tlast\r"),
             vec![
