@@ -1569,8 +1569,7 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
     std::thread::scope(|scope| {
         let others: Vec<_> = groups
             .map(|(first, group)| {
-                let thread =
-                    std::thread::Builder::new().spawn_scoped(scope, move || compress(first, group));
+                let thread = spawn_scoped(scope, move || compress(first, group));
                 (first, group, thread)
             })
             .collect();
@@ -1585,6 +1584,19 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
         }
         Ok(output)
     })
+}
+
+/// Start a thread in `scope`, which fails like any thread start, for example
+/// under a limit on the user's processes.
+fn spawn_scoped<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    run: impl FnOnce() -> T + Send + 'scope,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    if tests::SPAWN_FAILS.get() {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    std::thread::Builder::new().spawn_scoped(scope, run)
 }
 
 /// Deflate one segment of a stream. Every segment but the last ends with a
@@ -1669,6 +1681,9 @@ mod tests {
         /// Replaces `DEFLATE_SEGMENT` in saves on the current thread, so that
         /// small replacements are deflated in many segments.
         pub(super) static SEGMENT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Makes the compression threads of saves on the current thread fail
+        /// to start, as they can under a limit on the user's processes.
+        pub(super) static SPAWN_FAILS: Cell<bool> = const { Cell::new(false) };
     }
 
     fn append(archive: &Archive, changes: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
@@ -2631,6 +2646,18 @@ mod tests {
                 assert_eq!(output, data);
             }
         }
+    }
+
+    #[test]
+    fn segments_whose_threads_cannot_start_are_deflated_by_the_calling_thread() {
+        const SEGMENT: usize = 4096;
+        let data = cells(4000);
+        let expected = deflate_segments(&data, SEGMENT, 1).unwrap();
+        assert!(expected.len() > MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(true);
+        let inline = deflate_segments(&data, SEGMENT, MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(false);
+        assert_eq!(inline.unwrap(), expected);
     }
 
     #[test]
