@@ -1,9 +1,15 @@
 mod common;
 
-use sheetpatch::{Error, Workbook};
-use std::io::{self, BufWriter, Write};
+use sheetpatch::{CellValue, Error, Workbook};
+use std::{
+    collections::BTreeMap,
+    io::{self, BufWriter, Write},
+};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
+const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 #[test]
 fn ambiguous_legacy_zip_names_cannot_select_a_different_worksheet() {
@@ -12,7 +18,6 @@ fn ambiguous_legacy_zip_names_cannot_select_a_different_worksheet() {
     const TARGET: &str = "xl/worksheets/├⌐.xml";
     const LEGACY: &str = "xl/worksheets/é.xml";
     const ENCODED: &str = "worksheets/%E2%94%9C%E2%8C%90.xml";
-    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     let mut parts = common::payloads(FIXTURE);
     parts.remove("xl/worksheets/sheet1.xml");
     for name in ["xl/_rels/workbook.xml.rels", "[Content_Types].xml"] {
@@ -154,4 +159,131 @@ fn ole_compound_files_are_unsupported_rather_than_invalid() {
         Workbook::from_bytes(vec![0; 4096]),
         Err(Error::InvalidWorkbook(_))
     ));
+}
+
+/// Which of `count` bytes from `start` in `bytes`, each `a` or `c`, to flip
+/// to the other letter so that the CRC-32 of `bytes` becomes `target`, as a
+/// bit set. CRC-32 is affine over GF(2), so the flips' effects combine by XOR.
+fn flips_for_crc(bytes: &[u8], start: usize, count: usize, target: u32) -> u128 {
+    let crc = common::crc32(bytes);
+    // Each row is a CRC change and the flips causing it. Rows have distinct
+    // highest bits and stay sorted by them, so XOR with a row only lowers a
+    // value whose highest bit it shares.
+    let mut rows: Vec<(u32, u128)> = Vec::new();
+    for position in 0..count {
+        let mut flipped = bytes.to_vec();
+        flipped[start + position] ^= b'a' ^ b'c';
+        let mut row = (common::crc32(&flipped) ^ crc, 1 << position);
+        for &(change, flips) in &rows {
+            if row.0 ^ change < row.0 {
+                row = (row.0 ^ change, row.1 ^ flips);
+            }
+        }
+        if row.0 != 0 {
+            rows.push(row);
+            rows.sort_unstable_by_key(|&(change, _)| std::cmp::Reverse(change));
+        }
+    }
+    let (mut remaining, mut solution) = (crc ^ target, 0);
+    for &(change, flips) in &rows {
+        if remaining ^ change < remaining {
+            remaining ^= change;
+            solution ^= flips;
+        }
+    }
+    assert_eq!(remaining, 0, "no flips give the target checksum");
+    solution
+}
+
+#[test]
+fn saves_refuse_checksums_that_would_form_another_end_record() {
+    const SHEET: &str = "xl/worksheets/sheet1.xml";
+    const END_SIGNATURE: u32 = 0x0605_4b50;
+    let content_types = "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/></Types>";
+    let parts = BTreeMap::from([
+        ("[Content_Types].xml", content_types.to_owned()),
+        (
+            "_rels/.rels",
+            format!(
+                "<Relationships xmlns='{PACKAGE}'><Relationship Id='office' Type='{OFFICE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+            ),
+        ),
+        (
+            "xl/workbook.xml",
+            format!(
+                "<workbook xmlns='{MAIN}' xmlns:r='{OFFICE}'><sheets><sheet name='S1' sheetId='1' r:id='s1'/></sheets></workbook>"
+            ),
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            format!(
+                "<Relationships xmlns='{PACKAGE}'><Relationship Id='s1' Type='{OFFICE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
+            ),
+        ),
+        (
+            SHEET,
+            format!(
+                "<worksheet xmlns='{MAIN}'><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData></worksheet>"
+            ),
+        ),
+    ]);
+    let entries: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|(name, xml)| (*name, xml.as_bytes()))
+        .collect();
+    let input = common::stored_archive(&entries);
+    let edited = |text: &str| {
+        let mut book = Workbook::from_bytes(input.clone()).unwrap();
+        book.set_cell("S1", "A1", CellValue::Text(text.to_owned()))
+            .unwrap();
+        book
+    };
+    // The worksheet is the last stored local record, so text alone sets its
+    // distance from EOF. The name bytes "or" sit 20 bytes after the header's
+    // checksum field; choose a length that puts that field 22 + "or" bytes
+    // before EOF, then letters that make the checksum the end-record
+    // signature. The field then starts a complete end record whose comment
+    // ends at EOF, and this crate would refuse to reopen the output.
+    let probe = edited(&"a".repeat(1000)).to_bytes().unwrap();
+    let sheet = common::zip_entry(&probe, SHEET);
+    assert_eq!(
+        sheet.local.len() + sheet.local_offset,
+        common::central_directory_offset(&probe)
+    );
+    let checksum_field = sheet.local_offset + 14;
+    let length =
+        1000 + 22 + usize::from(u16::from_le_bytes(*b"or")) - (probe.len() - checksum_field);
+    let base = "a".repeat(length);
+    let saved = edited(&base).to_bytes().unwrap();
+    assert_eq!(
+        common::zip_entry(&saved, SHEET).local_offset,
+        sheet.local_offset
+    );
+    let mut xml = common::payload(&saved, SHEET);
+    let start = xml
+        .windows(length)
+        .position(|window| window == base.as_bytes())
+        .unwrap();
+    let flips = flips_for_crc(&xml, start, 128, END_SIGNATURE);
+    let mut text = base.into_bytes();
+    for (position, letter) in text.iter_mut().take(128).enumerate() {
+        if flips >> position & 1 == 1 {
+            *letter = b'c';
+        }
+    }
+    xml[start..start + length].copy_from_slice(&text);
+    assert_eq!(common::crc32(&xml), END_SIGNATURE);
+
+    let book = edited(std::str::from_utf8(&text).unwrap());
+    let refused = |result: sheetpatch::Result<()>| {
+        matches!(
+            result,
+            Err(Error::Unsupported(message))
+                if message.contains("would contain another end-of-directory record")
+        )
+    };
+    assert!(refused(book.to_bytes().map(drop)));
+    assert!(refused(book.to_bytes_compact().map(drop)));
+    // What `patch --check` runs.
+    assert!(refused(book.write_to(io::sink())));
 }

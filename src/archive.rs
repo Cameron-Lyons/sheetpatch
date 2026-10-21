@@ -31,6 +31,10 @@ const END_LEN: usize = 22;
 const ZIP64_LOCATOR_LEN: usize = 20;
 const DESCRIPTOR_LEN: usize = 12;
 const SIGNED_DESCRIPTOR_LEN: usize = 16;
+/// The bytes before EOF that the end-record rules examine: an end record with
+/// the longest comment, and a ZIP64 locator before it. This is also the tail
+/// window in which libzip before 1.11 looks for end records.
+const END_TAIL_LEN: usize = ZIP64_LOCATOR_LEN + END_LEN + u16::MAX as usize;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DESCRIPTOR: u16 = 0x0008;
@@ -360,70 +364,155 @@ fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < END_LEN {
         return Err(invalid("file is not a ZIP workbook"));
     }
-    // A valid EOCD ends at EOF, including its comment. Multiple matching
-    // EOCDs would make the member index ambiguous and are rejected.
-    let search_start = bytes.len().saturating_sub(END_LEN + u16::MAX as usize);
-    let mut endings = Vec::new();
-    for offset in (search_start..=bytes.len() - END_LEN).rev() {
-        if u32_at(bytes, offset)? == END {
-            let comment = u16_at(bytes, offset + 20)? as usize;
-            if add(add(offset, END_LEN)?, comment)? == bytes.len() {
-                endings.push(offset);
-            }
-        }
-    }
-    let end = match endings.as_slice() {
-        [end] => *end,
-        [] => {
-            return Err(invalid(
-                "ZIP end-of-directory record is missing or truncated",
-            ));
-        }
-        _ => return Err(invalid("ambiguous ZIP end-of-directory records")),
-    };
-    // Fixed fields may legitimately hold the signature's bytes, for example a
-    // central directory at offset 0x06054b50. That matters only when the
-    // comment leaves room for a complete record after the signature.
-    if hides_end_record(&bytes[end..]) {
-        return Err(invalid("ambiguous ZIP end-of-directory records"));
-    }
-    // libzip before 1.11 instead scans its tail window forward and keeps the
-    // first record whose directory it can read, unless a later one spans more
-    // local data. Refuse any earlier record it could select.
-    let window = bytes
-        .len()
-        .saturating_sub(END_LEN + u16::MAX as usize + ZIP64_LOCATOR_LEN);
-    for offset in window..end {
-        if decoy_end_record(bytes, offset)? {
+    let (end, decoy_directories) = locate_end_record(bytes, 0)?;
+    for directory in decoy_directories {
+        if u32_at(bytes, directory)? == CENTRAL {
             return Err(invalid("ambiguous ZIP end-of-directory records"));
         }
     }
     Ok(end)
 }
 
-/// Whether a reader scanning forward could select an end record at `offset`:
-/// a complete single-disk record for a nonempty directory, with a comment that
-/// ends by EOF, whose directory ends before the record and starts with a
-/// central-directory header. Such a reader never prefers an empty directory.
+/// Offsets in `tail`, the end of an archive, of end-record signatures whose
+/// record and comment end exactly at EOF, last first. A comment of at most
+/// 64 KiB puts every such record in the last `END_LEN + u16::MAX` bytes.
+fn end_record_candidates(tail: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let first = tail.len().saturating_sub(END_LEN + u16::MAX as usize);
+    (first..=tail.len().saturating_sub(END_LEN))
+        .rev()
+        .filter(|&offset| {
+            u32_at(tail, offset).ok() == Some(END)
+                && u16_at(tail, offset + 20)
+                    .is_ok_and(|comment| offset + END_LEN + comment as usize == tail.len())
+        })
+}
+
+/// Apply the end-record rules to `tail`, the last bytes of an archive that
+/// has `base` bytes before them. `tail` must hold the whole archive or at
+/// least its last `END_TAIL_LEN` bytes, since every rule is relative to EOF
+/// except where a decoy record's directory starts.
 ///
-/// A Stored embedded ZIP's own end record normally fails the last test,
-/// because its directory offset is relative to the embedded archive.
-fn decoy_end_record(bytes: &[u8], offset: usize) -> Result<bool> {
-    let record_end = add(offset, END_LEN)?;
-    if record_end > bytes.len() || u32_at(bytes, offset)? != END {
-        return Ok(false);
+/// Returns the offset in `tail` of the end record, which must be the only
+/// record that ends at EOF with its comment and the only one readers scanning
+/// back from EOF could select. Also returns the directory offsets of earlier
+/// records that libzip could select instead: the archive is ambiguous if a
+/// central-directory header starts at any of them.
+fn locate_end_record(tail: &[u8], base: usize) -> Result<(usize, Vec<usize>)> {
+    // Multiple records ending at EOF would make the member index ambiguous.
+    let mut candidates = end_record_candidates(tail);
+    let end = match (candidates.next(), candidates.next()) {
+        (Some(end), None) => end,
+        (None, _) => {
+            return Err(invalid(
+                "ZIP end-of-directory record is missing or truncated",
+            ));
+        }
+        (Some(_), Some(_)) => return Err(invalid("ambiguous ZIP end-of-directory records")),
+    };
+    // Fixed fields may legitimately hold the signature's bytes, for example a
+    // central directory at offset 0x06054b50. That matters only when the
+    // comment leaves room for a complete record after the signature.
+    if hides_end_record(&tail[end..]) {
+        return Err(invalid("ambiguous ZIP end-of-directory records"));
     }
-    let entries = u16_at(bytes, offset + 10)?;
-    let comment_end = add(record_end, u16_at(bytes, offset + 20)? as usize)?;
-    let central_start = u32_at(bytes, offset + 16)? as usize;
-    let central_end = add(central_start, u32_at(bytes, offset + 12)? as usize)?;
-    Ok(u16_at(bytes, offset + 4)? == 0
-        && u16_at(bytes, offset + 6)? == 0
-        && u16_at(bytes, offset + 8)? == entries
+    // libzip before 1.11 instead scans its tail window forward and keeps the
+    // first record whose directory it can read, unless a later one spans more
+    // local data. Report every earlier record it could select.
+    let window = tail.len().saturating_sub(END_TAIL_LEN);
+    let mut decoy_directories = Vec::new();
+    for offset in window..end {
+        if let Some(directory) = decoy_directory(tail, base, offset)? {
+            decoy_directories.push(directory);
+        }
+    }
+    Ok((end, decoy_directories))
+}
+
+/// The directory offset of a record at `offset` in `tail`, the end of an
+/// archive with `base` bytes before it, if a reader scanning forward could
+/// select it as the end record once its directory starts with a
+/// central-directory header: a complete single-disk record for a nonempty
+/// directory, with a comment that ends by EOF, whose directory ends before the
+/// record. Such a reader never prefers an empty directory.
+///
+/// A Stored embedded ZIP's own end record normally fails the header test,
+/// because its directory offset is relative to the embedded archive.
+fn decoy_directory(tail: &[u8], base: usize, offset: usize) -> Result<Option<usize>> {
+    let record_end = add(offset, END_LEN)?;
+    if record_end > tail.len() || u32_at(tail, offset)? != END {
+        return Ok(None);
+    }
+    let entries = u16_at(tail, offset + 10)?;
+    let comment_end = add(record_end, u16_at(tail, offset + 20)? as usize)?;
+    let central_start = u32_at(tail, offset + 16)? as usize;
+    let central_end = add(central_start, u32_at(tail, offset + 12)? as usize)?;
+    let selectable = u16_at(tail, offset + 4)? == 0
+        && u16_at(tail, offset + 6)? == 0
+        && u16_at(tail, offset + 8)? == entries
         && entries != 0
-        && comment_end <= bytes.len()
-        && central_end <= offset
-        && u32_at(bytes, central_start)? == CENTRAL)
+        && comment_end <= tail.len()
+        && central_end <= add(base, offset)?;
+    Ok(selectable.then_some(central_start))
+}
+
+/// Refuse output that readers could interpret differently from its own end
+/// record, the last one in `tail`. `tail` holds the output's last bytes after
+/// `base` earlier ones, as [`locate_end_record`] requires: `local_len` bytes
+/// of local records, then the central directory and end record. `reemit`
+/// writes the local records again, for reading back earlier bytes.
+fn check_end_records(
+    tail: &[u8],
+    base: usize,
+    local_len: usize,
+    reemit: impl FnOnce(&mut Probe) -> Result<()>,
+) -> Result<()> {
+    debug_assert!(base == 0 || tail.len() >= END_TAIL_LEN);
+    let ambiguous = || {
+        unsupported(
+            "saving would make the ZIP end-of-directory record ambiguous: the saved \
+             archive would contain another end-of-directory record that readers could select",
+        )
+    };
+    // Rewritten local offsets, sizes and checksums can form a record, and so
+    // can bytes that a save moves to a new distance from EOF. Records whose
+    // comment reaches EOF would make this crate refuse its own output.
+    let (end, decoy_directories) = locate_end_record(tail, base).map_err(|_| ambiguous())?;
+    if end >= ZIP64_LOCATOR_LEN
+        && tail[end - ZIP64_LOCATOR_LEN..].starts_with(&ZIP64_LOCATOR.to_le_bytes())
+    {
+        return Err(unsupported(
+            "saving would make the archive look like ZIP64: the saved archive would have a \
+             ZIP64 end-of-directory locator signature before its end record",
+        ));
+    }
+    let central = CENTRAL.to_le_bytes();
+    let mut earlier = Vec::new();
+    for directory in decoy_directories {
+        match directory
+            .checked_sub(base)
+            .and_then(|offset| tail.get(offset..offset + central.len()))
+        {
+            Some(bytes) if bytes == central => return Err(ambiguous()),
+            Some(_) => {}
+            None => earlier.push(directory),
+        }
+    }
+    // Output before `tail` is no longer held. Records that point there are
+    // rare: in ordinary workbooks only a Stored embedded ZIP's own end record,
+    // whose directory offset is relative to that ZIP. Emission is
+    // deterministic, so write the output again and read those bytes back.
+    if !earlier.is_empty() {
+        earlier.sort_unstable();
+        earlier.dedup();
+        let mut probe = Probe::new(earlier);
+        reemit(&mut probe)?;
+        debug_assert_eq!(probe.position, base + local_len);
+        probe.write_all(&tail[local_len..])?;
+        if probe.words.iter().any(|&(_, word)| word == central) {
+            return Err(ambiguous());
+        }
+    }
+    Ok(())
 }
 
 /// Return the central directory's start and entry count from the EOCD.
@@ -557,6 +646,91 @@ fn emit<W: Write>(writer: &mut W, position: &mut usize, bytes: &[u8]) -> Result<
     writer.write_all(bytes)?;
     *position = end;
     Ok(())
+}
+
+/// Passes output on to a writer, keeping the last `len` bytes written.
+struct KeepTail<'a, W> {
+    writer: &'a mut W,
+    len: usize,
+    tail: Vec<u8>,
+}
+
+impl<'a, W: Write> KeepTail<'a, W> {
+    fn new(writer: &'a mut W, len: usize) -> Self {
+        Self {
+            writer,
+            len,
+            tail: Vec::new(),
+        }
+    }
+
+    fn into_tail(mut self) -> Vec<u8> {
+        let excess = self.tail.len().saturating_sub(self.len);
+        self.tail.drain(..excess);
+        self.tail
+    }
+}
+
+impl<W: Write> Write for KeepTail<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        let kept = &bytes[written.saturating_sub(self.len)..written];
+        // Trim only once the buffer doubles, so each byte moves at most once.
+        if self.tail.len() + kept.len() > 2 * self.len {
+            self.tail.drain(..self.tail.len() + kept.len() - self.len);
+        }
+        self.tail.extend_from_slice(kept);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Discards output, recording the four bytes at each of some offsets.
+struct Probe {
+    position: usize,
+    /// Each offset, in ascending order, and the bytes written there.
+    words: Vec<(usize, [u8; 4])>,
+}
+
+impl Probe {
+    fn new(offsets: Vec<usize>) -> Self {
+        debug_assert!(offsets.is_sorted());
+        Self {
+            position: 0,
+            words: offsets.into_iter().map(|offset| (offset, [0; 4])).collect(),
+        }
+    }
+}
+
+impl Write for Probe {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let start = self.position;
+        self.position += bytes.len();
+        let first = self
+            .words
+            .partition_point(|&(offset, _)| offset + 4 <= start);
+        for (offset, word) in &mut self.words[first..] {
+            if *offset >= self.position {
+                break;
+            }
+            for (index, byte) in word.iter_mut().enumerate() {
+                if let Some(&value) = (*offset + index)
+                    .checked_sub(start)
+                    .and_then(|at| bytes.get(at))
+                {
+                    *byte = value;
+                }
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Entry {
@@ -760,9 +934,9 @@ impl Archive {
     ///
     /// Only one changed member's compressed payload is held in memory at a
     /// time. As with `Write::write_all`, a writer error may leave partial output,
-    /// and so may the rare refusal of an ambiguous end record, which can only be
-    /// detected once the directory offset is known. The writer is flushed before
-    /// success is reported.
+    /// and so may the rare refusal of output whose last bytes would form another
+    /// end record or a ZIP64 locator, which can only be detected once every local
+    /// record is written. The writer is flushed before success is reported.
     pub(crate) fn write_to<W: Write>(
         &self,
         changes: &impl PartChanges,
@@ -793,6 +967,39 @@ impl Archive {
                 false
             }
         };
+        let mut output = KeepTail::new(writer, self.local_tail_len());
+        let (mut position, offsets, replacements) =
+            self.emit_local_records(plan, &mut output, preserve_gaps)?;
+        let local_tail = output.into_tail();
+        self.emit_directory(
+            writer,
+            &mut position,
+            &local_tail,
+            &offsets,
+            &replacements,
+            |probe| {
+                self.emit_local_records(plan, probe, preserve_gaps)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// How many bytes of local records the end-record check needs: the
+    /// directory and end record, which keep their input length, may not fill
+    /// the `END_TAIL_LEN` bytes before EOF.
+    fn local_tail_len(&self) -> usize {
+        END_TAIL_LEN.saturating_sub(self.original.len() - self.central_start)
+    }
+
+    /// Write every local record, and the gaps between them when
+    /// `preserve_gaps`. Returns the directory offset, each member's new
+    /// local-record offset, and the new sizes of replaced members.
+    fn emit_local_records<W: Write>(
+        &self,
+        plan: &ChangePlan<'_>,
+        writer: &mut W,
+        preserve_gaps: bool,
+    ) -> Result<(usize, Vec<u32>, Vec<Option<Sizes>>)> {
         let mut position = 0;
         let mut original_position = 0;
         let mut replacements = vec![None; self.entries.len()];
@@ -831,7 +1038,7 @@ impl Archive {
                 &self.original[original_position..self.central_start],
             )?;
         }
-        self.emit_directory(writer, &mut position, &offsets, &replacements)
+        Ok((position, offsets, replacements))
     }
 
     /// Reproduce pre-1.0 append saves to exercise migration and compaction.
@@ -844,8 +1051,15 @@ impl Archive {
         let mut plan = self.validate_changes(changes)?;
         // Legacy appends emit replacements in central-directory order.
         plan.data.sort_unstable_by_key(|change| change.0);
+        // These saves only build test inputs, so the end-record check reads
+        // all of their local records from memory.
+        let mut local = Vec::new();
         let mut position = 0;
-        emit(writer, &mut position, &self.original[..self.central_start])?;
+        emit(
+            &mut local,
+            &mut position,
+            &self.original[..self.central_start],
+        )?;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = Vec::with_capacity(self.entries.len());
         let mut pending = plan.data.iter().peekable();
@@ -853,12 +1067,20 @@ impl Archive {
             if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
                 offsets.push(zip32(position, "ZIP local-record offset")?);
                 replacements[index] =
-                    Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
+                    Some(self.emit_replacement(entry, codec, data, &mut local, &mut position)?);
             } else {
                 offsets.push(entry.local_record.start as u32);
             }
         }
-        self.emit_directory(writer, &mut position, &offsets, &replacements)
+        writer.write_all(&local)?;
+        self.emit_directory(
+            writer,
+            &mut position,
+            &local,
+            &offsets,
+            &replacements,
+            |probe| Ok(probe.write_all(&local)?),
+        )
     }
 
     /// Remove obsolete local records from earlier append saves. Unknown gaps
@@ -936,12 +1158,19 @@ impl Archive {
         Ok(sizes)
     }
 
+    /// Write the central directory and end record after local records ending
+    /// at `position`, unless readers could misread the output's last bytes.
+    /// `local_tail` holds the last local-record bytes written: all of them, or
+    /// at least those within `END_TAIL_LEN` bytes of EOF. `reemit` writes every
+    /// local record again, for reading back earlier output.
     fn emit_directory<W: Write>(
         &self,
         writer: &mut W,
         position: &mut usize,
+        local_tail: &[u8],
         offsets: &[u32],
         replacements: &[Option<Sizes>],
+        reemit: impl FnOnce(&mut Probe) -> Result<()>,
     ) -> Result<()> {
         let central_start = zip32(*position, "ZIP central-directory offset")?;
         // Central records are copied whole, so the directory keeps its size,
@@ -965,6 +1194,11 @@ impl Archive {
                  back through the archive comment would select",
             ));
         }
+        // Build the directory after the last local bytes, which the check of
+        // the output's end needs, and write it only once that check passes.
+        let mut tail =
+            Vec::with_capacity(local_tail.len() + self.original.len() - self.central_start);
+        tail.extend_from_slice(local_tail);
         for (index, entry) in self.entries.iter().enumerate() {
             let record = &self.original[entry.central.clone()];
             let mut header = [0; CENTRAL_HEADER_LEN];
@@ -976,11 +1210,14 @@ impl Archive {
             // The local offset is the only field compaction changes for an
             // untouched member; comments, extras and all other metadata survive.
             set_u32(&mut header, 42, offsets[index]);
-            emit(writer, position, &header)?;
-            emit(writer, position, &record[CENTRAL_HEADER_LEN..])?;
+            tail.extend_from_slice(&header);
+            tail.extend_from_slice(&record[CENTRAL_HEADER_LEN..]);
         }
-        debug_assert_eq!(*position - central_start as usize, central_size as usize);
-        emit(writer, position, &ending)
+        debug_assert_eq!(tail.len() - local_tail.len(), central_size as usize);
+        tail.extend_from_slice(&ending);
+        let base = *position - local_tail.len();
+        check_end_records(&tail, base, local_tail.len(), reemit)?;
+        emit(writer, position, &tail[local_tail.len()..])
     }
 
     /// Require every byte before the central directory to belong to an active
@@ -2712,6 +2949,30 @@ mod tests {
         bytes
     }
 
+    /// Emit `archive`'s directory as if zero-filled local records ended at
+    /// `position`, returning the result and the bytes written.
+    fn emit_directory_at(
+        archive: &Archive,
+        position: usize,
+        offsets: &[u32],
+        replacements: &[Option<Sizes>],
+    ) -> (Result<()>, Vec<u8>) {
+        let local_tail = vec![0; position.min(archive.local_tail_len())];
+        let mut output = Vec::new();
+        let result = archive.emit_directory(
+            &mut output,
+            &mut position.clone(),
+            &local_tail,
+            offsets,
+            replacements,
+            |probe| {
+                std::io::copy(&mut std::io::repeat(0).take(position as u64), probe)?;
+                Ok(())
+            },
+        );
+        (result, output)
+    }
+
     #[test]
     fn saves_refuse_directory_offsets_that_would_make_the_end_record_ambiguous() {
         let comment = |first: &[u8], length: usize| {
@@ -2734,9 +2995,7 @@ mod tests {
             (0x5000_0000, comment(&[7], 0x054b), false),
         ] {
             let archive = Archive::new(with_comment(fixture(false), &comment)).unwrap();
-            let mut output = Vec::new();
-            let mut position = offset as usize;
-            let result = archive.emit_directory(&mut output, &mut position, &[0], &[None]);
+            let (result, output) = emit_directory_at(&archive, offset as usize, &[0], &[None]);
             if refused {
                 assert!(matches!(
                     result,
@@ -2765,10 +3024,8 @@ mod tests {
         set_u16(&mut archive.original, archive.end + 8, 0x4b50);
         set_u16(&mut archive.original, archive.end + 10, 0x4b50);
         assert!(shadows_end_record(&archive.original[archive.end..]));
-        let mut output = Vec::new();
-        archive
-            .emit_directory(&mut output, &mut 0x100, &[0], &[None])
-            .unwrap();
+        let (result, output) = emit_directory_at(&archive, 0x100, &[0], &[None]);
+        result.unwrap();
         let end = output.len() - END_LEN - 5;
         assert!(shadows_end_record(&output[end..]));
         assert_eq!(u32_at(&output, end + 16).unwrap(), 0x100);
@@ -2787,6 +3044,171 @@ mod tests {
         }
         let bytes = end_record(1, 46, 64, &[b'c'; 100]);
         assert!(!shadows_end_record(&bytes[64..]));
+    }
+
+    fn refused_as_ambiguous(result: Result<()>) -> bool {
+        matches!(
+            result,
+            Err(Error::Unsupported(message))
+                if message.contains("would contain another end-of-directory record")
+        )
+    }
+
+    #[test]
+    fn saves_refuse_rewritten_fields_that_would_form_another_end_record() {
+        // A signature in a rewritten central-header field starts a complete
+        // record that ends at EOF when the u16 20 bytes later counts the
+        // bytes left after that record. This crate would refuse its own
+        // output, so the save is refused instead.
+        //
+        // First the field is a new checksum, at header offset 16, and the
+        // member's internal attributes, which saves copy, count the rest.
+        let mut bytes = fixture(false);
+        let central = Archive::new(bytes.clone()).unwrap().central_start;
+        let rest = bytes.len() - (central + 16) - END_LEN;
+        set_u16(&mut bytes, central + 36, rest as u16);
+        let archive = Archive::new(bytes).unwrap();
+        let new_sizes = |crc| {
+            Some(Sizes {
+                crc,
+                compressed_size: 7,
+                size: 7,
+            })
+        };
+        let (result, output) = emit_directory_at(&archive, 45, &[0], &[new_sizes(END)]);
+        assert!(refused_as_ambiguous(result));
+        assert!(output.is_empty());
+        let (result, output) = emit_directory_at(&archive, 45, &[0], &[new_sizes(END + 1)]);
+        result.unwrap();
+        assert_eq!(end_record_candidates(&output).count(), 1);
+
+        // Then the field is a new local-record offset, at header offset 42,
+        // and name bytes 16..18, "00", count the rest: the archive comment.
+        // Local records of about 101 MB would move a member that far, so
+        // emit the directory from there.
+        let name = b"xl/media/image0000.png";
+        let rest = u16::from_le_bytes(*b"00") as usize;
+        let comment = vec![b'c'; 42 + END_LEN + rest - (CENTRAL_HEADER_LEN + name.len() + END_LEN)];
+        let archive = Archive::new(with_comment(named_fixture(name, 0, false), &comment)).unwrap();
+        let position = END as usize + 0x100;
+        let (result, output) = emit_directory_at(&archive, position, &[END], &[None]);
+        assert!(refused_as_ambiguous(result));
+        assert!(output.is_empty());
+        let (result, output) = emit_directory_at(&archive, position, &[END + 1], &[None]);
+        result.unwrap();
+        assert_eq!(end_record_candidates(&output).count(), 1);
+    }
+
+    #[test]
+    fn saves_refuse_offsets_that_would_form_a_zip64_locator() {
+        // When the last central record's name, extra field and comment take
+        // 16 bytes, its local-record offset is the 4 bytes 20 before the end
+        // record, where readers look for a ZIP64 locator. Local records of
+        // about 118 MB would move a member that far.
+        for (name, offset, refused) in [
+            (b"docProps/app.xml".as_slice(), ZIP64_LOCATOR, true),
+            (b"docProps/app.xml", ZIP64_LOCATOR + 1, false),
+            // With a 17-byte name those bytes start inside the offset.
+            (b"docProps/app.xmlx", ZIP64_LOCATOR, false),
+        ] {
+            let archive = Archive::new(named_fixture(name, 0, false)).unwrap();
+            let position = offset as usize + 0x100;
+            let (result, output) = emit_directory_at(&archive, position, &[offset], &[None]);
+            if refused {
+                assert!(matches!(
+                    result,
+                    Err(Error::Unsupported(message)) if message.contains("ZIP64")
+                ));
+                assert!(output.is_empty());
+            } else {
+                result.unwrap();
+                let end = output.len() - END_LEN - b"comment".len();
+                assert_ne!(
+                    u32_at(&output, end - ZIP64_LOCATOR_LEN).unwrap(),
+                    ZIP64_LOCATOR
+                );
+            }
+        }
+    }
+
+    /// `bytes` with `comment` as its last central-directory entry's comment.
+    fn with_entry_comment(bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+        let archive = Archive::new(bytes).unwrap();
+        let record = archive.entries.last().unwrap().central.clone();
+        let old = u16_at(&archive.original, record.start + 32).unwrap() as usize;
+        let mut bytes = archive.original[..record.end - old].to_vec();
+        set_u16(&mut bytes, record.start + 32, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        let mut ending = archive.original[archive.end..].to_vec();
+        set_u32(
+            &mut ending,
+            12,
+            (bytes.len() - archive.central_start) as u32,
+        );
+        bytes.extend_from_slice(&ending);
+        bytes
+    }
+
+    #[test]
+    fn saves_refuse_end_records_that_forward_scanning_readers_could_select() {
+        // A complete end record for a one-entry directory at `directory`,
+        // which libzip before 1.11 selects if a central-directory header
+        // starts there.
+        let decoy = |directory: usize| {
+            let mut decoy = vec![0; END_LEN];
+            set_u32(&mut decoy, 0, END);
+            set_u16(&mut decoy, 8, 1);
+            set_u16(&mut decoy, 10, 1);
+            set_u32(&mut decoy, 12, CENTRAL_HEADER_LEN as u32);
+            set_u32(&mut decoy, 16, directory as u32);
+            decoy
+        };
+        let filler = |signature_at: usize| {
+            let mut filler = vec![0; END_TAIL_LEN + 4096];
+            set_u32(&mut filler, signature_at, CENTRAL);
+            filler
+        };
+        // Replacing part.xml at offset 0 moves everything after it. Four more
+        // bytes move the directory from 45 onto a decoy pointing at 49, and
+        // with a long member after part.xml, its central-directory signature
+        // from 183 onto a decoy pointing at 187. That decoy's directory lies
+        // before the output's last END_TAIL_LEN bytes.
+        let cases = [
+            with_entry_comment(fixture(false), &decoy(49)),
+            with_entry_comment(
+                combine(
+                    fixture(false),
+                    stored_fixture(b"fill.bin", &filler(100), 0, None),
+                ),
+                &decoy(45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100),
+            ),
+        ];
+        for original in cases {
+            let archive = Archive::new(original).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
+            for (replacement, refused) in
+                [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)]
+            {
+                let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
+                for compact in [false, true] {
+                    let mut output = Vec::new();
+                    let result = if compact {
+                        archive.compact_to(&changes, &mut output)
+                    } else {
+                        archive.write_to(&changes, &mut output)
+                    };
+                    if refused {
+                        assert!(refused_as_ambiguous(result));
+                        // Only the local records were written.
+                        assert_eq!(output.len(), archive.central_start + 4);
+                    } else {
+                        result.unwrap();
+                        let reopened = Archive::new(output).unwrap();
+                        assert_eq!(reopened.read("part.xml").unwrap(), replacement);
+                    }
+                }
+            }
+        }
     }
 
     fn unicode_path(raw_name: &[u8], name: &[u8], version: u8) -> Vec<u8> {
