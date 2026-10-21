@@ -2,61 +2,33 @@ use super::parse::{Attributes, Element, NamespaceId, XmlDocument, parse};
 use super::validation::validate_ranges;
 use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
-use crate::{CellRef, CellValue, Result};
+use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Clone, Copy)]
-pub(super) struct Range {
-    pub(super) first: CellRef,
-    pub(super) last: CellRef,
-}
-impl Range {
-    pub(super) fn contains(self, cell: CellRef) -> bool {
-        cell.row >= self.first.row
-            && cell.row <= self.last.row
-            && cell.column >= self.first.column
-            && cell.column <= self.last.column
-    }
-    pub(super) fn including(self, cell: CellRef) -> Self {
-        Self {
-            first: CellRef {
-                row: self.first.row.min(cell.row),
-                column: self.first.column.min(cell.column),
-            },
-            last: CellRef {
-                row: self.last.row.max(cell.row),
-                column: self.last.column.max(cell.column),
-            },
-        }
-    }
-    pub(super) fn reference(self) -> String {
-        if self.first == self.last {
-            self.first.to_string()
+// A worksheet reference such as a merge, formula group or dimension range.
+// Unlike `CellRange`'s parser, this accepts `$` markers anywhere and refuses
+// reversed corners instead of normalizing them. A third part is refused
+// because a corner can never contain `:`.
+pub(super) fn reference_range(reference: &str) -> Result<CellRange> {
+    let corner = |text: &str| -> Result<CellRef> {
+        let cell = if text.contains('$') {
+            text.replace('$', "").parse()
         } else {
-            format!("{}:{}", self.first, self.last)
-        }
-    }
-}
-
-pub(super) fn reference_range(reference: &str) -> Result<Range> {
-    let mut parts = reference.split(':');
-    let first: CellRef = parts
-        .next()
-        .unwrap_or_default()
-        .replace('$', "")
-        .parse()
-        .map_err(|_| unsupported(format!("invalid cell range {reference:?}")))?;
-    let last = if let Some(last) = parts.next() {
-        last.replace('$', "")
-            .parse()
-            .map_err(|_| unsupported(format!("invalid cell range {reference:?}")))?
-    } else {
-        first
+            text.parse()
+        };
+        cell.map_err(|_| unsupported(format!("invalid cell range {reference:?}")))
     };
-    if parts.next().is_some() || first.row > last.row || first.column > last.column {
+    let (first, last) = match reference.split_once(':') {
+        Some((first, last)) => (corner(first)?, corner(last)?),
+        None => {
+            let cell = corner(reference)?;
+            (cell, cell)
+        }
+    };
+    if first.row > last.row || first.column > last.column {
         return Err(unsupported(format!("invalid cell range {reference:?}")));
     }
-    Ok(Range { first, last })
+    Ok(CellRange::new(first, last))
 }
 
 // Column default styles as sorted, nonoverlapping `(min, max, style)` intervals.
@@ -117,7 +89,7 @@ pub(super) struct RowEntry {
 // Formula groups: the ranges they protect, and any group missing its range.
 #[derive(Default)]
 struct Formulas {
-    ranges: Vec<Range>,
+    ranges: Vec<CellRange>,
     // Each shared-formula index maps to its first cell and whether any
     // member of the group carries the group's reference range.
     shared: HashMap<u32, (CellRef, bool)>,
@@ -261,7 +233,7 @@ fn merged_ranges(
     elements: &[Element],
     attributes: &Attributes,
     namespace: NamespaceId,
-) -> Result<Vec<Range>> {
+) -> Result<Vec<CellRange>> {
     let mut ranges = Vec::new();
     for index in elements[0].children(elements) {
         let merges = &elements[index];
@@ -362,8 +334,8 @@ pub(super) struct WorksheetIndex<'a> {
     pub(super) namespace: NamespaceId,
     pub(super) data_index: usize,
     pub(super) rows: Vec<RowEntry>,
-    pub(super) formula_ranges: Vec<Range>,
-    pub(super) merged_ranges: Vec<Range>,
+    pub(super) formula_ranges: Vec<CellRange>,
+    pub(super) merged_ranges: Vec<CellRange>,
     /// The first formula cell whose shared, array, or data-table group lacks a
     /// reference range, leaving the protected cells unknown.
     pub(super) incomplete_formula_group: Option<CellRef>,

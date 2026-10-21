@@ -1,8 +1,8 @@
-use super::index::Range;
 use super::parse::{XmlDocument, parse};
 use super::patch::text_escaped;
 use super::validation::validate_ranges;
 use super::*;
+use crate::CellRange;
 
 fn sheet(body: &str) -> String {
     format!(
@@ -1482,16 +1482,16 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
     for _ in 0..100 {
         let first_row = 1 + next() % 30;
         let first_column = 1 + (next() % 10) as u16;
-        ranges.push(Range {
-            first: CellRef {
+        ranges.push(CellRange::new(
+            CellRef {
                 row: first_row,
                 column: first_column,
             },
-            last: CellRef {
+            CellRef {
                 row: first_row + next() % 5,
                 column: first_column + (next() % 3) as u16,
             },
-        });
+        ));
     }
     for merged in [false, true] {
         for row in 1..=35 {
@@ -1499,7 +1499,7 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
                 let cell = CellRef { row, column };
                 let blocked = ranges
                     .iter()
-                    .any(|range| range.contains(cell) && (!merged || cell != range.first));
+                    .any(|range| range.contains(cell) && (!merged || cell != range.first()));
                 assert_eq!(
                     validate_ranges(&BTreeMap::from([(cell, CellValue::Blank)]), &ranges, merged)
                         .is_err(),
@@ -1515,16 +1515,16 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
             }
         }
     }
-    let boundary = Range {
-        first: CellRef {
+    let boundary = CellRange::new(
+        CellRef {
             row: 1,
             column: CellRef::MAX_COLUMN,
         },
-        last: CellRef {
+        CellRef {
             row: CellRef::MAX_ROW,
             column: CellRef::MAX_COLUMN,
         },
-    };
+    );
     assert!(
         validate_ranges(
             &BTreeMap::from([("XFD1".parse().unwrap(), CellValue::Blank)]),
@@ -1545,17 +1545,11 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
 
 #[test]
 fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() {
-    let mut ranges = vec![
-        Range {
-            first: "AF1".parse().unwrap(),
-            last: "AG30".parse().unwrap(),
-        };
-        40
-    ];
-    ranges.push(Range {
-        first: "B15".parse().unwrap(),
-        last: "F15".parse().unwrap(),
-    });
+    let mut ranges = vec![CellRange::new("AF1".parse().unwrap(), "AG30".parse().unwrap()); 40];
+    ranges.push(CellRange::new(
+        "B15".parse().unwrap(),
+        "F15".parse().unwrap(),
+    ));
     let mut cells: BTreeMap<_, _> = (1..=10)
         .chain([30])
         .map(|row| (CellRef::new(row, 26).unwrap(), CellValue::Blank))
@@ -1569,12 +1563,77 @@ fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() 
     cells.insert("B15".parse().unwrap(), CellValue::Blank);
     assert!(validate_ranges(&cells, &ranges, true).is_ok());
     assert!(validate_ranges(&cells, &ranges, false).is_err());
-    ranges.push(Range {
-        first: "A15".parse().unwrap(),
-        last: "D15".parse().unwrap(),
-    });
+    ranges.push(CellRange::new(
+        "A15".parse().unwrap(),
+        "D15".parse().unwrap(),
+    ));
     let error = validate_ranges(&cells, &ranges, true).unwrap_err();
     assert!(error.to_string().contains("B15"));
+}
+
+#[test]
+fn worksheet_range_references_accept_markers_anywhere_but_not_reversed_corners() {
+    // Worksheet references differ from `CellRange`'s syntax on purpose: `$`
+    // markers may appear anywhere, and reversed corners are refused rather
+    // than normalized.
+    let merged = |reference: &str| {
+        sheet(&format!(
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><mergeCells><mergeCell ref='{reference}'/></mergeCells>"
+        ))
+    };
+    for reference in ["C1:D2", "c1:d2", "$C$1:$D$2", "C$$1:D2$", "$C1:D$2"] {
+        let input = merged(reference);
+        assert!(edit(&input, "C1", 2.0.into()).is_ok(), "{reference}");
+        assert!(edit(&input, "E3", 2.0.into()).is_ok(), "{reference}");
+        assert!(
+            matches!(
+                edit(&input, "D2", 2.0.into()),
+                Err(Error::ProtectedCell { cell, reason, .. })
+                    if cell.to_string() == "D2" && reason == protection::MERGED
+            ),
+            "{reference}"
+        );
+    }
+    for reference in [
+        "D2:C1", "C2:D1", "D1:C2", " C1:D2", "C1:D2 ", "C1:D2:E3", "C1::D2", "C1:", ":D2", "",
+        "C:D", "1:2", "C1:XFE1", "$", "C1:$",
+    ] {
+        let message = format!("invalid cell range {reference:?}");
+        assert!(
+            matches!(
+                edit(&merged(reference), "A1", 2.0.into()),
+                Err(Error::Unsupported(m)) if m == message
+            ),
+            "{reference:?}"
+        );
+    }
+    let formula = sheet(
+        "<sheetData><row r='1'><c r='A1'><f t='array' ref='$b$2:C$3'>1</f><v>1</v></c></row></sheetData>",
+    );
+    assert!(edit(&formula, "D4", 2.0.into()).is_ok());
+    assert!(matches!(
+        edit(&formula, "B2", 2.0.into()),
+        Err(Error::ProtectedCell { reason, .. }) if reason == protection::FORMULA_RANGE
+    ));
+    // A dimension grows to the edited cells and is written without markers.
+    for (reference, cell, grown) in [
+        ("$B$2", "B2", None),
+        ("b2:c3", "C3", None),
+        ("$B$2", "C3", Some("B2:C3")),
+        ("B$2:c3", "A1", Some("A1:C3")),
+        ("B2", "B9", Some("B2:B9")),
+    ] {
+        let input = sheet(&format!(
+            "<dimension ref='{reference}'/><sheetData><row r='2'><c r='B2'><v>1</v></c></row></sheetData>"
+        ));
+        let changed = edit(&input, cell, 2.0.into()).unwrap();
+        let expected = format!("<dimension ref='{}'/>", grown.unwrap_or(reference));
+        assert!(changed.contains(&expected), "{reference} {cell}: {changed}");
+    }
+    assert!(matches!(
+        edit(&sheet("<dimension ref='C3:B2'/><sheetData/>"), "A1", 2.0.into()),
+        Err(Error::Unsupported(m)) if m == "invalid cell range \"C3:B2\""
+    ));
 }
 
 #[test]

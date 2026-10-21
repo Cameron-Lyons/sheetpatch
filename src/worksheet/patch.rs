@@ -535,14 +535,14 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     let range = changed_cells
         .iter()
         .fold(old, |range, &cell| range.including(cell));
-    if old.contains(range.first) && old.contains(range.last) {
+    if old.contains(range.first()) && old.contains(range.last()) {
         return Ok(None);
     }
     Ok(attribute_edit(
         dimension,
         &index.attributes,
         "ref",
-        Some(&range.reference()),
+        Some(&range.to_string()),
     ))
 }
 

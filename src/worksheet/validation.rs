@@ -1,8 +1,7 @@
-use super::index::Range;
 use super::parse::{Attributes, Element, NamespaceId};
 use super::read::validate_rich_text_structure;
 use super::{protected, protection, unsupported};
-use crate::{CellRef, CellValue, Result};
+use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::BTreeMap;
 
 // Known rich text is the old value and may be replaced. Unfamiliar markup
@@ -105,7 +104,7 @@ pub(super) fn sort_guard_events(events: &mut Vec<GuardEvent>) {
 
 pub(super) fn validate_ranges(
     cells: &BTreeMap<CellRef, CellValue>,
-    ranges: &[Range],
+    ranges: &[CellRange],
     merged: bool,
 ) -> Result<()> {
     if cells.is_empty() || ranges.is_empty() {
@@ -126,7 +125,7 @@ pub(super) fn validate_ranges(
         for &cell in cells.keys() {
             if ranges
                 .iter()
-                .any(|range| range.contains(cell) && (!merged || cell != range.first))
+                .any(|range| range.contains(cell) && (!merged || cell != range.first()))
             {
                 return Err(violation(cell));
             }
@@ -142,10 +141,10 @@ pub(super) fn validate_ranges(
     // cell. Count relevant ranges before reserving event storage, so unrelated
     // worksheet ranges add no memory overhead to a batch.
     let relevant_ranges = ranges.iter().filter(|range| {
-        range.first.row <= last_row
-            && range.last.row >= first_row
-            && range.first.column <= last_column
-            && range.last.column >= first_column
+        range.first().row <= last_row
+            && range.last().row >= first_row
+            && range.first().column <= last_column
+            && range.last().column >= first_column
     });
     let relevant_count = relevant_ranges.clone().count();
     if relevant_count == 0 {
@@ -172,23 +171,23 @@ pub(super) fn validate_ranges(
         if merged {
             // The anchor remains editable; the rest of its rectangle does not.
             add_range(
-                range.first.row,
-                range.first.row,
-                range.first.column + 1,
-                range.last.column,
+                range.first().row,
+                range.first().row,
+                range.first().column + 1,
+                range.last().column,
             );
             add_range(
-                range.first.row + 1,
-                range.last.row,
-                range.first.column,
-                range.last.column,
+                range.first().row + 1,
+                range.last().row,
+                range.first().column,
+                range.last().column,
             );
         } else {
             add_range(
-                range.first.row,
-                range.last.row,
-                range.first.column,
-                range.last.column,
+                range.first().row,
+                range.last().row,
+                range.first().column,
+                range.last().column,
             );
         }
     }
