@@ -39,7 +39,7 @@ const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
 const FLAG_UTF8: u16 = 0x0800;
 const FLAG_MASKED_HEADERS: u16 = 0x2000;
 // Patched data is not encryption: active patched members stay opaque, while
-// compaction refuses to discard obsolete ones (`FLAG_PATCHED` at those sites).
+// compaction refuses to discard obsolete ones (both through `Codec::of`).
 const ENCRYPTION_FLAGS: u16 = FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTION | FLAG_MASKED_HEADERS;
 
 const STORED: u16 = 0;
@@ -163,10 +163,32 @@ struct StoredDescriptor {
     sizes: Sizes,
 }
 
+/// How member data is decoded and replacements are encoded. Patched data and
+/// other compression methods stay opaque: preserved, but never read or replaced.
+#[derive(Clone, Copy)]
+enum Codec {
+    Stored,
+    Deflated,
+}
+
+impl Codec {
+    fn of(flags: u16, method: u16) -> Option<Self> {
+        if flags & FLAG_PATCHED != 0 {
+            return None;
+        }
+        match method {
+            STORED => Some(Self::Stored),
+            DEFLATED => Some(Self::Deflated),
+            _ => None,
+        }
+    }
+}
+
 struct ChangePlan<'a> {
-    // Keep only changed entry indexes and borrowed payloads, ordered by their
-    // physical local-record positions for a single merge during emission.
-    data: Vec<(usize, &'a [u8])>,
+    // Keep only changed entry indexes, their codecs and borrowed payloads,
+    // ordered by their physical local-record positions for a single merge
+    // during emission.
+    data: Vec<(usize, Codec, &'a [u8])>,
 }
 
 #[derive(Clone, Copy)]
@@ -538,6 +560,18 @@ fn emit<W: Write>(writer: &mut W, position: &mut usize, bytes: &[u8]) -> Result<
 }
 
 impl Entry {
+    fn codec(&self) -> Result<Codec> {
+        Codec::of(self.flags, self.method).ok_or_else(|| {
+            let name = &self.name;
+            if self.flags & FLAG_PATCHED != 0 {
+                unsupported(format!("patched ZIP member data in {name}"))
+            } else {
+                let method = self.method;
+                unsupported(format!("ZIP compression method {method} in {name}"))
+            }
+        })
+    }
+
     /// Validate a member's local record against its central header.
     fn new(bytes: &[u8], central: &CentralHeader<'_>, central_start: usize) -> Result<Self> {
         let name = central.name;
@@ -683,17 +717,15 @@ impl Archive {
             .get(name)
             .map(|&index| &self.entries[index])
             .ok_or_else(|| invalid(format!("ZIP member is missing: {name}")))?;
-        if entry.flags & FLAG_PATCHED != 0 {
-            return Err(unsupported(format!("patched ZIP member data in {name}")));
-        }
+        let codec = entry.codec()?;
         let sizes = entry.sizes;
         if sizes.size as usize > MAX_READ {
             return Err(over_read_limit(format_args!("ZIP member {name}")));
         }
         let compressed = &self.original[entry.data.clone()];
-        let output = match entry.method {
-            STORED => compressed.to_vec(),
-            DEFLATED => {
+        let output = match codec {
+            Codec::Stored => compressed.to_vec(),
+            Codec::Deflated => {
                 let mut decoder = Decompress::new(false);
                 // The declared length also bounds malformed streams that expand
                 // beyond their header, rather than trusting that header.
@@ -710,11 +742,6 @@ impl Archive {
                     )));
                 }
                 output
-            }
-            method => {
-                return Err(unsupported(format!(
-                    "ZIP compression method {method} in {name}"
-                )));
             }
         };
         if output.len() != sizes.size as usize || crc32(&output) != sizes.crc {
@@ -785,9 +812,9 @@ impl Archive {
                 )?;
             }
             offsets[index] = zip32(position, "ZIP local-record offset")?;
-            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
                 replacements[index] =
-                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
+                    Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
             } else {
                 emit(
                     writer,
@@ -823,10 +850,10 @@ impl Archive {
         let mut offsets = Vec::with_capacity(self.entries.len());
         let mut pending = plan.data.iter().peekable();
         for (index, entry) in self.entries.iter().enumerate() {
-            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
                 offsets.push(zip32(position, "ZIP local-record offset")?);
                 replacements[index] =
-                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
+                    Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
             } else {
                 offsets.push(entry.local_record.start as u32);
             }
@@ -863,37 +890,30 @@ impl Archive {
             if data.len() > MAX_READ {
                 return Err(over_read_limit(format_args!("ZIP member {name}")));
             }
-            let entry = &self.entries[index];
-            if entry.flags & FLAG_PATCHED != 0 {
-                return Err(unsupported(format!("patched ZIP member data in {name}")));
-            }
-            let method = entry.method;
-            if !matches!(method, STORED | DEFLATED) {
-                return Err(unsupported(format!(
-                    "ZIP compression method {method} in {name}"
-                )));
-            }
-            plan.data.push((index, data));
+            let codec = self.entries[index].codec()?;
+            plan.data.push((index, codec, data));
         }
         plan.data
-            .sort_unstable_by_key(|&(index, _)| self.entries[index].local_record.start);
+            .sort_unstable_by_key(|&(index, ..)| self.entries[index].local_record.start);
         Ok(plan)
     }
 
     fn emit_replacement<W: Write>(
         &self,
         entry: &Entry,
+        codec: Codec,
         data: &[u8],
         writer: &mut W,
         position: &mut usize,
     ) -> Result<Sizes> {
         let size = zip32(data.len(), "ZIP member size")?;
-        let compressed = if entry.method == STORED {
-            Cow::Borrowed(data)
-        } else {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
-            encoder.write_all(data)?;
-            Cow::Owned(encoder.finish()?)
+        let compressed = match codec {
+            Codec::Stored => Cow::Borrowed(data),
+            Codec::Deflated => {
+                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
+                encoder.write_all(data)?;
+                Cow::Owned(encoder.finish()?)
+            }
         };
         let compressed_size = zip32(compressed.len(), "compressed ZIP member size")?;
         let sizes = Sizes {
@@ -1011,9 +1031,12 @@ impl Archive {
         else {
             return Err(opaque());
         };
-        if flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0 || !matches!(method, STORED | DEFLATED) {
+        if flags & ENCRYPTION_FLAGS != 0 {
             return Err(opaque());
         }
+        let Some(codec) = Codec::of(flags, method) else {
+            return Err(opaque());
+        };
         if header.compressed_size == u32::MAX || header.size == u32::MAX {
             return Err(opaque());
         }
@@ -1026,28 +1049,33 @@ impl Archive {
         }
         check_extra(extra, name)?;
         let has_descriptor = flags & FLAG_DESCRIPTOR != 0;
-        let actual = if method == DEFLATED {
-            let end = if has_descriptor && header.compressed_size == 0 {
-                self.central_start
-            } else {
-                add(data_start, header.compressed_size as usize)?
-            };
-            if end > self.central_start {
-                return Err(opaque());
+        let actual = match codec {
+            Codec::Deflated => {
+                let end = if has_descriptor && header.compressed_size == 0 {
+                    self.central_start
+                } else {
+                    add(data_start, header.compressed_size as usize)?
+                };
+                if end > self.central_start {
+                    return Err(opaque());
+                }
+                inspect_deflate(&bytes[data_start..end], name)?
             }
-            inspect_deflate(&bytes[data_start..end], name)?
-        } else if has_descriptor && header.compressed_size == 0 {
-            let descriptors = stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
-            return self.stored_orphan_end(data_start, header, name, descriptors);
-        } else {
-            let end = add(data_start, header.compressed_size as usize)?;
-            if end > self.central_start || header.compressed_size as usize > MAX_READ {
-                return Err(opaque());
+            Codec::Stored if has_descriptor && header.compressed_size == 0 => {
+                let descriptors =
+                    stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
+                return self.stored_orphan_end(data_start, header, name, descriptors);
             }
-            Sizes {
-                crc: crc32(&bytes[data_start..end]),
-                compressed_size: header.compressed_size,
-                size: header.compressed_size,
+            Codec::Stored => {
+                let end = add(data_start, header.compressed_size as usize)?;
+                if end > self.central_start || header.compressed_size as usize > MAX_READ {
+                    return Err(opaque());
+                }
+                Sizes {
+                    crc: crc32(&bytes[data_start..end]),
+                    compressed_size: header.compressed_size,
+                    size: header.compressed_size,
+                }
             }
         };
         if !header.matches(actual, has_descriptor) {
@@ -1161,8 +1189,7 @@ impl Archive {
         // Reject unsupported obsolete records before scanning their names.
         // Fake headers can otherwise use nonzero method/flag bytes to make
         // many overlapping long names pass the NUL check below.
-        if header.flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0
-            || !matches!(header.method, STORED | DEFLATED)
+        if header.flags & ENCRYPTION_FLAGS != 0 || Codec::of(header.flags, header.method).is_none()
         {
             return false;
         }
@@ -1831,10 +1858,19 @@ mod tests {
     #[test]
     fn rejects_bad_changes_before_streaming_any_bytes() {
         let archive = Archive::new(decorate_fixture(b"part.xml", true)).unwrap();
+        let opaque = |result: Result<()>| {
+            matches!(
+                result,
+                Err(Error::Unsupported(message))
+                    if message == "ZIP compression method 99 in part.xml"
+            )
+        };
+        assert!(opaque(archive.read("part.xml").map(drop)));
         for name in ["part.xml", "missing.xml"] {
             let changes = BTreeMap::from([(name.into(), b"changed".to_vec())]);
             let mut output = Vec::new();
-            assert!(archive.write_to(&changes, &mut output).is_err());
+            let result = archive.write_to(&changes, &mut output);
+            assert_eq!(opaque(result), name == "part.xml");
             assert!(output.is_empty());
             assert!(archive.compact_to(&changes, &mut output).is_err());
             assert!(output.is_empty());
