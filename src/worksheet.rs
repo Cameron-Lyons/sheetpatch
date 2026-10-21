@@ -16,8 +16,9 @@ mod validation;
 use index::WorksheetIndex;
 pub(crate) use read::read_shared_strings;
 
-/// A validated worksheet index retained only for the lifetime of an explicit view.
-/// All spans borrow the immutable XML supplied at construction.
+/// A validated worksheet index retained only for the lifetime of an explicit
+/// view or of one worksheet's edits. All spans borrow the immutable XML
+/// supplied at construction.
 pub(crate) struct PreparedWorksheet<'xml> {
     xml: &'xml [u8],
     index: WorksheetIndex<'xml>,
@@ -29,6 +30,11 @@ impl<'xml> PreparedWorksheet<'xml> {
             xml,
             index: WorksheetIndex::parse(xml)?,
         })
+    }
+
+    /// The XML this worksheet indexes.
+    pub(crate) fn xml(&self) -> &'xml [u8] {
+        self.xml
     }
 
     /// The address of every `<c>` element, in row-major order.
@@ -59,6 +65,26 @@ impl<'xml> PreparedWorksheet<'xml> {
     ) -> std::result::Result<Vec<CellContent>, ReadError> {
         read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
     }
+
+    /// Returns the indexed XML with `cells` written. This worksheet is left
+    /// unchanged, so its reads still return the cells as they were before
+    /// the edits. Every public edit path validates its values before reaching
+    /// the worksheet, so they are not checked again here.
+    ///
+    /// Shared strings are loaded at most once, only to recognize rewriting a
+    /// `t="s"` cell's current text; a table that is absent or fails to load
+    /// leaves such an edit as a change. `date1904` likewise recognizes
+    /// rewriting an ISO 8601 (`t="d"`) cell's serial. Returns the original
+    /// XML, borrowed, when nothing changes.
+    pub(crate) fn patch_cells<'strings>(
+        &self,
+        cells: &BTreeMap<CellRef, CellValue>,
+        shared_strings: impl FnMut() -> Option<&'strings [String]>,
+        date1904: bool,
+    ) -> Result<Cow<'xml, [u8]>> {
+        debug_assert!(cells.values().all(|value| value.validate().is_ok()));
+        patch::patch_cells(self.xml, &self.index, cells, shared_strings, date1904)
+    }
 }
 
 /// Why a read failed: a problem in the worksheet itself, or a failure to load
@@ -75,28 +101,6 @@ impl From<Error> for ReadError {
     fn from(error: Error) -> Self {
         Self::Worksheet(error)
     }
-}
-
-/// Parses and patches a worksheet. Every public edit path validates its values
-/// before reaching the worksheet, so they are not checked again here.
-///
-/// Shared strings are loaded at most once, only to recognize rewriting a
-/// `t="s"` cell's current text; a table that is absent or fails to load leaves
-/// such an edit as a change. `date1904` likewise recognizes rewriting an ISO
-/// 8601 (`t="d"`) cell's serial. Returns the original XML, borrowed, when
-/// nothing changes.
-pub(crate) fn patch_cells<'xml, 'strings>(
-    xml: &'xml [u8],
-    cells: &BTreeMap<CellRef, CellValue>,
-    shared_strings: impl FnMut() -> Option<&'strings [String]>,
-    date1904: bool,
-) -> Result<Cow<'xml, [u8]>> {
-    if cells.is_empty() {
-        return Ok(Cow::Borrowed(xml));
-    }
-    debug_assert!(cells.values().all(|value| value.validate().is_ok()));
-    let index = WorksheetIndex::parse(xml)?;
-    patch::patch_cells(xml, &index, cells, shared_strings, date1904)
 }
 
 pub(crate) fn read_cells<'strings>(
@@ -164,6 +168,16 @@ fn unique<T>(
         return Err(error());
     }
     Ok(first)
+}
+
+#[cfg(test)]
+fn patch_cells<'xml, 'strings>(
+    xml: &'xml [u8],
+    cells: &BTreeMap<CellRef, CellValue>,
+    shared_strings: impl FnMut() -> Option<&'strings [String]>,
+    date1904: bool,
+) -> Result<Cow<'xml, [u8]>> {
+    PreparedWorksheet::parse(xml)?.patch_cells(cells, shared_strings, date1904)
 }
 
 #[cfg(test)]

@@ -2261,3 +2261,40 @@ fn row_spans_reject_non_xml_whitespace() {
         ));
     }
 }
+
+#[test]
+fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
+    let input = sheet(
+        "<dimension ref='A2:B2'/><sheetData><row r='2'><c r='A2' t='s'><v>0</v></c><c r='B2'><v>5</v></c></row></sheetData>",
+    );
+    let strings = ["Name".to_owned()];
+    let cells = |worksheet: &PreparedWorksheet<'_>| {
+        let addresses = ["A1", "A2", "B2"].map(|address| address.parse().unwrap());
+        worksheet
+            .read_cells(&addresses, || Ok(Some(&strings)), false)
+            .unwrap()
+            .into_iter()
+            .map(|content| content.value)
+            .collect::<Vec<_>>()
+    };
+    let worksheet = PreparedWorksheet::parse(input.as_bytes()).unwrap();
+    // The new row and the widened dimension move every original cell.
+    let patched = worksheet
+        .patch_cells(
+            &BTreeMap::from([
+                ("A1".parse().unwrap(), "new".into()),
+                ("B2".parse().unwrap(), 8.0.into()),
+            ]),
+            || Some(&strings),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        cells(&worksheet),
+        [CellValue::Blank, "Name".into(), 5.0.into()]
+    );
+    assert_eq!(
+        cells(&PreparedWorksheet::parse(&patched).unwrap()),
+        ["new".into(), "Name".into(), 8.0.into()]
+    );
+}
