@@ -3079,6 +3079,24 @@ mod tests {
             Err(Error::InvalidWorkbook(message))
                 if message == "ambiguous ZIP end-of-directory records"
         ));
+        // A complete older archive followed by newer records puts the decoy
+        // right after its directory, which then ends exactly at the record.
+        let mut adjacent = stale.original[..stale.end + END_LEN].to_vec();
+        set_u16(&mut adjacent, stale.end + 20, 0);
+        let live_start = adjacent.len();
+        adjacent.extend_from_slice(&live.original[..live.central_start]);
+        let central_start = adjacent.len();
+        let mut central = live.original[live.central_start..live.end].to_vec();
+        set_u32(&mut central, 42, live_start as u32);
+        adjacent.extend_from_slice(&central);
+        let mut ending = live.original[live.end..].to_vec();
+        set_u32(&mut ending, 16, central_start as u32);
+        adjacent.extend_from_slice(&ending);
+        assert!(matches!(
+            Archive::new(adjacent),
+            Err(Error::InvalidWorkbook(message))
+                if message == "ambiguous ZIP end-of-directory records"
+        ));
         // That reader cannot select these records, so they stay comment bytes
         // that neither opening nor saving refuses.
         let unreadable: [fn(&mut [u8]); 8] = [
@@ -3423,15 +3441,15 @@ mod tests {
 
     #[test]
     fn saves_refuse_end_records_that_forward_scanning_readers_could_select() {
-        // A complete end record for a one-entry directory at `directory`,
-        // which libzip before 1.11 selects if a central-directory header
-        // starts there.
-        let decoy = |directory: usize| {
+        // A complete end record for a one-entry directory of `size` bytes at
+        // `directory`, which libzip before 1.11 selects if a central-directory
+        // header starts there and the directory ends by the record.
+        let decoy = |directory: usize, size: usize| {
             let mut decoy = vec![0; END_LEN];
             set_u32(&mut decoy, 0, END);
             set_u16(&mut decoy, 8, 1);
             set_u16(&mut decoy, 10, 1);
-            set_u32(&mut decoy, 12, CENTRAL_HEADER_LEN as u32);
+            set_u32(&mut decoy, 12, size as u32);
             set_u32(&mut decoy, 16, directory as u32);
             decoy
         };
@@ -3444,15 +3462,24 @@ mod tests {
         // bytes move the directory from 45 onto a decoy pointing at 49, and
         // with a long member after part.xml, its central-directory signature
         // from 183 onto a decoy pointing at 187. That decoy's directory lies
-        // before the output's last END_TAIL_LEN bytes.
+        // before the output's last END_TAIL_LEN bytes. The third decoy's
+        // directory spans part.xml's central header and ends exactly where
+        // the decoy, that entry's comment, starts.
         let cases = [
-            with_entry_comment(fixture(false), &decoy(49)),
+            with_entry_comment(fixture(false), &decoy(49, CENTRAL_HEADER_LEN)),
             with_entry_comment(
                 combine(
                     fixture(false),
                     stored_fixture(b"fill.bin", &filler(100), 0, None),
                 ),
-                &decoy(45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100),
+                &decoy(
+                    45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100,
+                    CENTRAL_HEADER_LEN,
+                ),
+            ),
+            with_entry_comment(
+                fixture(false),
+                &decoy(49, CENTRAL_HEADER_LEN + b"part.xml".len()),
             ),
         ];
         for original in cases {
