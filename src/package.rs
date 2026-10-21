@@ -422,21 +422,9 @@ impl Workbook {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = fs::File::open(path)?;
         let metadata = file.metadata()?;
-        let mut bytes = Vec::new();
-        if metadata.is_file() {
-            if metadata.len() > archive::MAX_ARCHIVE_LEN {
-                return Err(archive::archive_too_large());
-            }
-            // Fall back to an unsized read on targets where the length does
-            // not fit in memory; reading then reports the allocation failure.
-            if let Ok(len) = usize::try_from(metadata.len()) {
-                bytes
-                    .try_reserve_exact(len)
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-            }
-        }
         // Devices and pipes have no useful length; reading stops at the limit.
-        let mut workbook = Self::from_bytes(archive::read_archive(file, bytes)?)?;
+        let file_len = metadata.is_file().then_some(metadata.len());
+        let mut workbook = Self::from_bytes(archive::read_archive(file, file_len)?)?;
         // Pipes and devices carry no meaningful file permissions to inherit.
         workbook.source_permissions = metadata
             .is_file()
@@ -468,7 +456,7 @@ impl Workbook {
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
     pub fn from_reader(reader: impl std::io::Read) -> Result<Self> {
-        Self::from_bytes(archive::read_archive(reader, Vec::new())?)
+        Self::from_bytes(archive::read_archive(reader, None)?)
     }
 
     /// Open an in-memory workbook, retaining its original archive bytes.
@@ -978,13 +966,18 @@ impl Workbook {
     /// with contiguous local records stays contiguous; edited records do not
     /// accumulate as obsolete copies. Central-directory offsets may change.
     /// Without edits this returns the original bytes. Pending edits are retained.
+    /// Changed worksheets keep their compression method; a deflated one larger
+    /// than 2 MiB is compressed in 1 MiB segments on up to eight threads,
+    /// including the calling thread.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when an edited worksheet cannot be
-    /// written, for example because the output would exceed a ZIP32 limit or
-    /// its new central-directory offset would form an end-of-directory
-    /// signature exposed by the archive comment, making the archive ambiguous.
+    /// written, for example because the output would exceed a ZIP32 limit, or
+    /// because its new offsets, sizes, or checksums, or records moved to a new
+    /// distance from the end of the file, would form another end-of-directory
+    /// record or a ZIP64 locator that ZIP readers could select, making the
+    /// archive ambiguous.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.archive.write(&self.changed_parts())
     }
@@ -995,7 +988,8 @@ impl Workbook {
     /// central-directory offsets may change. The writer is flushed before this
     /// returns, so buffered writers passed by value still report write errors.
     /// An error after output has started, such as a failing writer, may leave a
-    /// partial archive; use `save` for atomic files.
+    /// partial archive; use `save` for atomic files. Changed worksheets are
+    /// compressed as described for [`Self::to_bytes`].
     ///
     /// # Errors
     ///
@@ -1010,20 +1004,22 @@ impl Workbook {
     /// offsets may change. Opaque ZIP prefixes or gaps cause an error. The writer
     /// is flushed before this returns. An error after output has started, such
     /// as a failing writer, may leave a partial archive; use `save_compact` for
-    /// files.
+    /// files. Changed worksheets are compressed as described for
+    /// [`Self::to_bytes`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] when writing or flushing fails, and
     /// [`Error::Unsupported`] when the archive has an opaque prefix, gaps, or
-    /// unrecognized obsolete records, which compaction would discard.
-    /// Otherwise fails like [`Self::to_bytes`].
+    /// obsolete records that compaction cannot recognize or verify, which it
+    /// would discard. Otherwise fails like [`Self::to_bytes`].
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changed_parts(), &mut writer)
     }
 
     /// Serialize a compact archive, removing obsolete ZIP records.
     /// Opaque ZIP prefixes or gaps cause an error. Pending edits are retained.
+    /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
     /// # Errors
     ///
@@ -1038,6 +1034,7 @@ impl Workbook {
     /// The original destination is retained if generation or writing fails.
     /// Using the input path as destination is supported.
     /// Saving does not clear pending edits or replace the retained original.
+    /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
     /// The destination must name a file. An existing destination must resolve
     /// to a regular file: directories, FIFOs, devices, and sockets are rejected
@@ -1075,7 +1072,8 @@ impl Workbook {
     /// Atomically save while removing recognizable obsolete ZIP records already
     /// present in the input. Opaque ZIP prefixes or gaps cause an error.
     /// Saving does not clear pending edits or replace the retained original.
-    /// Destinations and permissions are handled as described for [`Self::save`].
+    /// Destinations, permissions, and compression are handled as described for
+    /// [`Self::save`].
     ///
     /// # Errors
     ///
