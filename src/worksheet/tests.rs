@@ -283,7 +283,7 @@ fn shared_formula_indices_use_their_numeric_identity() {
         let invalid = input.replace("si='01'", &format!("si='{index}'"));
         assert!(matches!(
             edit(&invalid, "C1", 2.0.into()),
-            Err(Error::Unsupported(_))
+            Err(Error::InvalidWorkbook(_))
         ));
     }
 }
@@ -653,7 +653,7 @@ fn incomplete_formula_groups_block_every_edit_and_name_the_formula_cell() {
     ] {
         let input = sheet(&format!("<sheetData><row r='1'>{cell}</row></sheetData>"));
         assert!(
-            matches!(edit(&input, "C3", 2.0.into()), Err(Error::Unsupported(m)) if m == message),
+            matches!(edit(&input, "C3", 2.0.into()), Err(Error::InvalidWorkbook(m)) if m == message),
             "{cell}"
         );
     }
@@ -661,30 +661,54 @@ fn incomplete_formula_groups_block_every_edit_and_name_the_formula_cell() {
 
 #[test]
 fn unsorted_or_duplicate_rows_and_cells_are_rejected_with_their_location() {
-    for (rows, message) in [
+    // Duplicate, unsorted, or malformed coordinates leave a cell's position
+    // ambiguous and make the workbook invalid. Absent coordinates are valid
+    // but cannot be indexed.
+    for (rows, expected) in [
         (
             "<row r='2'/><row r='1'/>",
-            "row 1: duplicate, unsorted, or invalid row numbers",
+            "invalid workbook: row 1: duplicate, unsorted, or invalid row numbers",
         ),
         (
             "<row r='1'/><row r='1'/>",
-            "row 1: duplicate, unsorted, or invalid row numbers",
+            "invalid workbook: row 1: duplicate, unsorted, or invalid row numbers",
+        ),
+        (
+            "<row r='0'/>",
+            "invalid workbook: row 0: duplicate, unsorted, or invalid row numbers",
         ),
         (
             "<row r='1048577'/>",
-            "row 1048577: duplicate, unsorted, or invalid row numbers",
+            "invalid workbook: row 1048577: duplicate, unsorted, or invalid row numbers",
         ),
+        ("<row r='x'/>", "invalid workbook: invalid row number"),
         (
             "<row r='1'><c r='B1'/><c r='A1'/></row>",
-            "A1: duplicate, unsorted, or inconsistent cell references",
+            "invalid workbook: A1: duplicate, unsorted, or inconsistent cell references",
+        ),
+        (
+            "<row r='1'><c r='A1'/><c r='A1'/></row>",
+            "invalid workbook: A1: duplicate, unsorted, or inconsistent cell references",
         ),
         (
             "<row r='1'><c r='A2'/></row>",
-            "A2: duplicate, unsorted, or inconsistent cell references",
+            "invalid workbook: A2: duplicate, unsorted, or inconsistent cell references",
+        ),
+        (
+            "<row r='1'><c r='A0'/></row>",
+            "invalid workbook: row 1: invalid cell reference in worksheet",
+        ),
+        (
+            "<row r='1'><c r='XFE1'/></row>",
+            "invalid workbook: row 1: invalid cell reference in worksheet",
         ),
         (
             "<row r='3'><c/></row>",
-            "row 3: cells without explicit references",
+            "unsupported: row 3: cells without explicit references",
+        ),
+        (
+            "<row><c r='A1'/></row>",
+            "unsupported: rows without explicit row numbers",
         ),
     ] {
         let input = sheet(&format!("<sheetData>{rows}</sheetData>"));
@@ -692,10 +716,7 @@ fn unsorted_or_duplicate_rows_and_cells_are_rejected_with_their_location() {
             edit(&input, "C5", 2.0.into()).map(drop),
             read_cell(input.as_bytes(), "C5".parse().unwrap(), None).map(drop),
         ] {
-            assert!(
-                matches!(&result, Err(Error::Unsupported(m)) if m == message),
-                "{rows}: {result:?}"
-            );
+            assert_eq!(result.unwrap_err().to_string(), expected, "{rows}");
         }
     }
     // Positive control: sorted, distinct rows edit and read normally.
@@ -707,6 +728,62 @@ fn unsorted_or_duplicate_rows_and_cells_are_rejected_with_their_location() {
             .value,
         CellValue::Number(2.0)
     );
+}
+
+#[test]
+fn malformed_worksheet_structure_makes_the_workbook_invalid() {
+    for (input, message) in [
+        (
+            format!("<chartsheet xmlns='{TRANSITIONAL}'><sheetData/></chartsheet>"),
+            "expected an OOXML worksheet",
+        ),
+        (
+            "<worksheet><sheetData/></worksheet>".into(),
+            "worksheet has no OOXML namespace",
+        ),
+        (
+            sheet(""),
+            "worksheet must contain exactly one sheetData element",
+        ),
+        (
+            sheet("<sheetData/><sheetData/>"),
+            "worksheet must contain exactly one sheetData element",
+        ),
+        (
+            sheet("<sheetData/><mergeCells><mergeCell/></mergeCells>"),
+            "merged cells without a reference",
+        ),
+    ] {
+        for result in [
+            edit(&input, "A1", 2.0.into()).map(drop),
+            read_cell(input.as_bytes(), "A1".parse().unwrap(), None).map(drop),
+        ] {
+            assert!(
+                matches!(&result, Err(Error::InvalidWorkbook(m)) if m == message),
+                "{input}: {result:?}"
+            );
+        }
+    }
+    // A repeated or malformed dimension only refuses the edits that may need
+    // to widen it.
+    for (dimension, message) in [
+        (
+            "<dimension ref='A1'/><dimension ref='A1'/>",
+            "multiple worksheet dimensions",
+        ),
+        ("<dimension ref='nope'/>", "invalid cell range \"nope\""),
+        ("<dimension/>", "dimension without a reference"),
+    ] {
+        let input = sheet(&format!("{dimension}<sheetData/>"));
+        assert!(read_cell(input.as_bytes(), "A1".parse().unwrap(), None).is_ok());
+        assert!(
+            matches!(
+                edit(&input, "B2", 2.0.into()),
+                Err(Error::Unsupported(m)) if m == message
+            ),
+            "{dimension}"
+        );
+    }
 }
 
 #[test]
@@ -1672,7 +1749,7 @@ fn worksheet_range_references_accept_markers_anywhere_but_not_reversed_corners()
         assert!(
             matches!(
                 edit(&merged(reference), "A1", 2.0.into()),
-                Err(Error::Unsupported(m)) if m == message
+                Err(Error::InvalidWorkbook(m)) if m == message
             ),
             "{reference:?}"
         );
@@ -1942,6 +2019,40 @@ fn read_errors_name_the_cell() {
         read_cell(input.as_bytes(), "B2".parse().unwrap(), None),
         Err(Error::InvalidWorkbook(error)) if error == "B2: invalid cell style index"
     ));
+    // So do payloads that do not match their cell type or each other.
+    for (cell, message) in [
+        (
+            "<c r='B2' t='inlineStr'><v>1</v></c>",
+            "B2: inline string cell without an inline payload",
+        ),
+        (
+            "<c r='B2' t='s'><is><t>x</t></is></c>",
+            "B2: non-inline cell has an inline payload",
+        ),
+        (
+            "<c r='B2'><is><t>x</t></is></c>",
+            "B2: non-inline cell has an inline payload",
+        ),
+        (
+            "<c r='B2'><v>1</v><v>2</v></c>",
+            "B2: cell has multiple value payloads",
+        ),
+        (
+            "<c r='B2' t='inlineStr'><v>1</v><is><t>x</t></is></c>",
+            "B2: cell has multiple value payloads",
+        ),
+        (
+            "<c r='B2'><f>1</f><f>2</f><v>2</v></c>",
+            "B2: cell has multiple formulas",
+        ),
+    ] {
+        let input = sheet(&format!("<sheetData><row r='2'>{cell}</row></sheetData>"));
+        let error = read_cell(input.as_bytes(), "B2".parse().unwrap(), None).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(error) if error == message),
+            "{message}: {error:?}"
+        );
+    }
     // Valid ISO 8601 values outside the supported forms are unsupported.
     for (payload, message) in [
         (
@@ -2046,7 +2157,7 @@ fn shared_strings_stream_without_changing_error_precedence() {
         format!("<worksheet xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{unsupported}</worksheet>");
     assert!(matches!(
         read_shared_strings(wrong_root.as_bytes()),
-        Err(Error::Unsupported(error)) if error == "expected an OOXML shared-string table"
+        Err(Error::InvalidWorkbook(error)) if error == "expected an OOXML shared-string table"
     ));
 }
 

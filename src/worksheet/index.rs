@@ -1,6 +1,6 @@
 use super::parse::{Attributes, Element, NamespaceId, XmlDocument, parse};
 use super::validation::validate_ranges;
-use super::{at_cell, protected, protection, unique, unsupported};
+use super::{at_cell, invalid, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 // A worksheet reference such as a merge, formula group or dimension range.
 // Unlike `CellRange`'s parser, this accepts `$` markers anywhere and refuses
 // reversed corners instead of normalizing them. A third part is refused
-// because a corner can never contain `:`.
+// because a corner can never contain `:`. A malformed reference makes the
+// worksheet invalid.
 pub(super) fn reference_range(reference: &str) -> Result<CellRange> {
     let corner = |text: &str| -> Result<CellRef> {
         let cell = if text.contains('$') {
@@ -16,7 +17,7 @@ pub(super) fn reference_range(reference: &str) -> Result<CellRange> {
         } else {
             text.parse()
         };
-        cell.map_err(|_| unsupported(format!("invalid cell range {reference:?}")))
+        cell.map_err(|_| invalid(format!("invalid cell range {reference:?}")))
     };
     let (first, last) = match reference.split_once(':') {
         Some((first, last)) => (corner(first)?, corner(last)?),
@@ -26,7 +27,7 @@ pub(super) fn reference_range(reference: &str) -> Result<CellRange> {
         }
     };
     if first.row > last.row || first.column > last.column {
-        return Err(unsupported(format!("invalid cell range {reference:?}")));
+        return Err(invalid(format!("invalid cell range {reference:?}")));
     }
     Ok(CellRange::new(first, last))
 }
@@ -112,11 +113,11 @@ impl Formulas {
         {
             Some("shared") => {
                 let index_reference = formula.attr(attributes, "si").ok_or_else(|| {
-                    unsupported(format!("{address}: shared formula without an index"))
+                    invalid(format!("{address}: shared formula without an index"))
                 })?;
                 let index = trim_xml_whitespace(index_reference.value)
                     .parse::<u32>()
-                    .map_err(|_| unsupported(format!("{address}: invalid shared formula index")))?;
+                    .map_err(|_| invalid(format!("{address}: invalid shared formula index")))?;
                 let group = self.shared.entry(index).or_insert((address, false));
                 group.1 |= range.is_some();
             }
@@ -142,25 +143,29 @@ impl Formulas {
 fn worksheet_namespace(document: &XmlDocument) -> Result<NamespaceId> {
     let root = &document.elements[0];
     if root.namespace.is_unbound() {
-        return Err(unsupported("worksheet has no OOXML namespace"));
+        return Err(invalid("worksheet has no OOXML namespace"));
     }
     if root.local_name(document.source) != "worksheet"
         || !document.is_spreadsheet_namespace(root.namespace)
     {
-        return Err(unsupported("expected an OOXML worksheet"));
+        return Err(invalid("expected an OOXML worksheet"));
     }
     Ok(root.namespace)
 }
 
+// Row numbers and cell references are optional in the schema, but this index
+// needs them, so an absent one is unsupported. One that is malformed, out of
+// order, or repeated leaves its cells' positions ambiguous: the workbook is
+// invalid.
 fn row_number(row: &Element, attributes: &Attributes, previous: u32) -> Result<u32> {
     let reference = row
         .attr(attributes, "r")
         .ok_or_else(|| unsupported("rows without explicit row numbers"))?;
     let number = trim_xml_whitespace(reference.value)
         .parse::<u32>()
-        .map_err(|_| unsupported("invalid row number"))?;
+        .map_err(|_| invalid("invalid row number"))?;
     if number <= previous || number > CellRef::MAX_ROW {
-        return Err(unsupported(format!(
+        return Err(invalid(format!(
             "row {number}: duplicate, unsorted, or invalid row numbers"
         )));
     }
@@ -172,7 +177,7 @@ fn cell_address(cell: &Element, attributes: &Attributes, row: u32) -> Result<Cel
         .ok_or_else(|| unsupported(format!("row {row}: cells without explicit references")))?
         .value
         .parse()
-        .map_err(|_| unsupported(format!("row {row}: invalid cell reference in worksheet")))
+        .map_err(|_| invalid(format!("row {row}: invalid cell reference in worksheet")))
 }
 
 type RowIndex = (Vec<RowEntry>, Vec<(CellRef, usize)>);
@@ -206,7 +211,7 @@ fn index_rows(
             }
             let address = cell_address(cell, attributes, number)?;
             if address.row != number || address.column <= previous_column {
-                return Err(unsupported(format!(
+                return Err(invalid(format!(
                     "{address}: duplicate, unsorted, or inconsistent cell references"
                 )));
             }
@@ -247,7 +252,7 @@ fn merged_ranges(
             }
             let reference = merge
                 .attr(attributes, "ref")
-                .ok_or_else(|| unsupported("merged cells without a reference"))?;
+                .ok_or_else(|| invalid("merged cells without a reference"))?;
             ranges.push(reference_range(reference.value)?);
         }
     }
@@ -353,13 +358,14 @@ impl<'a> WorksheetIndex<'a> {
             attributes,
             ..
         } = document;
+        let one_sheet_data = || invalid("worksheet must contain exactly one sheetData element");
         let data_index = unique(
             elements[0]
                 .children(&elements)
                 .filter(|&index| elements[index].is(source, namespace, "sheetData")),
-            "worksheet must contain exactly one sheetData element",
+            one_sheet_data,
         )?
-        .ok_or_else(|| unsupported("worksheet must contain exactly one sheetData element"))?;
+        .ok_or_else(one_sheet_data)?;
         let mut formulas = Formulas::default();
         let (rows, cells) = index_rows(
             source,

@@ -176,7 +176,7 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
         true
     })?;
     if !is_string_table(&document) {
-        return Err(unsupported("expected an OOXML shared-string table"));
+        return Err(invalid("expected an OOXML shared-string table"));
     }
     if mixed_namespace {
         return Err(unsupported(
@@ -204,7 +204,7 @@ pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Op
             elements[child].is(source, namespace, "v")
                 || elements[child].is(source, namespace, "is")
         }),
-        "cell has multiple value payloads",
+        || invalid("cell has multiple value payloads"),
     )
 }
 
@@ -238,13 +238,13 @@ pub(super) fn decode_payload(
         .map_or("n", |attribute| attribute.value);
     if kind == "inlineStr" {
         if !payload.is(source, namespace, "is") {
-            return Err(unsupported("inline string cell without an inline payload"));
+            return Err(invalid("inline string cell without an inline payload"));
         }
         let text = rich_text(source, elements, payload_index, namespace)?;
         return Ok(StoredValue::Value(CellValue::Text(text)));
     }
     if !payload.is(source, namespace, "v") {
-        return Err(unsupported("non-inline cell has an inline payload"));
+        return Err(invalid("non-inline cell has an inline payload"));
     }
     let text = element_text(xml, payload)?;
     // Values that their cell type cannot hold make the workbook malformed;
@@ -309,7 +309,7 @@ fn stored_cell(
     let formulas = cell
         .children(elements)
         .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
-    let formula = unique(formulas, "cell has multiple formulas")?
+    let formula = unique(formulas, || invalid("cell has multiple formulas"))?
         .map(|formula| element_text(xml, &elements[formula]))
         .transpose()?;
     Ok((

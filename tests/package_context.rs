@@ -236,10 +236,15 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
             .unwrap();
         bytes[at + 3] = b'2';
     };
-    let cases: [(&str, Vec<u8>, Error); 5] = [
+    let cases: [(&str, Vec<u8>, Error); 6] = [
         (
             "unsorted rows",
             worksheet("<sheetData><row r='2'/><row r='1'/></sheetData>"),
+            Error::InvalidWorkbook(String::new()),
+        ),
+        (
+            "rows without numbers",
+            worksheet("<sheetData><row/></sheetData>"),
             Error::Unsupported(String::new()),
         ),
         (
@@ -255,7 +260,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         (
             "not a worksheet",
             format!("<chartsheet xmlns='{MAIN_NS}'/>").into_bytes(),
-            Error::Unsupported(String::new()),
+            Error::InvalidWorkbook(String::new()),
         ),
         (
             "checksum mismatch",
@@ -608,6 +613,20 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
     );
 }
 
+/// Adds a shared-string table to the workbook's parts.
+fn add_shared_strings(parts: &mut BTreeMap<String, Vec<u8>>, table: &[u8]) {
+    let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+    parts.insert(
+        "xl/_rels/workbook.xml.rels".into(),
+        rels.replace(
+            "</Relationships>",
+            &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+        )
+        .into_bytes(),
+    );
+    parts.insert("xl/sharedStrings.xml".into(), table.to_vec());
+}
+
 /// A Data worksheet whose A1 is the shared string at index 0 and B1 a number,
 /// with the given shared-string part, or none.
 fn shared_string_book(table: Option<&[u8]>) -> Workbook {
@@ -616,16 +635,7 @@ fn shared_string_book(table: Option<&[u8]>) -> Workbook {
     );
     let mut parts = parts(&[("Data", data)]);
     if let Some(table) = table {
-        let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
-        parts.insert(
-            "xl/_rels/workbook.xml.rels".into(),
-            rels.replace(
-                "</Relationships>",
-                &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
-            )
-            .into_bytes(),
-        );
-        parts.insert("xl/sharedStrings.xml".into(), table.to_vec());
+        add_shared_strings(&mut parts, table);
     }
     Workbook::from_bytes(archive(&parts)).unwrap()
 }
@@ -652,7 +662,7 @@ fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
         (
             "wrong root",
             format!("<worksheet xmlns='{MAIN_NS}'/>").into_bytes(),
-            Error::Unsupported(String::new()),
+            Error::InvalidWorkbook(String::new()),
         ),
     ];
     for (case, xml, expected) in cases {
@@ -703,18 +713,9 @@ fn table_headers_read_through_a_damaged_shared_string_table_name_that_part() {
         )
         .into_bytes(),
     );
-    let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
-    parts.insert(
-        "xl/_rels/workbook.xml.rels".into(),
-        rels.replace(
-            "</Relationships>",
-            &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
-        )
-        .into_bytes(),
-    );
-    parts.insert(
-        "xl/sharedStrings.xml".into(),
-        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si>").into_bytes(),
+    add_shared_strings(
+        &mut parts,
+        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si>").as_bytes(),
     );
     let mut book = Workbook::from_bytes(archive(&parts)).unwrap();
     let error = book.set_cell("Beta", "J1", "Other").unwrap_err();
@@ -746,4 +747,203 @@ fn shared_string_cells_without_a_table_are_invalid_cells_of_their_worksheet() {
         book.get_cell("Data", "B1").unwrap().value,
         CellValue::Number(2.0)
     );
+}
+
+/// A Data worksheet whose A1 is the shared string at index 0 and A2 a number,
+/// in an Excel table on A1:A2 whose header row is A1.
+fn every_part() -> BTreeMap<String, Vec<u8>> {
+    let data = format!(
+        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData>\
+         <row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2'><v>1</v></c></row>\
+         </sheetData><tableParts count='1'><tablePart r:id='t1'/></tableParts></worksheet>"
+    );
+    let mut parts = parts(&[("Data", data.into_bytes())]);
+    add_shared_strings(
+        &mut parts,
+        format!("<sst xmlns='{MAIN_NS}'><si><t>H</t></si></sst>").as_bytes(),
+    );
+    parts.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+    );
+    parts.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='A1:A2'><tableColumns count='1'><tableColumn id='1' name='H'/></tableColumns></table>").into_bytes(),
+    );
+    parts
+}
+
+#[test]
+fn each_kind_of_defect_has_one_variant_in_every_part() {
+    const WORKBOOK: &str = "xl/workbook.xml";
+    const SHEET: &str = "xl/worksheets/sheet1.xml";
+    const TABLE: &str = "xl/tables/table1.xml";
+    const STRINGS: &str = "xl/sharedStrings.xml";
+    let strict = "xmlns='http://purl.oclc.org/ooxml/spreadsheetml/main'";
+    let branch = |contents: &str| {
+        format!(
+            "<mc:AlternateContent xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006'><mc:Choice Requires='x'>{contents}</mc:Choice></mc:AlternateContent>"
+        )
+    };
+    // Each defect replaces text in one part.
+    let malformed: [(&str, &str, &str, String); 21] = [
+        ("wrong root", WORKBOOK, "workbook", "document".into()),
+        ("wrong root", SHEET, "worksheet", "document".into()),
+        ("wrong root", TABLE, "table", "document".into()),
+        ("wrong root", STRINGS, "sst", "document".into()),
+        (
+            "repeated container",
+            WORKBOOK,
+            "</sheets>",
+            "</sheets><sheets/>".into(),
+        ),
+        (
+            "repeated container",
+            SHEET,
+            "</sheetData>",
+            "</sheetData><sheetData/>".into(),
+        ),
+        ("invalid range", TABLE, "A1:A2", "nope".into()),
+        (
+            "invalid range",
+            SHEET,
+            "</sheetData>",
+            "</sheetData><mergeCells><mergeCell ref='nope'/></mergeCells>".into(),
+        ),
+        (
+            "invalid range",
+            SHEET,
+            "<v>1</v>",
+            "<f t='array' ref='nope'>1</f><v>1</v>".into(),
+        ),
+        ("missing range", TABLE, " ref='A1:A2'", String::new()),
+        (
+            "missing range",
+            SHEET,
+            "</sheetData>",
+            "</sheetData><mergeCells><mergeCell/></mergeCells>".into(),
+        ),
+        ("invalid cell reference", SHEET, "r='A2'", "r='nope'".into()),
+        (
+            "ill-typed attribute",
+            WORKBOOK,
+            "sheetId='1'",
+            "sheetId='1' state='x'".into(),
+        ),
+        (
+            "ill-typed attribute",
+            TABLE,
+            "ref='A1:A2'",
+            "ref='A1:A2' headerRowCount='x'".into(),
+        ),
+        (
+            "ill-typed attribute",
+            SHEET,
+            "<row r='2'>",
+            "<row r='x'>".into(),
+        ),
+        (
+            "ill-typed attribute",
+            SHEET,
+            "r='A2'",
+            "r='A2' s='x'".into(),
+        ),
+        (
+            "ill-typed attribute",
+            SHEET,
+            "<v>1</v>",
+            "<f t='shared' si='x' ref='A2'>1</f><v>1</v>".into(),
+        ),
+        (
+            "duplicate",
+            WORKBOOK,
+            "</sheets>",
+            "</sheets><workbookPr/><workbookPr/>".into(),
+        ),
+        (
+            "duplicate",
+            SHEET,
+            "<row r='2'>",
+            "<row r='1'/><row r='2'>".into(),
+        ),
+        ("duplicate", SHEET, "<v>1</v>", "<v>1</v><v>2</v>".into()),
+        (
+            "payload of the wrong type",
+            SHEET,
+            "r='A2'",
+            "r='A2' t='inlineStr'".into(),
+        ),
+    ];
+    let unhandled: [(&str, &str, &str, String); 7] = [
+        (
+            "mixed dialects",
+            WORKBOOK,
+            "</sheets>",
+            format!("</sheets><workbookPr {strict}/>"),
+        ),
+        (
+            "mixed dialects",
+            SHEET,
+            "</sheetData>",
+            format!("</sheetData><extLst {strict}/>"),
+        ),
+        (
+            "mixed dialects",
+            STRINGS,
+            "</si>",
+            format!("</si><extLst {strict}/>"),
+        ),
+        (
+            "hidden content",
+            WORKBOOK,
+            "</sheets>",
+            format!("</sheets>{}", branch("<workbookPr date1904='1'/>")),
+        ),
+        (
+            "hidden content",
+            SHEET,
+            "</sheetData>",
+            format!("{}</sheetData>", branch("<row r='3'/>")),
+        ),
+        (
+            "hidden content",
+            STRINGS,
+            "</sst>",
+            format!("{}</sst>", branch("<si><t>hidden</t></si>")),
+        ),
+        (
+            "missing optional reference",
+            SHEET,
+            "<row r='2'>",
+            "<row>".into(),
+        ),
+    ];
+    // The first error from opening the workbook, reading its cells, or
+    // editing the table body, which reads the table part.
+    let first_error = |parts: &BTreeMap<String, Vec<u8>>| {
+        let mut book = Workbook::from_bytes(archive(parts))?;
+        book.get_cells("Data", ["A1", "A2"])?;
+        book.set_cell("Data", "A2", 5)
+    };
+    assert!(first_error(&every_part()).is_ok());
+    // Malformed or ambiguous content makes the workbook invalid; valid
+    // content outside the supported scope is unsupported.
+    for (expected, cases) in [
+        (Error::InvalidWorkbook(String::new()), &malformed[..]),
+        (Error::Unsupported(String::new()), &unhandled[..]),
+    ] {
+        for (defect, part, from, to) in cases {
+            let mut parts = every_part();
+            let xml = String::from_utf8(parts[*part].clone()).unwrap();
+            let damaged = xml.replace(from, to);
+            assert_ne!(damaged, xml, "{defect} in {part}");
+            parts.insert(part.to_string(), damaged.into_bytes());
+            let error = first_error(&parts).unwrap_err();
+            assert_eq!(
+                discriminant(&error),
+                discriminant(&expected),
+                "{defect} in {part}: {error}"
+            );
+        }
+    }
 }

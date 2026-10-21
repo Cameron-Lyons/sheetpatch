@@ -180,6 +180,11 @@ impl SheetVisibility {
 /// worksheet's tables are parsed on first use, so a damaged or unsupported
 /// part is reported by the first read or edit that needs it, as
 /// [`Error::Xml`], [`Error::InvalidWorkbook`], or [`Error::Unsupported`].
+/// Malformed or ambiguous content, such as a value its cell type cannot hold,
+/// a cell reference that is not an address, or rows out of order, returns
+/// [`Error::InvalidWorkbook`]. Valid content that cannot be indexed safely,
+/// such as rows without explicit numbers or cells inside a
+/// markup-compatibility branch, returns [`Error::Unsupported`].
 /// Messages about a worksheet name it, and messages about another part, such
 /// as a shared-string table that cannot be loaded, name that part's path in
 /// the archive instead.

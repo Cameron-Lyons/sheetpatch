@@ -960,7 +960,6 @@ fn edit_refusals_name_the_cell() {
     );
     for (address, message) in [
         ("B1", "B1: unfamiliar XML inside the cell value payload"),
-        ("C1", "C1: cell has multiple value payloads"),
         (
             "D1",
             "D1: unfamiliar attributes inside the cell value payload",
@@ -972,6 +971,14 @@ fn edit_refusals_name_the_cell() {
             message
         );
     }
+    // Two payloads leave the cell's value ambiguous, which makes the
+    // workbook invalid rather than the edit unsupported.
+    let error = book.set_cell("Data", "C1", 5).unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidWorkbook(message)
+            if message == "worksheet \"Data\": C1: cell has multiple value payloads"),
+        "{error:?}"
+    );
     let mut book = workbook(
         "<sheetData><row r='1' spans='x'><c r='A1'><v>1</v></c></row></sheetData>",
         None,

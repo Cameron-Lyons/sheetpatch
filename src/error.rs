@@ -22,7 +22,10 @@ pub enum Error {
     /// An accessed XML part could not be parsed safely.
     Xml(String),
     /// The archive or workbook structure is invalid or ambiguous, including
-    /// malformed cell data such as a numeric cell whose value is not a number.
+    /// malformed cell data such as a numeric cell whose value is not a number,
+    /// and malformed worksheet or shared-string structure such as a cell
+    /// reference that is not an address, rows out of order, or a cell with
+    /// two values.
     InvalidWorkbook(String),
     /// An address or range is invalid or outside Excel's row and column limits.
     InvalidCellReference(String),
@@ -50,8 +53,9 @@ pub enum Error {
     },
     /// The input or requested operation is outside the supported scope: valid
     /// input the crate does not handle, such as an ISO 8601 date with a
-    /// time-zone offset, or an edit refused for a reason other than a
-    /// protected cell, such as a digitally signed package. See the
+    /// time-zone offset or a worksheet row without an explicit row number, or
+    /// an edit refused for a reason other than a protected cell, such as a
+    /// digitally signed package. See the
     /// [edit restrictions](crate::Workbook#edit-restrictions).
     Unsupported(String),
 }

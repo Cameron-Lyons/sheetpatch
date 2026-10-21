@@ -4,7 +4,7 @@ use super::read::{StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
 use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
-use crate::{CellRef, CellValue, Result};
+use crate::{CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 
 struct Edit {
@@ -496,7 +496,7 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
             .children(elements)
             .map(|child| &elements[child])
             .filter(|element| element.is(source, index.namespace, "dimension")),
-        "multiple worksheet dimensions",
+        || unsupported("multiple worksheet dimensions"),
     )?;
     let Some(dimension) = dimension else {
         return Ok(None);
@@ -504,7 +504,12 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     let reference = dimension
         .attr(&index.attributes, "ref")
         .ok_or_else(|| unsupported("dimension without a reference"))?;
-    let old = reference_range(reference.value)?;
+    // Reads ignore the dimension, so a malformed reference refuses only the
+    // edits that may need to widen it, like a malformed `spans` hint.
+    let old = reference_range(reference.value).map_err(|error| match error {
+        Error::InvalidWorkbook(message) => unsupported(message),
+        error => error,
+    })?;
     let range = changed_cells
         .iter()
         .fold(old, |range, &cell| range.including(cell));
