@@ -2496,3 +2496,15 @@ fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
         ["new".into(), "Name".into(), 8.0.into()]
     );
 }
+
+#[test]
+fn shared_string_tables_are_parsed_one_entry_at_a_time() {
+    // Each entry holds a normalized attribute value, and so does the root.
+    let entries = "<si><r><t a='&#49;'>a</t></r></si>".repeat(1000);
+    let input = format!("<sst xmlns='{TRANSITIONAL}' a='&#9;'>{entries}</sst>");
+    super::read::SHARED_STRING_PEAKS.set((0, 0));
+    let strings = read_shared_strings(input.as_bytes()).unwrap();
+    assert_eq!(strings.get(999).unwrap().unwrap(), "a");
+    // The root, then one entry's si, r and t elements and t's value.
+    assert_eq!(super::read::SHARED_STRING_PEAKS.get(), (4, 2));
+}

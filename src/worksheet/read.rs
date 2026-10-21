@@ -139,6 +139,14 @@ fn is_string_table(document: &XmlDocument) -> bool {
     root.local_name(document.source) == "sst" && document.is_spreadsheet_namespace(root.namespace)
 }
 
+// The most elements and normalized attribute values that the streaming
+// shared-string parse has held at once on this thread, for tests.
+#[cfg(test)]
+thread_local! {
+    pub(super) static SHARED_STRING_PEAKS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Decodes each string as its `si` element completes and then releases that
 /// subtree, so the parse holds one string's markup rather than the whole
 /// table while still validating every event.
@@ -158,6 +166,14 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
     let mut mixed_namespace = false;
     let mut table_error = None;
     let document = parse_with(xml, |document, index| {
+        #[cfg(test)]
+        SHARED_STRING_PEAKS.with(|peaks| {
+            let (elements, values) = peaks.get();
+            peaks.set((
+                elements.max(document.elements.len()),
+                values.max(document.attributes.normalized_len()),
+            ));
+        });
         if hidden_string || mixed_namespace || !is_string_table(document) {
             return true;
         }
