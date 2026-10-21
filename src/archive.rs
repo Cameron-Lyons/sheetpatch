@@ -402,9 +402,9 @@ fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
 }
 
 /// Whether a reader scanning forward could select an end record at `offset`:
-/// a complete single-disk record for a nonempty directory that ends before the
-/// record and starts with a central-directory header, and a comment that ends
-/// by EOF. Such a reader never prefers an empty directory to another one.
+/// a complete single-disk record for a nonempty directory, with a comment that
+/// ends by EOF, whose directory ends before the record and starts with a
+/// central-directory header. Such a reader never prefers an empty directory.
 ///
 /// A Stored embedded ZIP's own end record normally fails the last test,
 /// because its directory offset is relative to the embedded archive.
