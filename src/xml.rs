@@ -161,7 +161,7 @@ impl<'xml> NamespaceReader<'xml> {
 /// Resolved namespaces by prefix for one reader's active declaration scopes.
 /// Unrelated declarations do not evict inherited bindings, and ending a scope
 /// restores its parent's cache. Storage stays bounded by active bindings.
-pub(crate) struct NamespaceCache<T> {
+struct NamespaceCache<T> {
     scopes: Vec<CachedNamespaceScope<T>>,
     last: (String, Option<T>),
 }
@@ -228,12 +228,7 @@ impl<T: Clone> NamespaceCache<T> {
         self.last.1 = Some(value);
     }
 
-    pub(crate) fn get(
-        &mut self,
-        reader: &NamespaceReader<'_>,
-        name: QName<'_>,
-        attribute: bool,
-    ) -> Option<T> {
+    fn get(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, attribute: bool) -> Option<T> {
         let prefix = Self::key(name, attribute)?;
         self.synchronize(reader);
         if self.last.0 == prefix
@@ -247,13 +242,7 @@ impl<T: Clone> NamespaceCache<T> {
         Some(value)
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        reader: &NamespaceReader<'_>,
-        name: QName<'_>,
-        attribute: bool,
-        value: T,
-    ) {
+    fn insert(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, attribute: bool, value: T) {
         if let Some(prefix) = Self::key(name, attribute) {
             self.synchronize(reader);
             let scope = self.scope(reader, prefix);
@@ -397,7 +386,7 @@ pub(crate) fn valid_char(c: char) -> bool {
 /// vectorizes, into whether it holds such a control or any EF byte. ASCII and
 /// most other text holds neither; a chunk that does, such as one of
 /// full-width forms, takes a second look.
-pub(crate) fn valid_text(text: &str) -> bool {
+fn valid_text(text: &str) -> bool {
     valid_text_in_chunks::<128>(text)
 }
 
@@ -508,7 +497,7 @@ fn ncname(name: &str) -> bool {
 }
 
 // Element and attribute names follow Namespaces in XML's QName grammar.
-pub(crate) fn valid_qname(name: &str) -> bool {
+fn valid_qname(name: &str) -> bool {
     match name.split_once(':') {
         Some((prefix, local)) => ncname(prefix) && ncname(local),
         None => ncname(name),
@@ -516,7 +505,7 @@ pub(crate) fn valid_qname(name: &str) -> bool {
 }
 
 // PI targets follow XML's Name grammar, which allows colons without a prefix.
-pub(crate) fn valid_name(name: &str) -> bool {
+fn valid_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters.next().is_some_and(|c| c == ':' || name_start(c))
         && characters.all(|c| c == ':' || name_character(c))
@@ -524,15 +513,15 @@ pub(crate) fn valid_name(name: &str) -> bool {
 
 // The deepest element nesting accepted in an XML part. Deeper input is
 // refused as unsupported rather than malformed.
-pub(crate) const MAX_DEPTH: usize = 256;
+const MAX_DEPTH: usize = 256;
 
 // XML whitespace is exactly these four characters, unlike Rust's ASCII and
 // Unicode whitespace sets.
-pub(crate) fn is_space(byte: u8) -> bool {
+fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-pub(crate) fn whitespace(text: &str) -> bool {
+fn whitespace(text: &str) -> bool {
     text.bytes().all(is_space)
 }
 
@@ -586,7 +575,7 @@ fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
+fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
     let content = declaration.as_ref();
     let start = BytesStart::from_content(content, 3);
     validate_attribute_spacing(&start)?;
@@ -625,7 +614,7 @@ pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
 
 // quick-xml returns namespace declarations without attribute normalization.
 // Resolve entity references before comparing URIs or expanded attribute names.
-pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
+fn namespace(result: ResolveResult<'_>) -> Result<String> {
     match result {
         ResolveResult::Bound(ns) => {
             let attribute = XmlAttribute {
