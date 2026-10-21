@@ -2039,6 +2039,25 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_checks_of_long_attribute_lists_start_over_for_each_tag() {
+        // Past 16 attributes the checks use sets, reused across tags. Each
+        // later tag's 17th attribute repeats an earlier tag's name, plain or
+        // expanded, which is no duplicate.
+        let attributes = |name: &str, count: usize| -> String {
+            (1..=count).map(|n| format!(" {name}{n}='1'")).collect()
+        };
+        let xml = format!(
+            "<r xmlns:p='urn:p'><a{}/><b{} a1='1'/><c{}/><d{} p:a1='1'/></r>",
+            attributes("a", 17),
+            attributes("b", 16),
+            attributes("p:a", 17),
+            attributes("p:b", 16),
+        );
+        xml_nodes(xml.as_bytes(), root_only).unwrap();
+        crate::worksheet::parse_xml(xml.as_bytes()).unwrap();
+    }
+
+    #[test]
     fn namespace_pool_restarts_keep_every_check_and_retained_namespace() {
         let padding: String = (0..3 * NAMESPACE_LIMIT)
             .map(|n| format!("<x:a xmlns:x='urn:{n}' x:n='{n}'/>"))
