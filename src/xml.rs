@@ -842,12 +842,26 @@ impl<'xml> Attributes<'xml> {
 
     /// The attribute named `name` among those at `indexes`.
     pub(crate) fn find(&self, indexes: Range<usize>, name: &str) -> Option<AttrView<'_>> {
-        // Names compare as bytes, so only a match builds a view.
+        self.position(indexes, name).map(|index| self.view(index))
+    }
+
+    /// The value of the attribute named `name` among those at `indexes`,
+    /// borrowed from the source unless XML normalization changed it.
+    pub(crate) fn find_value(&self, indexes: Range<usize>, name: &str) -> Option<Cow<'xml, str>> {
+        let record = &self.records[self.position(indexes, name)?];
+        Some(if record.normalized == RAW_VALUE {
+            Cow::Borrowed(&self.source[record.value_start as usize..record.value_end as usize])
+        } else {
+            Cow::Owned(self.normalized[record.normalized as usize].to_string())
+        })
+    }
+
+    fn position(&self, indexes: Range<usize>, name: &str) -> Option<usize> {
+        // Names compare as bytes, so only a match reads a value.
         let xml = self.source.as_bytes();
         indexes
             .into_iter()
             .find(|&index| self.records[index].name(xml) == name.as_bytes())
-            .map(|index| self.view(index))
     }
 
     /// Discards the attributes from index `first` on, with their values.
