@@ -1006,8 +1006,8 @@ impl Workbook {
     ///
     /// Returns [`Error::Io`] when writing or flushing fails, and
     /// [`Error::Unsupported`] when the archive has an opaque prefix, gaps, or
-    /// unrecognized obsolete records, which compaction would discard.
-    /// Otherwise fails like [`Self::to_bytes`].
+    /// obsolete records that compaction cannot recognize or verify, which it
+    /// would discard. Otherwise fails like [`Self::to_bytes`].
     pub fn write_compact_to(&self, mut writer: impl Write) -> Result<()> {
         self.archive.compact_to(&self.changed_parts(), &mut writer)
     }

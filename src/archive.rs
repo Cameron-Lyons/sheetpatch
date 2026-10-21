@@ -213,6 +213,15 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }
 
+/// Compaction cannot prove a record in a gap obsolete. Readers never see the
+/// gap, so this refuses the operation rather than reporting an invalid archive.
+fn not_obsolete(error: Error) -> Error {
+    match error {
+        Error::InvalidWorkbook(message) => unsupported(format!("cannot compact: {message}")),
+        error => error,
+    }
+}
+
 fn zip64() -> Error {
     unsupported("ZIP64 workbooks are not supported")
 }
@@ -1320,7 +1329,7 @@ impl Archive {
         }
         let data_end = add(data_start, actual.compressed_size as usize)?;
         if has_descriptor {
-            descriptor_end(bytes, data_end, self.central_start, actual, name)
+            descriptor_end(bytes, data_end, self.central_start, actual, name).map_err(not_obsolete)
         } else {
             Ok(data_end)
         }
@@ -1469,8 +1478,8 @@ impl Archive {
         if !header.matches(descriptor.sizes, true)
             || crc32(&self.original[data_start..descriptor.data_end]) != descriptor.sizes.crc
         {
-            return Err(invalid(format!(
-                "obsolete ZIP size or checksum mismatch in {name}"
+            return Err(unsupported(format!(
+                "cannot compact obsolete ZIP record with a size or checksum mismatch in {name}"
             )));
         }
         let end = descriptor_end(
@@ -1479,10 +1488,11 @@ impl Archive {
             self.central_start,
             descriptor.sizes,
             name,
-        )?;
+        )
+        .map_err(not_obsolete)?;
         if end != descriptor.end {
-            return Err(invalid(format!(
-                "conflicting obsolete ZIP descriptor in {name}"
+            return Err(unsupported(format!(
+                "cannot compact conflicting obsolete ZIP descriptor in {name}"
             )));
         }
         Ok(end)
@@ -1507,8 +1517,8 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
                 FlushDecompress::None,
             )
             .map_err(|error| {
-                invalid(format!(
-                    "invalid obsolete deflate stream in {name}: {error}"
+                unsupported(format!(
+                    "cannot compact invalid obsolete deflate stream in {name}: {error}"
                 ))
             })?;
         if decoder.total_out() > MAX_READ as u64 {
@@ -1525,8 +1535,8 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
             });
         }
         if decoder.total_in() == previous_in && decoder.total_out() == previous_out {
-            return Err(invalid(format!(
-                "incomplete obsolete deflate stream in {name}"
+            return Err(unsupported(format!(
+                "cannot compact incomplete obsolete deflate stream in {name}"
             )));
         }
     }
@@ -2742,16 +2752,34 @@ mod tests {
 
     #[test]
     fn compaction_does_not_discard_corrupt_obsolete_records() {
-        let archive = Archive::new(fixture(true)).unwrap();
-        let mut changed = append(
-            &archive,
-            &BTreeMap::from([("part.xml".into(), b"updated".to_vec())]),
-        );
-        changed[archive.entries[0].data.start] ^= 1;
-        let archive = Archive::new(changed).unwrap();
-        let mut output = Vec::new();
-        assert!(archive.compact_to(&BTreeMap::new(), &mut output).is_err());
-        assert!(output.is_empty());
+        // A single final stored DEFLATE block holding the original payload.
+        let mut stored_block = vec![1, 7, 0, 0xf8, 0xff];
+        stored_block.extend_from_slice(b"<part/>");
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        // Corrupt the first payload byte of every encoding, or the checksum
+        // in a streaming stored header, which must be zero or match.
+        for (original, corrupt_header_byte) in [
+            (fixture(false), None),
+            (fixture(true), None),
+            (deflate_fixture(&stored_block), None),
+            (deflate_descriptor_fixture(true), None),
+            (fixture(true), Some(14)),
+        ] {
+            let archive = Archive::new(original).unwrap();
+            let mut bytes = append(&archive, &changes);
+            bytes[corrupt_header_byte.unwrap_or(archive.entries[0].data.start)] ^= 1;
+            // Readers never see the obsolete record, and saves keep it.
+            let archive = Archive::new(bytes.clone()).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"updated");
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), bytes);
+            // Compaction cannot verify it, so it refuses to discard it.
+            let mut output = Vec::new();
+            assert!(matches!(
+                archive.compact_to(&BTreeMap::new(), &mut output),
+                Err(Error::Unsupported(message)) if message.starts_with("cannot compact")
+            ));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
