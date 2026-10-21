@@ -167,16 +167,21 @@ fn owning_group_entry(acl: &[u8]) -> Option<u32> {
 /// directory's default ACL or, without one, the process umask.
 ///
 /// The hidden name, `.{prefix}.sheetpatch-{pid}-{n}.tmp`, starts with at most
-/// 32 bytes of the destination's file name, so a file left behind by a killed
-/// process can be traced to its workbook.
+/// 32 bytes of the destination's file name, up to any colon, so a file left
+/// behind by a killed process can be traced to its workbook.
 fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    // Bound the prefix to keep the temporary name short: a valid destination
-    // can already use the filesystem's full name limit.
-    let name = destination
+    let file_name = destination
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
+    // On Windows a colon starts the name of an alternate data stream: a prefix
+    // with one would write the temporary into a stream of another file, and
+    // removing it would leave that file behind. Every platform cuts there, so
+    // temporary names do not depend on the platform.
+    let name = file_name.split(':').next().unwrap_or_default();
+    // Bound the prefix to keep the temporary name short: a valid destination
+    // can already use the filesystem's full name limit.
     let mut end = name.len().min(32);
     while !name.is_char_boundary(end) {
         end -= 1;
@@ -1111,12 +1116,19 @@ mod tests {
         let long = format!("{}.xlsx", "x".repeat(40));
         // 33 bytes, so the cut at 32 bytes falls inside the last character.
         let euros = "€".repeat(11);
-        for (name, prefix) in [
+        let mut names = vec![
             ("book.xlsx", "book.xlsx".to_owned()),
             (".hidden.xlsx", ".hidden.xlsx".to_owned()),
             (&long, "x".repeat(32)),
             (&euros, "€".repeat(10)),
-        ] {
+        ];
+        // On Windows a colon in a destination name starts the name of an
+        // alternate data stream, so only Unix saves to this name.
+        if cfg!(unix) {
+            names.push(("v2:book.xlsx", "v2".to_owned()));
+        }
+        let saves = names.len();
+        for (name, prefix) in names {
             let destination = directory.join(name);
             let mut temporary = None;
             write(&destination, None, |writer| {
@@ -1139,7 +1151,7 @@ mod tests {
                 "{temporary}"
             );
         }
-        assert_eq!(directory.entries(), 4);
+        assert_eq!(directory.entries(), saves);
     }
 
     #[cfg(unix)]
