@@ -1,6 +1,6 @@
 use super::date::excel_serial;
 use super::index::{RowEntry, WorksheetIndex, reference_range};
-use super::parse::{Attribute, Element};
+use super::parse::{Attributes, Element};
 use super::read::{element_text, rich_text};
 use super::validation::validate_payload;
 use super::{at_cell, protected, protection, unique, unsupported};
@@ -27,14 +27,14 @@ impl EditPlan {
     }
 
     // Turns an empty element `<name/>` into `<name>contents</name>`.
-    fn expand(&mut self, element: &Element, mut contents: Vec<u8>) {
+    fn expand(&mut self, source: &str, element: &Element, mut contents: Vec<u8>) {
         let open_end = element.open_end();
         self.push(Edit {
             start: open_end - 2,
             end: open_end - 1,
             bytes: Vec::new(),
         });
-        contents.extend_from_slice(format!("</{}>", element.name).as_bytes());
+        contents.extend_from_slice(format!("</{}>", element.name(source)).as_bytes());
         self.push(Edit {
             start: open_end,
             end: open_end,
@@ -77,7 +77,7 @@ impl EditPlan {
 
 fn attribute_edit(
     element: &Element,
-    attributes: &[Attribute],
+    attributes: &Attributes,
     name: &str,
     value: Option<&str>,
 ) -> Option<Edit> {
@@ -133,12 +133,12 @@ fn value_type(value: &CellValue) -> Option<&'static str> {
     }
 }
 
-fn payload(prefix: &Element, value: &CellValue) -> Vec<u8> {
-    let v = prefix.qualified("v");
+fn payload(source: &str, prefix: &Element, value: &CellValue) -> Vec<u8> {
+    let v = prefix.qualified(source, "v");
     match value {
         CellValue::Text(text) => {
-            let is = prefix.qualified("is");
-            let t = prefix.qualified("t");
+            let is = prefix.qualified(source, "is");
+            let t = prefix.qualified(source, "t");
             format!(
                 "<{is}><{t} xml:space=\"preserve\">{}</{t}></{is}>",
                 text_escaped(text)
@@ -152,12 +152,18 @@ fn payload(prefix: &Element, value: &CellValue) -> Vec<u8> {
     }
 }
 
-fn new_cell(context: &Element, cell: CellRef, style: Option<u32>, value: &CellValue) -> Vec<u8> {
-    let c = context.qualified("c");
+fn new_cell(
+    source: &str,
+    context: &Element,
+    cell: CellRef,
+    style: Option<u32>,
+    value: &CellValue,
+) -> Vec<u8> {
+    let c = context.qualified(source, "c");
     let style = style.map_or(String::new(), |style| format!(" s=\"{style}\""));
     let kind = value_type(value).map_or(String::new(), |kind| format!(" t=\"{kind}\""));
     let mut output = format!("<{c} r=\"{cell}\"{style}{kind}>").into_bytes();
-    output.extend(payload(context, value));
+    output.extend(payload(source, context, value));
     output.extend_from_slice(format!("</{c}>").as_bytes());
     output
 }
@@ -181,34 +187,34 @@ fn unchanged_value<'s>(
     value: &CellValue,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
 ) -> bool {
-    let (elements, namespace) = (&index.elements, index.namespace);
+    let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
     let old = &elements[payload];
     let old_text = || element_text(xml, old).ok();
     match value {
-        CellValue::Number(number) if kind == "n" && old.is(namespace, "v") => old_text()
+        CellValue::Number(number) if kind == "n" && old.is(source, namespace, "v") => old_text()
             .and_then(|text| trim_xml_whitespace(&text).parse::<f64>().ok())
             .is_some_and(|old| old == *number),
         // An ISO 8601 date reads as its serial in the workbook's date system.
-        CellValue::Number(number) if kind == "d" && old.is(namespace, "v") => old_text()
+        CellValue::Number(number) if kind == "d" && old.is(source, namespace, "v") => old_text()
             .and_then(|text| excel_serial(trim_xml_whitespace(&text), current.date1904).ok())
             .is_some_and(|old| old == *number),
-        CellValue::Bool(boolean) if kind == "b" && old.is(namespace, "v") => old_text()
+        CellValue::Bool(boolean) if kind == "b" && old.is(source, namespace, "v") => old_text()
             .is_some_and(|text| match trim_xml_whitespace(&text) {
                 "1" | "true" => *boolean,
                 "0" | "false" => !*boolean,
                 _ => false,
             }),
-        CellValue::Text(text) if kind == "inlineStr" && old.is(namespace, "is") => {
-            rich_text(xml, elements, payload, namespace).is_ok_and(|old| old == *text)
+        CellValue::Text(text) if kind == "inlineStr" && old.is(source, namespace, "is") => {
+            rich_text(source, elements, payload, namespace).is_ok_and(|old| old == *text)
         }
-        CellValue::Text(text) if kind == "s" && old.is(namespace, "v") => old_text()
+        CellValue::Text(text) if kind == "s" && old.is(source, namespace, "v") => old_text()
             .and_then(|position| trim_xml_whitespace(&position).parse::<usize>().ok())
             .and_then(|position| (current.shared_strings)()?.get(position))
             .is_some_and(|old| old == text),
-        CellValue::Text(text) if kind == "str" && old.is(namespace, "v") => old_text()
+        CellValue::Text(text) if kind == "str" && old.is(source, namespace, "v") => old_text()
             .and_then(|old| excel_text(&old).ok())
             .is_some_and(|old| old == *text),
-        CellValue::Error(error) if kind == "e" && old.is(namespace, "v") => old_text()
+        CellValue::Error(error) if kind == "e" && old.is(source, namespace, "v") => old_text()
             .and_then(|old| excel_text(&old).ok())
             .is_some_and(|old| old == *error),
         _ => false,
@@ -224,22 +230,28 @@ fn patched_cell<'s>(
     edits: &mut EditPlan,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
 ) -> Result<bool> {
-    let (elements, attributes, namespace) = (&index.elements, &index.attributes, index.namespace);
+    let (source, elements, attributes, namespace) = (
+        index.source,
+        &index.elements,
+        &index.attributes,
+        index.namespace,
+    );
     let cell = &elements[cell_index];
     let value_child = unique(
         cell.children(elements).filter(|&child| {
-            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
+            elements[child].is(source, namespace, "v")
+                || elements[child].is(source, namespace, "is")
         }),
         "cell has multiple value payloads",
     )
     .map_err(|error| at_cell(address, error))?;
     if let Some(child) = value_child {
-        validate_payload(elements, attributes, child, namespace)
+        validate_payload(source, elements, attributes, child, namespace)
             .map_err(|error| at_cell(address, error))?;
     }
     let kind = cell
         .attr(attributes, "t")
-        .map_or("n", |attribute| attribute.value.as_ref());
+        .map_or("n", |attribute| attribute.value);
     let unchanged = if let Some(child) = value_child {
         unchanged_value(xml, index, kind, child, value, current)
     } else {
@@ -258,13 +270,13 @@ fn patched_cell<'s>(
     if cell.attr(attributes, "cm").is_some() {
         return Err(protected(address, protection::CELL_METADATA));
     }
-    let value_bytes = payload(cell, value);
+    let value_bytes = payload(source, cell, value);
     if let Some(kind) = attribute_edit(cell, attributes, "t", value_type(value)) {
         edits.push(kind);
     }
     if cell.empty {
         if !value_bytes.is_empty() {
-            edits.expand(cell, value_bytes);
+            edits.expand(source, cell, value_bytes);
         }
         return Ok(true);
     }
@@ -278,7 +290,7 @@ fn patched_cell<'s>(
         let position = cell
             .children(elements)
             .map(|child| &elements[child])
-            .find(|child| child.is(namespace, "extLst"))
+            .find(|child| child.is(source, namespace, "extLst"))
             .map_or(cell.close_start(), Element::start);
         edits.push(Edit {
             start: position,
@@ -292,7 +304,7 @@ fn patched_cell<'s>(
 fn spans_edit(
     row: &Element,
     row_number: u32,
-    attributes: &[Attribute],
+    attributes: &Attributes,
     columns: impl Iterator<Item = u16>,
 ) -> Result<Option<Edit>> {
     let Some(attribute) = row.attr(attributes, "spans") else {
@@ -357,7 +369,7 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
     let attributes = &index.attributes;
     let custom_format = row
         .attr(attributes, "customFormat")
-        .map(|attribute| trim_xml_whitespace(&attribute.value));
+        .map(|attribute| trim_xml_whitespace(attribute.value));
     if matches!(custom_format, None | Some("0" | "false")) {
         return Ok(RowStyle::ColumnDefault);
     }
@@ -367,7 +379,7 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
     let Some(style) = row.attr(attributes, "s") else {
         return Ok(RowStyle::Custom(0));
     };
-    trim_xml_whitespace(&style.value)
+    trim_xml_whitespace(style.value)
         .parse::<u32>()
         .map(RowStyle::Custom)
         .map_err(|_| unsupported(format!("{cell}: invalid row style index")))
@@ -388,7 +400,7 @@ fn patch_existing_row<'s>(
     changed_cells: &mut Vec<CellRef>,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
 ) -> Result<()> {
-    let elements = &index.elements;
+    let (source, elements) = (index.source, &index.elements);
     let element = &elements[row.element];
     let existing_cells = &index.cells[row.cells.clone()];
     let mut cell_position = 0;
@@ -407,7 +419,7 @@ fn patch_existing_row<'s>(
     let fallback = element
         .children(elements)
         .map(|child| &elements[child])
-        .find(|child| child.start() >= after_cells && child.is(index.namespace, "extLst"))
+        .find(|child| child.start() >= after_cells && child.is(source, index.namespace, "extLst"))
         .map_or(element.close_start(), Element::start);
     for &(&cell, value) in changes {
         while cell_position < existing_cells.len()
@@ -437,7 +449,7 @@ fn patch_existing_row<'s>(
                 RowStyle::ColumnDefault => index.column_style(cell)?,
                 RowStyle::Custom(style) => (style != 0).then_some(style),
             };
-            let bytes = new_cell(element, cell, style, value);
+            let bytes = new_cell(source, element, cell, style, value);
             if element.empty {
                 empty_row_cells.extend(bytes);
             } else {
@@ -467,7 +479,7 @@ fn patch_existing_row<'s>(
         edits.push(spans);
     }
     if element.empty {
-        edits.expand(element, empty_row_cells);
+        edits.expand(source, element, empty_row_cells);
     }
     Ok(())
 }
@@ -484,14 +496,15 @@ fn new_row(
     let mut cells = Vec::new();
     for &(&cell, value) in changes {
         if !matches!(value, CellValue::Blank) {
-            cells.extend(new_cell(data, cell, index.column_style(cell)?, value));
+            let style = index.column_style(cell)?;
+            cells.extend(new_cell(index.source, data, cell, style, value));
             changed_cells.push(cell);
         }
     }
     if cells.is_empty() {
         return Ok(None);
     }
-    let row = data.qualified("row");
+    let row = data.qualified(index.source, "row");
     let mut bytes = format!("<{row} r=\"{number}\">").into_bytes();
     bytes.extend(cells);
     bytes.extend_from_slice(format!("</{row}>").as_bytes());
@@ -504,12 +517,12 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     if changed_cells.is_empty() {
         return Ok(None);
     }
-    let elements = &index.elements;
+    let (source, elements) = (index.source, &index.elements);
     let dimension = unique(
         elements[0]
             .children(elements)
             .map(|child| &elements[child])
-            .filter(|element| element.is(index.namespace, "dimension")),
+            .filter(|element| element.is(source, index.namespace, "dimension")),
         "multiple worksheet dimensions",
     )?;
     let Some(dimension) = dimension else {
@@ -518,7 +531,7 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     let reference = dimension
         .attr(&index.attributes, "ref")
         .ok_or_else(|| unsupported("dimension without a reference"))?;
-    let old = reference_range(&reference.value)?;
+    let old = reference_range(reference.value)?;
     let range = changed_cells
         .iter()
         .fold(old, |range, &cell| range.including(cell));
@@ -601,7 +614,7 @@ pub(super) fn patch_cells<'a, 's>(
         }
     }
     if !empty_data_rows.is_empty() {
-        edits.expand(data, empty_data_rows);
+        edits.expand(index.source, data, empty_data_rows);
     }
     if let Some(edit) = dimension_edit(index, &changed_cells)? {
         edits.push(edit);

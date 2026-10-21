@@ -1,4 +1,4 @@
-use super::parse::{Attribute, Element, NamespaceId, XmlDocument, parse};
+use super::parse::{Attributes, Element, NamespaceId, XmlDocument, parse};
 use super::validation::validate_ranges;
 use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
@@ -64,16 +64,17 @@ pub(super) fn reference_range(reference: &str) -> Result<Range> {
 // its column's style, so reads and edits of existing cells are unaffected.
 type ColumnStyles = std::result::Result<Vec<(u32, u32, u32)>, &'static str>;
 
-fn column_styles<'a>(
-    elements: &[Element<'a>],
-    attributes: &[Attribute<'a>],
+fn column_styles(
+    source: &str,
+    elements: &[Element],
+    attributes: &Attributes,
     namespace: NamespaceId,
 ) -> ColumnStyles {
     let number = |column: &Element, name, default| {
         column
             .attr(attributes, name)
             .map_or(Ok(default), |attribute| {
-                trim_xml_whitespace(&attribute.value)
+                trim_xml_whitespace(attribute.value)
                     .parse::<u32>()
                     .map_err(|_| "invalid column definition")
             })
@@ -81,12 +82,12 @@ fn column_styles<'a>(
     let mut columns = Vec::new();
     for index in elements[0].children(elements) {
         let definitions = &elements[index];
-        if !definitions.is(namespace, "cols") {
+        if !definitions.is(source, namespace, "cols") {
             continue;
         }
         for index in definitions.children(elements) {
             let column = &elements[index];
-            if !column.is(namespace, "col") {
+            if !column.is(source, namespace, "col") {
                 continue;
             }
             let first = number(column, "min", 0)?;
@@ -125,11 +126,11 @@ struct Formulas {
 }
 
 impl Formulas {
-    fn add(&mut self, address: CellRef, formula: &Element, attributes: &[Attribute]) -> Result<()> {
+    fn add(&mut self, address: CellRef, formula: &Element, attributes: &Attributes) -> Result<()> {
         self.cells.insert(address);
         let range = formula
             .attr(attributes, "ref")
-            .map(|attribute| reference_range(&attribute.value))
+            .map(|attribute| reference_range(attribute.value))
             .transpose()
             .map_err(|error| at_cell(address, error))?;
         if let Some(range) = range {
@@ -137,13 +138,13 @@ impl Formulas {
         }
         match formula
             .attr(attributes, "t")
-            .map(|attribute| attribute.value.as_ref())
+            .map(|attribute| attribute.value)
         {
             Some("shared") => {
                 let index_reference = formula.attr(attributes, "si").ok_or_else(|| {
                     unsupported(format!("{address}: shared formula without an index"))
                 })?;
-                let index = trim_xml_whitespace(&index_reference.value)
+                let index = trim_xml_whitespace(index_reference.value)
                     .parse::<u32>()
                     .map_err(|_| unsupported(format!("{address}: invalid shared formula index")))?;
                 let group = self.shared.entry(index).or_insert((address, false));
@@ -173,17 +174,19 @@ fn worksheet_namespace(document: &XmlDocument) -> Result<NamespaceId> {
     if root.namespace.is_unbound() {
         return Err(unsupported("worksheet has no OOXML namespace"));
     }
-    if root.local_name() != "worksheet" || !document.is_spreadsheet_namespace(root.namespace) {
+    if root.local_name(document.source) != "worksheet"
+        || !document.is_spreadsheet_namespace(root.namespace)
+    {
         return Err(unsupported("expected an OOXML worksheet"));
     }
     Ok(root.namespace)
 }
 
-fn row_number(row: &Element, attributes: &[Attribute], previous: u32) -> Result<u32> {
+fn row_number(row: &Element, attributes: &Attributes, previous: u32) -> Result<u32> {
     let reference = row
         .attr(attributes, "r")
         .ok_or_else(|| unsupported("rows without explicit row numbers"))?;
-    let number = trim_xml_whitespace(&reference.value)
+    let number = trim_xml_whitespace(reference.value)
         .parse::<u32>()
         .map_err(|_| unsupported("invalid row number"))?;
     if number <= previous || number > CellRef::MAX_ROW {
@@ -194,7 +197,7 @@ fn row_number(row: &Element, attributes: &[Attribute], previous: u32) -> Result<
     Ok(number)
 }
 
-fn cell_address(cell: &Element, attributes: &[Attribute], row: u32) -> Result<CellRef> {
+fn cell_address(cell: &Element, attributes: &Attributes, row: u32) -> Result<CellRef> {
     cell.attr(attributes, "r")
         .ok_or_else(|| unsupported(format!("row {row}: cells without explicit references")))?
         .value
@@ -207,8 +210,9 @@ type RowIndex = (Vec<RowEntry>, Vec<(CellRef, usize)>);
 // Rows of `sheetData` and their cells need explicit, strictly increasing
 // addresses, so every lookup and insertion point is a binary search away.
 fn index_rows(
+    source: &str,
     elements: &[Element],
-    attributes: &[Attribute],
+    attributes: &Attributes,
     namespace: NamespaceId,
     data_index: usize,
     formulas: &mut Formulas,
@@ -218,7 +222,7 @@ fn index_rows(
     let mut previous_row = 0;
     for row_index in elements[data_index].children(elements) {
         let row = &elements[row_index];
-        if !row.is(namespace, "row") {
+        if !row.is(source, namespace, "row") {
             continue;
         }
         let number = row_number(row, attributes, previous_row)?;
@@ -227,7 +231,7 @@ fn index_rows(
         let mut previous_column = 0;
         for cell_index in row.children(elements) {
             let cell = &elements[cell_index];
-            if !cell.is(namespace, "c") {
+            if !cell.is(source, namespace, "c") {
                 continue;
             }
             let address = cell_address(cell, attributes, number)?;
@@ -240,7 +244,7 @@ fn index_rows(
             cells.push((address, cell_index));
             for formula in cell.children(elements) {
                 let formula = &elements[formula];
-                if formula.is(namespace, "f") {
+                if formula.is(source, namespace, "f") {
                     formulas.add(address, formula, attributes)?;
                 }
             }
@@ -255,25 +259,26 @@ fn index_rows(
 }
 
 fn merged_ranges(
+    source: &str,
     elements: &[Element],
-    attributes: &[Attribute],
+    attributes: &Attributes,
     namespace: NamespaceId,
 ) -> Result<Vec<Range>> {
     let mut ranges = Vec::new();
     for index in elements[0].children(elements) {
         let merges = &elements[index];
-        if !merges.is(namespace, "mergeCells") {
+        if !merges.is(source, namespace, "mergeCells") {
             continue;
         }
         for index in merges.children(elements) {
             let merge = &elements[index];
-            if !merge.is(namespace, "mergeCell") {
+            if !merge.is(source, namespace, "mergeCell") {
                 continue;
             }
             let reference = merge
                 .attr(attributes, "ref")
                 .ok_or_else(|| unsupported("merged cells without a reference"))?;
-            ranges.push(reference_range(&reference.value)?);
+            ranges.push(reference_range(reference.value)?);
         }
     }
     Ok(ranges)
@@ -285,6 +290,7 @@ fn merged_ranges(
 // suffices. Returns whether column definitions are hidden the same way, which
 // leaves a new cell's default style unknown.
 fn hidden_containers(
+    source: &str,
     elements: &[Element],
     namespace: NamespaceId,
     other_namespace: Option<NamespaceId>,
@@ -294,7 +300,7 @@ fn hidden_containers(
         element
             .parent()
             .map(|parent| &elements[parent])
-            .filter(|parent| parent.is(namespace, name))
+            .filter(|parent| parent.is(source, namespace, name))
     };
     let mut hidden_columns = false;
     for element in elements {
@@ -309,7 +315,7 @@ fn hidden_containers(
         if element.namespace != namespace {
             continue;
         }
-        match element.local_name() {
+        match element.local_name(source) {
             "row" if element.parent() != Some(data_index) => {
                 return Err(unsupported("row outside sheetData"));
             }
@@ -349,8 +355,10 @@ fn hidden_containers(
 // A worksheet's structure is indexed once. Byte spans remain relative to the
 // original document, so unrelated whitespace, prefixes and markup never move.
 pub(super) struct WorksheetIndex<'a> {
-    pub(super) elements: Vec<Element<'a>>,
-    pub(super) attributes: Vec<Attribute<'a>>,
+    /// The worksheet XML, which holds every element name and raw value.
+    pub(super) source: &'a str,
+    pub(super) elements: Vec<Element>,
+    pub(super) attributes: Attributes<'a>,
     /// Every cell of `sheetData` in document order, with its element index.
     pub(super) cells: Vec<(CellRef, usize)>,
     pub(super) namespace: NamespaceId,
@@ -371,6 +379,7 @@ impl<'a> WorksheetIndex<'a> {
         let namespace = worksheet_namespace(&document)?;
         let other_namespace = document.other_spreadsheet_namespace(namespace);
         let XmlDocument {
+            source,
             elements,
             attributes,
             ..
@@ -378,20 +387,27 @@ impl<'a> WorksheetIndex<'a> {
         let data_index = unique(
             elements[0]
                 .children(&elements)
-                .filter(|&index| elements[index].is(namespace, "sheetData")),
+                .filter(|&index| elements[index].is(source, namespace, "sheetData")),
             "worksheet must contain exactly one sheetData element",
         )?
         .ok_or_else(|| unsupported("worksheet must contain exactly one sheetData element"))?;
         let mut formulas = Formulas::default();
-        let (rows, cells) =
-            index_rows(&elements, &attributes, namespace, data_index, &mut formulas)?;
-        let mut column_styles = column_styles(&elements, &attributes, namespace);
-        let merged_ranges = merged_ranges(&elements, &attributes, namespace)?;
-        if hidden_containers(&elements, namespace, other_namespace, data_index)? {
+        let (rows, cells) = index_rows(
+            source,
+            &elements,
+            &attributes,
+            namespace,
+            data_index,
+            &mut formulas,
+        )?;
+        let mut column_styles = column_styles(source, &elements, &attributes, namespace);
+        let merged_ranges = merged_ranges(source, &elements, &attributes, namespace)?;
+        if hidden_containers(source, &elements, namespace, other_namespace, data_index)? {
             column_styles = Err("column definitions inside an unsupported XML container");
         }
         let incomplete_formula_group = formulas.first_incomplete_group();
         Ok(Self {
+            source,
             elements,
             attributes,
             cells,

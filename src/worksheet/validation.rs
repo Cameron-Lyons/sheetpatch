@@ -1,5 +1,5 @@
 use super::index::Range;
-use super::parse::{Attribute, Element, NamespaceId};
+use super::parse::{Attributes, Element, NamespaceId};
 use super::read::validate_rich_text_structure;
 use super::{protected, protection, unsupported};
 use crate::{CellRef, CellValue, Result};
@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 // Known rich text is the old value and may be replaced. Unfamiliar markup
 // within that value could carry other meaning: refuse to discard it.
 pub(super) fn validate_payload(
+    source: &str,
     elements: &[Element],
-    attributes: &[Attribute],
+    attributes: &Attributes,
     index: usize,
     namespace: NamespaceId,
 ) -> Result<()> {
@@ -17,17 +18,18 @@ pub(super) fn validate_payload(
     if element.namespace != namespace || element.opaque_markup {
         return Err(unsupported("unfamiliar XML inside the cell value payload"));
     }
-    if element.local_name() == "is" {
+    if element.local_name(source) == "is" {
         // The same hidden text that makes a scalar read ambiguous must not be
         // discarded by an edit, even when each individual tag is familiar.
-        validate_rich_text_structure(elements, index, namespace)?;
+        validate_rich_text_structure(source, elements, index, namespace)?;
     }
-    validate_payload_element(elements, attributes, index, namespace)
+    validate_payload_element(source, elements, attributes, index, namespace)
 }
 
 fn validate_payload_element(
+    source: &str,
     elements: &[Element],
-    attributes: &[Attribute],
+    attributes: &Attributes,
     index: usize,
     namespace: NamespaceId,
 ) -> Result<()> {
@@ -35,7 +37,7 @@ fn validate_payload_element(
     if element.namespace != namespace || element.opaque_markup {
         return Err(unsupported("unfamiliar XML inside the cell value payload"));
     }
-    let allowed_attributes: &[&str] = match element.local_name() {
+    let allowed_attributes: &[&str] = match element.local_name(source) {
         "v" | "is" | "r" | "rPr" => &[],
         "t" => &["xml:space"],
         "rPh" => &["sb", "eb"],
@@ -45,7 +47,7 @@ fn validate_payload_element(
         | "condense" | "extend" | "sz" | "u" | "vertAlign" | "scheme" => &["val"],
         _ => return Err(unsupported("unfamiliar XML inside the cell value payload")),
     };
-    if element.attributes(attributes).iter().any(|attribute| {
+    if element.attributes(attributes).any(|attribute| {
         attribute.name != "xmlns"
             && !attribute.name.starts_with("xmlns:")
             && !allowed_attributes.contains(&attribute.name)
@@ -54,11 +56,11 @@ fn validate_payload_element(
             "unfamiliar attributes inside the cell value payload",
         ));
     }
-    if matches!(element.local_name(), "v" | "t") && element.has_children() {
+    if matches!(element.local_name(source), "v" | "t") && element.has_children() {
         return Err(unsupported("elements inside a simple cell value payload"));
     }
     for child in element.children(elements) {
-        validate_payload_element(elements, attributes, child, namespace)?;
+        validate_payload_element(source, elements, attributes, child, namespace)?;
     }
     Ok(())
 }

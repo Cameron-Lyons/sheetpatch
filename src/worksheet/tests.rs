@@ -186,13 +186,14 @@ fn normalizes_literal_attribute_whitespace_before_character_references() {
         "<sheetData><row r=\"1\"><c r=\"A1\" x:flag=\"a\r\nb\rc\nd\te&#13;f&#10;g&#9;h\"/></row></sheetData>",
     );
     let XmlDocument {
+        source,
         elements,
         attributes,
         ..
     } = parse(input.as_bytes()).unwrap();
     let cell = elements
         .iter()
-        .find(|element| element.is(elements[0].namespace, "c"))
+        .find(|element| element.is(source, elements[0].namespace, "c"))
         .unwrap();
     assert_eq!(
         cell.attr(&attributes, "x:flag").unwrap().value,
@@ -1579,8 +1580,7 @@ fn attribute_lists_end_only_at_the_tag_terminator() {
             ..
         } = parse(input.as_bytes()).unwrap();
         let element = elements.last().unwrap();
-        let spans = element.attributes(&attributes);
-        assert!(spans.iter().all(|attribute| {
+        assert!(element.attributes(&attributes).all(|attribute| {
             input.as_bytes()[attribute.end() - 1] == input.as_bytes()[attribute.value_start() - 1]
         }));
         assert_eq!(
@@ -1627,8 +1627,92 @@ fn duplicate_attributes_are_found_in_tags_of_any_length() {
 #[cfg(target_pointer_width = "64")]
 fn parse_records_stay_compact() {
     use super::parse::{Attribute, Element};
-    assert_eq!(size_of::<Element>(), 64);
-    assert_eq!(size_of::<Attribute>(), 56);
+    assert_eq!(size_of::<Element>(), 48);
+    assert_eq!(size_of::<Attribute>(), 24);
+}
+
+#[test]
+fn element_names_match_whole_local_names() {
+    let input = sheet(&format!(
+        "<sheetData/><c/><s:c xmlns:s='{TRANSITIONAL}'/><x:c/><cc/><xc/><s:xc xmlns:s='{TRANSITIONAL}'/><x:sheetData/>"
+    ));
+    let XmlDocument {
+        source, elements, ..
+    } = parse(input.as_bytes()).unwrap();
+    let main = elements[0].namespace;
+    let mut matches = Vec::new();
+    for element in &elements {
+        for name in ["c", "xc", "sheetData", "worksheet"] {
+            let local = element.namespace == main && element.local_name(source) == name;
+            assert_eq!(element.is(source, main, name), local, "{name}");
+            if local {
+                matches.push(format!("{}={name}", element.name(source)));
+            }
+        }
+    }
+    assert_eq!(
+        matches,
+        [
+            "worksheet=worksheet",
+            "sheetData=sheetData",
+            "c=c",
+            "s:c=c",
+            "xc=xc",
+            "s:xc=xc"
+        ]
+    );
+}
+
+#[test]
+fn released_subtrees_take_their_normalized_attribute_values() {
+    // Every attribute but `n` has a value that normalization changes.
+    let input = format!(
+        "<sst xmlns='{TRANSITIONAL}' a='root&#9;value'>{}</sst>",
+        (0..6)
+            .map(|n| format!(
+                "<si n='{n}' a='&#{};' b='x&amp;{n}'><t c='one&#10;{n}'/></si>",
+                65 + n
+            ))
+            .collect::<String>()
+    );
+    let values = |document: &XmlDocument, index: usize| {
+        std::iter::once(index)
+            .chain(document.elements[index].descendants())
+            .flat_map(|element| document.elements[element].attributes(&document.attributes))
+            .map(|attribute| attribute.value.to_owned())
+            .collect::<Vec<_>>()
+    };
+    let expected = |n: u8| {
+        [
+            n.to_string(),
+            char::from(65 + n).to_string(),
+            format!("x&{n}"),
+            format!("one\n{n}"),
+        ]
+    };
+    let mut n = 0;
+    let document = super::parse::parse_with(input.as_bytes(), |document, index| {
+        assert_eq!(values(document, index), expected(n));
+        // Keep every other string and release the rest.
+        let release = n % 2 == 1;
+        n += 1;
+        release
+    })
+    .unwrap();
+    let kept: Vec<_> = document.elements[0]
+        .children(&document.elements)
+        .map(|index| values(&document, index))
+        .collect();
+    assert_eq!(kept, [expected(0), expected(2), expected(4)]);
+    assert_eq!(
+        document.elements[0]
+            .attr(&document.attributes, "a")
+            .unwrap()
+            .value,
+        "root\tvalue"
+    );
+    // The root's value and three for each kept string.
+    assert_eq!(document.attributes.normalized_len(), 1 + 3 * 3);
 }
 
 #[test]
