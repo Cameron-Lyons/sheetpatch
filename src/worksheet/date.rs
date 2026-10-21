@@ -142,3 +142,48 @@ pub(super) fn excel_serial(text: &str, date1904: bool) -> Result<f64, DateError>
     let next_day = (serial + 1) as f64;
     Ok((serial as f64 + fraction).min(next_day.next_down()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Month lengths come from a table independent of `date`, so a wrong
+    // month length there accepts an invalid day, and a wrong day count in
+    // `days_from_civil` skips or repeats a serial.
+    #[test]
+    fn every_calendar_day_has_the_next_serial() {
+        let month_days = |year: i64, month: i64| match month {
+            2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let mut previous = 0.0;
+        // The full 1900-9999 range takes seconds in a debug build.
+        for year in 1900..=2100 {
+            for month in 1..=12 {
+                let last = month_days(year, month);
+                for day in [0, last + 1] {
+                    assert_eq!(
+                        excel_serial(&format!("{year:04}-{month:02}-{day:02}"), false),
+                        Err(DateError::Invalid),
+                        "{year}-{month}-{day}"
+                    );
+                }
+                for day in 1..=last {
+                    let serial =
+                        excel_serial(&format!("{year:04}-{month:02}-{day:02}"), false).unwrap();
+                    // Excel counts a nonexistent 1900-02-29 as serial 60.
+                    let step = if (year, month, day) == (1900, 3, 1) {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    assert_eq!(serial, previous + step, "{year}-{month}-{day}");
+                    previous = serial;
+                }
+            }
+        }
+        assert_eq!(previous, 73_415.0);
+    }
+}

@@ -224,6 +224,13 @@ impl CellRange {
         (self.first.row..=self.last.row).contains(&cell.row)
             && (self.first.column..=self.last.column).contains(&cell.column)
     }
+    // The smallest range containing this range and the cell.
+    pub(crate) fn including(self, cell: CellRef) -> Self {
+        Self::new(
+            Self::new(self.first, cell).first,
+            Self::new(self.last, cell).last,
+        )
+    }
     /// Iterate over the range's cells in row-major order: every cell of the
     /// first row from left to right, then the next row.
     pub fn cells(self) -> CellRangeIter {

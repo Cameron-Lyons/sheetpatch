@@ -154,10 +154,14 @@ fn at_cell(cell: CellRef, error: Error) -> Error {
     }
 }
 
-fn unique<T>(mut items: impl Iterator<Item = T>, message: &'static str) -> Result<Option<T>> {
+// At most one item, or `error()` when there are more.
+fn unique<T>(
+    mut items: impl Iterator<Item = T>,
+    error: impl FnOnce() -> Error,
+) -> Result<Option<T>> {
     let first = items.next();
     if items.next().is_some() {
-        return Err(unsupported(message));
+        return Err(error());
     }
     Ok(first)
 }

@@ -256,16 +256,39 @@ fn empty_sheet_expansion_retains_whitespace_and_sorts_new_rows_and_cells() {
 
 #[test]
 fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() {
+    // Malformed ranges and formula groups make the workbook invalid; content
+    // hidden in a vendor container is unsupported.
     let cases = [
-        "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><mergeCells><mergeCell ref='B1:A1'/></mergeCells>",
-        "<sheetData><row r='1'><c r='A1'><f t='shared' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><f t='shared' si='bad' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><v>1</v><extLst><ext uri='keep'><v:foreign><f>1</f></v:foreign></ext></extLst></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><v:foreign><mergeCells><mergeCell ref='A1:B1'/></mergeCells></v:foreign>",
-        "<sheetData><v:foreign><row r='1'><c r='A1'><v>1</v></c></row></v:foreign></sheetData>",
-        "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><v:foreign><t>hidden</t></v:foreign></is></c></row></sheetData>",
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><mergeCells><mergeCell ref='B1:A1'/></mergeCells>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><f t='shared' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><f t='shared' si='bad' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v><extLst><ext uri='keep'><v:foreign><f>1</f></v:foreign></ext></extLst></c></row></sheetData>",
+            false,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><v:foreign><mergeCells><mergeCell ref='A1:B1'/></mergeCells></v:foreign>",
+            false,
+        ),
+        (
+            "<sheetData><v:foreign><row r='1'><c r='A1'><v>1</v></c></row></v:foreign></sheetData>",
+            false,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><v:foreign><t>hidden</t></v:foreign></is></c></row></sheetData>",
+            false,
+        ),
     ];
-    for body in cases {
+    for (body, invalid) in cases {
         let sheet = format!("<worksheet xmlns='{MAIN_NS}' xmlns:v='urn:vendor'>{body}</worksheet>");
         let original = fixture_with_replacements(&[(DATA_PATH, sheet.as_bytes())]);
         let book = Workbook::from_bytes(original.clone()).unwrap();
@@ -275,7 +298,14 @@ fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() 
             Err(error) => error,
         };
         assert_eq!(prepared.to_string(), direct.to_string(), "{body}");
-        assert!(matches!(direct, Error::Unsupported(_)), "{body}: {direct}");
+        if invalid {
+            assert!(
+                matches!(direct, Error::InvalidWorkbook(_)),
+                "{body}: {direct}"
+            );
+        } else {
+            assert!(matches!(direct, Error::Unsupported(_)), "{body}: {direct}");
+        }
         assert_eq!(book.to_bytes().unwrap(), original);
         assert!(!book.has_changes());
     }

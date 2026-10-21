@@ -8,7 +8,7 @@ use quick_xml::events::Event;
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
-pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
+fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     if element.has_children() {
         return Err(unsupported("elements inside a simple cell text value"));
     }
@@ -55,6 +55,7 @@ pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
 }
 
 pub(super) fn validate_rich_text_structure(
+    source: &str,
     elements: &[Element],
     index: usize,
     namespace: NamespaceId,
@@ -63,14 +64,15 @@ pub(super) fn validate_rich_text_structure(
     // return an incomplete scalar value. Phonetic text is a known, separate
     // annotation and remains excluded from the displayed text.
     for element in &elements[elements[index].descendants()] {
-        let known_container = element.is(namespace, "r") || element.is(namespace, "rPh");
-        let known_text = element.is(namespace, "t");
+        let known_container =
+            element.is(source, namespace, "r") || element.is(source, namespace, "rPh");
+        let known_text = element.is(source, namespace, "t");
         if (known_container && element.parent() != Some(index))
             || (known_text
                 && !element.parent().is_some_and(|parent| {
                     parent == index
-                        || ((elements[parent].is(namespace, "r")
-                            || elements[parent].is(namespace, "rPh"))
+                        || ((elements[parent].is(source, namespace, "r")
+                            || elements[parent].is(source, namespace, "rPh"))
                             && elements[parent].parent() == Some(index))
                 }))
         {
@@ -79,10 +81,10 @@ pub(super) fn validate_rich_text_structure(
         // CT_RElt permits one text element. Consumers can keep only the last
         // duplicate, so concatenating them would give reads and no-op detection
         // a different value. Each run's immediate children are scanned once.
-        if element.is(namespace, "r")
+        if element.is(source, namespace, "r")
             && element
                 .children(elements)
-                .filter(|&child| elements[child].is(namespace, "t"))
+                .filter(|&child| elements[child].is(source, namespace, "t"))
                 .nth(1)
                 .is_some()
         {
@@ -92,16 +94,16 @@ pub(super) fn validate_rich_text_structure(
     Ok(())
 }
 
-pub(super) fn rich_text(
-    xml: &[u8],
+fn rich_text(
+    source: &str,
     elements: &[Element],
     index: usize,
     namespace: NamespaceId,
 ) -> Result<String> {
-    validate_rich_text_structure(elements, index, namespace)?;
+    validate_rich_text_structure(source, elements, index, namespace)?;
     let mut text = String::new();
     let mut append = |element: &Element| -> Result<()> {
-        let piece = element_text(xml, element)?;
+        let piece = element_text(source.as_bytes(), element)?;
         // Only an underscore can start an Excel escape.
         let piece = if piece.contains('_') {
             excel_text(&piece)?
@@ -117,12 +119,12 @@ pub(super) fn rich_text(
     };
     for child in elements[index].children(elements) {
         let element = &elements[child];
-        if element.is(namespace, "t") {
+        if element.is(source, namespace, "t") {
             append(element)?;
-        } else if element.is(namespace, "r") {
+        } else if element.is(source, namespace, "r") {
             for child in element.children(elements) {
                 let element = &elements[child];
-                if element.is(namespace, "t") {
+                if element.is(source, namespace, "t") {
                     append(element)?;
                 }
             }
@@ -133,7 +135,7 @@ pub(super) fn rich_text(
 
 fn is_string_table(document: &XmlDocument) -> bool {
     let root = &document.elements[0];
-    root.local_name() == "sst" && document.is_spreadsheet_namespace(root.namespace)
+    root.local_name(document.source) == "sst" && document.is_spreadsheet_namespace(root.namespace)
 }
 
 /// Decodes each string as its `si` element completes and then releases that
@@ -151,6 +153,7 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
             return true;
         }
         let elements = &document.elements;
+        let source = document.source;
         let namespace = elements[0].namespace;
         // Every element below the root arrives in exactly one released
         // subtree, as the child itself or one of its descendants.
@@ -158,14 +161,14 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
             let element = &elements[current];
             mixed_namespace |= element.namespace != namespace
                 && document.is_spreadsheet_namespace(element.namespace);
-            hidden_string |= current != index && element.is(namespace, "si");
+            hidden_string |= current != index && element.is(source, namespace, "si");
         }
         if !hidden_string
             && !mixed_namespace
             && decode_error.is_none()
-            && elements[index].is(namespace, "si")
+            && elements[index].is(source, namespace, "si")
         {
-            match rich_text(xml, elements, index, namespace) {
+            match rich_text(source, elements, index, namespace) {
                 Ok(text) => strings.push(text),
                 Err(error) => decode_error = Some(error),
             }
@@ -173,7 +176,7 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
         true
     })?;
     if !is_string_table(&document) {
-        return Err(unsupported("expected an OOXML shared-string table"));
+        return Err(invalid("expected an OOXML shared-string table"));
     }
     if mixed_namespace {
         return Err(unsupported(
@@ -188,9 +191,21 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
 
 // A cell's stored value. A shared string is resolved separately: failing to
 // load the table concerns that part rather than the cell.
-enum StoredValue {
+pub(super) enum StoredValue {
     Value(CellValue),
     SharedString(usize),
+}
+
+// The cell's `v` or `is` payload, if it has one.
+pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
+    let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
+    unique(
+        cell.children(elements).filter(|&child| {
+            elements[child].is(source, namespace, "v")
+                || elements[child].is(source, namespace, "is")
+        }),
+        || invalid("cell has multiple value payloads"),
+    )
 }
 
 fn stored_value(
@@ -199,30 +214,37 @@ fn stored_value(
     cell: &Element,
     date1904: bool,
 ) -> Result<StoredValue> {
+    match value_payload(index, cell)? {
+        None => Ok(StoredValue::Value(CellValue::Blank)),
+        Some(payload_index) => decode_payload(xml, index, cell, payload_index, date1904),
+    }
+}
+
+// Decodes the cell's payload as reads see it; no-op detection compares an
+// edit against the same value.
+pub(super) fn decode_payload(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    cell: &Element,
+    payload_index: usize,
+    date1904: bool,
+) -> Result<StoredValue> {
     let elements = &index.elements;
+    let source = index.source;
     let namespace = index.namespace;
-    let payload_index = unique(
-        cell.children(elements).filter(|&child| {
-            elements[child].is(namespace, "v") || elements[child].is(namespace, "is")
-        }),
-        "cell has multiple value payloads",
-    )?;
-    let Some(payload_index) = payload_index else {
-        return Ok(StoredValue::Value(CellValue::Blank));
-    };
     let payload = &elements[payload_index];
     let kind = cell
         .attr(&index.attributes, "t")
-        .map_or("n", |attribute| attribute.value.as_ref());
+        .map_or("n", |attribute| attribute.value);
     if kind == "inlineStr" {
-        if !payload.is(namespace, "is") {
-            return Err(unsupported("inline string cell without an inline payload"));
+        if !payload.is(source, namespace, "is") {
+            return Err(invalid("inline string cell without an inline payload"));
         }
-        let text = rich_text(xml, elements, payload_index, namespace)?;
+        let text = rich_text(source, elements, payload_index, namespace)?;
         return Ok(StoredValue::Value(CellValue::Text(text)));
     }
-    if !payload.is(namespace, "v") {
-        return Err(unsupported("non-inline cell has an inline payload"));
+    if !payload.is(source, namespace, "v") {
+        return Err(invalid("non-inline cell has an inline payload"));
     }
     let text = element_text(xml, payload)?;
     // Values that their cell type cannot hold make the workbook malformed;
@@ -279,15 +301,15 @@ fn stored_cell(
     let style_index = cell
         .attr(&index.attributes, "s")
         .map(|attribute| {
-            trim_xml_whitespace(&attribute.value)
+            trim_xml_whitespace(attribute.value)
                 .parse::<u32>()
                 .map_err(|_| invalid("invalid cell style index"))
         })
         .transpose()?;
     let formulas = cell
         .children(elements)
-        .filter(|&child| elements[child].is(index.namespace, "f"));
-    let formula = unique(formulas, "cell has multiple formulas")?
+        .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
+    let formula = unique(formulas, || invalid("cell has multiple formulas"))?
         .map(|formula| element_text(xml, &elements[formula]))
         .transpose()?;
     Ok((

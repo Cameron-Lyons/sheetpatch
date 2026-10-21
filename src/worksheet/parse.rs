@@ -109,16 +109,76 @@ fn compact(value: usize) -> u32 {
     value as u32
 }
 
+// An attribute's value is its raw span unless XML normalization changed it.
+// Changed values live in a side table, which ordinary worksheets leave empty;
+// this index marks a value read from its span.
+const RAW_VALUE: u32 = u32::MAX;
+
+// One attribute's spans. Its name and raw value are read from the source, so
+// the record holds no pointers of its own.
 #[derive(Debug)]
-pub(super) struct Attribute<'a> {
+pub(super) struct Attribute {
+    start: u32,
+    name_start: u32,
+    name_end: u32,
+    value_start: u32,
+    value_end: u32,
+    // The value's index in `Attributes::normalized`, or `RAW_VALUE`.
+    normalized: u32,
+}
+
+impl Attribute {
+    fn name<'s>(&self, xml: &'s [u8]) -> &'s [u8] {
+        &xml[self.name_start as usize..self.name_end as usize]
+    }
+}
+
+/// Every attribute of a document, with the source their spans index.
+pub(super) struct Attributes<'xml> {
+    source: &'xml str,
+    records: Vec<Attribute>,
+    normalized: Vec<Box<str>>,
+}
+
+impl Attributes<'_> {
+    fn view(&self, index: usize) -> AttrView<'_> {
+        let record = &self.records[index];
+        // The parser checked that these spans lie on character boundaries.
+        let name = &self.source[record.name_start as usize..record.name_end as usize];
+        let value = if record.normalized == RAW_VALUE {
+            &self.source[record.value_start as usize..record.value_end as usize]
+        } else {
+            &self.normalized[record.normalized as usize]
+        };
+        AttrView {
+            name,
+            value,
+            start: record.start,
+            value_start: record.value_start,
+            value_end: record.value_end,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Attributes<'_> {
+    /// How many values the side table holds.
+    pub(super) fn normalized_len(&self) -> usize {
+        self.normalized.len()
+    }
+}
+
+/// An attribute's name and normalized value, with its spans.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AttrView<'a> {
     pub(super) name: &'a str,
-    pub(super) value: Cow<'a, str>,
+    pub(super) value: &'a str,
     start: u32,
     value_start: u32,
     value_end: u32,
 }
 
-impl Attribute<'_> {
+impl AttrView<'_> {
     /// The start of the whitespace that separates the attribute from the
     /// preceding name or attribute.
     pub(super) fn start(&self) -> usize {
@@ -137,8 +197,9 @@ impl Attribute<'_> {
 }
 
 #[derive(Debug)]
-pub(super) struct Element<'a> {
-    pub(super) name: &'a str,
+pub(super) struct Element {
+    // The qualified name follows the tag's `<`, so only its length is stored.
+    name_len: u32,
     pub(super) namespace: NamespaceId,
     parent: u32,
     children_start: u32,
@@ -153,7 +214,7 @@ pub(super) struct Element<'a> {
     pub(super) opaque_markup: bool,
 }
 
-impl<'xml> Element<'xml> {
+impl Element {
     pub(super) fn parent(&self) -> Option<usize> {
         (self.parent != NO_PARENT).then_some(self.parent as usize)
     }
@@ -176,29 +237,47 @@ impl<'xml> Element<'xml> {
     pub(super) fn descendants(&self) -> Range<usize> {
         self.children_start as usize..self.children_end as usize
     }
-    pub(super) fn local_name(&self) -> &str {
-        self.name.rsplit(':').next().unwrap()
+    fn name_span(&self) -> Range<usize> {
+        let start = self.start as usize + 1;
+        start..start + self.name_len as usize
     }
-    pub(super) fn is(&self, namespace: NamespaceId, name: &str) -> bool {
-        self.namespace == namespace && self.local_name() == name
+    /// The qualified name, read from the document's source.
+    pub(super) fn name<'s>(&self, source: &'s str) -> &'s str {
+        &source[self.name_span()]
+    }
+    pub(super) fn local_name<'s>(&self, source: &'s str) -> &'s str {
+        self.name(source).rsplit(':').next().unwrap()
+    }
+    pub(super) fn is(&self, source: &str, namespace: NamespaceId, name: &str) -> bool {
+        // Callers name an unprefixed local name, so it matches the whole
+        // qualified name or the bytes after its colon.
+        debug_assert!(!name.contains(':'));
+        let qualified = &source.as_bytes()[self.name_span()];
+        self.namespace == namespace
+            && qualified.ends_with(name.as_bytes())
+            && (qualified.len() == name.len()
+                || qualified[qualified.len() - name.len() - 1] == b':')
     }
     pub(super) fn attributes<'a>(
         &self,
-        attributes: &'a [Attribute<'xml>],
-    ) -> &'a [Attribute<'xml>] {
-        &attributes[self.attributes_start as usize..self.attributes_end as usize]
+        attributes: &'a Attributes<'_>,
+    ) -> impl Iterator<Item = AttrView<'a>> {
+        (self.attributes_start as usize..self.attributes_end as usize)
+            .map(|index| attributes.view(index))
     }
     pub(super) fn attr<'a>(
         &self,
-        attributes: &'a [Attribute<'xml>],
+        attributes: &'a Attributes<'_>,
         name: &str,
-    ) -> Option<&'a Attribute<'xml>> {
-        self.attributes(attributes)
-            .iter()
-            .find(|attr| attr.name == name)
+    ) -> Option<AttrView<'a>> {
+        // Names compare as bytes, so only a match builds a view.
+        let xml = attributes.source.as_bytes();
+        (self.attributes_start as usize..self.attributes_end as usize)
+            .find(|&index| attributes.records[index].name(xml) == name.as_bytes())
+            .map(|index| attributes.view(index))
     }
-    pub(super) fn qualified(&self, name: &str) -> String {
-        self.name
+    pub(super) fn qualified(&self, source: &str, name: &str) -> String {
+        self.name(source)
             .rsplit_once(':')
             .map_or_else(|| name.to_owned(), |(prefix, _)| format!("{prefix}:{name}"))
     }
@@ -207,7 +286,7 @@ impl<'xml> Element<'xml> {
         self.children_start < self.children_end
     }
 
-    pub(super) fn children<'a>(&self, elements: &'a [Element<'xml>]) -> Children<'a, 'xml> {
+    pub(super) fn children<'a>(&self, elements: &'a [Element]) -> Children<'a> {
         Children {
             elements,
             next: self.children_start as usize,
@@ -218,13 +297,13 @@ impl<'xml> Element<'xml> {
 
 // Elements are recorded in preorder. A child's subtree ends at the next
 // sibling, so the index needs no separately allocated list for each parent.
-pub(super) struct Children<'a, 'xml> {
-    pub(super) elements: &'a [Element<'xml>],
+pub(super) struct Children<'a> {
+    pub(super) elements: &'a [Element],
     pub(super) next: usize,
     pub(super) end: usize,
 }
 
-impl Iterator for Children<'_, '_> {
+impl Iterator for Children<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -254,7 +333,7 @@ struct AttributeChecks<'xml> {
     // Expanded names of the tag's ordinary prefixed attributes so far.
     expanded: Vec<(NamespaceId, &'xml str)>,
     // Used only by tags with many attributes.
-    names: HashSet<&'xml str>,
+    names: HashSet<&'xml [u8]>,
     expanded_names: HashSet<(NamespaceId, &'xml str)>,
 }
 
@@ -299,8 +378,7 @@ fn attribute_spans<'xml>(
     checks: &mut AttributeChecks<'xml>,
 ) -> Result<Range<usize>> {
     let xml = source.as_bytes();
-    let attributes = &mut document.attributes;
-    let attributes_start = attributes.len();
+    let attributes_start = document.attributes.records.len();
     checks.expanded.clear();
     loop {
         let whitespace_start = position;
@@ -323,10 +401,10 @@ fn attribute_spans<'xml>(
         if !valid_qname(name) {
             return Err(xml_error("invalid XML attribute name"));
         }
-        let earlier = attributes[attributes_start..]
+        let earlier = document.attributes.records[attributes_start..]
             .iter()
-            .map(|attribute| attribute.name);
-        if repeated(earlier, &mut checks.names, name) {
+            .map(|attribute| attribute.name(xml));
+        if repeated(earlier, &mut checks.names, name.as_bytes()) {
             return Err(xml_error("duplicate XML attribute"));
         }
         while position < open_end && is_space(xml[position]) {
@@ -389,24 +467,36 @@ fn attribute_spans<'xml>(
             }
             checks.expanded.push(expanded);
         }
+        // A borrowed value is the raw span itself and needs no storage.
+        let attributes = &mut document.attributes;
+        let normalized = match value {
+            Cow::Borrowed(_) => RAW_VALUE,
+            Cow::Owned(value) => {
+                attributes.normalized.push(value.into_boxed_str());
+                compact(attributes.normalized.len() - 1)
+            }
+        };
         arena_push(
-            attributes,
+            &mut attributes.records,
             Attribute {
-                name,
-                value,
                 start: compact(whitespace_start),
+                name_start: compact(name_start),
+                name_end: compact(name_start + name.len()),
                 value_start: compact(value_start),
                 value_end: compact(value_end),
+                normalized,
             },
         );
         position = value_end + 1;
     }
-    Ok(attributes_start..attributes.len())
+    Ok(attributes_start..document.attributes.records.len())
 }
 
 pub(super) struct XmlDocument<'xml> {
-    pub(super) elements: Vec<Element<'xml>>,
-    pub(super) attributes: Vec<Attribute<'xml>>,
+    /// The parsed XML, which holds every element name and raw value.
+    pub(super) source: &'xml str,
+    pub(super) elements: Vec<Element>,
+    pub(super) attributes: Attributes<'xml>,
     namespaces: NamespacePool,
 }
 
@@ -432,9 +522,18 @@ impl<'xml> XmlDocument<'xml> {
     // the child's subtree. The root is the only open element at that point.
     fn complete_child(&mut self, index: usize, release: &mut impl FnMut(&Self, usize) -> bool) {
         if release(self, index) {
-            let attributes = self.elements[index].attributes_start as usize;
+            let first = self.elements[index].attributes_start as usize;
             self.elements.truncate(index);
-            self.attributes.truncate(attributes);
+            // Normalized values are stored in attribute order, so the
+            // subtree's values begin with its first attribute that has one.
+            let attributes = &mut self.attributes;
+            if let Some(record) = attributes.records[first..]
+                .iter()
+                .find(|record| record.normalized != RAW_VALUE)
+            {
+                attributes.normalized.truncate(record.normalized as usize);
+            }
+            attributes.records.truncate(first);
         }
     }
 }
@@ -475,8 +574,13 @@ pub(super) fn parse_with<'xml>(
     let mut reader = NamespaceReader::from_reader(&xml[bom..]);
     reader.config_mut().check_comments = true;
     let mut document = XmlDocument {
+        source,
         elements: Vec::new(),
-        attributes: Vec::new(),
+        attributes: Attributes {
+            source,
+            records: Vec::new(),
+            normalized: Vec::new(),
+        },
         namespaces: NamespacePool::new(),
     };
     let mut checks = AttributeChecks::default();
@@ -517,7 +621,7 @@ pub(super) fn parse_with<'xml>(
                 arena_push(
                     &mut document.elements,
                     Element {
-                        name,
+                        name_len: compact(name.len()),
                         namespace,
                         parent: stack.last().map_or(NO_PARENT, |&parent| compact(parent)),
                         children_start: compact(index + 1),

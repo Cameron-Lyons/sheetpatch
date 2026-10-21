@@ -1236,6 +1236,12 @@ mod tests {
             "<a><b><c q:x='1'/></b></a>",
             "<a><b>&#1;</b></a>",
             "\u{feff}\u{feff}<a/>",
+            "<a>]]></a>",
+            "<a/>&amp;",
+            "<a/><![CDATA[x]]>",
+            "<a x='&#1;'/>",
+            "<a>\u{1}</a>",
+            "<a></b>",
         ] {
             assert!(xml_nodes(xml.as_bytes(), root_only).is_err(), "{xml}");
         }
