@@ -73,10 +73,10 @@ impl<'xml> PreparedWorksheet<'xml> {
     /// the worksheet, so they are not checked again here.
     ///
     /// The shared-string loader is called only to recognize rewriting a
-    /// `t="s"` cell's current text; a table that is absent or fails to load
-    /// leaves such an edit as a change. `date1904` likewise recognizes
-    /// rewriting an ISO 8601 (`t="d"`) cell's serial. Returns the original
-    /// XML, borrowed, when nothing changes.
+    /// `t="s"` cell's current text; a table that is absent or fails to load,
+    /// or an entry it cannot decode, leaves such an edit as a change.
+    /// `date1904` likewise recognizes rewriting an ISO 8601 (`t="d"`) cell's
+    /// serial. Returns the original XML, borrowed, when nothing changes.
     pub(crate) fn patch_cells<'strings>(
         &self,
         cells: &BTreeMap<CellRef, CellValue>,

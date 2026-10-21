@@ -194,7 +194,9 @@ impl SheetVisibility {
 /// that entry: reads of cells that use it fail with a message naming the
 /// part and the entry's index, such as
 /// `part "xl/sharedStrings.xml": string 1: …`, while other cells read
-/// normally. Rewriting such a cell counts as a change.
+/// normally. Rewriting such a cell counts as a change, so an edit of an
+/// Excel table header cell that uses it, whose current value must be read,
+/// fails with the same error.
 pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
@@ -534,9 +536,10 @@ impl Workbook {
     /// such as legacy `.xls` and password-encrypted (OLE compound) files,
     /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, encrypted
     /// ZIP entries, and a sheet name with an unpaired UTF-16 surrogate
-    /// escape, which names the sheet's position in the workbook. Returns [`Error::InvalidWorkbook`] or [`Error::Xml`] for a
-    /// damaged or ambiguous archive or package metadata. Worksheet XML is
-    /// checked when a worksheet is first read or edited.
+    /// escape, which names the sheet's position in the workbook. Returns
+    /// [`Error::InvalidWorkbook`] or [`Error::Xml`] for a damaged or ambiguous
+    /// archive or package metadata. Worksheet XML is checked when a worksheet
+    /// is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::new(bytes)?;
         let discovery::PackageMetadata {
