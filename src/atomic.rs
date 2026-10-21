@@ -58,7 +58,7 @@ impl Temporary {
 #[derive(Clone, Copy)]
 pub(crate) struct SourcePermissions {
     #[cfg(unix)]
-    mode: u32,
+    mode: Mode,
     #[cfg(unix)]
     gid: u32,
 }
@@ -77,7 +77,7 @@ impl SourcePermissions {
             #[cfg(not(target_os = "linux"))]
             let mode = {
                 let _ = file;
-                metadata.mode()
+                Mode::from(metadata.mode())
             };
             Self {
                 mode,
@@ -93,23 +93,67 @@ impl SourcePermissions {
     }
 }
 
+/// A file's mode bits, as a new file in its owning group receives them.
+///
+/// With an access ACL, Linux keeps the ACL's mask in the group mode bits. The
+/// mask only limits the owning group's own entry, which can grant less. A new
+/// file that inherits an access ACL from its directory's default ACL takes its
+/// group mode bits as that ACL's mask, so it keeps the mask; any other new
+/// file takes them as its owning group's permissions.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mode {
+    /// The mode bits, with the group bits the owning group actually has.
+    plain: u32,
+    /// The mode bits, with an access ACL's mask as the group bits.
+    masked: u32,
+}
+
+#[cfg(unix)]
+impl From<u32> for Mode {
+    /// The mode of a file without an access ACL.
+    fn from(mode: u32) -> Self {
+        Self {
+            plain: mode,
+            masked: mode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Mode {
+    /// The mode bits for `file`, a new file in the owning group.
+    fn of(self, file: &File) -> u32 {
+        // An empty buffer asks only whether the file has an access ACL, which
+        // a new file inherits from its directory's default ACL.
+        #[cfg(target_os = "linux")]
+        let has_acl = self.masked != self.plain
+            && rustix::fs::fgetxattr(file, ACCESS_ACL, &mut [0; 0]).is_ok();
+        // Elsewhere both modes are the file's mode bits as they are.
+        #[cfg(not(target_os = "linux"))]
+        let has_acl = {
+            let _ = file;
+            false
+        };
+        if has_acl { self.masked } else { self.plain }
+    }
+}
+
 /// The extended attribute that holds a Linux file's access ACL.
 #[cfg(target_os = "linux")]
 const ACCESS_ACL: &str = "system.posix_acl_access";
 
-/// The mode in a file's `metadata`, with the group bits its owning group
-/// actually has. `read_acl` reads the file's access ACL into a buffer.
+/// The mode of a file with `metadata`. `read_acl` reads the file's access ACL
+/// into a buffer.
 ///
-/// With an access ACL, Linux keeps the ACL's mask in the group mode bits. The
-/// mask only limits the owning group's own entry, which can grant less. A file
-/// without an ACL, or on a filesystem without them, keeps its mode. An ACL
-/// that cannot be read leaves the owning group's access unknown, so group and
-/// other bits are cleared.
+/// A file without an ACL, or on a filesystem without them, keeps its mode. An
+/// ACL that cannot be read leaves the owning group's access unknown, so group
+/// and other bits are cleared.
 #[cfg(target_os = "linux")]
 fn file_mode(
     metadata: &fs::Metadata,
     read_acl: impl FnOnce(&mut [u8]) -> rustix::io::Result<usize>,
-) -> u32 {
+) -> Mode {
     use rustix::io::Errno;
     use std::os::unix::fs::MetadataExt;
 
@@ -118,22 +162,25 @@ fn file_mode(
     match read_acl(&mut value) {
         Ok(len) => effective_mode(metadata.mode(), Some(&value[..len])),
         Err(Errno::NODATA | Errno::NOTSUP) => effective_mode(metadata.mode(), None),
-        Err(_) => metadata.mode() & !0o077,
+        Err(_) => Mode::from(metadata.mode() & !0o077),
     }
 }
 
-/// `st_mode`, whose group bits hold the mask of the access ACL `acl`, with
-/// those bits ANDed with the ACL's entry for the owning group. Without an ACL
-/// the mode is unchanged. An ACL that cannot be parsed clears the group and
-/// other bits.
+/// The mode of a file with `st_mode`, whose group bits hold the mask of the
+/// access ACL `acl`: its plain group bits are the mask ANDed with the ACL's
+/// entry for the owning group. Without an ACL the mode is unchanged. An ACL
+/// that cannot be parsed clears the group and other bits.
 #[cfg(target_os = "linux")]
-fn effective_mode(st_mode: u32, acl: Option<&[u8]>) -> u32 {
+fn effective_mode(st_mode: u32, acl: Option<&[u8]>) -> Mode {
     let Some(acl) = acl else {
-        return st_mode;
+        return Mode::from(st_mode);
     };
     match owning_group_entry(acl) {
-        Some(permissions) => (st_mode & !0o070) | (st_mode & (permissions << 3)),
-        None => st_mode & !0o077,
+        Some(permissions) => Mode {
+            plain: (st_mode & !0o070) | (st_mode & (permissions << 3)),
+            masked: st_mode,
+        },
+        None => Mode::from(st_mode & !0o077),
     }
 }
 
@@ -280,11 +327,18 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
         rustix::fs::getxattr(path, ACCESS_ACL, value)
     });
     #[cfg(not(target_os = "linux"))]
-    let mode = destination.mode();
+    let mode = Mode::from(destination.mode());
     // Owner-only until the replacement has the destination's group, so no
     // group can open it yet.
-    let temp = create_temporary(path, Some(mode & 0o700))?;
+    let temp = create_temporary(path, Some(mode.plain & 0o700))?;
     let same_group = assign_group(temp.file(), destination.gid())?;
+    // In another group, the group bits are cleared and the owning group's
+    // actual permissions limit others.
+    let mode = if same_group {
+        mode.of(temp.file())
+    } else {
+        mode.plain
+    };
     temp.file()
         .set_permissions(fs::Permissions::from_mode(replacement_mode(
             mode, same_group,
@@ -312,7 +366,15 @@ fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporar
     let Some(source) = source else {
         return create_temporary(path, None);
     };
-    let temp = create_temporary(path, Some(source.mode & 0o777))?;
+    // A file that inherits an access ACL takes the source's mask as its own.
+    // Any other file would grant the mask to its owning group, so it is
+    // discarded unwritten and created with the group's actual permissions.
+    let mut temp = create_temporary(path, Some(source.mode.masked & 0o777))?;
+    let mode = source.mode.of(temp.file());
+    if mode != source.mode.masked {
+        drop(temp);
+        temp = create_temporary(path, Some(mode & 0o777))?;
+    }
     let created = temp.file().metadata()?;
     if created.gid() == source.gid {
         return Ok(temp);
@@ -330,6 +392,13 @@ fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporar
         create_temporary(path, Some(mode & 0o700))?
     };
     let same_group = assign_group(temp.file(), source.gid)?;
+    // As for a replacement, the source's owning group's actual permissions
+    // limit others in another group.
+    let mode = if same_group {
+        mode
+    } else {
+        mode & source.mode.plain
+    };
     temp.file()
         .set_permissions(fs::Permissions::from_mode(replacement_mode(
             mode, same_group,
@@ -368,8 +437,9 @@ fn sync_directory(_: &Path) {}
 /// destination uses the `source` file's mode bits, under the OS's default ACL
 /// or umask rules and the same group rule, or the default mode when it is
 /// `None`. ACLs are not preserved; inherited ACLs can grant additional access.
-/// On Linux, the group bits of a file with an access ACL are the owning
-/// group's own entry as limited by the ACL's mask, not the mask alone.
+/// On Linux, the group bits of a file with an access ACL hold the ACL's mask.
+/// A new file that inherits an access ACL from its directory keeps that mask;
+/// any other gets the owning group's own entry as limited by the mask.
 /// Setuid, setgid and sticky bits are never applied.
 pub(crate) fn write(
     path: &Path,
@@ -750,7 +820,7 @@ mod tests {
             fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).unwrap();
             // A private source must not override an existing file's mode.
             let source = SourcePermissions {
-                mode: 0o600,
+                mode: Mode::from(0o600),
                 gid: default_gid,
             };
             write(&destination, Some(source), |writer| {
@@ -810,7 +880,7 @@ mod tests {
         let umask = umask(&directory);
         let destination = directory.join("private-to-group.xlsx");
         let source = SourcePermissions {
-            mode: 0o604,
+            mode: Mode::from(0o604),
             gid: foreign,
         };
         // Check both the temporary during serialization and the saved file.
@@ -858,7 +928,10 @@ mod tests {
             ("default.xlsx", None, 0o666),
         ] {
             let destination = directory.join(name);
-            let source = permissions.map(|mode| SourcePermissions { mode, gid });
+            let source = permissions.map(|mode| SourcePermissions {
+                mode: Mode::from(mode),
+                gid,
+            });
             write(&destination, source, |writer| {
                 writer.write_all(b"new")?;
                 Ok(())
@@ -884,7 +957,7 @@ mod tests {
         // The source's own group: the mode applies from creation.
         let destination = directory.join("same.xlsx");
         let source = SourcePermissions {
-            mode: 0o640,
+            mode: Mode::from(0o640),
             gid: default,
         };
         assert_eq!(create(&destination, source), expected);
@@ -895,7 +968,7 @@ mod tests {
         if let Some(foreign) = foreign_gid(&directory.0) {
             let destination = directory.join("foreign.xlsx");
             let source = SourcePermissions {
-                mode: 0o640,
+                mode: Mode::from(0o640),
                 gid: foreign,
             };
             assert_eq!(create(&destination, source) & 0o070, 0);
@@ -911,7 +984,7 @@ mod tests {
         };
         let destination = directory.join("other.xlsx");
         let source = SourcePermissions {
-            mode: 0o640,
+            mode: Mode::from(0o640),
             gid: other,
         };
         create(&destination, source);
@@ -927,7 +1000,7 @@ mod tests {
         assert_eq!(default_gid(&shared), other);
         let destination = shared.join("inherited.xlsx");
         let source = SourcePermissions {
-            mode: 0o640,
+            mode: Mode::from(0o640),
             gid: default,
         };
         assert_eq!(create(&destination, source), expected);
@@ -935,7 +1008,7 @@ mod tests {
         if let Some(foreign) = foreign_gid(&shared) {
             let destination = shared.join("foreign.xlsx");
             let source = SourcePermissions {
-                mode: 0o640,
+                mode: Mode::from(0o640),
                 gid: foreign,
             };
             assert_eq!(create(&destination, source) & 0o070, 0);
@@ -1006,6 +1079,63 @@ mod tests {
         assert_eq!(directory.entries(), 5);
     }
 
+    /// Give `directory` a default ACL that shares new files with one other
+    /// user, but not with their owning group: new files inherit user:65534:rw-,
+    /// group::--- and other::r--, and their group mode bits set the inherited
+    /// ACL's mask. Returns false when `setfacl` is missing or the filesystem
+    /// refuses ACLs.
+    #[cfg(target_os = "linux")]
+    fn share_new_files_with_one_user(directory: &Path) -> bool {
+        std::process::Command::new("setfacl")
+            .args(["-d", "-m", "u:65534:rw,g::-,o::r"])
+            .arg(directory)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_access_acls_keep_their_mask() {
+        let directory = TempDir::new("default-acl");
+        if !share_new_files_with_one_user(&directory.0) {
+            return;
+        }
+        // The default ACL replaces the umask: the mask is rw-, so the other
+        // user can write, while the owning group has no access.
+        let destination = directory.join("book.xlsx");
+        fs::write(&destination, b"original").unwrap();
+        assert_eq!(mode(&destination), 0o664);
+        let file = File::open(&destination).unwrap();
+        let source = SourcePermissions::new(&file, &file.metadata().unwrap());
+        drop(file);
+
+        // The replacement and a new copy inherit the same ACL, so their group
+        // bits are its mask again. The owning group's own entry, ---, would
+        // take the other user's write access away.
+        replace(&destination, b"replacement").unwrap();
+        assert_eq!(mode(&destination), 0o664);
+        let file = File::open(&destination).unwrap();
+        let replaced = SourcePermissions::new(&file, &file.metadata().unwrap());
+        assert_eq!(replaced.mode.plain & 0o777, 0o604);
+        let created = directory.join("new.xlsx");
+        assert_eq!(create(&created, source), 0o664);
+        assert_eq!(mode(&created), 0o664);
+
+        // A copy in a group the process cannot assign drops the mask, and the
+        // owning group's own entry still limits others.
+        let Some(foreign) = foreign_gid(&directory.0) else {
+            return;
+        };
+        let source = SourcePermissions {
+            gid: foreign,
+            ..source
+        };
+        let destination = directory.join("foreign.xlsx");
+        assert_eq!(create(&destination, source), 0o600);
+        assert_eq!(mode(&destination), 0o600);
+        assert_eq!(directory.entries(), 3);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn symlinked_destinations_use_the_access_acl_of_their_target() {
@@ -1050,7 +1180,7 @@ mod tests {
             value
         }
 
-        assert_eq!(effective_mode(0o100_664, None), 0o100_664);
+        assert_eq!(effective_mode(0o100_664, None), Mode::from(0o100_664));
         // `chmod 604; setfacl -m u:65534:rw` stores mask::rw- in the group
         // bits while group:: stays ---.
         let shared = acl(
@@ -1063,7 +1193,13 @@ mod tests {
                 (OTHER, 4, UNDEFINED),
             ],
         );
-        assert_eq!(effective_mode(0o100_664, Some(&shared)), 0o100_604);
+        assert_eq!(
+            effective_mode(0o100_664, Some(&shared)),
+            Mode {
+                plain: 0o100_604,
+                masked: 0o100_664
+            }
+        );
         // group::rw- with mask::r-x leaves the group only r--.
         let narrow = acl(
             2,
@@ -1075,7 +1211,13 @@ mod tests {
                 (OTHER, 0, UNDEFINED),
             ],
         );
-        assert_eq!(effective_mode(0o100_750, Some(&narrow)), 0o100_740);
+        assert_eq!(
+            effective_mode(0o100_750, Some(&narrow)),
+            Mode {
+                plain: 0o100_740,
+                masked: 0o100_750
+            }
+        );
         // Without a mask the group bits already are group::.
         let minimal = acl(
             2,
@@ -1085,7 +1227,10 @@ mod tests {
                 (OTHER, 4, UNDEFINED),
             ],
         );
-        assert_eq!(effective_mode(0o100_644, Some(&minimal)), 0o100_644);
+        assert_eq!(
+            effective_mode(0o100_644, Some(&minimal)),
+            Mode::from(0o100_644)
+        );
 
         // Anything unparsable leaves only the owner's bits.
         let wrong_version = acl(1, &[(GROUP_OBJ, 6, UNDEFINED)]);
@@ -1099,7 +1244,10 @@ mod tests {
             &no_group,
             &two_groups,
         ] {
-            assert_eq!(effective_mode(0o100_664, Some(garbled)), 0o100_600);
+            assert_eq!(
+                effective_mode(0o100_664, Some(garbled)),
+                Mode::from(0o100_600)
+            );
         }
     }
 
@@ -1116,10 +1264,10 @@ mod tests {
         let metadata = fs::metadata(&path).unwrap();
         // No ACL, or no ACL support: the mode bits are the permissions.
         for error in [Errno::NODATA, Errno::NOTSUP, Errno::OPNOTSUPP] {
-            assert_eq!(file_mode(&metadata, |_| Err(error)) & 0o777, 0o664);
+            assert_eq!(file_mode(&metadata, |_| Err(error)), Mode::from(0o100_664));
         }
         for error in [Errno::IO, Errno::ACCESS, Errno::NOENT, Errno::RANGE] {
-            assert_eq!(file_mode(&metadata, |_| Err(error)) & 0o777, 0o600);
+            assert_eq!(file_mode(&metadata, |_| Err(error)), Mode::from(0o100_600));
         }
         // An ACL that grants the owning group read access only.
         let acl = [2, 0, 0, 0, 0x04, 0, 4, 0, 0xff, 0xff, 0xff, 0xff];
@@ -1127,7 +1275,13 @@ mod tests {
             value[..acl.len()].copy_from_slice(&acl);
             Ok(acl.len())
         };
-        assert_eq!(file_mode(&metadata, read) & 0o777, 0o644);
+        assert_eq!(
+            file_mode(&metadata, read),
+            Mode {
+                plain: 0o100_644,
+                masked: 0o100_664
+            }
+        );
     }
 
     #[test]
