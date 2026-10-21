@@ -1555,6 +1555,176 @@ mod tests {
         assert!(Archive::new(bytes).is_err());
     }
 
+    #[test]
+    fn rejects_archives_other_readers_could_interpret_differently() {
+        // fixture(false) has its local header at 0..38 with the name at 30,
+        // data at 38..45, the central record at 45..99, and the end record
+        // with its comment at 99..128. Member names have their own tests,
+        // such as rejects_empty_nul_and_duplicate_member_names.
+        const DIRECTORY: usize = 45;
+        const END_RECORD: usize = 99;
+        const ZIP64_EXTRA: [u8; 12] = [1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let base = Archive::new(fixture(false)).unwrap();
+        assert_eq!((base.central_start, base.end), (DIRECTORY, END_RECORD));
+        let edited = |surgery: fn(&mut Vec<u8>)| {
+            let mut bytes = fixture(false);
+            surgery(&mut bytes);
+            bytes
+        };
+        let mut fewer_entries = combine(fixture(false), decorate_fixture(b"keep.xml", false));
+        let end = Archive::new(fewer_entries.clone()).unwrap().end;
+        set_u16(&mut fewer_entries, end + 8, 1);
+        set_u16(&mut fewer_entries, end + 10, 1);
+        let multi_disk = || unsupported("multi-disk ZIP workbooks are not supported");
+        let cases = [
+            // Local and central headers must agree.
+            (
+                "local header offset",
+                edited(|b| set_u32(b, DIRECTORY + 42, 1)),
+                invalid("invalid ZIP local header for part.xml"),
+            ),
+            (
+                "local method",
+                edited(|b| set_u16(b, 8, DEFLATED)),
+                invalid("conflicting ZIP headers for part.xml"),
+            ),
+            (
+                "local name",
+                edited(|b| b[30] = b'P'),
+                invalid("conflicting ZIP member name for part.xml"),
+            ),
+            (
+                "local checksum",
+                edited(|b| b[14] ^= 0xff),
+                invalid("conflicting ZIP sizes or checksum for part.xml"),
+            ),
+            (
+                "stored sizes",
+                edited(|b| {
+                    set_u32(b, 22, 6);
+                    set_u32(b, DIRECTORY + 24, 6);
+                }),
+                invalid("invalid stored ZIP member size for part.xml"),
+            ),
+            (
+                "data past the directory",
+                edited(|b| {
+                    for at in [18, 22, DIRECTORY + 20, DIRECTORY + 24] {
+                        set_u32(b, at, 100);
+                    }
+                }),
+                invalid("ZIP member part.xml exceeds local-record bounds"),
+            ),
+            // The directory must fill the space before the end record with
+            // exactly the counted records.
+            (
+                "directory bounds",
+                edited(|b| set_u32(b, END_RECORD + 16, 44)),
+                invalid("ZIP central-directory bounds are inconsistent"),
+            ),
+            (
+                "more entries than records",
+                edited(|b| {
+                    set_u16(b, END_RECORD + 8, 2);
+                    set_u16(b, END_RECORD + 10, 2);
+                }),
+                invalid("truncated or invalid ZIP central-directory entry"),
+            ),
+            (
+                "fewer entries than records",
+                fewer_entries,
+                invalid("ZIP central-directory entry count is inconsistent"),
+            ),
+            // Multi-disk archives.
+            (
+                "end record disk",
+                edited(|b| set_u16(b, END_RECORD + 4, 1)),
+                multi_disk(),
+            ),
+            (
+                "end record directory disk",
+                edited(|b| set_u16(b, END_RECORD + 6, 1)),
+                multi_disk(),
+            ),
+            (
+                "end record disk entries",
+                edited(|b| set_u16(b, END_RECORD + 8, 0)),
+                multi_disk(),
+            ),
+            (
+                "central disk",
+                edited(|b| set_u16(b, DIRECTORY + 34, 1)),
+                multi_disk(),
+            ),
+            // ZIP64 locators, sentinels and extra fields.
+            (
+                "ZIP64 locator",
+                edited(|b| set_u32(b, END_RECORD - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR)),
+                zip64(),
+            ),
+            (
+                "end record entry sentinel",
+                edited(|b| {
+                    set_u16(b, END_RECORD + 8, u16::MAX);
+                    set_u16(b, END_RECORD + 10, u16::MAX);
+                }),
+                zip64(),
+            ),
+            (
+                "end record size sentinel",
+                edited(|b| set_u32(b, END_RECORD + 12, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central disk sentinel",
+                edited(|b| set_u16(b, DIRECTORY + 34, u16::MAX)),
+                zip64(),
+            ),
+            (
+                "central compressed size sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 20, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central size sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 24, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central offset sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 42, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central ZIP64 extra",
+                edited(|b| {
+                    b.splice(END_RECORD..END_RECORD, ZIP64_EXTRA);
+                    set_u16(b, DIRECTORY + 30, 12);
+                    set_u32(b, END_RECORD + 12 + 12, 54 + 12);
+                }),
+                zip64(),
+            ),
+            (
+                "local ZIP64 extra",
+                edited(|b| {
+                    b.splice(38..38, ZIP64_EXTRA);
+                    set_u16(b, 28, 12);
+                    set_u32(b, END_RECORD + 12 + 16, (DIRECTORY + 12) as u32);
+                }),
+                zip64(),
+            ),
+        ];
+        for (case, bytes, expected) in cases {
+            match (Archive::new(bytes), &expected) {
+                (Err(Error::InvalidWorkbook(actual)), Error::InvalidWorkbook(message))
+                | (Err(Error::Unsupported(actual)), Error::Unsupported(message)) => {
+                    assert_eq!(actual, *message, "{case}");
+                }
+                (result, _) => panic!("{case}: {:?} instead of {expected:?}", result.err()),
+            }
+        }
+    }
+
     fn deflate_fixture(compressed: &[u8]) -> Vec<u8> {
         let archive = Archive::new(fixture(false)).unwrap();
         let entry = &archive.entries[0];
