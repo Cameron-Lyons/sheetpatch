@@ -312,6 +312,49 @@ fn header_checks_agree_before_and_after_the_tables_are_resolved() {
 }
 
 #[test]
+fn tables_are_resolved_after_the_edits_are_checked_and_before_headers_are_read() {
+    // B2 holds a formula, and the header B1 a shared-string index that is out
+    // of bounds. The table part is missing, so resolving the tables fails.
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet
+        .replace("<c r='B2'><v>5</v></c>", "<c r='B2'><f>2+3</f><v>5</v></c>")
+        .replace(
+            "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+            "<c r='B1' t='s'><v>1</v></c>",
+        );
+    let complete = parts.clone();
+    parts.remove(TABLE_PATH);
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    // A refused edit is reported before the tables are needed.
+    let error = book.set_cells("Data", [("B3", 8), ("B2", 7)]).unwrap_err();
+    assert!(
+        matches!(&error, Error::ProtectedCell { cell, reason, .. }
+            if cell.to_string() == "B2" && reason == "contains a formula"),
+        "{error:?}"
+    );
+    // A batch that changes nothing does not need them.
+    book.set_cell("Data", "A1", "Name").unwrap();
+    // A change does, and their error precedes reading the edited header.
+    let missing = format!("invalid workbook: part {SHEET_RELS:?}: missing table part {TABLE_PATH}");
+    for batch in [&[("B3", "8")][..], &[("B1", "Total"), ("B3", "8")]] {
+        let error = book.set_cells("Data", batch.iter().copied()).unwrap_err();
+        assert_eq!(error.to_string(), missing, "{batch:?}");
+    }
+    assert_eq!(book.to_bytes().unwrap(), original);
+    // With its table, the header edit fails reading the header instead.
+    let mut book = self::book(&complete);
+    let error = book
+        .set_cells("Data", [("B1", "Total"), ("B3", "8")])
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid workbook: worksheet \"Data\": B1: shared-string index 1 is out of bounds"
+    );
+}
+
+#[test]
 fn tables_without_a_header_row_leave_the_first_row_editable() {
     let mut book = book(&parts("ref='A1:B3' headerRowCount='0'"));
     book.set_cell("Data", "A1", "first").unwrap();

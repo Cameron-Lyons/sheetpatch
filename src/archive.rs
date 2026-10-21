@@ -1569,8 +1569,7 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
     std::thread::scope(|scope| {
         let others: Vec<_> = groups
             .map(|(first, group)| {
-                let thread =
-                    std::thread::Builder::new().spawn_scoped(scope, move || compress(first, group));
+                let thread = spawn_scoped(scope, move || compress(first, group));
                 (first, group, thread)
             })
             .collect();
@@ -1585,6 +1584,19 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
         }
         Ok(output)
     })
+}
+
+/// Start a thread in `scope`, which fails like any thread start, for example
+/// under a limit on the user's processes.
+fn spawn_scoped<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    run: impl FnOnce() -> T + Send + 'scope,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    if tests::SPAWN_FAILS.get() {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    std::thread::Builder::new().spawn_scoped(scope, run)
 }
 
 /// Deflate one segment of a stream. Every segment but the last ends with a
@@ -1669,6 +1681,9 @@ mod tests {
         /// Replaces `DEFLATE_SEGMENT` in saves on the current thread, so that
         /// small replacements are deflated in many segments.
         pub(super) static SEGMENT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Makes the compression threads of saves on the current thread fail
+        /// to start, as they can under a limit on the user's processes.
+        pub(super) static SPAWN_FAILS: Cell<bool> = const { Cell::new(false) };
     }
 
     fn append(archive: &Archive, changes: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
@@ -2634,6 +2649,18 @@ mod tests {
     }
 
     #[test]
+    fn segments_whose_threads_cannot_start_are_deflated_by_the_calling_thread() {
+        const SEGMENT: usize = 4096;
+        let data = cells(4000);
+        let expected = deflate_segments(&data, SEGMENT, 1).unwrap();
+        assert!(expected.len() > MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(true);
+        let inline = deflate_segments(&data, SEGMENT, MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(false);
+        assert_eq!(inline.unwrap(), expected);
+    }
+
+    #[test]
     fn large_replacements_are_deflated_in_segments_that_read_back_and_compact() {
         const SEGMENT: usize = 4096;
         SEGMENT_OVERRIDE.set(Some(SEGMENT));
@@ -3079,6 +3106,24 @@ mod tests {
             Err(Error::InvalidWorkbook(message))
                 if message == "ambiguous ZIP end-of-directory records"
         ));
+        // A complete older archive followed by newer records puts the decoy
+        // right after its directory, which then ends exactly at the record.
+        let mut adjacent = stale.original[..stale.end + END_LEN].to_vec();
+        set_u16(&mut adjacent, stale.end + 20, 0);
+        let live_start = adjacent.len();
+        adjacent.extend_from_slice(&live.original[..live.central_start]);
+        let central_start = adjacent.len();
+        let mut central = live.original[live.central_start..live.end].to_vec();
+        set_u32(&mut central, 42, live_start as u32);
+        adjacent.extend_from_slice(&central);
+        let mut ending = live.original[live.end..].to_vec();
+        set_u32(&mut ending, 16, central_start as u32);
+        adjacent.extend_from_slice(&ending);
+        assert!(matches!(
+            Archive::new(adjacent),
+            Err(Error::InvalidWorkbook(message))
+                if message == "ambiguous ZIP end-of-directory records"
+        ));
         // That reader cannot select these records, so they stay comment bytes
         // that neither opening nor saving refuses.
         let unreadable: [fn(&mut [u8]); 8] = [
@@ -3421,20 +3466,21 @@ mod tests {
         bytes
     }
 
+    /// A complete end record for a one-entry directory of `size` bytes at
+    /// `directory`, which libzip before 1.11 selects if a central-directory
+    /// header starts there and the directory ends by the record.
+    fn decoy(directory: usize, size: usize) -> Vec<u8> {
+        let mut decoy = vec![0; END_LEN];
+        set_u32(&mut decoy, 0, END);
+        set_u16(&mut decoy, 8, 1);
+        set_u16(&mut decoy, 10, 1);
+        set_u32(&mut decoy, 12, size as u32);
+        set_u32(&mut decoy, 16, directory as u32);
+        decoy
+    }
+
     #[test]
     fn saves_refuse_end_records_that_forward_scanning_readers_could_select() {
-        // A complete end record for a one-entry directory at `directory`,
-        // which libzip before 1.11 selects if a central-directory header
-        // starts there.
-        let decoy = |directory: usize| {
-            let mut decoy = vec![0; END_LEN];
-            set_u32(&mut decoy, 0, END);
-            set_u16(&mut decoy, 8, 1);
-            set_u16(&mut decoy, 10, 1);
-            set_u32(&mut decoy, 12, CENTRAL_HEADER_LEN as u32);
-            set_u32(&mut decoy, 16, directory as u32);
-            decoy
-        };
         let filler = |signature_at: usize| {
             let mut filler = vec![0; END_TAIL_LEN + 4096];
             set_u32(&mut filler, signature_at, CENTRAL);
@@ -3444,15 +3490,24 @@ mod tests {
         // bytes move the directory from 45 onto a decoy pointing at 49, and
         // with a long member after part.xml, its central-directory signature
         // from 183 onto a decoy pointing at 187. That decoy's directory lies
-        // before the output's last END_TAIL_LEN bytes.
+        // before the output's last END_TAIL_LEN bytes. The third decoy's
+        // directory spans part.xml's central header and ends exactly where
+        // the decoy, that entry's comment, starts.
         let cases = [
-            with_entry_comment(fixture(false), &decoy(49)),
+            with_entry_comment(fixture(false), &decoy(49, CENTRAL_HEADER_LEN)),
             with_entry_comment(
                 combine(
                     fixture(false),
                     stored_fixture(b"fill.bin", &filler(100), 0, None),
                 ),
-                &decoy(45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100),
+                &decoy(
+                    45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100,
+                    CENTRAL_HEADER_LEN,
+                ),
+            ),
+            with_entry_comment(
+                fixture(false),
+                &decoy(49, CENTRAL_HEADER_LEN + b"part.xml".len()),
             ),
         ];
         for original in cases {
@@ -3479,6 +3534,108 @@ mod tests {
                         assert_eq!(reopened.read("part.xml").unwrap(), replacement);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn saves_check_records_in_untouched_members_longer_than_the_kept_tail() {
+        // An untouched stored member longer than the bytes the end-record
+        // check keeps is written in one piece. It holds an end record whose
+        // comment reaches EOF once the member after it grows by four bytes.
+        let layout = |comment: u16| {
+            let mut data = vec![b'x'; 70_000];
+            let at = data.len() - 100;
+            set_u32(&mut data, at, END);
+            set_u16(&mut data, at + 20, comment);
+            let bytes = combine(stored_fixture(b"big.bin", &data, 0, None), fixture(false));
+            (bytes, at)
+        };
+        let (bytes, at) = layout(0);
+        let record = Archive::new(bytes.clone()).unwrap().entries[0].data.start + at;
+        let (original, _) = layout((bytes.len() + 4 - record - END_LEN) as u16);
+        let archive = Archive::new(original).unwrap();
+        assert!(archive.entries[0].local_record.len() > archive.local_tail_len());
+        for (replacement, refused) in [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)] {
+            let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
+            let mut output = Vec::new();
+            let result = archive.write_to(&changes, &mut output);
+            if refused {
+                assert!(refused_as_ambiguous(result));
+            } else {
+                result.unwrap();
+                let reopened = Archive::new(output).unwrap();
+                assert_eq!(reopened.read("part.xml").unwrap(), replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_reads_back_earlier_output_without_obsolete_records() {
+        // A pre-1.0 append save leaves part.xml's first record obsolete
+        // before a long member with a central-directory signature in its
+        // data. Compaction drops that 45-byte record, moving the signature
+        // onto a decoy in the last entry's comment. The signature lies before
+        // the output's kept tail, so only the records written again show it.
+        let mut filler = vec![0; END_TAIL_LEN + 4096];
+        set_u32(&mut filler, 100, CENTRAL);
+        let base = Archive::new(combine(
+            fixture(false),
+            stored_fixture(b"fill.bin", &filler, 0, None),
+        ))
+        .unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"<part/>abcd".to_vec())]);
+        let appended = append(&base, &changes);
+        let moved = LOCAL_HEADER_LEN + b"fill.bin".len() + 100;
+        for (directory, refused) in [(moved, true), (moved + 1, false)] {
+            let original =
+                with_entry_comment(appended.clone(), &decoy(directory, CENTRAL_HEADER_LEN));
+            let archive = Archive::new(original).unwrap();
+            let mut output = Vec::new();
+            let result = archive.compact_to(&BTreeMap::new(), &mut output);
+            if refused {
+                assert!(refused_as_ambiguous(result));
+            } else {
+                result.unwrap();
+                let compacted = Archive::new(output).unwrap();
+                assert_eq!(compacted.entries[1].local_record.start, 0);
+                assert_eq!(compacted.read("part.xml").unwrap(), b"<part/>abcd");
+            }
+        }
+    }
+
+    #[test]
+    fn kept_tails_are_the_last_bytes_written_whatever_the_write_lengths() {
+        // Accepts at most three bytes per write, like a pipe.
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let length = bytes.len().min(3);
+                self.0.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn keep(writer: &mut impl Write, len: usize, piece: usize, data: &[u8]) -> Vec<u8> {
+            let mut output = KeepTail::new(writer, len);
+            for chunk in data.chunks(piece) {
+                output.write_all(chunk).unwrap();
+            }
+            output.into_tail()
+        }
+        let data: Vec<u8> = (0..=255).cycle().take(300).collect();
+        for len in [0, 1, 10, 100] {
+            let expected = &data[data.len() - len..];
+            // Writes shorter than, as long as, and longer than the tail.
+            for piece in [1, len.max(2) - 1, len.max(1), len + 1, data.len()] {
+                let mut written = Vec::new();
+                assert_eq!(keep(&mut written, len, piece, &data), expected);
+                assert_eq!(written, data);
+                let mut written = ShortWriter(Vec::new());
+                assert_eq!(keep(&mut written, len, piece, &data), expected);
+                assert_eq!(written.0, data);
             }
         }
     }

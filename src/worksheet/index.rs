@@ -359,13 +359,23 @@ impl<'a> WorksheetIndex<'a> {
             ..
         } = document;
         let one_sheet_data = || invalid("worksheet must contain exactly one sheetData element");
-        let data_index = unique(
+        let data_index = match unique(
             elements[0]
                 .children(&elements)
                 .filter(|&index| elements[index].is(source, namespace, "sheetData")),
             one_sheet_data,
-        )?
-        .ok_or_else(one_sheet_data)?;
+        )? {
+            Some(index) => index,
+            // Like a row, a sheetData in a markup-compatibility branch can
+            // hold the cells of whichever branch a reader selects.
+            None if elements
+                .iter()
+                .any(|element| element.is(source, namespace, "sheetData")) =>
+            {
+                return Err(unsupported("sheetData inside an unsupported XML container"));
+            }
+            None => return Err(one_sheet_data()),
+        };
         let mut formulas = Formulas::default();
         let (rows, cells) = index_rows(
             source,

@@ -31,7 +31,7 @@ fn command_help(command: &str) -> Option<&'static str> {
             "Usage: sheetpatch get [--json] INPUT SHEET CELL [CELL ...]\n\nRead A1 addresses in input order with one worksheet parse. A CELL may also be a range such as A1:C3, which is read row by row from its top-left cell; one get reads at most 1048576 cells. Names are case-sensitive; addresses accept lowercase letters. Formula results are stored caches, without recalculation. --json includes normalized addresses, scalar types, values, formulas and style indices. Blank values use null in JSON and an empty line in plain output. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes; --json output is exact.",
         ),
         "cells" => Some(
-            "Usage: sheetpatch cells [--json] INPUT SHEET [RANGE]\n\nList the cells of a worksheet that hold a value or a formula, row by row, with one worksheet parse. A RANGE such as A1:C3 or B2 limits the list to the cells within it. Cells holding only formatting are skipped. Plain output has one CELL<TAB>TYPE<TAB>VALUE line per cell, with the types text, number, bool, error or blank, and values printed as get prints them. Prefixing each line with the sheet name and a tab gives patch rows for values without line breaks, with these exceptions. patch refuses rows for error values other than Excel's writable error codes and for text longer than 32,767 UTF-16 code units. Applied to the cells they were listed from, it also refuses rows for formula cells, for the other cells of a shared, array (including dynamic-array spill) or data-table formula range, and for merged cells other than their range's top-left cell, even though the value is unchanged. Formula results are stored caches, without recalculation. --json returns the same objects as get --json, including formulas and style indices, and is exact. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes.",
+            "Usage: sheetpatch cells [--json] INPUT SHEET [RANGE]\n\nList the cells of a worksheet that hold a value or a formula, row by row, with one worksheet parse. A RANGE such as A1:C3 or B2 limits the list to the cells within it. Cells holding only formatting are skipped. Plain output has one CELL<TAB>TYPE<TAB>VALUE line per cell, with the types text, number, bool, error or blank, and values printed as get prints them. Prefixing each line with the sheet name and a tab gives patch rows for values without line breaks, with these exceptions. patch refuses rows for error values other than Excel's writable error codes and for text longer than 32,767 UTF-16 code units. Applied to the cells they were listed from, it also refuses rows for formula cells, for the other cells of a shared, array (including dynamic-array spill) or data-table formula range, for merged cells other than their range's top-left cell, and for cells whose stored value holds markup sheetpatch does not recognize, such as unfamiliar elements or attributes inside <v> or <is>, even though the value is unchanged. It refuses every row of a worksheet with a shared, array or data-table formula group that has no reference range, and of a digitally signed workbook. Formula results are stored caches, without recalculation. --json returns the same objects as get --json, including formulas and style indices, and is exact. Use - as INPUT to read the workbook from standard input. On a terminal, plain output shows control characters other than tab and line feed as \\u{..} escapes.",
         ),
         "set" => Some(
             "Usage:\n  sheetpatch set INPUT OUTPUT SHEET CELL text|number|bool|error VALUE\n  sheetpatch set INPUT OUTPUT SHEET CELL blank\n\nSet one scalar cell value and save atomically. Text stays text even when it starts with =. Numbers must be finite; booleans are true or false; error tokens include #N/A and #DIV/0!. Blank clears the value while retaining formatting. Protected cells are refused: formula cells and formula ranges, merged-range followers, Excel table headers, and cells with cell or value metadata. INPUT and OUTPUT may be the same path. Use - as INPUT to read the workbook from standard input, or as OUTPUT to write it to standard output when that is not a terminal.",
@@ -1522,6 +1522,63 @@ mod tests {
                         assert!(output.is_empty(), "budget {budget}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_read_output_stops_before_stored_text_over_the_budget() {
+        // Records the length of each write. The buffered prefix is written
+        // with one write_all, so it is the first write.
+        struct Writes(Vec<usize>);
+        impl Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.push(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let long = "x".repeat(1000);
+        let sheet = format!(
+            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
+             <c r='B1' t='inlineStr'><is><t>{long}</t></is></c>\
+             <c r='C1'><f>{long}</f><v>2</v></c></row></sheetData></worksheet>"
+        );
+        let mut parts = common::payloads(&std::fs::read(FIXTURE).unwrap());
+        parts.insert("xl/worksheets/sheet1.xml".into(), sheet.into_bytes());
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let workbook = Workbook::from_bytes(common::stored_archive(&entries)).unwrap();
+        let view = workbook.prepare_sheet("Data").unwrap();
+        let cell = |address: &str| address.parse::<CellRef>().unwrap();
+        // Long text in either format, and a long formula, which only JSON
+        // output repeats. Plain output of C1 fits.
+        for (cells, json, buffered) in [
+            ([cell("A1"), cell("B1")], false, false),
+            ([cell("A1"), cell("B1")], true, false),
+            ([cell("A1"), cell("C1")], true, false),
+            ([cell("A1"), cell("C1")], false, true),
+        ] {
+            for records in [false, true] {
+                let format = CellOutput {
+                    sheet: "Data",
+                    json,
+                    records,
+                    escape: Escape::Exact,
+                };
+                let mut output = Writes(Vec::new());
+                write_read_cells(&view, &cells, 200, &mut output, format).unwrap();
+                let prefix = output.0[0];
+                assert!(
+                    prefix <= 200,
+                    "{cells:?} json={json}: prefix of {prefix} bytes"
+                );
+                // Output that fits is the prefix, and any closing bracket.
+                assert_eq!(output.0.len() == 1 + usize::from(json), buffered);
             }
         }
     }

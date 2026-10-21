@@ -308,6 +308,16 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
         <row r='2'><c r='A2'><v>2</v></c><c r='B2'><v>2</v></c><c r='C2'><v>4</v></c>\
         <c r='D2'><v>6</v></c></row></sheetData>\
         <mergeCells count='1'><mergeCell ref='D1:D2'/></mergeCells>";
+    // Values stored with markup the crate does not recognize, which a
+    // rewrite would discard, beside an ordinary value.
+    let payloads = "<sheetData><row r='1'>\
+        <c r='A1' t='inlineStr'><is unexpected='1'><t>y</t></is></c>\
+        <c r='B1'><v xmlns:q='urn:q' q:a='1'>5</v></c>\
+        <c r='C1' t='inlineStr'><is><t>x</t><x:foreign xmlns:x='urn:x'/></is></c>\
+        <c r='D1'><v>6</v></c></row></sheetData>";
+    // A shared formula group without a reference range could cover any cell.
+    let group = "<sheetData><row r='1'><c r='A1'><v>1</v></c>\
+        <c r='B1'><f t='shared' si='0'/><v>2</v></c></row></sheetData>";
     let path = saved(
         &directory,
         "in.xlsx",
@@ -315,6 +325,8 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
             ("Values", "", &values),
             ("Copy", "", "<sheetData/>"),
             ("Ranges", "", ranges),
+            ("Payloads", "", payloads),
+            ("Group", "", group),
         ],
     );
     let path = text(&path);
@@ -332,6 +344,12 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
             format!(
                 "sheetpatch: Patch line 1: protected cell: worksheet \"Ranges\": {cell} {reason}\n"
             ),
+        ))
+    };
+    let unsupported = |sheet: &str, message: &str| {
+        Some((
+            1,
+            format!("sheetpatch: unsupported: worksheet \"{sheet}\": {message}\n"),
         ))
     };
     let formula = "contains a formula";
@@ -368,6 +386,45 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
                 ("C2", protected("C2", range)),
                 ("D2", protected("D2", "is merged into another cell's range")),
             ],
+        ),
+        (
+            "Payloads",
+            "Payloads",
+            vec![
+                (
+                    "A1",
+                    unsupported(
+                        "Payloads",
+                        "A1: unfamiliar attributes inside the cell value payload",
+                    ),
+                ),
+                (
+                    "B1",
+                    unsupported(
+                        "Payloads",
+                        "B1: unfamiliar attributes inside the cell value payload",
+                    ),
+                ),
+                (
+                    "C1",
+                    unsupported(
+                        "Payloads",
+                        "C1: unfamiliar XML inside the cell value payload",
+                    ),
+                ),
+                ("D1", None),
+            ],
+        ),
+        // Every row of such a worksheet is refused.
+        (
+            "Group",
+            "Group",
+            ["A1", "B1"]
+                .map(|cell| {
+                    let message = "B1 belongs to a formula group without a reference range";
+                    (cell, unsupported("Group", message))
+                })
+                .into(),
         ),
     ] {
         let listed = success(&["cells", path, source]);

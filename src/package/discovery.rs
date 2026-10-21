@@ -13,7 +13,9 @@ use quick_xml::{
     name::{QName, ResolveResult},
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ops::Range,
     rc::Rc,
     sync::Arc,
 };
@@ -55,7 +57,14 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
     };
     let (sheets_index, date1904) = workbook_properties(&workbook)?;
     let rels_path = part_path(archive, &relationships_path(&office.uri))?;
-    let rels = relationships(&archive.read(&rels_path)?)?;
+    // Discovery uses only the shared-string relationships and those that
+    // sheets name.
+    let sheet_ids: HashSet<&str> = sheet_nodes(&workbook)
+        .flat_map(sheet_relationship_ids)
+        .collect();
+    let rels = relationships(&archive.read(&rels_path)?, &|id, kind| {
+        office_type(kind, "sharedStrings") || sheet_ids.contains(id)
+    })?;
     let shared_strings_path = shared_strings_path(archive, &office.uri, &rels)?;
     let sheets = sheets(archive, &office.uri, &workbook, sheets_index, &rels)?;
     Ok(PackageMetadata {
@@ -93,12 +102,9 @@ pub(super) fn table_headers(
     let mut base = None;
     let relationships = archive
         .read(&rels_path)
-        .and_then(|xml| relationships(&xml))
+        .and_then(|xml| relationships(&xml, &|_, kind| office_type(kind, "table")))
         .map_err(in_rels)?;
     for relationship in relationships {
-        if !office_type(&relationship.kind, "table") {
-            continue;
-        }
         if relationship.external {
             return Err(in_rels(Error::InvalidWorkbook(format!(
                 "table relationship {} is external",
@@ -204,7 +210,10 @@ struct OfficeDocument {
 
 fn office_document(archive: &Archive) -> Result<OfficeDocument> {
     let rels_path = archive.part_name("_rels/.rels")?.unwrap_or("_rels/.rels");
-    let roots = relationships(&archive.read(rels_path)?)?;
+    // Only the office document and a signature origin are used.
+    let roots = relationships(&archive.read(rels_path)?, &|_, kind| {
+        office_type(kind, "officeDocument") || kind == SIGNATURE_ORIGIN
+    })?;
     let mut office = roots
         .iter()
         .filter(|r| office_type(&r.kind, "officeDocument"));
@@ -266,6 +275,15 @@ fn workbook_properties(nodes: &[Node]) -> Result<(usize, bool)> {
     }
     let in_workbook =
         |node: &Node, local: &str| node.local == local && node.namespace == root.namespace;
+    // Which sheet list a reader sees would depend on the branch it selects.
+    if nodes
+        .iter()
+        .any(|node| in_workbook(node, "sheets") && in_branch(nodes, node))
+    {
+        return Err(Error::Unsupported(
+            "sheets inside a markup-compatibility branch".into(),
+        ));
+    }
     let mut containers = nodes
         .iter()
         .enumerate()
@@ -339,15 +357,16 @@ fn sheets(
     sheets_index: usize,
     rels: &[Relationship],
 ) -> Result<Vec<DiscoveredSheet>> {
-    let namespace = &nodes[0].namespace;
     let relationships_by_id: BTreeMap<_, _> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
     let mut sheets = Vec::new();
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    let sheet_nodes = nodes
-        .iter()
-        .filter(|node| node.local == "sheet" && node.namespace == *namespace);
-    for (position, node) in (1usize..).zip(sheet_nodes) {
+    for (position, node) in (1usize..).zip(sheet_nodes(nodes)) {
+        if in_branch(nodes, node) {
+            return Err(Error::Unsupported(
+                "sheet inside a markup-compatibility branch".into(),
+            ));
+        }
         if node.parent != Some(sheets_index) {
             return Err(Error::InvalidWorkbook(
                 "sheet outside workbook sheets".into(),
@@ -363,12 +382,9 @@ fn sheets(
             return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
         }
         let visibility = visibility(node, &name)?;
-        let mut ids = node
-            .attributes
-            .iter()
-            .filter(|a| a.local == "id" && matches!(&*a.namespace, OFFICE_NS | STRICT_OFFICE_NS));
+        let mut ids = sheet_relationship_ids(node);
         let id = match (ids.next(), ids.next()) {
-            (Some(attribute), None) => attribute.value.as_str(),
+            (Some(id), None) => id,
             _ => {
                 return Err(Error::InvalidWorkbook(format!(
                     "sheet {name} needs one relationship id"
@@ -411,6 +427,23 @@ fn sheets(
     Ok(sheets)
 }
 
+// The workbook's sheet elements, in the workbook root's namespace.
+fn sheet_nodes(nodes: &[Node]) -> impl Iterator<Item = &Node> {
+    let namespace = &nodes[0].namespace;
+    nodes
+        .iter()
+        .filter(move |node| node.local == "sheet" && node.namespace == *namespace)
+}
+
+// The relationship IDs a sheet element names; a valid sheet names one.
+fn sheet_relationship_ids(sheet: &Node) -> impl Iterator<Item = &str> {
+    sheet
+        .attributes
+        .iter()
+        .filter(|a| a.local == "id" && matches!(&*a.namespace, OFFICE_NS | STRICT_OFFICE_NS))
+        .map(|a| a.value.as_str())
+}
+
 fn visibility(sheet: &Node, name: &str) -> Result<SheetVisibility> {
     // ST_SheetState is an enumeration, which collapses XML whitespace.
     Ok(match sheet.attr("", "state").map(trim_whitespace) {
@@ -433,23 +466,32 @@ fn root_only(_: usize, _: &str, _: &str, _: Option<&Node>) -> bool {
     false
 }
 
-// Misplaced relationships, sheet lists, and sheets are kept so that they can
-// be rejected; unrelated elements, wherever they occur, are not.
-fn relationship_node(_: usize, namespace: &str, local: &str, _: Option<&Node>) -> bool {
-    namespace == PACKAGE_NS && local == "Relationship"
-}
-
 fn compatibility_branch(node: &Node) -> bool {
     &*node.namespace == COMPATIBILITY_NS && matches!(node.local.as_str(), "Choice" | "Fallback")
 }
 
+// Whether a retained node's parent is a retained compatibility branch.
+fn in_branch(nodes: &[Node], node: &Node) -> bool {
+    node.parent
+        .is_some_and(|parent| compatibility_branch(&nodes[parent]))
+}
+
+// Misplaced sheet lists and sheets are kept so that they can be rejected;
+// unrelated elements, wherever they occur, are not.
 fn workbook_node(depth: usize, namespace: &str, local: &str, parent: Option<&Node>) -> bool {
     // Retain only compatibility branches that can substitute direct workbook
-    // children, including nested AlternateContent. Ordinary opaque extensions
-    // and their unrelated workbookPr elements stay outside discovery.
+    // children or sheets, including nested AlternateContent. Ordinary opaque
+    // extensions and their unrelated workbookPr elements stay outside
+    // discovery.
     if namespace == COMPATIBILITY_NS {
         return match local {
-            "AlternateContent" => depth == 1 || parent.is_some_and(compatibility_branch),
+            "AlternateContent" => {
+                depth == 1
+                    || parent.is_some_and(|node| {
+                        compatibility_branch(node)
+                            || (node.local == "sheets" && main_namespace(&node.namespace))
+                    })
+            }
             "Choice" | "Fallback" => parent.is_some_and(|node| {
                 &*node.namespace == COMPATIBILITY_NS && node.local == "AlternateContent"
             }),
@@ -497,24 +539,110 @@ struct PartXml {
 // without bound.
 const NAMESPACE_LIMIT: usize = 64;
 
+// The most attribute records and namespace spellings that package parsing has
+// held at once on this thread, for tests of its memory bounds.
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SPELLING_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_peak(peak: &'static std::thread::LocalKey<std::cell::Cell<usize>>, value: usize) {
+    peak.set(peak.get().max(value));
+}
+
 fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     part_xml(bytes, retain).map(|part| part.nodes)
 }
 
-/// Parses and validates a whole package part with the worksheet parser's
-/// rules, keeping its root and the elements that `retain` selects when they
-/// start. Memory therefore grows with the retained elements, not with
-/// unrelated markup.
+/// Parses and validates a whole package part, keeping its root and the
+/// elements that `retain` selects when they start. Memory therefore grows
+/// with the retained elements, not with unrelated markup.
 fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
+    let mut nodes: Vec<Node> = Vec::new();
+    // Each open element's index among the retained nodes, if it was retained.
+    let process_content = walk_part(bytes, &mut |tag, parent: Option<&Option<usize>>| {
+        let parent = parent.copied().flatten();
+        let keep = tag.depth == 0
+            || retain(
+                tag.depth,
+                tag.namespace(),
+                tag.local,
+                parent.map(|index| &nodes[index]),
+            );
+        if !keep {
+            return Ok(None);
+        }
+        let mut attributes = Vec::new();
+        for attribute in tag.spans.clone().map(|index| tag.attributes.view(index)) {
+            let qualified = QName(attribute.name);
+            // Namespace declarations are not attributes of a node.
+            if qualified.as_namespace_binding().is_some() {
+                continue;
+            }
+            let id = tag.namespaces.resolve(tag.reader, qualified, true)?;
+            attributes.push(Attribute {
+                namespace: Arc::clone(tag.namespaces.uri(id)),
+                local: qualified.local_name().into_inner().to_owned(),
+                value: attribute.value.to_owned(),
+            });
+        }
+        nodes.push(Node {
+            namespace: Arc::clone(tag.namespaces.uri(tag.namespace)),
+            local: tag.local.to_owned(),
+            attributes,
+            parent,
+        });
+        Ok(Some(nodes.len() - 1))
+    })?;
+    Ok(PartXml {
+        nodes,
+        process_content,
+    })
+}
+
+/// A start tag that `walk_part` passes on, with its scanned attributes and
+/// the namespaces in scope. No namespace ID outlives the tag.
+struct Tag<'t, 'xml> {
+    /// How many elements enclose this one: the root's depth is zero.
+    depth: usize,
+    namespace: NamespaceId,
+    local: &'t str,
+    namespaces: &'t mut NamespacePool,
+    reader: &'t NamespaceReader<'xml>,
+    attributes: &'t Attributes<'xml>,
+    spans: Range<usize>,
+}
+
+impl<'xml> Tag<'_, 'xml> {
+    fn namespace(&self) -> &str {
+        self.namespaces.uri(self.namespace)
+    }
+
+    /// The value of the unprefixed attribute `name`, which has no namespace,
+    /// borrowed from the part unless XML normalization changed it.
+    fn attr(&self, name: &str) -> Option<Cow<'xml, str>> {
+        self.attributes.find_value(self.spans.clone(), name)
+    }
+}
+
+/// Parses and validates a whole package part with the worksheet parser's
+/// rules. Each start tag goes to `visit` with what `visit` returned for its
+/// parent, if any; the value is kept while the element is open. Returns
+/// whether any element of the part has a non-empty mc:ProcessContent
+/// attribute.
+fn walk_part<'xml, T>(
+    bytes: &'xml [u8],
+    visit: &mut dyn FnMut(&mut Tag<'_, 'xml>, Option<&T>) -> Result<T>,
+) -> Result<bool> {
     let (source, mut rules) = DocumentRules::source(bytes)?;
     let mut reader = rules.reader(source);
     let mut namespaces = NamespacePool::new();
-    // One tag's attributes at a time; only retained elements copy theirs.
+    // One tag's attributes at a time.
     let mut attributes = Attributes::new(source);
     let mut checks = AttributeChecks::default();
-    let mut nodes = Vec::new();
-    // Each open element's index among the retained nodes, if it was retained.
-    let mut stack: Vec<Option<usize>> = Vec::new();
+    let mut stack: Vec<T> = Vec::new();
     let mut process_content = false;
     loop {
         let start = rules.position(&reader);
@@ -525,15 +653,6 @@ fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
                 let name = tag.name();
                 rules.start_element(stack.len(), name.as_ref())?;
                 let namespace = namespaces.resolve(&reader, name, false)?;
-                let local = tag.local_name();
-                let parent = stack.last().copied().flatten();
-                let keep = stack.is_empty()
-                    || retain(
-                        stack.len(),
-                        namespaces.uri(namespace),
-                        local.as_ref(),
-                        parent.map(|index| &nodes[index]),
-                    );
                 attributes.clear();
                 let spans = attribute_spans(
                     start + 1 + name.as_ref().len(),
@@ -543,44 +662,38 @@ fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
                     &reader,
                     &mut checks,
                 )?;
-                let mut kept = Vec::new();
-                for attribute in spans.map(|index| attributes.view(index)) {
+                // The part's attributes matter as a whole only as
+                // mc:ProcessContent.
+                for attribute in spans.clone().map(|index| attributes.view(index)) {
                     let qualified = QName(attribute.name);
-                    let attribute_local = qualified.local_name().into_inner();
-                    // Namespace declarations are not attributes of a node, and
-                    // the attributes of an element that is not retained matter
-                    // only as mc:ProcessContent.
-                    if qualified.as_namespace_binding().is_some()
-                        || !(keep || attribute_local == "ProcessContent")
+                    if qualified.local_name().into_inner() != "ProcessContent"
+                        || qualified.as_namespace_binding().is_some()
                     {
                         continue;
                     }
                     let id = namespaces.resolve(&reader, qualified, true)?;
-                    let attribute_namespace = namespaces.uri(id);
-                    process_content |= &**attribute_namespace == COMPATIBILITY_NS
-                        && attribute_local == "ProcessContent"
+                    process_content |= &**namespaces.uri(id) == COMPATIBILITY_NS
                         && !trim_whitespace(attribute.value).is_empty();
-                    if keep {
-                        kept.push(Attribute {
-                            namespace: Arc::clone(attribute_namespace),
-                            local: attribute_local.to_owned(),
-                            value: attribute.value.to_owned(),
-                        });
-                    }
                 }
-                let index = keep.then(|| {
-                    nodes.push(Node {
-                        namespace: Arc::clone(namespaces.uri(namespace)),
-                        local: local.as_ref().to_owned(),
-                        attributes: kept,
-                        parent,
-                    });
-                    nodes.len() - 1
-                });
+                let mut tag = Tag {
+                    depth: stack.len(),
+                    namespace,
+                    local: tag.local_name().into_inner(),
+                    namespaces: &mut namespaces,
+                    reader: &reader,
+                    attributes: &attributes,
+                    spans,
+                };
+                let value = visit(&mut tag, stack.last())?;
                 if matches!(event, Event::Start(_)) {
-                    stack.push(index);
+                    stack.push(value);
                 }
-                // Nodes hold their URIs, and no ID outlives its tag.
+                #[cfg(test)]
+                {
+                    record_peak(&ATTRIBUTE_PEAK, attributes.records_len());
+                    record_peak(&SPELLING_PEAK, namespaces.spellings());
+                }
+                // Visitors keep URIs, not IDs, past their tags.
                 if namespaces.spellings() > NAMESPACE_LIMIT {
                     namespaces.clear();
                 }
@@ -595,10 +708,7 @@ fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
         }
     }
     rules.finish(stack.len())?;
-    Ok(PartXml {
-        nodes,
-        process_content,
-    })
+    Ok(process_content)
 }
 
 // ProcessContent can promote children of an ignored vendor wrapper into the
@@ -677,6 +787,8 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
                 // in scope hold IDs, so they move to the other pool, and the
                 // limit grows with them to keep that work linear.
                 let live: usize = rules.iter().map(|names| names.added.len()).sum();
+                #[cfg(test)]
+                record_peak(&SPELLING_PEAK, namespaces.spellings());
                 if namespaces.spellings() > NAMESPACE_LIMIT + live {
                     previous.clear();
                     std::mem::swap(&mut namespaces, &mut previous);
@@ -790,44 +902,85 @@ struct Relationship {
     target: String,
     external: bool,
 }
-fn relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
-    let nodes = xml_nodes(bytes, relationship_node)?;
-    if nodes[0].local != "Relationships" || &*nodes[0].namespace != PACKAGE_NS {
+
+/// Validates a whole relationships part and returns, in document order, the
+/// relationships that `keep` selects by their ID and type. The others are
+/// not copied: only their IDs are kept while the part is parsed, to find
+/// duplicates, borrowed from `bytes` unless XML normalization changed them.
+fn relationships(bytes: &[u8], keep: &dyn Fn(&str, &str) -> bool) -> Result<Vec<Relationship>> {
+    // Structural errors are reported only once the whole part is known to be
+    // well-formed: an invalid root, then a relationship outside it, then the
+    // first relationship with invalid attributes.
+    let mut valid_root = false;
+    let mut misplaced = false;
+    let mut invalid = None;
+    let mut ids = HashSet::new();
+    let mut kept = Vec::new();
+    walk_part(bytes, &mut |tag, _: Option<&()>| {
+        if tag.depth == 0 {
+            valid_root = tag.local == "Relationships" && tag.namespace() == PACKAGE_NS;
+        } else if valid_root && tag.local == "Relationship" && tag.namespace() == PACKAGE_NS {
+            if tag.depth > 1 {
+                misplaced = true;
+            } else if !misplaced && invalid.is_none() {
+                match relationship(tag, &ids, keep) {
+                    Ok((id, relationship)) => {
+                        kept.extend(relationship);
+                        ids.insert(id);
+                    }
+                    Err(error) => invalid = Some(error),
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if !valid_root {
         return Err(Error::InvalidWorkbook("invalid relationships root".into()));
     }
-    // Every retained element after the root is a relationship.
-    let relationships = &nodes[1..];
-    if relationships.iter().any(|node| node.parent != Some(0)) {
+    if misplaced {
         return Err(Error::InvalidWorkbook(
             "relationship outside relationships root".into(),
         ));
     }
-    let mut ids = BTreeSet::new();
-    let mut result = Vec::new();
-    for node in relationships {
-        let required = |key| {
-            node.attr("", key)
-                .map(str::to_owned)
-                .ok_or_else(|| Error::InvalidWorkbook(format!("relationship lacks {key}")))
-        };
-        let id = required("Id")?;
-        if !ids.insert(id.clone()) {
-            return Err(Error::InvalidWorkbook("duplicate relationship id".into()));
-        }
-        let mode = node.attr("", "TargetMode").unwrap_or("Internal");
-        if !matches!(mode, "Internal" | "External") {
+    match invalid {
+        Some(error) => Err(error),
+        None => Ok(kept),
+    }
+}
+
+// Checks a relationship element's attributes against the IDs before it.
+// Returns its ID, and the relationship if `keep` selects it.
+fn relationship<'xml>(
+    tag: &Tag<'_, 'xml>,
+    ids: &HashSet<Cow<'xml, str>>,
+    keep: &dyn Fn(&str, &str) -> bool,
+) -> Result<(Cow<'xml, str>, Option<Relationship>)> {
+    let required = |key| {
+        tag.attr(key)
+            .ok_or_else(|| Error::InvalidWorkbook(format!("relationship lacks {key}")))
+    };
+    let id = required("Id")?;
+    if ids.contains(&*id) {
+        return Err(Error::InvalidWorkbook("duplicate relationship id".into()));
+    }
+    let external = match tag.attr("TargetMode").as_deref() {
+        None | Some("Internal") => false,
+        Some("External") => true,
+        Some(_) => {
             return Err(Error::InvalidWorkbook(
                 "invalid relationship TargetMode".into(),
             ));
         }
-        result.push(Relationship {
-            id,
-            kind: required("Type")?,
-            target: required("Target")?,
-            external: mode == "External",
-        });
-    }
-    Ok(result)
+    };
+    let kind = required("Type")?;
+    let target = required("Target")?;
+    let relationship = keep(&id, &kind).then(|| Relationship {
+        id: id.to_string(),
+        kind: kind.into_owned(),
+        target: target.into_owned(),
+        external,
+    });
+    Ok((id, relationship))
 }
 
 fn main_namespace(ns: &str) -> bool {
@@ -1197,6 +1350,195 @@ mod tests {
         }
     }
 
+    // Relationship elements wherever they occur, so that misplaced ones can
+    // be rejected.
+    fn relationship_node(_: usize, namespace: &str, local: &str, _: Option<&Node>) -> bool {
+        namespace == PACKAGE_NS && local == "Relationship"
+    }
+
+    // The relationships parser before it validated relationships as they
+    // stream: it retained every relationship element, then checked them.
+    fn reference_relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
+        let nodes = xml_nodes(bytes, relationship_node)?;
+        if nodes[0].local != "Relationships" || &*nodes[0].namespace != PACKAGE_NS {
+            return Err(Error::InvalidWorkbook("invalid relationships root".into()));
+        }
+        let relationships = &nodes[1..];
+        if relationships.iter().any(|node| node.parent != Some(0)) {
+            return Err(Error::InvalidWorkbook(
+                "relationship outside relationships root".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut result = Vec::new();
+        for node in relationships {
+            let required = |key| {
+                node.attr("", key)
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::InvalidWorkbook(format!("relationship lacks {key}")))
+            };
+            let id = required("Id")?;
+            if !ids.insert(id.clone()) {
+                return Err(Error::InvalidWorkbook("duplicate relationship id".into()));
+            }
+            let mode = node.attr("", "TargetMode").unwrap_or("Internal");
+            if !matches!(mode, "Internal" | "External") {
+                return Err(Error::InvalidWorkbook(
+                    "invalid relationship TargetMode".into(),
+                ));
+            }
+            result.push(Relationship {
+                id,
+                kind: required("Type")?,
+                target: required("Target")?,
+                external: mode == "External",
+            });
+        }
+        Ok(result)
+    }
+
+    fn expected_relationship(id: &str, kind: &str, target: &str, external: bool) -> Relationship {
+        Relationship {
+            id: id.into(),
+            kind: kind.into(),
+            target: target.into(),
+            external,
+        }
+    }
+
+    type Summary = std::result::Result<Vec<(String, String, String, bool)>, String>;
+
+    fn summary(relationships: Result<Vec<Relationship>>) -> Summary {
+        relationships
+            .map(|relationships| {
+                relationships
+                    .into_iter()
+                    .map(|r| (r.id, r.kind, r.target, r.external))
+                    .collect()
+            })
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    #[test]
+    fn streamed_relationships_match_the_retaining_reference() {
+        let roots = [
+            (
+                format!("<Relationships xmlns='{PACKAGE_NS}'>"),
+                "</Relationships>",
+            ),
+            (
+                format!(
+                    "<?xml version='1.0'?><r:Relationships xmlns:r='{PACKAGE_NS}' xmlns='{PACKAGE_NS}'>"
+                ),
+                "</r:Relationships>",
+            ),
+            // Unprefixed children of these are in no namespace or another.
+            (
+                format!("<r:Relationships xmlns:r='{PACKAGE_NS}'>"),
+                "</r:Relationships>",
+            ),
+            (
+                "<Relationships xmlns='urn:x'>".to_owned(),
+                "</Relationships>",
+            ),
+            (format!("<Relations xmlns='{PACKAGE_NS}'>"), "</Relations>"),
+            (
+                format!("<Relationship xmlns='{PACKAGE_NS}'>"),
+                "</Relationship>",
+            ),
+        ];
+        let restart: String = (0..NAMESPACE_LIMIT + 8)
+            .map(|n| format!("<v:a xmlns:v='urn:{n}'/>"))
+            .collect();
+        let children = [
+            format!("<Relationship Id='a' Type='{OFFICE_NS}/table' Target='t.xml'/>"),
+            format!("<Relationship Id='b' Type='{OFFICE_NS}/hyperlink' Target='https://example.com/' TargetMode='External'/>"),
+            format!("<Relationship Id='c' Type='{OFFICE_NS}/worksheet' Target='s.xml' TargetMode='Internal'></Relationship>"),
+            "<Relationship Id='a&#98;' Type='t' Target='&#120;&amp;'/>".to_owned(),
+            "<Relationship Id='ab' Type='t' Target='y'/>".to_owned(),
+            "<Relationship Id='a\tb' Type='t\n' Target='z'/>".to_owned(),
+            "<Relationship Id='a b' Type='t' Target='z'/>".to_owned(),
+            "<Relationship Type='t' Target='x'/>".to_owned(),
+            "<Relationship Id='m' Target='x'/>".to_owned(),
+            "<Relationship Id='n' Type='t'/>".to_owned(),
+            "<Relationship Id='e' Type='t' Target='x' TargetMode='external'/>".to_owned(),
+            "<Relationship Id='f' Type='t' Target='x' TargetMode=' External'/>".to_owned(),
+            "<Relationship Id='g' TargetMode='bad'/>".to_owned(),
+            "<Relationship xmlns:p='urn:p' p:Id='h' Type='t' Target='x'/>".to_owned(),
+            format!("<Relationship xmlns:p='{PACKAGE_NS}' p:Id='i' Id='j' p:Type='t' Type='u' Target='x'/>"),
+            format!("<q:Relationship xmlns:q='{PACKAGE_NS}' Id='k' Type='t' Target='x'/>"),
+            "<x:Relationship xmlns:x='urn:x' Id='a'/>".to_owned(),
+            "<Relationship xmlns='urn:other' Id='a'/>".to_owned(),
+            "<other Id='a'/>".to_owned(),
+            "<x:wrap xmlns:x='urn:x'><Relationship Id='w' Type='t' Target='x'/></x:wrap>".to_owned(),
+            "<Relationship Id='o' Type='t' Target='x'><Relationship Id='p' Type='t' Target='y'/></Relationship>".to_owned(),
+            "<!-- comment --> ".to_owned(),
+            restart,
+            // Errors in the XML itself, which every structural error defers to.
+            "<Relationship Id='a' Id='b'/>".to_owned(),
+            "<u:x/>".to_owned(),
+            "<a>&unknown;</a>".to_owned(),
+            "<a></b>".to_owned(),
+            "]]>".to_owned(),
+        ];
+        let mut state: u64 = 0x5eed_1234;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        let selected = |id: &str, kind: &str| id.starts_with('a') || kind.ends_with("/table");
+        let mut outcomes = BTreeSet::new();
+        for _ in 0..4_000 {
+            let (open, close) = &roots[next() % roots.len()];
+            let mut xml = open.clone();
+            for _ in 0..next() % 6 {
+                xml.push_str(&children[next() % children.len()]);
+            }
+            xml.push_str(close);
+            let reference = summary(reference_relationships(xml.as_bytes()));
+            assert_eq!(
+                summary(relationships(xml.as_bytes(), &|_, _| true)),
+                reference,
+                "{xml}"
+            );
+            let filtered = reference.clone().map(|relationships| {
+                relationships
+                    .into_iter()
+                    .filter(|(id, kind, _, _)| selected(id, kind))
+                    .collect()
+            });
+            assert_eq!(
+                summary(relationships(xml.as_bytes(), &selected)),
+                filtered,
+                "{xml}"
+            );
+            outcomes.insert(match reference {
+                Ok(relationships) => format!("Ok({})", relationships.len().min(2)),
+                Err(error) => error,
+            });
+        }
+        // Every structural refusal and an XML error occur among the cases.
+        for expected in [
+            "invalid relationships root",
+            "relationship outside relationships root",
+            "relationship lacks Id",
+            "relationship lacks Type",
+            "relationship lacks Target",
+            "duplicate relationship id",
+            "invalid relationship TargetMode",
+            "Xml(",
+            "Ok(0)",
+            "Ok(2)",
+        ] {
+            assert!(
+                outcomes.iter().any(|outcome| outcome.contains(expected)),
+                "{expected}: {outcomes:?}"
+            );
+        }
+    }
+
     #[test]
     fn relationship_resolution_preserves_empty_segments_and_directory_targets() {
         for target in [
@@ -1302,8 +1644,33 @@ mod tests {
 
     #[test]
     fn malformed_xml_has_no_partial_document() {
-        for xml in MALFORMED_XML {
+        for xml in MALFORMED_XML.iter().chain(ROOTLESS_XML) {
             assert!(xml_nodes(xml.as_bytes(), root_only).is_err(), "{xml}");
+        }
+    }
+
+    // Parts that end before any root element starts.
+    const ROOTLESS_XML: &[&str] = &[
+        "",
+        " ",
+        "<!--comment-->",
+        "<?xml version='1.0'?>",
+        "<?target data?>",
+        "\u{feff}",
+    ];
+
+    #[test]
+    fn parts_without_a_root_element_are_incomplete() {
+        for xml in ROOTLESS_XML {
+            for result in [
+                xml_nodes(xml.as_bytes(), root_only).map(drop),
+                crate::worksheet::parse_xml(xml.as_bytes()),
+            ] {
+                assert!(
+                    matches!(&result, Err(Error::Xml(message)) if message == "incomplete XML document"),
+                    "{xml:?}: {result:?}"
+                );
+            }
         }
     }
 
@@ -1416,6 +1783,16 @@ mod tests {
         let nodes = xml_nodes(rels.as_bytes(), relationship_node).unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[1].attr("", "Target"), Some("b"));
+        assert_eq!(
+            summary(relationships(rels.as_bytes(), &|_, _| true)),
+            summary(Ok(vec![expected_relationship("a", "t", "b", false)]))
+        );
+        // Relationships that the caller does not select are not kept at all.
+        assert!(
+            relationships(rels.as_bytes(), &|_, _| false)
+                .unwrap()
+                .is_empty()
+        );
 
         let workbook = format!(
             "<workbook xmlns='{MAIN_NS}' xmlns:x='urn:x'>{padding}<workbookPr date1904='1'/><sheets>{padding}<sheet name='a'/></sheets><extLst><workbookPr/>{padding}<ext><sheet name='b'/></ext></extLst></workbook>"
@@ -1613,6 +1990,7 @@ mod tests {
         let sheet = worksheet("<sheetData/>");
         let mut inputs: Vec<Vec<u8>> = [
             MALFORMED_XML,
+            ROOTLESS_XML,
             WELL_FORMED_XML,
             NAMESPACE_VIOLATIONS,
             NAMESPACE_DECLARATIONS,
@@ -1661,6 +2039,25 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_checks_of_long_attribute_lists_start_over_for_each_tag() {
+        // Past 16 attributes the checks use sets, reused across tags. Each
+        // later tag's 17th attribute repeats an earlier tag's name, plain or
+        // expanded, which is no duplicate.
+        let attributes = |name: &str, count: usize| -> String {
+            (1..=count).map(|n| format!(" {name}{n}='1'")).collect()
+        };
+        let xml = format!(
+            "<r xmlns:p='urn:p'><a{}/><b{} a1='1'/><c{}/><d{} p:a1='1'/></r>",
+            attributes("a", 17),
+            attributes("b", 16),
+            attributes("p:a", 17),
+            attributes("p:b", 16),
+        );
+        xml_nodes(xml.as_bytes(), root_only).unwrap();
+        crate::worksheet::parse_xml(xml.as_bytes()).unwrap();
+    }
+
+    #[test]
     fn namespace_pool_restarts_keep_every_check_and_retained_namespace() {
         let padding: String = (0..3 * NAMESPACE_LIMIT)
             .map(|n| format!("<x:a xmlns:x='urn:{n}' x:n='{n}'/>"))
@@ -1704,6 +2101,17 @@ mod tests {
             }))
             .collect();
         assert_eq!(retained, expected);
+        let streamed = super::relationships(rels.as_bytes(), &|_, _| true).unwrap();
+        let streamed: Vec<_> = streamed
+            .iter()
+            .map(|r| (r.id.as_str(), r.target.as_str()))
+            .collect();
+        let ids: Vec<_> = (0..3 * NAMESPACE_LIMIT).map(|n| format!("r{n}")).collect();
+        let expected: Vec<_> = [("a", "b")]
+            .into_iter()
+            .chain((0..3 * NAMESPACE_LIMIT).map(|n| (ids[n].as_str(), targets[n].as_str())))
+            .collect();
+        assert_eq!(streamed, expected);
         // An inherited binding still expands to the same name afterwards.
         let duplicate =
             format!("<a xmlns:p='urn:same'>{padding}<b xmlns:q='urn:same' p:x='1' q:x='2'/></a>");
@@ -1718,6 +2126,33 @@ mod tests {
                 .unwrap()
                 .process_content
         );
+    }
+
+    #[test]
+    fn package_parsing_holds_one_tag_of_attributes_and_a_bounded_namespace_pool() {
+        // Each tag binds a new namespace and has three attributes.
+        let padding: String = (0..10 * NAMESPACE_LIMIT)
+            .map(|n| format!("<x:a xmlns:x='urn:{n}' b='1' c='2'/>"))
+            .collect();
+        let xml = format!("<Types xmlns='{CONTENT_TYPES_NS}'>{padding}</Types>");
+        ATTRIBUTE_PEAK.set(0);
+        SPELLING_PEAK.set(0);
+        xml_nodes(xml.as_bytes(), root_only).unwrap();
+        assert_eq!(ATTRIBUTE_PEAK.get(), 3);
+        // The pool starts over once a tag takes it past the limit.
+        assert_eq!(SPELLING_PEAK.get(), NAMESPACE_LIMIT + 1);
+
+        // Each child of a workbook using mc:ProcessContent resolves a new
+        // namespace. The limit grows by the two rules in scope.
+        let padding: String = (0..10 * NAMESPACE_LIMIT)
+            .map(|n| format!("<a xmlns='urn:{n}'/>"))
+            .collect();
+        let workbook = format!(
+            "<workbook xmlns='{MAIN_NS}' xmlns:mc='{COMPATIBILITY_NS}' xmlns:v='urn:v' mc:Ignorable='v' mc:ProcessContent='v:w'>{padding}</workbook>"
+        );
+        SPELLING_PEAK.set(0);
+        reject_promoted_workbook_properties(workbook.as_bytes()).unwrap();
+        assert_eq!(SPELLING_PEAK.get(), NAMESPACE_LIMIT + 2 + 1);
     }
 
     #[test]

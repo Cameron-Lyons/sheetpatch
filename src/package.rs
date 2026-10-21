@@ -7,10 +7,10 @@ use crate::{
     },
 };
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt, fs,
     io::Write,
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{Mutex, OnceLock, PoisonError},
 };
@@ -200,7 +200,10 @@ pub struct Workbook {
     shared_strings_path: Option<String>,
     // The outcome of the table's first load. Untouched parts never change,
     // so a table that fails to load fails the same way on every later use.
-    shared_strings: OnceLock<std::result::Result<SharedStrings, Error>>,
+    // `Error` is not `RefUnwindSafe` only because an `io::Error` can box any
+    // source. A kept error never changes, and loading the table from memory
+    // never fails with an I/O error, so the workbook stays unwind-safe.
+    shared_strings: OnceLock<std::result::Result<SharedStrings, AssertUnwindSafe<Error>>>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
@@ -775,13 +778,19 @@ impl Workbook {
             // Shared strings only recognize rewriting a cell's current text,
             // so a table that cannot be loaded leaves such an edit a change.
             let worksheet = PreparedWorksheet::parse(current).map_err(in_sheet)?;
-            let Cow::Owned(patched) = worksheet
-                .patch_cells(&cells, || self.loaded_shared_strings(), self.date1904)
+            let Some(patch) = worksheet
+                .plan_cells(&cells, || self.loaded_shared_strings(), self.date1904)
                 .map_err(in_sheet)?
             else {
                 continue;
             };
-            self.check_table_headers(index, worksheet, &cells)?;
+            // A worksheet's first change resolves its tables, reading its
+            // whole relationships part. That happens before the edited XML is
+            // written, so that the part is never held with both the index and
+            // the output. A patch error still comes first.
+            let headers = self.table_headers(index);
+            let patched = patch.apply().map_err(in_sheet)?;
+            self.check_table_headers(index, &worksheet, headers?, &cells)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -794,34 +803,21 @@ impl Workbook {
     // Excel requires each table header cell's text to equal its table column's
     // name, and repairs or removes a table whose header differs. An edit may
     // rewrite a header cell's current value, as it reads, but not change it.
-    // `worksheet` is the edited worksheet as it was before the edits. Errors
-    // name the worksheet or the package part they concern.
+    // `worksheet` is the edited worksheet as it was before the edits, and
+    // `headers` its tables' header rows. Errors name the worksheet or the
+    // package part they concern.
     fn check_table_headers(
         &self,
         index: usize,
-        worksheet: PreparedWorksheet<'_>,
+        worksheet: &PreparedWorksheet<'_>,
+        headers: &[CellRange],
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
-        // A worksheet's first change resolves its tables, which can read and
-        // parse many relationships. The index is released meanwhile and
-        // rebuilt only for an edit in a header; once the tables are known, it
-        // is kept for the header reads instead.
-        let xml = worksheet.xml();
-        let retained = if self.sheet_xml[index].table_headers.get().is_some() {
-            Some(worksheet)
-        } else {
-            drop(worksheet);
-            None
-        };
-        let edits = header_cells(cells, self.table_headers(index)?);
+        let edits = header_cells(cells, headers);
         if edits.is_empty() {
             return Ok(());
         }
-        let worksheet = match retained {
-            Some(worksheet) => worksheet,
-            None => PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?,
-        };
         let mut changed_header = None;
         // Keep one value at a time: many headers can refer to the same long
         // shared string. Validate all reads before reporting the first changed
@@ -1072,9 +1068,9 @@ impl Workbook {
             self.archive
                 .read(path)
                 .and_then(|xml| read_shared_strings(&xml))
-                .map_err(|error| in_part(path, error))
+                .map_err(|error| AssertUnwindSafe(in_part(path, error)))
         });
-        Some(loaded.as_ref())
+        Some(loaded.as_ref().map_err(|error| &error.0))
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
@@ -1313,6 +1309,20 @@ mod tests {
     const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    #[test]
+    fn batch_reads_collect_exactly_sixteen_whole_columns() {
+        let too_many = |result: Result<Vec<CellRef>>| matches!(result, Err(Error::Unsupported(message)) if message.contains("too many cells"));
+        let columns: CellRange = "A1:P1048576".parse().unwrap();
+        assert_eq!(columns.cell_count(), MAX_READ_CELLS as u64);
+        // With an exact size hint, and with none, whose cells are counted.
+        assert_eq!(collect_cells(columns).unwrap().len(), MAX_READ_CELLS);
+        let unsized_cells = columns.cells().filter(|_| true);
+        assert_eq!(collect_cells(unsized_cells).unwrap().len(), MAX_READ_CELLS);
+        let one_more = || columns.cells().chain([CellRef::new(1, 17).unwrap()]);
+        assert!(too_many(collect_cells(one_more())));
+        assert!(too_many(collect_cells(one_more().filter(|_| true))));
+    }
 
     // A workbook whose Data worksheet's A1 and A2 are shared strings 0 and 1,
     // with `strings` as the body of its shared-string table.

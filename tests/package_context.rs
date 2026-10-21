@@ -864,6 +864,35 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     );
 }
 
+#[test]
+fn every_part_without_a_root_element_is_incomplete_xml() {
+    for part in [
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/worksheets/sheet1.xml",
+        "xl/sharedStrings.xml",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/tables/table1.xml",
+    ] {
+        for rootless in ["", "<!--comment-->", "<?xml version='1.0'?>"] {
+            let mut parts = every_part();
+            assert!(parts.insert(part.into(), rootless.into()).is_some());
+            // Opening the workbook, reading its cells, and editing the table
+            // body parse every part.
+            let result = Workbook::from_bytes(archive(&parts)).and_then(|mut book| {
+                book.get_cells("Data", ["A1", "A2"])?;
+                book.set_cell("Data", "A2", 5)
+            });
+            assert!(
+                matches!(&result, Err(Error::Xml(message)) if message.ends_with("incomplete XML document")),
+                "{part} {rootless:?}: {result:?}"
+            );
+        }
+    }
+}
+
 /// A Data worksheet whose A1 is the shared string at index 0 and A2 a number,
 /// in an Excel table on A1:A2 whose header row is A1.
 fn every_part() -> BTreeMap<String, Vec<u8>> {
@@ -900,6 +929,14 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
             "<mc:AlternateContent xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006'><mc:Choice Requires='x'>{contents}</mc:Choice></mc:AlternateContent>"
         )
     };
+    // The same contents in both branches, so that either one is valid.
+    let both = |contents: &str| {
+        format!(
+            "<mc:AlternateContent xmlns:mc='http://schemas.openxmlformats.org/markup-compatibility/2006'><mc:Choice Requires='x'>{contents}</mc:Choice><mc:Fallback>{contents}</mc:Fallback></mc:AlternateContent>"
+        )
+    };
+    let sheets = "<sheets><sheet name=\"Data\" sheetId='1' r:id='s1'/></sheets>";
+    let sheet_data = "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2'><v>1</v></c></row></sheetData>";
     // Each defect replaces text in one part.
     let malformed: [(&str, &str, &str, String); 21] = [
         ("wrong root", WORKBOOK, "workbook", "document".into()),
@@ -989,7 +1026,7 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
             "r='A2' t='inlineStr'".into(),
         ),
     ];
-    let unhandled: [(&str, &str, &str, String); 7] = [
+    let unhandled: [(&str, &str, &str, String); 10] = [
         (
             "mixed dialects",
             WORKBOOK,
@@ -1016,10 +1053,21 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
         ),
         (
             "hidden content",
+            WORKBOOK,
+            "</sheets>",
+            format!(
+                "{}</sheets>",
+                both("<sheet name='Hidden' sheetId='2' r:id='s1'/>")
+            ),
+        ),
+        ("hidden content", WORKBOOK, sheets, both(sheets)),
+        (
+            "hidden content",
             SHEET,
             "</sheetData>",
             format!("{}</sheetData>", branch("<row r='3'/>")),
         ),
+        ("hidden content", SHEET, sheet_data, both(sheet_data)),
         (
             "hidden content",
             STRINGS,

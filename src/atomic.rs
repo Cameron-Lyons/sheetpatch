@@ -124,8 +124,17 @@ impl From<u32> for Mode {
 impl Mode {
     /// The mode bits for `file`, a new file in the owning group.
     fn of(self, file: &File) -> u32 {
-        // An empty buffer asks only whether the file has an access ACL, which
-        // a new file inherits from its directory's default ACL.
+        if self.inherited_acl(file) {
+            self.masked
+        } else {
+            self.plain
+        }
+    }
+
+    /// Whether `file`, a new file, has an access ACL whose mask matters: one
+    /// it inherits from its directory's default ACL.
+    fn inherited_acl(self, file: &File) -> bool {
+        // An empty buffer asks only whether the file has an access ACL.
         #[cfg(target_os = "linux")]
         let has_acl = self.masked != self.plain
             && rustix::fs::fgetxattr(file, ACCESS_ACL, &mut [0; 0]).is_ok();
@@ -135,7 +144,7 @@ impl Mode {
             let _ = file;
             false
         };
-        if has_acl { self.masked } else { self.plain }
+        has_acl
     }
 }
 
@@ -303,6 +312,21 @@ fn replacement_mode(destination_mode: u32, same_group: bool) -> u32 {
     }
 }
 
+/// The permission bits applied to the replacement of a destination with
+/// `mode`, once it is known whether the replacement has the destination's
+/// group and whether it inherited an access ACL. In that group it keeps the
+/// mode that a new file there receives (see [`Mode::of`]). In another group
+/// the owning group's actual permissions, not an ACL's mask, limit others.
+#[cfg(unix)]
+fn replacement_bits(mode: Mode, same_group: bool, inherited_acl: bool) -> u32 {
+    let mode = if same_group && inherited_acl {
+        mode.masked
+    } else {
+        mode.plain
+    };
+    replacement_mode(mode, same_group)
+}
+
 /// Give `file` the group `gid` when the process may, and report whether it
 /// has that group. The result is checked, because some filesystems accept a
 /// group change without applying it.
@@ -332,16 +356,12 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
     // group can open it yet.
     let temp = create_temporary(path, Some(mode.plain & 0o700))?;
     let same_group = assign_group(temp.file(), destination.gid())?;
-    // In another group, the group bits are cleared and the owning group's
-    // actual permissions limit others.
-    let mode = if same_group {
-        mode.of(temp.file())
-    } else {
-        mode.plain
-    };
+    let inherited_acl = same_group && mode.inherited_acl(temp.file());
     temp.file()
-        .set_permissions(fs::Permissions::from_mode(replacement_mode(
-            mode, same_group,
+        .set_permissions(fs::Permissions::from_mode(replacement_bits(
+            mode,
+            same_group,
+            inherited_acl,
         )))?;
     Ok(temp)
 }
@@ -1157,6 +1177,24 @@ mod tests {
         assert_eq!(mode(&link), 0o600);
         assert_eq!(mode(&target), 0o660);
         assert_eq!(directory.entries(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacements_in_another_group_limit_others_by_the_owning_group_entry() {
+        // A 0604 file shared with one user through an access ACL whose mask
+        // is rw- while the owning group's own entry grants nothing.
+        let mode = Mode {
+            plain: 0o604,
+            masked: 0o664,
+        };
+        // In another group, others keep only what the owning group had.
+        assert_eq!(replacement_bits(mode, false, false), 0o600);
+        assert_eq!(replacement_bits(mode, false, true), 0o600);
+        // In the destination's group, an inherited ACL keeps the mask.
+        assert_eq!(replacement_bits(mode, true, false), 0o604);
+        assert_eq!(replacement_bits(mode, true, true), 0o664);
+        assert_eq!(replacement_bits(Mode::from(0o4775), false, false), 0o705);
     }
 
     #[cfg(target_os = "linux")]

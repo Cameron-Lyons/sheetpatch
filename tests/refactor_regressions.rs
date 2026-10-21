@@ -46,6 +46,42 @@ fn fixture_with_replacements(replacements: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn workbooks_and_their_views_can_be_used_across_catch_unwind() {
+    use sheetpatch::{CellContent, CellRange, CellRangeIter, Sheet, SheetVisibility};
+    use std::panic::{RefUnwindSafe, UnwindSafe, catch_unwind};
+    fn unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+    unwind_safe::<Workbook>();
+    unwind_safe::<WorksheetView<'_>>();
+    unwind_safe::<Sheet>();
+    unwind_safe::<SheetVisibility>();
+    unwind_safe::<CellRef>();
+    unwind_safe::<CellRange>();
+    unwind_safe::<CellRangeIter>();
+    unwind_safe::<CellValue>();
+    unwind_safe::<CellContent>();
+    unwind_safe::<CellEdit>();
+    // The workbook keeps the error of a shared-string table that cannot be
+    // loaded, and of each entry that cannot be decoded.
+    for strings in [
+        "<sst".to_owned(),
+        format!("<sst xmlns='{MAIN_NS}'><si><t>_xD83D_</t></si></sst>"),
+    ] {
+        let book = Workbook::from_bytes(fixture_with_replacements(&[(
+            "xl/sharedStrings.xml",
+            strings.as_bytes(),
+        )]))
+        .unwrap();
+        assert!(
+            catch_unwind(|| book.get_cell("Data", "C1"))
+                .unwrap()
+                .is_err()
+        );
+        let view = book.prepare_sheet("Data").unwrap();
+        assert!(catch_unwind(|| view.get_cell("C1")).unwrap().is_err());
+    }
+}
+
+#[test]
 fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Workbook>();

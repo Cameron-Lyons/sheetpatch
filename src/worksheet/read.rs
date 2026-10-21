@@ -5,7 +5,7 @@ use super::{ReadError, invalid, unique, unsupported, xml_error};
 use crate::xml::{NamespaceId, excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
-use std::collections::HashMap;
+use std::{collections::HashMap, panic::AssertUnwindSafe};
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
@@ -139,6 +139,14 @@ fn is_string_table(document: &XmlDocument) -> bool {
     root.local_name(document.source) == "sst" && document.is_spreadsheet_namespace(root.namespace)
 }
 
+// The most elements and normalized attribute values that the streaming
+// shared-string parse has held at once on this thread, for tests.
+#[cfg(test)]
+thread_local! {
+    pub(super) static SHARED_STRING_PEAKS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Decodes each string as its `si` element completes and then releases that
 /// subtree, so the parse holds one string's markup rather than the whole
 /// table while still validating every event.
@@ -158,6 +166,14 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
     let mut mixed_namespace = false;
     let mut table_error = None;
     let document = parse_with(xml, |document, index| {
+        #[cfg(test)]
+        SHARED_STRING_PEAKS.with(|peaks| {
+            let (elements, values) = peaks.get();
+            peaks.set((
+                elements.max(document.elements.len()),
+                values.max(document.attributes.normalized_len()),
+            ));
+        });
         if hidden_string || mixed_namespace || !is_string_table(document) {
             return true;
         }
@@ -220,8 +236,11 @@ pub(crate) struct SharedStrings {
     // position of its error in `errors`. Such an entry holds no text.
     undecodable: Vec<(u32, u32)>,
     // Each distinct decoding error once, so that a table of many damaged
-    // entries costs little more than their indexes.
-    errors: Vec<Error>,
+    // entries costs little more than their indexes. `Error` is not
+    // `RefUnwindSafe` only because an `io::Error` can box any source. A kept
+    // error never changes, and decoding never fails with an I/O error, so
+    // the table, and a workbook holding it, stay unwind-safe.
+    errors: Vec<AssertUnwindSafe<Error>>,
 }
 
 impl SharedStrings {
@@ -233,7 +252,7 @@ impl SharedStrings {
             .undecodable
             .binary_search_by_key(&index, |&(entry, _)| entry as usize)
         {
-            return Some(Err(&self.errors[self.undecodable[position].1 as usize]));
+            return Some(Err(&self.errors[self.undecodable[position].1 as usize].0));
         }
         let start = index
             .checked_sub(1)
@@ -261,7 +280,7 @@ impl SharedStrings {
         self.push("")?;
         let errors = &mut self.errors;
         let position = *distinct.entry(error.to_string()).or_insert_with(|| {
-            errors.push(error);
+            errors.push(AssertUnwindSafe(error));
             next
         });
         self.undecodable.push((entry, position));
