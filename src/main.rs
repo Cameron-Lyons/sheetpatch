@@ -17,9 +17,9 @@ const USAGE: &str = "Usage:\n  sheetpatch list [--json] INPUT\n  sheetpatch get 
 
 /// The most cells one `get` reads, counting every cell of each range.
 const MAX_GET_CELLS: u64 = 1_048_576;
-/// Keep common queries to one read without retaining unbounded decoded output.
-const READ_CACHE_CELLS: usize = 128;
-const READ_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// The output `get` and `cells` buffer while validating, so a read whose
+/// output fits decodes each cell once.
+const READ_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 fn command_help(command: &str) -> Option<&'static str> {
     match command {
@@ -776,66 +776,89 @@ struct CellOutput<'a> {
     escape: Escape,
 }
 
-/// Validate every requested value before emitting any output. Cache a bounded
-/// prefix, then reread remaining values individually from the prepared sheet.
-/// A cell-count limit alone would let oversized stored strings multiply memory
-/// use; the byte budget covers both scalar text and stored formulas.
+/// Write one cell's output. `cells` output skips formatting-only cells, and
+/// JSON output separates objects with commas after the first.
+fn write_cell(
+    output: &mut impl Write,
+    cell: CellRef,
+    content: &CellContent,
+    format: &CellOutput<'_>,
+    first: &mut bool,
+) -> io::Result<()> {
+    if format.records && content.value.is_blank() && content.formula.is_none() {
+        return Ok(());
+    }
+    if format.json {
+        if !*first {
+            output.write_all(b",")?;
+        }
+        *first = false;
+        write_json_cell(output, format.sheet, cell, content)
+    } else if format.records {
+        let kind = value_type(&content.value);
+        writeln!(
+            output,
+            "{cell}\t{kind}\t{}",
+            Escaped(&content.value, format.escape)
+        )
+    } else {
+        writeln!(output, "{}", Escaped(&content.value, format.escape))
+    }
+}
+
+/// The length of the stored text that a cell's output repeats: its value and,
+/// in JSON, its formula. Escaping only lengthens it, so this is a lower bound.
+fn stored_len(content: &CellContent, json: bool) -> usize {
+    let value = match &content.value {
+        CellValue::Text(text) | CellValue::Error(text) => text.len(),
+        _ => 0,
+    };
+    let formula = match &content.formula {
+        Some(formula) if json => formula.len(),
+        _ => 0,
+    };
+    value.saturating_add(formula)
+}
+
+/// Validate every requested value before emitting any output. While
+/// validating, buffer the output of cells until it exceeds `budget` bytes;
+/// only the cells after that prefix are read a second time. A cell whose
+/// stored text would exceed the budget ends the prefix before it is formatted,
+/// so the buffer outgrows the budget only by its last cell's formatting and
+/// escapes.
 fn write_read_cells(
     view: &WorksheetView<'_>,
     cells: &[CellRef],
+    budget: usize,
     output: &mut impl Write,
     format: CellOutput<'_>,
 ) -> Result<(), Failure> {
-    let mut cached = Vec::with_capacity(cells.len().min(READ_CACHE_CELLS));
-    let mut cached_bytes = 0usize;
-    let mut caching = true;
-    for &cell in cells {
-        let content = view.get_cell_at(cell)?;
-        if caching {
-            let value_bytes = match &content.value {
-                CellValue::Text(text) | CellValue::Error(text) => text.capacity(),
-                _ => 0,
-            };
-            let bytes =
-                value_bytes.saturating_add(content.formula.as_ref().map_or(0, String::capacity));
-            if bytes <= READ_CACHE_BYTES - cached_bytes {
-                cached_bytes += bytes;
-                cached.push(content);
-                caching = cached.len() < READ_CACHE_CELLS;
-            } else {
-                caching = false;
-            }
-        }
-    }
+    let mut buffer = Vec::new();
     if format.json {
-        output.write_all(b"[")?;
+        buffer.push(b'[');
     }
     let mut first = true;
-    let mut cached = cached.into_iter();
-    for &cell in cells {
-        let content = match cached.next() {
-            Some(content) => content,
-            None => view.get_cell_at(cell)?,
-        };
-        if format.records && content.value.is_blank() && content.formula.is_none() {
-            continue;
-        }
-        if format.json {
-            if !first {
-                output.write_all(b",")?;
+    // The index of the first cell whose output is not in `buffer`.
+    let mut rest = None;
+    for (index, &cell) in cells.iter().enumerate() {
+        let content = view.get_cell_at(cell)?;
+        if rest.is_none() {
+            let stored = stored_len(&content, format.json);
+            if buffer.len().saturating_add(stored) > budget {
+                rest = Some(index);
+            } else {
+                write_cell(&mut buffer, cell, &content, &format, &mut first)?;
+                if buffer.len() > budget {
+                    rest = Some(index + 1);
+                }
             }
-            write_json_cell(output, format.sheet, cell, &content)?;
-            first = false;
-        } else if format.records {
-            let kind = value_type(&content.value);
-            writeln!(
-                output,
-                "{cell}\t{kind}\t{}",
-                Escaped(&content.value, format.escape)
-            )?;
-        } else {
-            writeln!(output, "{}", Escaped(&content.value, format.escape))?;
         }
+    }
+    output.write_all(&buffer)?;
+    // Release the buffer before the remaining cells are read again.
+    drop(buffer);
+    for &cell in &cells[rest.unwrap_or(cells.len())..] {
+        write_cell(output, cell, &view.get_cell_at(cell)?, &format, &mut first)?;
     }
     if format.json {
         output.write_all(b"]\n")?;
@@ -914,6 +937,7 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     write_read_cells(
         &view,
         &cells,
+        READ_BUFFER_BYTES,
         output,
         CellOutput {
             sheet,
@@ -945,6 +969,7 @@ fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     write_read_cells(
         &view,
         &cells,
+        READ_BUFFER_BYTES,
         output,
         CellOutput {
             sheet,
@@ -1426,6 +1451,78 @@ mod tests {
                     .contains("\"x\\r\\u009b2J\\u007f\\ty\""),
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn read_output_does_not_depend_on_the_buffer_budget() {
+        // Every scalar type, formulas with and without a cached value, a
+        // formatting-only cell, a missing cell, controls, and text long enough
+        // that the budget can end the buffered prefix before or after a cell.
+        let long = "long ".repeat(12);
+        let sheet = format!(
+            "<worksheet xmlns='{MAIN_NS}'><sheetData>\
+             <row r='1'><c r='A1' t='s'><v>1</v></c><c r='B1'><v>12.5</v></c>\
+             <c r='C1' s='1'/><c r='D1'><f>B1*2</f><v>25</v></c></row>\
+             <row r='2'><c r='A2' t='inlineStr'><is><t>x&#13;&#x9b;2J&#x7f;&#9;y&#10;z</t></is></c>\
+             <c r='B2' t='b'><v>1</v></c><c r='C2' t='e'><v>#N/A</v></c><c r='D2'><f>{long}</f></c></row>\
+             <row r='3'><c r='A3' t='inlineStr'><is><t>{long}</t></is></c>\
+             <c r='B3'><v>not-a-number</v></c></row></sheetData></worksheet>"
+        );
+        let mut parts = common::payloads(&std::fs::read(FIXTURE).unwrap());
+        parts.insert("xl/worksheets/sheet1.xml".into(), sheet.into_bytes());
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let workbook = Workbook::from_bytes(common::stored_archive(&entries)).unwrap();
+        let view = workbook.prepare_sheet("Data").unwrap();
+        let cell = |address: &str| address.parse::<CellRef>().unwrap();
+        let mut cells: Vec<CellRef> = "A1:D3"
+            .parse::<CellRange>()
+            .unwrap()
+            .cells()
+            .filter(|&address| address != cell("B3"))
+            .collect();
+        cells.extend(["A3", "C1", "E9", "A2"].map(cell));
+        for json in [false, true] {
+            for records in [false, true] {
+                for escape in [Escape::Exact, Escape::Controls] {
+                    let format = || CellOutput {
+                        sheet: "Data",
+                        json,
+                        records,
+                        escape,
+                    };
+                    // Formatting each cell in turn gives the unbuffered output.
+                    let mut expected = if json { b"[".to_vec() } else { Vec::new() };
+                    let mut first = true;
+                    for &cell in &cells {
+                        let content = view.get_cell_at(cell).unwrap();
+                        write_cell(&mut expected, cell, &content, &format(), &mut first).unwrap();
+                    }
+                    if json {
+                        expected.extend_from_slice(b"]\n");
+                    }
+                    for budget in (0..=expected.len() + 1).chain([usize::MAX]) {
+                        let mut output = Vec::new();
+                        write_read_cells(&view, &cells, budget, &mut output, format()).unwrap();
+                        assert_eq!(output, expected, "budget {budget}");
+                    }
+                    // A malformed value after any buffered prefix still
+                    // prevents all output.
+                    let mut invalid = cells.clone();
+                    invalid.push(cell("B3"));
+                    for budget in [0, expected.len() / 2, usize::MAX] {
+                        let mut output = Vec::new();
+                        let failure =
+                            write_read_cells(&view, &invalid, budget, &mut output, format())
+                                .unwrap_err();
+                        assert!(failure.to_string().contains("B3"), "{failure}");
+                        assert!(output.is_empty(), "budget {budget}");
+                    }
+                }
+            }
         }
     }
 
