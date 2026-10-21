@@ -364,10 +364,20 @@ impl NamespacePool {
         self.canonical.get(uri).copied()
     }
 
-    /// How many distinct URI spellings this pool has resolved, which bounds
-    /// its size. A parser that keeps no IDs can start a new pool past a limit.
+    /// How many distinct URI spellings this pool has resolved since it was
+    /// created or cleared. Each adds at most one URI, so a parser that keeps
+    /// no IDs can clear the pool once this passes a limit.
     pub(crate) fn spellings(&self) -> usize {
         self.raw.len()
+    }
+
+    /// Forgets every URI, ID and cached binding but keeps the allocations,
+    /// so that a pool cleared again and again does not regrow its tables.
+    pub(crate) fn clear(&mut self) {
+        self.prefixes = NamespaceCache::default();
+        self.raw.clear();
+        self.canonical.clear();
+        self.values.truncate(1);
     }
 }
 
@@ -1401,6 +1411,28 @@ mod tests {
         assert_eq!(resolutions["urn:parent"], 1);
         assert_eq!(resolutions["urn:child"], 32);
         assert_eq!(resolutions["urn:other"], 32);
+    }
+
+    #[test]
+    fn cleared_namespace_pools_forget_every_uri_id_and_binding() {
+        let mut reader = NamespaceReader::from_str("<p:a xmlns:p='urn:p' xmlns:q='urn&#58;q'/>");
+        let Event::Empty(tag) = reader.read_event().unwrap() else {
+            panic!("expected the empty root");
+        };
+        let mut pool = NamespacePool::new();
+        let p = pool.resolve(&reader, tag.name(), false).unwrap();
+        let q = pool.resolve(&reader, QName("q:x"), true).unwrap();
+        assert_eq!((pool.spellings(), &**pool.uri(q)), (2, "urn:q"));
+        pool.clear();
+        assert_eq!(
+            (pool.spellings(), pool.id("urn:p"), pool.id("urn:q")),
+            (0, None, None)
+        );
+        // IDs start over: neither a cached binding nor the URI table keeps an
+        // ID from before.
+        assert_eq!(pool.resolve(&reader, QName("q:x"), true).unwrap(), p);
+        assert_eq!(pool.resolve(&reader, tag.name(), false).unwrap(), q);
+        assert_eq!((&**pool.uri(p), &**pool.uri(q)), ("urn:q", "urn:p"));
     }
 
     #[test]

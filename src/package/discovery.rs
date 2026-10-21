@@ -493,8 +493,8 @@ struct PartXml {
 }
 
 // Parts use few namespaces. Past this many spellings a parser that keeps no
-// namespace IDs starts a new pool, so that distinct declarations cannot grow
-// it without bound.
+// namespace IDs clears its pool, so that distinct declarations cannot grow it
+// without bound.
 const NAMESPACE_LIMIT: usize = 64;
 
 fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
@@ -582,7 +582,7 @@ fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
                 }
                 // Nodes hold their URIs, and no ID outlives its tag.
                 if namespaces.spellings() > NAMESPACE_LIMIT {
-                    namespaces = NamespacePool::new();
+                    namespaces.clear();
                 }
             }
             Event::End(_) => {
@@ -637,8 +637,8 @@ impl CompatibilityNames {
         }
     }
 
-    // Moves every name to its namespace's ID in a new pool. The names keep
-    // their order, so earlier checkpoints remain valid.
+    // Moves every name to its namespace's ID in a newly cleared pool. The
+    // names keep their order, so earlier checkpoints remain valid.
     fn renumber(&mut self, previous: &NamespacePool, pool: &mut NamespacePool) -> Result<()> {
         self.names.clear();
         for (namespace, local) in &mut self.added {
@@ -662,6 +662,8 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
     }
     let mut reader = NamespaceReader::from_reader(xml);
     let mut namespaces = NamespacePool::new();
+    // The pool in use before the last restart, kept for its allocations.
+    let mut previous = NamespacePool::new();
     // Namespace / expanded-name lookup stays bounded even for long inherited
     // rule lists. Only newly inserted names need removing when a scope closes.
     let mut rules: [CompatibilityNames; 2] = Default::default();
@@ -672,11 +674,12 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
         match event {
             Event::Start(e) | Event::Empty(e) => {
                 // As in part_xml, the pool starts over past a limit. The rules
-                // in scope hold IDs, so they move to the new pool, and the
+                // in scope hold IDs, so they move to the other pool, and the
                 // limit grows with them to keep that work linear.
                 let live: usize = rules.iter().map(|names| names.added.len()).sum();
                 if namespaces.spellings() > NAMESPACE_LIMIT + live {
-                    let previous = std::mem::replace(&mut namespaces, NamespacePool::new());
+                    previous.clear();
+                    std::mem::swap(&mut namespaces, &mut previous);
                     for names in &mut rules {
                         names.renumber(&previous, &mut namespaces)?;
                     }
