@@ -463,13 +463,16 @@ fn decoy_directory(tail: &[u8], base: usize, offset: usize) -> Result<Option<usi
     let entries = u16_at(tail, offset + 10)?;
     let comment_end = add(record_end, u16_at(tail, offset + 20)? as usize)?;
     let central_start = u32_at(tail, offset + 16)? as usize;
-    let central_end = add(central_start, u32_at(tail, offset + 12)? as usize)?;
+    // These bytes need not be a record. On 32-bit targets their directory can
+    // end past the address space, and then it does not end before the record.
+    let central_end = central_start.checked_add(u32_at(tail, offset + 12)? as usize);
+    let record_start = add(base, offset)?;
     let selectable = u16_at(tail, offset + 4)? == 0
         && u16_at(tail, offset + 6)? == 0
         && u16_at(tail, offset + 8)? == entries
         && entries != 0
         && comment_end <= tail.len()
-        && central_end <= add(base, offset)?;
+        && central_end.is_some_and(|central_end| central_end <= record_start);
     Ok(selectable.then_some(central_start))
 }
 
@@ -3080,8 +3083,9 @@ mod tests {
             Err(Error::InvalidWorkbook(message))
                 if message == "ambiguous ZIP end-of-directory records"
         ));
-        // That reader cannot select these records, so they stay comment bytes.
-        let unreadable: [fn(&mut [u8]); 7] = [
+        // That reader cannot select these records, so they stay comment bytes
+        // that neither opening nor saving refuses.
+        let unreadable: [fn(&mut [u8]); 8] = [
             // Another disk, or a directory spanning disks.
             |decoy| set_u16(decoy, 4, 1),
             |decoy| set_u16(decoy, 6, 1),
@@ -3097,10 +3101,19 @@ mod tests {
             // central-directory header.
             |decoy| set_u32(decoy, 12, 1000),
             |decoy| set_u32(decoy, 16, 1),
+            // A directory ending at 4 GiB, past the address space of 32-bit
+            // targets.
+            |decoy| {
+                set_u32(decoy, 12, 0x8000_0000);
+                set_u32(decoy, 16, 0x8000_0000);
+            },
         ];
+        let changes = BTreeMap::from([("part.xml".into(), b"<new/>".to_vec())]);
         for edit in unreadable {
             let archive = Archive::new(with_decoy(edit)).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"<live/>");
+            let saved = Archive::new(archive.write(&changes).unwrap()).unwrap();
+            assert_eq!(saved.read("part.xml").unwrap(), b"<new/>");
         }
     }
 
