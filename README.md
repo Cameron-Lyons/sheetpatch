@@ -164,7 +164,9 @@ An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 `protected cell: worksheet "Summary": D2 contains a formula`. Other errors raised
 inside a worksheet name it and, where one applies, the cell. Errors in another
 part, such as the shared-string table or a worksheet's relationships and table
-parts, name that part instead, as in `part "xl/sharedStrings.xml": …`.
+parts, name that part instead, as in `part "xl/sharedStrings.xml": …`. An
+invalid value in a `set_cells` or `set_cells_at` batch names its cell but not
+its worksheet, as in `invalid cell value: B7: numbers must be finite`.
 Malformed or ambiguous content, such as a numeric cell whose value is not a
 number, a cell reference that is not an address, rows out of order, or a cell
 with two values, returns `Error::InvalidWorkbook` in worksheets and shared
@@ -232,9 +234,13 @@ Wherever the rows are applied, `patch` refuses rows for error tokens outside
 Excel's writable codes (see [Supported scope](#supported-scope)) and for text
 longer than 32,767 UTF-16 code units. Applied back to the cells they were listed
 from, it also refuses rows for formula cells, for the other cells of a shared,
-array (including dynamic-array spill), or data-table formula range, and for
-merged cells other than their range's top-left cell, even though the value is
-unchanged. `cells --json` returns the same objects as `get --json`, in which
+array (including dynamic-array spill), or data-table formula range, for merged
+cells other than their range's top-left cell, and for cells whose stored value
+holds markup that sheetpatch does not recognize, such as unfamiliar elements or
+attributes inside `<v>` or `<is>`, even though the value is unchanged. It
+refuses every row of a worksheet with a shared, array, or data-table formula
+group that has no reference range, and of a digitally signed workbook.
+`cells --json` returns the same objects as `get --json`, in which
 spill and other formula-range cells without a formula of their own have a `null`
 formula. An empty worksheet prints nothing, or `[]`.
 
@@ -386,7 +392,7 @@ incomplete copy and safe to delete.
 | Existing cell formatting | Style, other attributes, and unfamiliar sibling content are retained. |
 | New cells and rows | Inserted in coordinate order. A new cell takes its row's style when the row has a custom format, otherwise its column's style; existing cells are never restyled. Existing dimension and row-span hints are widened as needed. |
 | Text | Written as inline strings; shared strings stay untouched. Whitespace, XML characters, and literal Excel escape sequences are preserved. Characters XML 1.0 forbids, such as NUL and other control characters, are stored as Excel's `_xHHHH_` escapes and read back exactly. |
-| Unchanged values | Writing the value a cell already stores, including a shared string's own text or an ISO 8601 date cell's serial, leaves the worksheet unchanged; edits may load the shared-string table to compare. Protections still apply. |
+| Unchanged values | Writing the value a cell already stores, including a shared string's own text or an ISO 8601 date cell's serial, leaves the worksheet unchanged; edits may load the shared-string table to compare, and an entry that cannot be decoded counts as changed. Protections still apply. |
 | Blank values | Value and type are cleared; the cell and its formatting remain. Clearing a missing cell changes nothing. |
 | Save without edits | The entire original archive is returned unchanged. |
 
@@ -417,7 +423,9 @@ in cached results. The original workbook's calculation settings are retained.
 - Existing `.xlsx`, `.xlsm`, `.xltx`, and `.xltm` OOXML packages, including strict
   and transitional SpreadsheetML and namespace-prefixed worksheets.
 - ZIP32 archives; accessed XML parts must use Stored or Deflate compression,
-  be UTF-8 XML 1.0, and be at most 64 MiB, as must saved replacements. Pending
+  be UTF-8 XML 1.0, and be at most 64 MiB, as must saved replacements. Only
+  XML's five predefined entities and character references are resolved,
+  whatever features other dependencies enable in `quick-xml`. Pending
   worksheet XML of 4 GiB or more cannot be indexed and is refused. Other untouched
   compression methods are retained without decoding. ZIP patched-data entries can
   only be preserved untouched. Workbooks are held in memory; `Workbook::open`,
@@ -455,7 +463,9 @@ in cached results. The original workbook's calculation settings are retained.
   than one `workbookPr`, and duplicate worksheet targets are rejected when
   opening. `workbookPr` inside a markup-compatibility branch or a matching
   `mc:ProcessContent` wrapper is unsupported, since processing that content
-  could change the date system. Mixed strict and transitional SpreadsheetML in
+  could change the date system, and so are `sheets` and `sheet` elements inside
+  a branch, since the sheets a reader lists would depend on the branch it
+  selects. Mixed strict and transitional SpreadsheetML in
   workbook metadata, worksheets, or shared strings is unsupported, since
   ignoring the other dialect could omit data or bypass edit protections.
   XML nested deeper than 256 elements is unsupported.
@@ -484,17 +494,27 @@ in cached results. The original workbook's calculation settings are retained.
   writes remain available.
 - Merged cells can be edited through their top-left anchor. Other cells in a
   merged range are protected.
-- Cell values, formulas, and merged ranges inside unsupported XML containers
-  are refused when accessing that worksheet, preventing hidden content from
-  bypassing these protections.
+- Cell values, formulas, and merged ranges inside unsupported XML containers,
+  and a worksheet whose only `sheetData` is inside one, are refused with
+  `Error::Unsupported` when accessing that worksheet, preventing hidden content
+  from bypassing these protections.
 - Unfamiliar XML inside a value payload is protected against replacement;
   unfamiliar cell attributes and sibling elements are preserved.
-- String reads refuse hidden text or shared-string entries in unsupported XML
-  containers, preventing partial values or shifted shared-string indices.
-  Multiple text elements within a single rich-text run are also unsupported,
-  since spreadsheet readers can interpret them differently.
-  Edits also refuse inline strings with hidden rich text, preserving content
-  that cannot be interpreted safely.
+- String reads refuse hidden text in unsupported XML containers, preventing
+  partial values, and multiple text elements within a single rich-text run,
+  since spreadsheet readers can interpret them differently. In the
+  shared-string table such an entry fails only reads of the cells that use it;
+  an `si` hidden in another element fails every shared-string read, since it
+  could shift later indices. Edits also refuse inline strings with hidden rich
+  text, preserving content that cannot be interpreted safely.
+- Text with an unpaired UTF-16 surrogate escape, such as `_xD83D_` alone, is
+  valid but cannot be returned as a Rust string, so reading it returns
+  `Error::Unsupported`; it is never replaced with U+FFFD. In the shared-string
+  table only that entry is refused, with a message naming the part and the
+  entry's index (`part "xl/sharedStrings.xml": string 1: …`). Rewriting a cell
+  that uses it counts as a change, and an edit of a table header cell that uses
+  it fails with the same error. A sheet name with such an escape makes opening
+  the workbook return `Error::Unsupported`, naming the sheet's position.
 - Legacy `.xls` and password-encrypted workbooks (OLE compound files) are
   detected and return `Error::Unsupported`, as do binary `.xlsb`, encrypted ZIP
   entries, ZIP64, multi-disk ZIP, and XML DTDs. Digitally signed OOXML packages
@@ -520,6 +540,7 @@ in the crate so untouched records can remain unchanged.
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+cargo test --locked --lib --features quick-xml/escape-html
 cargo test --locked --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 cargo build --locked --release --all-targets --all-features
@@ -531,7 +552,9 @@ dispatch, and a weekly schedule; a newer push to a pull request cancels its
 superseded run, while other runs always complete. It checks formatting, Clippy
 for the host and the Windows MSVC target, and documentation, with warnings
 treated as errors. Tests run on Linux, macOS, and Windows with stable Rust, and
-on Linux with the minimum supported Rust 1.88.0. The package job builds release
+on Linux with the minimum supported Rust 1.88.0; each run repeats the library
+tests with `quick-xml`'s `escape-html` feature, which another dependency could
+enable. The package job builds release
 targets, runs the benchmark's correctness checks with one sample of a fast
 operation subset, verifies `cargo package` and a publishing dry run, then tests,
 installs, and inspects the extracted package. An independent LibreOffice
@@ -573,13 +596,15 @@ Larger batches exclude ranges outside the edited cells' bounding rectangle
 before allocating a sweep index. Table-header guards coalesce the rows that
 headers span and test the edits in those rows against every header in one row
 sweep, so overlapping headers do not repeat work for each table; current header
-values are compared one at a time. Table targets are normalized against the
-worksheet's directory once, so spellings that differ only in letter case,
-escapes of unreserved characters, or dot segments share one resolution, and
-each distinct table part is decompressed and parsed once per workbook, even
-when several worksheets relate to it. Inserted cells resolve their row's
-default style once, while column defaults remain specific to each column. Row
-defaults are validated only when needed.
+values are read through the edit's own worksheet index and compared one at a
+time. A worksheet's tables are resolved only by a batch that changes it, after
+its edits are planned and before the edited XML is written. Table targets are
+normalized against the worksheet's directory once, so spellings that differ
+only in letter case, escapes of unreserved characters, or dot segments share
+one resolution, and each distinct table part is decompressed and parsed once
+per workbook, even when several worksheets relate to it. Inserted cells resolve
+their row's default style once, while column defaults remain specific to each
+column. Row defaults are validated only when needed.
 Indexed ZIP/sheet lookup and cached decompression avoid repeated archive scans,
 and ZIP physical order is cached for repeated saves.
 
@@ -591,8 +616,19 @@ the streaming shared-string parse releases them with each string. Direct
 children use ranges in the parse index, attributes and row cells use shared
 buffers, and normalized namespace URIs use compact identifiers.
 Namespace resolution reuses active prefix bindings across descendants and
-restores cached parent bindings after nested declarations. Package attribute
-checks reuse cached URI fingerprints and still compare exact namespace names.
+restores cached parent bindings after nested declarations. XML 1.0 character
+checks scan each part's UTF-8 bytes in vectorizable chunks rather than decoding
+every character. Package parts are checked by the same validating parser core
+as worksheets, with the same compact namespace identifiers, so a tag in a
+package part briefly costs what it does in a worksheet: a 24-byte record per
+attribute, each value that XML normalization changes, and past 16 attributes a
+set of their names. Package discovery validates whole parts but retains only
+the elements it needs, and clears its namespace table after 64 distinct URI
+spellings, so namespace declarations in markup it does not retain do not grow
+its memory. Relationships parts are checked as they stream: only the
+relationships that discovery uses are copied, and duplicate IDs are compared as
+spans of the part.
+
 One patch plan applies payload and attribute changes directly to worksheet spans;
 unchanged cell extensions are copied only into the final output. Edits that
 leave a worksheet unchanged retain its current XML without copying it. Shared
@@ -600,13 +636,14 @@ strings are decoded while streaming, releasing each entry's XML as it completes,
 and Excel text escapes are decoded without converting ordinary UTF-8 to a
 temporary UTF-16 buffer. Numeric and predefined XML text references are decoded
 directly, avoiding temporary strings for each reference. Writing XML-forbidden
-characters appends Excel escapes directly to the output buffer.
-Package discovery validates whole parts but retains
-only the elements it needs. For unchanged-value comparisons, multi-sheet edits
-attempt shared-string loading once per transaction, including when the table is
-damaged. Prepared worksheet views reuse a validated index
-across reads, with retention controlled by the view's lifetime; single-cell
-reads avoid allocating a batch result. CLI reads buffer up to 4 MiB of
+characters appends Excel escapes directly to the output buffer. The
+shared-string table is decompressed and parsed at most once per workbook, and
+the outcome is kept even when the table is damaged, so later reads and edits
+neither parse it again nor change its error. Its decoded text is held in one
+buffer with a 32-bit end offset per entry, rather than one allocation per
+string. Prepared worksheet views reuse a validated index across reads, with
+retention controlled by the view's lifetime; single-cell reads avoid
+allocating a batch result. CLI reads buffer up to 4 MiB of
 formatted output while validating, with no cell-count cap, so most reads decode
 each cell once. Cells beyond the buffer are validated before printing and then
 read again individually for output.
@@ -632,9 +669,11 @@ A deflated replacement larger than 2 MiB is compressed in fixed 1 MiB segments,
 each ending with a sync flush so that together they form one stream, on up to
 eight threads including the calling thread, and never more than
 `std::thread::available_parallelism` or the segment count. Its bytes do not
-depend on the thread count and are about 0.1% larger than a single stream's.
-Applications that save many large workbooks in parallel may therefore
-oversubscribe the CPU. Untouched parts keep their original compressed bytes.
+depend on the thread count and are up to about 0.25% larger than a single
+stream's. Applications that save many large workbooks in parallel may therefore
+oversubscribe the CPU; where a thread cannot be started, for example under a
+limit on the user's processes, the calling thread compresses its segments
+instead. Untouched parts keep their original compressed bytes.
 
 Run the dependency-free benchmark with:
 
@@ -662,33 +701,39 @@ SHEETPATCH_BENCH_SAMPLES=5 cargo bench --locked --bench editing
 
 ### Measurements
 
-The following measurements compare 1.0.0 with the preceding release candidate
-on an Intel Core Ultra 5 325, Linux x86_64, Rust 1.99.0, using release builds and
-synthetic workloads. Benchmark rows are harness medians; the other rows report a
-timed run and its peak resident memory. They describe these workloads, not a
-guarantee for every workbook, and vary between runs and machines.
+The following measurements compare 1.0.0 with an earlier release candidate,
+commit `32b1d6c`, on an Intel Core Ultra 5 325 (8 cores), Linux x86_64, Rust
+1.99.1, using release builds and synthetic workloads. Benchmark rows are harness
+medians. The other rows report the median CLI wall time and peak resident
+memory of 15 to 30 interleaved runs, except the earlier candidate's 3.2 GiB,
+which comes from an earlier run with Rust 1.99.0. They describe these
+workloads, not a guarantee for every workbook, and vary between runs and
+machines.
 
-| Workload | Previous candidate | 1.0.0 |
+| Workload | Earlier candidate | 1.0.0 |
 | --- | ---: | ---: |
-| `narrow_50000` `bulk_at`, 500 edits | 63 ms | 40 ms |
-| `narrow_50000` `get_cells_at`, 500 reads | 59 ms | 38 ms |
-| `narrow_50000` `cold_single_read` | 57 ms | 37 ms |
-| `guarded_bulk_at` | 29 ms | 19 ms |
-| `multisheet_apply`, 128 edits across 4 worksheets | 7.9 ms | 5.2 ms |
-| CLI `get` of one cell in a 200,000-cell worksheet | 167 ms, 97.7 MiB | 105 ms, 75.1 MiB |
-| Reading from a 61 MB `sharedStrings.xml` | 1,067 ms, 732 MiB | 790 ms, 197 MiB |
+| `narrow_50000` `bulk_at`, 500 edits | 50 ms | 26 ms |
+| `narrow_50000` `get_cells_at`, 500 reads | 47 ms | 24 ms |
+| `narrow_50000` `cold_single_read` | 49 ms | 27 ms |
+| `guarded_bulk_at` | 25 ms | 14 ms |
+| `multisheet_apply`, 128 edits across 4 worksheets | 6.8 ms | 4.2 ms |
+| CLI `get` of one cell in a 200,000-cell worksheet | 155 ms, 95.5 MiB | 86 ms, 48.7 MiB |
+| Reading from a 61 MB `sharedStrings.xml` | 1,004 ms, 731 MiB | 543 ms, 94.0 MiB |
 | Opening with a padded 16 MiB `[Content_Types].xml` | 819 MiB | 19 MiB |
 | Opening with a 63 MiB `workbook.xml` | 3.2 GiB | 66 MiB |
+| CLI `set` of one cell in an 800,000-cell, 36 MB worksheet | 1,031 ms, 405 MiB | 390 ms, 217 MiB |
 
-Worksheet parsing alone was about 30-36% faster and index construction 38-42%
+Worksheet parsing alone was about 40-49% faster and index construction 44-55%
 faster. Recompressing replacement parts at Deflate level 4 instead of the default
-level 6 made saves of edited worksheets 2 to 3.4 times faster in these
-measurements, with recompressed parts within a few percent of their level 6 size.
+level 6, in 1 MiB segments on several threads for parts over 2 MiB, made saving
+an edited worksheet about 3 times faster for a 0.7 MB worksheet and 5 to 17
+times faster for worksheets of 3.5 to 42 MB, with recompressed parts within 0.6%
+of their level 6 size.
 
 ### Historical 0.2 measurements
 
 Initial 0.2 measurements used one release-mode sample per synthetic workload on
-the same machine and toolchain:
+the same machine with Rust 1.99.0:
 
 | Worksheet cells / edits | Original sequential editor | Batch editor |
 | --- | ---: | ---: |
