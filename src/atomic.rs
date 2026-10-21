@@ -280,10 +280,7 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
         rustix::fs::getxattr(path, ACCESS_ACL, value)
     });
     #[cfg(not(target_os = "linux"))]
-    let mode = {
-        let _ = path;
-        destination.mode()
-    };
+    let mode = destination.mode();
     // Owner-only until the replacement has the destination's group, so no
     // group can open it yet.
     let temp = create_temporary(path, Some(mode & 0o700))?;
