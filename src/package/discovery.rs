@@ -858,8 +858,8 @@ struct Relationship {
 
 /// Validates a whole relationships part and returns, in document order, the
 /// relationships that `keep` selects by their ID and type. The others are
-/// not copied: only their IDs are kept while the part is parsed, borrowed
-/// from `bytes`, to find duplicates.
+/// not copied: only their IDs are kept while the part is parsed, to find
+/// duplicates, borrowed from `bytes` unless XML normalization changed them.
 fn relationships(bytes: &[u8], keep: &dyn Fn(&str, &str) -> bool) -> Result<Vec<Relationship>> {
     // Structural errors are reported only once the whole part is known to be
     // well-formed: an invalid root, then a relationship outside it, then the
