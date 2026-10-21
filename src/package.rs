@@ -966,6 +966,8 @@ impl Workbook {
     /// with contiguous local records stays contiguous; edited records do not
     /// accumulate as obsolete copies. Central-directory offsets may change.
     /// Without edits this returns the original bytes. Pending edits are retained.
+    /// Changed worksheets are recompressed; one larger than 2 MiB is compressed
+    /// in 1 MiB segments on up to eight threads, including the calling thread.
     ///
     /// # Errors
     ///
@@ -985,7 +987,8 @@ impl Workbook {
     /// central-directory offsets may change. The writer is flushed before this
     /// returns, so buffered writers passed by value still report write errors.
     /// An error after output has started, such as a failing writer, may leave a
-    /// partial archive; use `save` for atomic files.
+    /// partial archive; use `save` for atomic files. Changed worksheets are
+    /// compressed as described for [`Self::to_bytes`].
     ///
     /// # Errors
     ///
@@ -1000,7 +1003,8 @@ impl Workbook {
     /// offsets may change. Opaque ZIP prefixes or gaps cause an error. The writer
     /// is flushed before this returns. An error after output has started, such
     /// as a failing writer, may leave a partial archive; use `save_compact` for
-    /// files.
+    /// files. Changed worksheets are compressed as described for
+    /// [`Self::to_bytes`].
     ///
     /// # Errors
     ///
@@ -1028,6 +1032,7 @@ impl Workbook {
     /// The original destination is retained if generation or writing fails.
     /// Using the input path as destination is supported.
     /// Saving does not clear pending edits or replace the retained original.
+    /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
     /// The destination must name a file. An existing destination must resolve
     /// to a regular file: directories, FIFOs, devices, and sockets are rejected
@@ -1065,7 +1070,8 @@ impl Workbook {
     /// Atomically save while removing recognizable obsolete ZIP records already
     /// present in the input. Opaque ZIP prefixes or gaps cause an error.
     /// Saving does not clear pending edits or replace the retained original.
-    /// Destinations and permissions are handled as described for [`Self::save`].
+    /// Destinations, permissions, and compression are handled as described for
+    /// [`Self::save`].
     ///
     /// # Errors
     ///

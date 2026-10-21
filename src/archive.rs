@@ -9,10 +9,14 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
     io::{Read, Write},
+    num::NonZero,
     ops::Range,
 };
 
-use flate2::{Compression, Decompress, FlushDecompress, Status, write::DeflateEncoder};
+use flate2::{
+    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
+    write::DeflateEncoder,
+};
 
 use crate::{Error, Result};
 
@@ -60,6 +64,11 @@ const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as 
 // Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
 // produces archives about as small as the default level 6, several times faster.
 const DEFLATE_LEVEL: u32 = 4;
+// Replacements longer than two segments are deflated in segments of this
+// length, several at once. Each segment starts without the previous one's
+// history, which costs about 0.1% in size.
+const DEFLATE_SEGMENT: usize = 1 << 20;
+const MAX_DEFLATE_THREADS: usize = 8;
 
 pub(crate) trait PartChanges {
     // Names are unique; iteration order is also the validation error order.
@@ -1139,14 +1148,11 @@ impl Archive {
     ) -> Result<Sizes> {
         let size = zip32(data.len(), "ZIP member size")?;
         let compressed = match codec {
-            Codec::Stored => Cow::Borrowed(data),
-            Codec::Deflated => {
-                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
-                encoder.write_all(data)?;
-                Cow::Owned(encoder.finish()?)
-            }
+            Codec::Stored => vec![Cow::Borrowed(data)],
+            Codec::Deflated => deflate(data)?.into_iter().map(Cow::Owned).collect(),
         };
-        let compressed_size = zip32(compressed.len(), "compressed ZIP member size")?;
+        let compressed_len = compressed.iter().map(|piece| piece.len()).sum();
+        let compressed_size = zip32(compressed_len, "compressed ZIP member size")?;
         let sizes = Sizes {
             crc: crc32(data),
             compressed_size,
@@ -1158,12 +1164,14 @@ impl Archive {
         set_u16(&mut header, 6, entry.flags & !FLAG_DESCRIPTOR);
         sizes.write(&mut header, 14);
         zip32(
-            add(add(*position, original_header.len())?, compressed.len())?,
+            add(add(*position, original_header.len())?, compressed_len)?,
             "ZIP local-record area",
         )?;
         emit(writer, position, &header)?;
         emit(writer, position, &original_header[LOCAL_HEADER_LEN..])?;
-        emit(writer, position, &compressed)?;
+        for piece in &compressed {
+            emit(writer, position, piece)?;
+        }
         Ok(sizes)
     }
 
@@ -1510,6 +1518,104 @@ fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
 
+fn deflate_segment_len() -> usize {
+    #[cfg(test)]
+    if let Some(len) = tests::SEGMENT_OVERRIDE.get() {
+        return len;
+    }
+    DEFLATE_SEGMENT
+}
+
+/// Deflate `data` as one raw stream, returned in pieces to write in order.
+/// Data longer than two segments is split into segments compressed on up to
+/// `MAX_DEFLATE_THREADS` threads; the bytes do not depend on how many run.
+fn deflate(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let segment = deflate_segment_len();
+    if data.len() <= 2 * segment {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
+        encoder.write_all(data)?;
+        return Ok(vec![encoder.finish()?]);
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(MAX_DEFLATE_THREADS)
+        .min(data.len().div_ceil(segment));
+    deflate_segments(data, segment, threads)
+}
+
+/// Deflate nonempty `data` in segments of `segment` bytes, compressed one by
+/// one in contiguous groups on `threads` threads, the calling thread among
+/// them. A group whose thread cannot be started is compressed by the calling
+/// thread instead.
+fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<Vec<u8>>> {
+    let segments: Vec<_> = data.chunks(segment).collect();
+    let last = segments.len() - 1;
+    let compress = |first: usize, group: &[&[u8]]| -> Result<Vec<Vec<u8>>> {
+        group
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| deflate_segment(segment, first + index == last))
+            .collect()
+    };
+    let per_thread = segments.len().div_ceil(threads);
+    let mut groups = segments
+        .chunks(per_thread)
+        .enumerate()
+        .map(|(index, group)| (index * per_thread, group));
+    let (first, group) = groups.next().expect("data is nonempty");
+    std::thread::scope(|scope| {
+        let others: Vec<_> = groups
+            .map(|(first, group)| {
+                let thread =
+                    std::thread::Builder::new().spawn_scoped(scope, move || compress(first, group));
+                (first, group, thread)
+            })
+            .collect();
+        let mut output = compress(first, group)?;
+        for (first, group, thread) in others {
+            output.extend(match thread {
+                Ok(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?,
+                Err(_) => compress(first, group)?,
+            });
+        }
+        Ok(output)
+    })
+}
+
+/// Deflate one segment of a stream. Every segment but the last ends with a
+/// sync flush, which byte-aligns it without ending the stream, so the next
+/// segment's blocks can follow it.
+fn deflate_segment(data: &[u8], last: bool) -> Result<Vec<u8>> {
+    let mut compressor = Compress::new(Compression::new(DEFLATE_LEVEL), false);
+    let flush = if last {
+        FlushCompress::Finish
+    } else {
+        FlushCompress::Sync
+    };
+    let mut output = Vec::with_capacity(data.len() / 2 + 64);
+    loop {
+        let consumed = compressor.total_in() as usize;
+        let status = compressor
+            .compress_vec(&data[consumed..], &mut output, flush)
+            .map_err(std::io::Error::other)?;
+        // A flush is complete once a call consumed all input and left room
+        // in the output; until then the compressor may hold pending bytes.
+        // Stopping early would silently truncate the stream, which saves
+        // never read back.
+        let done = if last {
+            status == Status::StreamEnd
+        } else {
+            compressor.total_in() as usize == data.len() && output.len() < output.capacity()
+        };
+        if done {
+            return Ok(output);
+        }
+        output.reserve(output.capacity());
+    }
+}
+
 fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
     let mut decoder = Decompress::new(false);
     let mut buffer = [0; 8192];
@@ -1549,9 +1655,22 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
     }
 }
 
+// The integration tests' independent ZIP reader.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// Replaces `DEFLATE_SEGMENT` in saves on the current thread, so that
+        /// small replacements are deflated in many segments.
+        pub(super) static SEGMENT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
 
     fn append(archive: &Archive, changes: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -2466,6 +2585,89 @@ mod tests {
             Archive::new(compacted).unwrap().read("part.xml").unwrap(),
             b"updated"
         );
+    }
+
+    /// Bytes from a fixed pseudo-random sequence, which deflate cannot shrink.
+    fn noise(length: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn cells(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|row| {
+                format!("<c r=\"A{row}\"><v>{}</v></c>", row * 7919 % 10007).into_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deflate_segments_form_one_stream_whatever_the_thread_count() {
+        const SEGMENT: usize = 4096;
+        for data in [noise(3 * SEGMENT + 1), cells(1000)] {
+            for length in [SEGMENT, 2 * SEGMENT + 1, 3 * SEGMENT, 3 * SEGMENT + 1] {
+                let data = &data[..length];
+                let segments = deflate_segments(data, SEGMENT, 1).unwrap();
+                assert_eq!(segments.len(), length.div_ceil(SEGMENT));
+                for threads in [2, 3, MAX_DEFLATE_THREADS] {
+                    assert_eq!(deflate_segments(data, SEGMENT, threads).unwrap(), segments);
+                }
+                // Inflating stops at the end of the last segment and not
+                // before: only that segment ends the stream.
+                let compressed = segments.concat();
+                let mut decoder = Decompress::new(false);
+                let mut output = Vec::with_capacity(length + 1);
+                let status = decoder
+                    .decompress_vec(&compressed, &mut output, FlushDecompress::Finish)
+                    .unwrap();
+                assert_eq!(status, Status::StreamEnd);
+                assert_eq!(decoder.total_in() as usize, compressed.len());
+                assert_eq!(output, data);
+            }
+        }
+    }
+
+    #[test]
+    fn large_replacements_are_deflated_in_segments_that_read_back_and_compact() {
+        const SEGMENT: usize = 4096;
+        SEGMENT_OVERRIDE.set(Some(SEGMENT));
+        let large = cells(4000);
+        let segments = deflate_segments(&large, SEGMENT, 1).unwrap();
+        assert!(segments.len() > MAX_DEFLATE_THREADS);
+        let archive = Archive::new(deflate_descriptor_fixture(true)).unwrap();
+        let written = archive
+            .write(&BTreeMap::from([("part.xml".into(), large.clone())]))
+            .unwrap();
+        let reopened = Archive::new(written.clone()).unwrap();
+        assert_eq!(reopened.read("part.xml").unwrap(), large);
+        // Threads compressed the segments, with the same bytes as one.
+        let entry = &reopened.entries[0];
+        assert_eq!(reopened.original[entry.data.clone()], segments.concat());
+        // An independent reader agrees, and inflating everything after the
+        // payload start stops exactly at its recorded size.
+        assert_eq!(common::payload(&written, "part.xml"), large);
+        let sizes = inspect_deflate(&reopened.original[entry.data.start..], "part.xml").unwrap();
+        assert!(sizes == entry.sizes);
+        // Compaction recognizes the multi-segment record once obsolete.
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        let appended = Archive::new(append(&reopened, &changes)).unwrap();
+        let mut compacted = Vec::new();
+        appended
+            .compact_to(&BTreeMap::new(), &mut compacted)
+            .unwrap();
+        assert_eq!(compacted, reopened.write(&changes).unwrap());
+        // Replacements of at most two segments stay one stream.
+        let small = &large[..2 * SEGMENT];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
+        encoder.write_all(small).unwrap();
+        assert_eq!(deflate(small).unwrap(), [encoder.finish().unwrap()]);
     }
 
     #[test]
