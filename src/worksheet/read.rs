@@ -8,7 +8,7 @@ use quick_xml::events::Event;
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
-pub(super) fn element_text(xml: &[u8], element: &Element) -> Result<String> {
+fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     if element.has_children() {
         return Err(unsupported("elements inside a simple cell text value"));
     }
@@ -94,7 +94,7 @@ pub(super) fn validate_rich_text_structure(
     Ok(())
 }
 
-pub(super) fn rich_text(
+fn rich_text(
     source: &str,
     elements: &[Element],
     index: usize,
@@ -191,9 +191,21 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
 
 // A cell's stored value. A shared string is resolved separately: failing to
 // load the table concerns that part rather than the cell.
-enum StoredValue {
+pub(super) enum StoredValue {
     Value(CellValue),
     SharedString(usize),
+}
+
+// The cell's `v` or `is` payload, if it has one.
+pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
+    let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
+    unique(
+        cell.children(elements).filter(|&child| {
+            elements[child].is(source, namespace, "v")
+                || elements[child].is(source, namespace, "is")
+        }),
+        "cell has multiple value payloads",
+    )
 }
 
 fn stored_value(
@@ -202,19 +214,24 @@ fn stored_value(
     cell: &Element,
     date1904: bool,
 ) -> Result<StoredValue> {
+    match value_payload(index, cell)? {
+        None => Ok(StoredValue::Value(CellValue::Blank)),
+        Some(payload_index) => decode_payload(xml, index, cell, payload_index, date1904),
+    }
+}
+
+// Decodes the cell's payload as reads see it; no-op detection compares an
+// edit against the same value.
+pub(super) fn decode_payload(
+    xml: &[u8],
+    index: &WorksheetIndex,
+    cell: &Element,
+    payload_index: usize,
+    date1904: bool,
+) -> Result<StoredValue> {
     let elements = &index.elements;
     let source = index.source;
     let namespace = index.namespace;
-    let payload_index = unique(
-        cell.children(elements).filter(|&child| {
-            elements[child].is(source, namespace, "v")
-                || elements[child].is(source, namespace, "is")
-        }),
-        "cell has multiple value payloads",
-    )?;
-    let Some(payload_index) = payload_index else {
-        return Ok(StoredValue::Value(CellValue::Blank));
-    };
     let payload = &elements[payload_index];
     let kind = cell
         .attr(&index.attributes, "t")

@@ -1472,6 +1472,76 @@ fn no_op_patches_borrow_the_original_xml() {
 }
 
 #[test]
+fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
+    // Clearing an existing payload is a change even when it reads as blank;
+    // every other edit is a no-op only if a read returns the same value.
+    let strings = ["first".to_owned(), " 2".to_owned()];
+    let address: CellRef = "A1".parse().unwrap();
+    let values = [
+        CellValue::Blank,
+        2.5.into(),
+        2.0.into(),
+        3.0.into(),
+        0.0.into(),
+        true.into(),
+        false.into(),
+        "first".into(),
+        " 2".into(),
+        " 2A".into(),
+        "2".into(),
+        CellValue::Error("#N/A".into()),
+    ];
+    for cell in [
+        "<c r='A1'><v> 2.50 </v></c>",
+        "<c r='A1' t='n'><v/></c>",
+        "<c r='A1'><v>2 x</v></c>",
+        "<c r='A1' t='b'><v>true</v></c>",
+        "<c r='A1' t='b'><v> 0 </v></c>",
+        "<c r='A1' t='b'><v>yes</v></c>",
+        "<c r='A1' t='d'><v>1900-01-03</v></c>",
+        "<c r='A1' t='d'><v>1904-01-03</v></c>",
+        "<c r='A1' t='d'><v>2024-02-30</v></c>",
+        "<c r='A1' t='str'><v> 2_x0041_</v></c>",
+        "<c r='A1' t='str'><v>2</v></c>",
+        "<c r='A1' t='e'><v>#N/A</v></c>",
+        "<c r='A1' t='inlineStr'><is><r><t>fi</t></r><r><t>rst</t></r></is></c>",
+        "<c r='A1' t='inlineStr'><v>first</v></c>",
+        "<c r='A1'><is><t>first</t></is></c>",
+        "<c r='A1' t='s'><v> 0 </v></c>",
+        "<c r='A1' t='s'><v>1</v></c>",
+        "<c r='A1' t='s'><v>2</v></c>",
+        "<c r='A1' t='x'><v>2</v></c>",
+    ] {
+        let input = sheet(&format!("<sheetData><row r='1'>{cell}</row></sheetData>"));
+        for date1904 in [false, true] {
+            let read = read_cells(
+                input.as_bytes(),
+                &[address],
+                || Ok(Some(&strings)),
+                date1904,
+            )
+            .ok()
+            .map(|mut cells| cells.remove(0).value);
+            for value in &values {
+                let patched = patch_cells(
+                    input.as_bytes(),
+                    &BTreeMap::from([(address, value.clone())]),
+                    || Some(&strings),
+                    date1904,
+                )
+                .unwrap();
+                let no_op = *value != CellValue::Blank && read.as_ref() == Some(value);
+                assert_eq!(
+                    matches!(patched, Cow::Borrowed(_)),
+                    no_op,
+                    "{cell} {value:?} date1904={date1904}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
     let mut seed = 17u32;
     let mut next = || {

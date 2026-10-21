@@ -1,10 +1,9 @@
-use super::date::excel_serial;
 use super::index::{RowEntry, WorksheetIndex, reference_range};
 use super::parse::{Attributes, Element};
-use super::read::{element_text, rich_text};
+use super::read::{StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
 use super::{at_cell, protected, protection, unique, unsupported};
-use crate::xml::{excel_escaped, excel_text, trim_whitespace as trim_xml_whitespace};
+use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -175,49 +174,33 @@ struct CurrentValues<F> {
     date1904: bool,
 }
 
-// Whether `value` matches a cell's current payload, as it reads. Decoding the
-// old value only detects no-op edits, so an undecodable old value counts as a
+// Whether `value` is the cell's current payload, as it reads. Decoding the old
+// value only detects no-op edits, so an undecodable old value counts as a
 // change rather than blocking its replacement; `validate_payload` already
 // refused unfamiliar markup that a replacement would discard.
 fn unchanged_value<'s>(
     xml: &[u8],
     index: &WorksheetIndex,
-    kind: &str,
+    cell: &Element,
     payload: usize,
     value: &CellValue,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s [String]>>,
 ) -> bool {
-    let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
-    let old = &elements[payload];
-    let old_text = || element_text(xml, old).ok();
-    match value {
-        CellValue::Number(number) if kind == "n" && old.is(source, namespace, "v") => old_text()
-            .and_then(|text| trim_xml_whitespace(&text).parse::<f64>().ok())
-            .is_some_and(|old| old == *number),
-        // An ISO 8601 date reads as its serial in the workbook's date system.
-        CellValue::Number(number) if kind == "d" && old.is(source, namespace, "v") => old_text()
-            .and_then(|text| excel_serial(trim_xml_whitespace(&text), current.date1904).ok())
-            .is_some_and(|old| old == *number),
-        CellValue::Bool(boolean) if kind == "b" && old.is(source, namespace, "v") => old_text()
-            .is_some_and(|text| match trim_xml_whitespace(&text) {
-                "1" | "true" => *boolean,
-                "0" | "false" => !*boolean,
-                _ => false,
-            }),
-        CellValue::Text(text) if kind == "inlineStr" && old.is(source, namespace, "is") => {
-            rich_text(source, elements, payload, namespace).is_ok_and(|old| old == *text)
-        }
-        CellValue::Text(text) if kind == "s" && old.is(source, namespace, "v") => old_text()
-            .and_then(|position| trim_xml_whitespace(&position).parse::<usize>().ok())
-            .and_then(|position| (current.shared_strings)()?.get(position))
-            .is_some_and(|old| old == text),
-        CellValue::Text(text) if kind == "str" && old.is(source, namespace, "v") => old_text()
-            .and_then(|old| excel_text(&old).ok())
-            .is_some_and(|old| old == *text),
-        CellValue::Error(error) if kind == "e" && old.is(source, namespace, "v") => old_text()
-            .and_then(|old| excel_text(&old).ok())
-            .is_some_and(|old| old == *error),
-        _ => false,
+    // An existing payload, even an empty `<v/>` that reads as blank, is a
+    // representation that clearing removes.
+    if matches!(value, CellValue::Blank) {
+        return false;
+    }
+    match decode_payload(xml, index, cell, payload, current.date1904) {
+        Ok(StoredValue::Value(old)) => old == *value,
+        // The table is loaded only to compare text.
+        Ok(StoredValue::SharedString(position)) => match value {
+            CellValue::Text(text) => (current.shared_strings)()
+                .and_then(|strings| strings.get(position))
+                .is_some_and(|old| old == text),
+            _ => false,
+        },
+        Err(_) => false,
     }
 }
 
@@ -237,23 +220,13 @@ fn patched_cell<'s>(
         index.namespace,
     );
     let cell = &elements[cell_index];
-    let value_child = unique(
-        cell.children(elements).filter(|&child| {
-            elements[child].is(source, namespace, "v")
-                || elements[child].is(source, namespace, "is")
-        }),
-        "cell has multiple value payloads",
-    )
-    .map_err(|error| at_cell(address, error))?;
+    let value_child = value_payload(index, cell).map_err(|error| at_cell(address, error))?;
     if let Some(child) = value_child {
         validate_payload(source, elements, attributes, child, namespace)
             .map_err(|error| at_cell(address, error))?;
     }
-    let kind = cell
-        .attr(attributes, "t")
-        .map_or("n", |attribute| attribute.value);
     let unchanged = if let Some(child) = value_child {
-        unchanged_value(xml, index, kind, child, value, current)
+        unchanged_value(xml, index, cell, child, value, current)
     } else {
         matches!(value, CellValue::Blank) && cell.attr(attributes, "t").is_none()
     };
