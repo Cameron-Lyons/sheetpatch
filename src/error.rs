@@ -32,9 +32,9 @@ pub enum Error {
     /// An address or range is invalid or outside Excel's row and column limits.
     InvalidCellReference(String),
     /// A scalar value cannot be represented within the supported cell format.
-    /// From a batch edit, such as
-    /// [`Workbook::set_cells`](crate::Workbook::set_cells), the message names
-    /// the cell.
+    /// From [`Workbook::set_cells`](crate::Workbook::set_cells) or
+    /// [`Workbook::set_cells_at`](crate::Workbook::set_cells_at), the message
+    /// names the cell.
     InvalidValue(String),
     /// No worksheet has the requested exact, case-sensitive name.
     SheetNotFound(String),

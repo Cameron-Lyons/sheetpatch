@@ -162,9 +162,9 @@ impl SheetVisibility {
 ///
 /// Values are validated before any worksheet is read: non-finite numbers,
 /// text longer than Excel's 32,767 UTF-16 code units, and error values that
-/// are not Excel error codes return [`Error::InvalidValue`]. From a batch,
-/// such as [`Self::set_cells`], its message names the cell, as in
-/// `B7: numbers must be finite`, but not the worksheet.
+/// are not Excel error codes return [`Error::InvalidValue`]. From
+/// [`Self::set_cells`] or [`Self::set_cells_at`], its message names the cell,
+/// as in `B7: numbers must be finite`, but not the worksheet.
 ///
 /// # Errors while reading
 ///
