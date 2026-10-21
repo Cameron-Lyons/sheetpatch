@@ -727,6 +727,9 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         // Excel's day zero holds times without a date.
         ("1899-12-31", 0.0),
         ("1899-12-31T12:00:00", 0.5),
+        // Months of 30 days.
+        ("2024-04-30", 45_412.0),
+        ("2024-06-15", 45_458.0),
     ];
     let body: String = cells
         .iter()
@@ -754,6 +757,9 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         ("2024-01-15T00:00:00+01:00", true),
         ("2024-01-15-05:00", true),
         ("2023-02-29", false),
+        ("2024-04-31", false),
+        ("2023-09-31", false),
+        ("2024-06-00", false),
         ("2024-13-01", false),
         ("2024-01-15T24:00", false),
         ("2024-01-15T00:60", false),
