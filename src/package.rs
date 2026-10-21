@@ -752,20 +752,8 @@ impl Workbook {
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
-        let headers = self.table_headers(index)?;
-        // Edits are ordered by row and column. Search only the rows occupied
-        // by each header instead of testing every edit against every table.
-        // Keep one sorted entry per cell so overlapping headers retain the
-        // same read and refusal order as ordinary worksheet batches.
-        let mut header_cells = BTreeMap::new();
-        for header in headers {
-            header_cells.extend(
-                cells
-                    .range(header.first()..=header.last())
-                    .filter(|(cell, _)| header.contains(**cell)),
-            );
-        }
-        if header_cells.is_empty() {
+        let edits = header_cells(cells, self.table_headers(index)?);
+        if edits.is_empty() {
             return Ok(());
         }
         let worksheet = PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?;
@@ -773,7 +761,7 @@ impl Workbook {
         // Keep one value at a time: many headers can refer to the same long
         // shared string. Validate all reads before reporting the first changed
         // header, preserving read-error precedence without retaining copies.
-        for (&cell, value) in header_cells {
+        for (cell, value) in edits {
             let current = worksheet
                 .read_cell(cell, || self.shared_strings(), self.date1904)
                 .map_err(|error| sheet.read_context(error))?;
@@ -1102,5 +1090,173 @@ impl Workbook {
         crate::atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_compact_to(writer)
         })
+    }
+}
+
+// The edits inside any table header, once each and in edit order, so that
+// overlapping headers keep the read and refusal order of ordinary worksheet
+// batches. A package can relate many tables with overlapping headers, and the
+// work must not repeat for each table. The rows spanned by headers are
+// coalesced, so each edit is visited at most once, and the edits in those rows
+// are then tested against every header in one row sweep.
+fn header_cells<'a>(
+    cells: &'a BTreeMap<CellRef, CellValue>,
+    headers: &[CellRange],
+) -> Vec<(CellRef, &'a CellValue)> {
+    let mut spans: Vec<(u32, u32)> = headers
+        .iter()
+        .map(|header| (header.first().row, header.last().row))
+        .collect();
+    spans.sort_unstable();
+    let mut spans = spans.into_iter();
+    let Some(mut span) = spans.next() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    let mut search = |(first, last): (u32, u32)| {
+        let first = CellRef {
+            row: first,
+            column: 1,
+        };
+        let last = CellRef {
+            row: last,
+            column: CellRef::MAX_COLUMN,
+        };
+        candidates.extend(
+            cells
+                .range(first..=last)
+                .map(|(&cell, value)| (cell, value)),
+        );
+    };
+    for (first, last) in spans {
+        // Spans that overlap or touch form one run of rows.
+        if first > span.1 + 1 {
+            search(span);
+            span = (first, last);
+        } else {
+            span.1 = span.1.max(last);
+        }
+    }
+    search(span);
+    // With either collection small, direct membership checks cost less than
+    // sorting events and allocating a column index.
+    if candidates.len() <= 8
+        || headers.len() <= 8
+        || candidates.len().saturating_mul(headers.len()) <= 256
+    {
+        candidates.retain(|&(cell, _)| headers.iter().any(|header| header.contains(cell)));
+        return candidates;
+    }
+    // Each header counts once in its columns, from its first row to its last.
+    let mut events: Vec<(u32, u16, u16, i32)> = Vec::with_capacity(headers.len() * 2);
+    for header in headers {
+        let (first, last) = (header.first(), header.last());
+        events.push((first.row, first.column, last.column, 1));
+        events.push((last.row + 1, first.column, last.column, -1));
+    }
+    events.sort_unstable_by_key(|&(row, ..)| row);
+    // Fenwick indexes are one-based columns. A header also updates the slot
+    // after its last column, which is one past the grid's final column.
+    let mut active = vec![0i32; usize::from(CellRef::MAX_COLUMN) + 2];
+    let mut position = 0;
+    // Candidates are visited in edit order. The events of every row up to a
+    // candidate's own are applied before its column is counted.
+    candidates.retain(|&(cell, _)| {
+        while position < events.len() && events[position].0 <= cell.row {
+            let (_, first_column, last_column, delta) = events[position];
+            for (column, delta) in [
+                (usize::from(first_column), delta),
+                (usize::from(last_column) + 1, -delta),
+            ] {
+                let mut index = column;
+                while index < active.len() {
+                    active[index] += delta;
+                    index += index & index.wrapping_neg();
+                }
+            }
+            position += 1;
+        }
+        let mut count = 0;
+        let mut index = usize::from(cell.column);
+        while index > 0 {
+            count += active[index];
+            index &= index - 1;
+        }
+        count > 0
+    });
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The search before header rows were coalesced: every header's rows, one
+    // header at a time.
+    fn reference_header_cells<'a>(
+        cells: &'a BTreeMap<CellRef, CellValue>,
+        headers: &[CellRange],
+    ) -> Vec<(CellRef, &'a CellValue)> {
+        let mut header_cells = BTreeMap::new();
+        for header in headers {
+            header_cells.extend(
+                cells
+                    .range(header.first()..=header.last())
+                    .filter(|(cell, _)| header.contains(**cell)),
+            );
+        }
+        header_cells
+            .into_iter()
+            .map(|(&cell, value)| (cell, value))
+            .collect()
+    }
+
+    #[test]
+    fn header_cells_match_a_search_of_each_header() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..3_000 {
+            // Mostly small grids, so headers overlap and edits fall inside
+            // them, with occasional cells on the grid's last rows and columns.
+            let rows = 1 + next(if round % 3 == 0 { 40 } else { 8 }) as u32;
+            let columns = 1 + next(if round % 5 == 0 { 40 } else { 10 }) as u16;
+            let (header_count, edit_count) = (next(30), next(60));
+            let mut cell = || CellRef {
+                row: if next(20) == 0 {
+                    CellRef::MAX_ROW - next(2) as u32
+                } else {
+                    1 + next(rows.into()) as u32
+                },
+                column: if next(20) == 0 {
+                    CellRef::MAX_COLUMN - next(2) as u16
+                } else {
+                    1 + next(columns.into()) as u16
+                },
+            };
+            // Excel's headers span one row; crafted ones can span several.
+            let headers: Vec<CellRange> = (0..header_count)
+                .map(|index| {
+                    let first = cell();
+                    let mut last = cell();
+                    if index % 2 == 0 {
+                        last.row = first.row;
+                    }
+                    CellRange::new(first, last)
+                })
+                .collect();
+            let cells: BTreeMap<CellRef, CellValue> = (0..edit_count)
+                .map(|value| (cell(), CellValue::Number(value as f64)))
+                .collect();
+            assert_eq!(
+                header_cells(&cells, &headers),
+                reference_header_cells(&cells, &headers),
+                "round {round}"
+            );
+        }
     }
 }
