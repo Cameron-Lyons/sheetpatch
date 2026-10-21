@@ -667,8 +667,12 @@ impl Workbook {
     ///
     /// Returns [`Error::SheetNotFound`] before reading the batch if no
     /// worksheet has this name, then the first invalid address or value, and
-    /// otherwise fails like [`Self::set_cell`] for the first edit refused.
-    /// No edit of a failed batch is applied.
+    /// otherwise fails like [`Self::set_cell`] for one refused edit, which
+    /// need not be the batch's first. Formula cells, then cells in formula
+    /// ranges, then merged cells are checked across the whole batch, each in
+    /// row-major order. The cells are then patched in row-major order, where
+    /// metadata and payload refusals arise, and Excel table headers are
+    /// checked last. No edit of a failed batch is applied.
     pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -728,8 +732,10 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::SheetNotFound`] for the first edit that names no
-    /// worksheet, and otherwise fails like [`Self::set_cell`] for the first
-    /// edit refused. No edit of a failed transaction is applied.
+    /// worksheet, and otherwise fails like [`Self::set_cell`] for one refused
+    /// edit. Worksheets are checked in the order of [`Self::sheets`], not of
+    /// the edits, and each worksheet's edits in the order described for
+    /// [`Self::set_cells`]. No edit of a failed transaction is applied.
     pub fn apply_edits(&mut self, edits: impl IntoIterator<Item = CellEdit>) -> Result<()> {
         let mut grouped: BTreeMap<usize, BTreeMap<CellRef, CellValue>> = BTreeMap::new();
         for edit in edits {
