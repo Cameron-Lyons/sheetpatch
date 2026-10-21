@@ -5,7 +5,7 @@ use super::{ReadError, invalid, unique, unsupported, xml_error};
 use crate::xml::{NamespaceId, excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
-use std::collections::HashMap;
+use std::{collections::HashMap, panic::AssertUnwindSafe};
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
@@ -236,8 +236,11 @@ pub(crate) struct SharedStrings {
     // position of its error in `errors`. Such an entry holds no text.
     undecodable: Vec<(u32, u32)>,
     // Each distinct decoding error once, so that a table of many damaged
-    // entries costs little more than their indexes.
-    errors: Vec<Error>,
+    // entries costs little more than their indexes. `Error` is not
+    // `RefUnwindSafe` only because an `io::Error` can box any source. A kept
+    // error never changes, and decoding never fails with an I/O error, so
+    // the table, and a workbook holding it, stay unwind-safe.
+    errors: Vec<AssertUnwindSafe<Error>>,
 }
 
 impl SharedStrings {
@@ -249,7 +252,7 @@ impl SharedStrings {
             .undecodable
             .binary_search_by_key(&index, |&(entry, _)| entry as usize)
         {
-            return Some(Err(&self.errors[self.undecodable[position].1 as usize]));
+            return Some(Err(&self.errors[self.undecodable[position].1 as usize].0));
         }
         let start = index
             .checked_sub(1)
@@ -277,7 +280,7 @@ impl SharedStrings {
         self.push("")?;
         let errors = &mut self.errors;
         let position = *distinct.entry(error.to_string()).or_insert_with(|| {
-            errors.push(error);
+            errors.push(AssertUnwindSafe(error));
             next
         });
         self.undecodable.push((entry, position));

@@ -10,6 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt, fs,
     io::Write,
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{Mutex, OnceLock, PoisonError},
 };
@@ -199,7 +200,10 @@ pub struct Workbook {
     shared_strings_path: Option<String>,
     // The outcome of the table's first load. Untouched parts never change,
     // so a table that fails to load fails the same way on every later use.
-    shared_strings: OnceLock<std::result::Result<SharedStrings, Error>>,
+    // `Error` is not `RefUnwindSafe` only because an `io::Error` can box any
+    // source. A kept error never changes, and loading the table from memory
+    // never fails with an I/O error, so the workbook stays unwind-safe.
+    shared_strings: OnceLock<std::result::Result<SharedStrings, AssertUnwindSafe<Error>>>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
@@ -1064,9 +1068,9 @@ impl Workbook {
             self.archive
                 .read(path)
                 .and_then(|xml| read_shared_strings(&xml))
-                .map_err(|error| in_part(path, error))
+                .map_err(|error| AssertUnwindSafe(in_part(path, error)))
         });
-        Some(loaded.as_ref())
+        Some(loaded.as_ref().map_err(|error| &error.0))
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
