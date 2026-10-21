@@ -1,7 +1,7 @@
 use super::date::{DateError, excel_serial};
 use super::index::WorksheetIndex;
 use super::parse::{Element, NamespaceId, XmlDocument, parse_with};
-use super::{ReadError, at_cell, invalid, unique, unsupported, xml_error};
+use super::{ReadError, invalid, unique, unsupported, xml_error};
 use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
@@ -453,7 +453,7 @@ pub(super) fn cell_content<'a>(
     };
     let (style_index, formula, value) =
         stored_cell(xml, index, &index.elements[cell_index], date1904)
-            .map_err(|error| at_cell(address, error))?;
+            .map_err(|error| error.context(address))?;
     let value = match value {
         StoredValue::Value(value) => value,
         StoredValue::SharedString(position) => {

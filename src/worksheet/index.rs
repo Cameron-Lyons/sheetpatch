@@ -1,6 +1,6 @@
 use super::parse::{Attributes, Element, NamespaceId, XmlDocument, parse};
 use super::validation::validate_ranges;
-use super::{at_cell, invalid, protected, protection, unique, unsupported};
+use super::{invalid, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -103,7 +103,7 @@ impl Formulas {
             .attr(attributes, "ref")
             .map(|attribute| reference_range(attribute.value))
             .transpose()
-            .map_err(|error| at_cell(address, error))?;
+            .map_err(|error| error.context(address))?;
         if let Some(range) = range {
             self.ranges.push(range);
         }

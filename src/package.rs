@@ -50,7 +50,7 @@ impl Sheet {
                 cell,
                 reason,
             },
-            error => prefixed(error, format_args!("worksheet {:?}", self.name)),
+            error => error.context(format_args!("worksheet {:?}", self.name)),
         }
     }
 }
@@ -59,16 +59,7 @@ impl Sheet {
 // or a table part read while serving a worksheet operation, retaining the
 // error's variant. Such errors are never attributed to the worksheet.
 fn in_part(path: &str, error: Error) -> Error {
-    prefixed(error, format_args!("part {path:?}"))
-}
-
-fn prefixed(error: Error, prefix: fmt::Arguments<'_>) -> Error {
-    match error {
-        Error::Xml(message) => Error::Xml(format!("{prefix}: {message}")),
-        Error::InvalidWorkbook(message) => Error::InvalidWorkbook(format!("{prefix}: {message}")),
-        Error::Unsupported(message) => Error::Unsupported(format!("{prefix}: {message}")),
-        error => error,
-    }
+    error.context(format_args!("part {path:?}"))
 }
 
 /// Whether Excel shows a worksheet's tab.
@@ -171,7 +162,9 @@ impl SheetVisibility {
 ///
 /// Values are validated before any worksheet is read: non-finite numbers,
 /// text longer than Excel's 32,767 UTF-16 code units, and error values that
-/// are not Excel error codes return [`Error::InvalidValue`].
+/// are not Excel error codes return [`Error::InvalidValue`]. From a batch,
+/// such as [`Self::set_cells`], its message names the cell, as in
+/// `B7: numbers must be finite`, but not the worksheet.
 ///
 /// # Errors while reading
 ///
@@ -637,7 +630,7 @@ impl Workbook {
     ) -> Result<()> {
         // The sheet is resolved first, as in the batch and read methods.
         let index = self.sheet_index(sheet)?;
-        self.set_cells_in_sheet(index, [address.parse().map(|cell| (cell, value))])
+        self.set_cell_in_sheet(index, address.parse()?, value.into())
     }
 
     /// Set a scalar value using an already validated, one-based cell address.
@@ -655,7 +648,7 @@ impl Workbook {
         value: impl Into<CellValue>,
     ) -> Result<()> {
         let index = self.sheet_index(sheet)?;
-        self.set_cells_in_sheet(index, [Ok((cell, value))])
+        self.set_cell_in_sheet(index, cell, value.into())
     }
 
     /// Apply edits to a worksheet in one parse and one XML patch.
@@ -665,13 +658,15 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::SheetNotFound`] before reading the batch if no
-    /// worksheet has this name, then the first invalid address or value, and
-    /// otherwise fails like [`Self::set_cell`] for one refused edit, which
-    /// need not be the batch's first. Formula cells, then cells in formula
-    /// ranges, then merged cells are checked across the whole batch, each in
-    /// row-major order. The cells are then patched in row-major order, where
-    /// metadata and payload refusals arise, and Excel table headers are
-    /// checked last. No edit of a failed batch is applied.
+    /// worksheet has this name, then the first invalid address or value, where
+    /// an [`Error::InvalidValue`] message names its cell, as in
+    /// `B7: numbers must be finite`. Otherwise it fails like [`Self::set_cell`]
+    /// for one refused edit, which need not be the batch's first. Formula
+    /// cells, then cells in formula ranges, then merged cells are checked
+    /// across the whole batch, each in row-major order. The cells are then
+    /// patched in row-major order, where metadata and payload refusals arise,
+    /// and Excel table headers are checked last. No edit of a failed batch is
+    /// applied.
     pub fn set_cells<I, S, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, V)>,
@@ -697,7 +692,8 @@ impl Workbook {
     ///
     /// # Errors
     ///
-    /// Fails like [`Self::set_cells`], other than for addresses.
+    /// Fails like [`Self::set_cells`], other than for addresses. An
+    /// [`Error::InvalidValue`] message names its cell.
     pub fn set_cells_at<I, V>(&mut self, sheet: &str, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = (CellRef, V)>,
@@ -707,6 +703,14 @@ impl Workbook {
         self.set_cells_in_sheet(index, cells.into_iter().map(Ok))
     }
 
+    // The caller names the one cell, so its value error does not repeat it.
+    fn set_cell_in_sheet(&mut self, index: usize, cell: CellRef, value: CellValue) -> Result<()> {
+        value.validate()?;
+        self.apply_grouped_edits([(index, BTreeMap::from([(cell, value)]))])
+    }
+
+    // A value error names its cell, since a batch can hold many, but not the
+    // worksheet: only errors raised inside a worksheet name it.
     fn set_cells_in_sheet<I, V>(&mut self, index: usize, cells: I) -> Result<()>
     where
         I: IntoIterator<Item = Result<(CellRef, V)>>,
@@ -716,7 +720,7 @@ impl Workbook {
         for cell in cells {
             let (cell, value) = cell?;
             let value = value.into();
-            value.validate()?;
+            value.validate().map_err(|error| error.context(cell))?;
             values.insert(cell, value);
         }
         if values.is_empty() {
@@ -1035,7 +1039,7 @@ impl Workbook {
             ReadError::Worksheet(error) => sheet.context(error),
             ReadError::SharedStrings(error) => error,
             ReadError::UndecodableString { index, error } => {
-                let error = prefixed(error, format_args!("string {index}"));
+                let error = error.context(format_args!("string {index}"));
                 match &self.shared_strings_path {
                     Some(path) => in_part(path, error),
                     None => error,

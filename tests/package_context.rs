@@ -132,6 +132,33 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         book.set_cell("Alpha", "A1", f64::NAN),
         Err(Error::InvalidValue(message)) if !message.contains("worksheet")
     ));
+    // A single-cell edit's caller holds the cell, but a batch's value error
+    // names the cell it concerns.
+    let (a1, b7) = (CellRef::new(1, 1).unwrap(), CellRef::new(7, 2).unwrap());
+    for result in [
+        book.set_cell("Alpha", "B7", f64::NAN),
+        book.set_cell_at("Alpha", b7, f64::NAN),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::InvalidValue(message)) if message == "numbers must be finite"),
+            "{result:?}"
+        );
+    }
+    for result in [
+        book.set_cells("Alpha", [("A1", 1.0), ("B7", f64::NAN)]),
+        book.set_cells_at("Alpha", [(a1, 1.0), (b7, f64::NAN)]),
+    ] {
+        let error = result.unwrap_err();
+        let Error::InvalidValue(m) = &error else {
+            panic!("expected a value error, got {error:?}");
+        };
+        assert!(m.starts_with("B7: ") && !m.contains("worksheet"), "{m}");
+        assert_eq!(
+            error.to_string(),
+            "invalid cell value: B7: numbers must be finite"
+        );
+    }
+    assert!(!book.has_changes());
     book.set_cell("Alpha", "B1", 1).unwrap();
 }
 

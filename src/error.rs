@@ -32,6 +32,9 @@ pub enum Error {
     /// An address or range is invalid or outside Excel's row and column limits.
     InvalidCellReference(String),
     /// A scalar value cannot be represented within the supported cell format.
+    /// From a batch edit, such as
+    /// [`Workbook::set_cells`](crate::Workbook::set_cells), the message names
+    /// the cell.
     InvalidValue(String),
     /// No worksheet has the requested exact, case-sensitive name.
     SheetNotFound(String),
@@ -130,6 +133,23 @@ impl Error {
             Self::Unsupported(message) => Self::Unsupported(message.clone()),
         }
     }
+
+    // Names what an error concerns, such as a cell, worksheet, or part, by
+    // prefixing its message and retaining its variant. Every variant is
+    // listed, so a new one must be classified here.
+    pub(crate) fn context(self, prefix: impl fmt::Display) -> Self {
+        match self {
+            Self::Xml(message) => Self::Xml(format!("{prefix}: {message}")),
+            Self::InvalidWorkbook(message) => Self::InvalidWorkbook(format!("{prefix}: {message}")),
+            Self::InvalidValue(message) => Self::InvalidValue(format!("{prefix}: {message}")),
+            Self::Unsupported(message) => Self::Unsupported(format!("{prefix}: {message}")),
+            // These identify their subject in fields or in quoted input.
+            error @ (Self::Io(_)
+            | Self::InvalidCellReference(_)
+            | Self::SheetNotFound(_)
+            | Self::ProtectedCell { .. }) => error,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +219,55 @@ mod tests {
             Error::Io(io::ErrorKind::OutOfMemory.into()).duplicate(),
             Error::Io(error) if error.kind() == io::ErrorKind::OutOfMemory
         ));
+    }
+
+    #[test]
+    fn context_prefixes_only_messages_that_do_not_identify_their_subject() {
+        let cell = CellRef::new(7, 2).unwrap();
+        let prefixed = [
+            Error::Xml("xml".into()),
+            Error::InvalidWorkbook("invalid".into()),
+            Error::InvalidValue("value".into()),
+            Error::Unsupported("unsupported".into()),
+        ];
+        for error in prefixed {
+            let expected = error.to_string().replacen(": ", ": B7: ", 1);
+            let kind = std::mem::discriminant(&error);
+            let error = error.context(cell);
+            assert_eq!(std::mem::discriminant(&error), kind);
+            assert_eq!(error.to_string(), expected);
+        }
+        assert_eq!(
+            Error::Xml("xml".into())
+                .context(cell)
+                .context(format_args!("worksheet {:?}", "Data"))
+                .to_string(),
+            "XML error: worksheet \"Data\": B7: xml"
+        );
+
+        let unchanged = [
+            Error::Io(io::Error::other(Wrapper(Cause))),
+            Error::InvalidCellReference("A0".into()),
+            Error::SheetNotFound("Data".into()),
+            Error::ProtectedCell {
+                sheet: "Data".into(),
+                cell,
+                reason: "contains a formula".into(),
+            },
+        ];
+        for error in unchanged {
+            let expected = error.to_string();
+            let kind = std::mem::discriminant(&error);
+            let error = error.context(cell);
+            assert_eq!(std::mem::discriminant(&error), kind);
+            assert_eq!(error.to_string(), expected);
+        }
+        assert!(
+            Error::Io(io::Error::other(Wrapper(Cause)))
+                .context(cell)
+                .source()
+                .is_some()
+        );
     }
 
     #[test]

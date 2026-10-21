@@ -1,5 +1,5 @@
 //! Validated OOXML package discovery and relationship target resolution.
-use super::{Sheet, SheetVisibility, in_part, prefixed};
+use super::{Sheet, SheetVisibility, in_part};
 use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
@@ -351,7 +351,7 @@ fn sheets(
             node.attr("", "name")
                 .ok_or_else(|| Error::InvalidWorkbook("sheet lacks a name".into()))?,
         )
-        .map_err(|error| prefixed(error, format_args!("name of sheet {position}")))?;
+        .map_err(|error| error.context(format_args!("name of sheet {position}")))?;
         if !names.insert(name.clone()) {
             return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
         }

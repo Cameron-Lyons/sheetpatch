@@ -150,17 +150,6 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }
 
-// Names the cell an error concerns, retaining the error's variant. A
-// protected-cell refusal names its cell in a field instead.
-fn at_cell(cell: CellRef, error: Error) -> Error {
-    match error {
-        Error::Unsupported(message) => unsupported(format!("{cell}: {message}")),
-        Error::InvalidWorkbook(message) => invalid(format!("{cell}: {message}")),
-        Error::Xml(message) => xml_error(format!("{cell}: {message}")),
-        error => error,
-    }
-}
-
 // At most one item, or `error()` when there are more.
 fn unique<T>(
     mut items: impl Iterator<Item = T>,

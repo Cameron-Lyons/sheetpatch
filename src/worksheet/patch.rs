@@ -2,7 +2,7 @@ use super::index::{RowEntry, WorksheetIndex, reference_range};
 use super::parse::{Attributes, Element};
 use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
-use super::{at_cell, protected, protection, unique, unsupported};
+use super::{protected, protection, unique, unsupported};
 use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
@@ -222,10 +222,10 @@ fn patched_cell<'s>(
         index.namespace,
     );
     let cell = &elements[cell_index];
-    let value_child = value_payload(index, cell).map_err(|error| at_cell(address, error))?;
+    let value_child = value_payload(index, cell).map_err(|error| error.context(address))?;
     if let Some(child) = value_child {
         validate_payload(source, elements, attributes, child, namespace)
-            .map_err(|error| at_cell(address, error))?;
+            .map_err(|error| error.context(address))?;
     }
     let unchanged = if let Some(child) = value_child {
         unchanged_value(xml, index, cell, child, value, current)
