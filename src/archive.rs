@@ -319,7 +319,7 @@ fn shadows_end_record(ending: &[u8]) -> bool {
 }
 
 /// Locate the end-of-central-directory record. It must be the only record
-/// that ends at EOF with its comment.
+/// that ends at EOF with its comment, and the only one readers could select.
 fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < END_LEN {
         return Err(invalid("file is not a ZIP workbook"));
@@ -351,7 +351,43 @@ fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
     if hides_end_record(&bytes[end..]) {
         return Err(invalid("ambiguous ZIP end-of-directory records"));
     }
+    // libzip before 1.11 instead scans its tail window forward and keeps the
+    // first record whose directory it can read, unless a later one spans more
+    // local data. Refuse any earlier record it could select.
+    let window = bytes
+        .len()
+        .saturating_sub(END_LEN + u16::MAX as usize + ZIP64_LOCATOR_LEN);
+    for offset in window..end {
+        if decoy_end_record(bytes, offset)? {
+            return Err(invalid("ambiguous ZIP end-of-directory records"));
+        }
+    }
     Ok(end)
+}
+
+/// Whether a reader scanning forward could select an end record at `offset`:
+/// a complete single-disk record for a nonempty directory that ends before the
+/// record and starts with a central-directory header, and a comment that ends
+/// by EOF. Such a reader never prefers an empty directory to another one.
+///
+/// A Stored embedded ZIP's own end record normally fails the last test,
+/// because its directory offset is relative to the embedded archive.
+fn decoy_end_record(bytes: &[u8], offset: usize) -> Result<bool> {
+    let record_end = add(offset, END_LEN)?;
+    if record_end > bytes.len() || u32_at(bytes, offset)? != END {
+        return Ok(false);
+    }
+    let entries = u16_at(bytes, offset + 10)?;
+    let comment_end = add(record_end, u16_at(bytes, offset + 20)? as usize)?;
+    let central_start = u32_at(bytes, offset + 16)? as usize;
+    let central_end = add(central_start, u32_at(bytes, offset + 12)? as usize)?;
+    Ok(u16_at(bytes, offset + 4)? == 0
+        && u16_at(bytes, offset + 6)? == 0
+        && u16_at(bytes, offset + 8)? == entries
+        && entries != 0
+        && comment_end <= bytes.len()
+        && central_end <= offset
+        && u32_at(bytes, central_start)? == CENTRAL)
 }
 
 /// Return the central directory's start and entry count from the EOCD.
@@ -553,6 +589,13 @@ impl Archive {
         for _ in 0..count {
             let central = central_header(&original, position, end)?;
             let name = central.name;
+            // Some readers treat '\' as '/', so such a name can alias another
+            // member for them. OPC part names cannot contain it.
+            if name.contains('\\') {
+                return Err(invalid(format!(
+                    "ZIP member name contains a backslash: {name}"
+                )));
+            }
             if name.is_empty()
                 || name.contains('\0')
                 || index.insert(name.to_owned(), entries.len()).is_some()
@@ -2276,6 +2319,102 @@ mod tests {
                 Archive::new(bytes),
                 Err(Error::InvalidWorkbook(message))
                     if message == "ambiguous ZIP end-of-directory records"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_earlier_end_records_that_forward_scanning_readers_could_select() {
+        // libzip before 1.11 keeps the first end record in its tail window
+        // whose directory it can read. Here a stale member and its directory
+        // precede the live member, and an end record for that directory hides
+        // in the comment of the live directory's last entry.
+        let stale = Archive::new(fixture(false)).unwrap();
+        let live = Archive::new(stored_fixture(b"part.xml", b"<live/>", 0, None)).unwrap();
+        let with_decoy = |edit: fn(&mut [u8])| {
+            let mut bytes = stale.original[..stale.end].to_vec();
+            let live_start = bytes.len();
+            bytes.extend_from_slice(&live.original[..live.central_start]);
+            let central_start = bytes.len();
+            let mut decoy = stale.original[stale.end..stale.end + END_LEN].to_vec();
+            set_u16(&mut decoy, 20, 0);
+            edit(&mut decoy);
+            let mut central = live.original[live.central_start..live.end].to_vec();
+            set_u16(&mut central, 32, END_LEN as u16);
+            set_u32(&mut central, 42, live_start as u32);
+            central.extend_from_slice(&decoy);
+            bytes.extend_from_slice(&central);
+            let mut ending = live.original[live.end..].to_vec();
+            set_u32(&mut ending, 12, central.len() as u32);
+            set_u32(&mut ending, 16, central_start as u32);
+            bytes.extend_from_slice(&ending);
+            bytes
+        };
+        assert!(matches!(
+            Archive::new(with_decoy(|_| {})),
+            Err(Error::InvalidWorkbook(message))
+                if message == "ambiguous ZIP end-of-directory records"
+        ));
+        // That reader cannot select these records, so they stay comment bytes.
+        let unreadable: [fn(&mut [u8]); 7] = [
+            // Another disk, or a directory spanning disks.
+            |decoy| set_u16(decoy, 4, 1),
+            |decoy| set_u16(decoy, 6, 1),
+            |decoy| set_u16(decoy, 8, 0),
+            // An empty directory never spans more local data than another.
+            |decoy| {
+                set_u16(decoy, 8, 0);
+                set_u16(decoy, 10, 0);
+            },
+            // A comment running past EOF.
+            |decoy| set_u16(decoy, 20, 30),
+            // A directory overlapping the record, or not starting with a
+            // central-directory header.
+            |decoy| set_u32(decoy, 12, 1000),
+            |decoy| set_u32(decoy, 16, 1),
+        ];
+        for edit in unreadable {
+            let archive = Archive::new(with_decoy(edit)).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"<live/>");
+        }
+    }
+
+    #[test]
+    fn stored_embedded_archives_do_not_make_the_end_record_ambiguous() {
+        // The embedded archive's own end record lies in the tail window, but
+        // its directory offset is relative to that archive and finds no
+        // central-directory header in this one.
+        let inner = fixture(false);
+        let original = combine(fixture(false), stored_fixture(b"embedded", &inner, 0, None));
+        let archive = Archive::new(original).unwrap();
+        let inner_end = archive.entries[1].data.start + inner.len() - 29;
+        assert_eq!(u32_at(&archive.original, inner_end).unwrap(), END);
+        assert!(archive.original.len() - inner_end < END_LEN + u16::MAX as usize);
+        assert_eq!(archive.read("embedded").unwrap(), inner);
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        assert_eq!(updated.read("part.xml").unwrap(), b"updated");
+        assert_eq!(updated.read("embedded").unwrap(), inner);
+    }
+
+    #[test]
+    fn rejects_member_names_with_backslashes() {
+        // Some readers treat '\' as '/', so for them the second member here
+        // would alias the first, and the last of the two would win.
+        let mut aliased = combine(
+            named_fixture(b"xl/part.xml", 0, false),
+            named_fixture(b"xl_part.xml", 0, false),
+        );
+        // `combine` opens its parts, so respell the second name afterwards.
+        let second = &Archive::new(aliased.clone()).unwrap().entries[1];
+        for name_start in [second.local_header.start + 30, second.central.start + 46] {
+            aliased[name_start + 2] = b'\\';
+        }
+        let message = "ZIP member name contains a backslash: xl\\part.xml";
+        for bytes in [aliased, named_fixture(b"xl\\part.xml", 0, false)] {
+            assert!(matches!(
+                Archive::new(bytes),
+                Err(Error::InvalidWorkbook(actual)) if actual == message
             ));
         }
     }
