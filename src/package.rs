@@ -6,7 +6,14 @@ use crate::{
         PreparedWorksheet, ReadError, patch_cells, protection, read_cells, read_shared_strings,
     },
 };
-use std::{borrow::Cow, collections::BTreeMap, fmt, fs, io::Write, path::Path, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    fmt, fs,
+    io::Write,
+    path::Path,
+    sync::{Mutex, OnceLock, PoisonError},
+};
 
 mod discovery;
 
@@ -193,6 +200,9 @@ pub struct Workbook {
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
     shared_strings: OnceLock<Vec<String>>,
+    // Header rows of the table parts read so far, by ZIP member name. Several
+    // worksheets can relate to one table part, which is then parsed only once.
+    table_parts: Mutex<HashMap<String, Option<CellRange>>>,
     // Permission bits and group of the file this workbook was opened from,
     // used as the basis for new save destinations. ACLs are not copied.
     source_permissions: Option<SourcePermissions>,
@@ -517,6 +527,7 @@ impl Workbook {
             sheet_indexes,
             shared_strings_path,
             shared_strings: OnceLock::new(),
+            table_parts: Mutex::default(),
             source_permissions: None,
         })
     }
@@ -952,7 +963,14 @@ impl Workbook {
         if let Some(headers) = cache.get() {
             return Ok(headers);
         }
-        let headers = discovery::table_headers(&self.archive, &self.sheet_xml[index].uri)?;
+        // Poisoning is harmless: entries are inserted whole, never partially.
+        let mut parts = self
+            .table_parts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let headers =
+            discovery::table_headers(&self.archive, &self.sheet_xml[index].uri, &mut parts)?;
+        drop(parts);
         Ok(cache.get_or_init(|| headers))
     }
 

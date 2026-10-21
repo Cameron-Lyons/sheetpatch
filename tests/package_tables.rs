@@ -423,6 +423,54 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
 }
 
 #[test]
+fn a_table_part_shared_by_worksheets_protects_each_of_them() {
+    let mut shared = parts("ref='A1:B3'");
+    let data = shared["xl/worksheets/sheet1.xml"].clone();
+    shared.insert("xl/worksheets/sheet2.xml".into(), data);
+    let rels = shared[SHEET_RELS].clone();
+    shared.insert("xl/worksheets/_rels/sheet2.xml.rels".into(), rels);
+
+    // In separate calls, the second worksheet reuses the first one's table.
+    let mut separate = book(&shared);
+    assert_refused(separate.set_cell("Data", "A1", "Changed"), "A1");
+    assert_refused_in("Notes", separate.set_cell("Notes", "B1", "Changed"), "B1");
+    separate.set_cell("Notes", "B2", 1).unwrap();
+    separate.set_cell("Notes", "B1", "Amount").unwrap();
+
+    let mut together = book(&shared);
+    assert_refused_in(
+        "Notes",
+        together.apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "A1", "Changed").unwrap(),
+        ]),
+        "A1",
+    );
+    assert!(!together.has_changes());
+    together
+        .apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "B3", 4).unwrap(),
+        ])
+        .unwrap();
+
+    // A table part that cannot be read is reported again for each worksheet,
+    // naming the part rather than the worksheet.
+    let mut broken = shared.clone();
+    broken.insert(TABLE_PATH.into(), format!("<table xmlns='{MAIN_NS}'/>"));
+    let mut broken = book(&broken);
+    for sheet in ["Data", "Notes", "Data"] {
+        let error = broken.set_cell(sheet, "B2", 1).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message)
+                if message == &format!("part {TABLE_PATH:?}: table lacks a ref")),
+            "{sheet}: {error}"
+        );
+    }
+    assert!(!broken.has_changes());
+}
+
+#[test]
 fn many_repeated_table_targets_share_long_source_uris() {
     let mut parts = parts("ref='A1:B3'");
     let directory = format!("xl/{}", "nested".repeat(10_000));

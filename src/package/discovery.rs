@@ -62,7 +62,15 @@ pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
 /// The header rows of the Excel tables related to a worksheet part. Excel
 /// requires each header cell's text to equal its table column's name. Errors
 /// name the relationships or table part they concern, not the worksheet.
-pub(super) fn table_headers(archive: &Archive, worksheet_uri: &str) -> Result<Vec<CellRange>> {
+///
+/// `parsed` holds the header of each table part already read, by its ZIP
+/// member name, for any worksheet of the archive: a header depends only on its
+/// table part, which no edit changes. Parts that fail are not recorded.
+pub(super) fn table_headers(
+    archive: &Archive,
+    worksheet_uri: &str,
+    parsed: &mut HashMap<String, Option<CellRange>>,
+) -> Result<Vec<CellRange>> {
     let rels_uri = relationships_path(worksheet_uri);
     let rels_path = part_path(archive, &rels_uri).map_err(|error| in_part(&rels_uri, error))?;
     if !archive.contains(&rels_path) {
@@ -105,10 +113,17 @@ pub(super) fn table_headers(archive: &Archive, worksheet_uri: &str) -> Result<Ve
         if !tables.insert(path.clone()) {
             continue;
         }
-        let header = archive
-            .read(&path)
-            .and_then(|xml| table_header(&xml))
-            .map_err(|error| in_part(&path, error))?;
+        let header = match parsed.get(&path) {
+            Some(&header) => header,
+            None => {
+                let header = archive
+                    .read(&path)
+                    .and_then(|xml| table_header(&xml))
+                    .map_err(|error| in_part(&path, error))?;
+                parsed.insert(path, header);
+                header
+            }
+        };
         headers.extend(header);
     }
     Ok(headers)
