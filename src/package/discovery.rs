@@ -1644,8 +1644,33 @@ mod tests {
 
     #[test]
     fn malformed_xml_has_no_partial_document() {
-        for xml in MALFORMED_XML {
+        for xml in MALFORMED_XML.iter().chain(ROOTLESS_XML) {
             assert!(xml_nodes(xml.as_bytes(), root_only).is_err(), "{xml}");
+        }
+    }
+
+    // Parts that end before any root element starts.
+    const ROOTLESS_XML: &[&str] = &[
+        "",
+        " ",
+        "<!--comment-->",
+        "<?xml version='1.0'?>",
+        "<?target data?>",
+        "\u{feff}",
+    ];
+
+    #[test]
+    fn parts_without_a_root_element_are_incomplete() {
+        for xml in ROOTLESS_XML {
+            for result in [
+                xml_nodes(xml.as_bytes(), root_only).map(drop),
+                crate::worksheet::parse_xml(xml.as_bytes()),
+            ] {
+                assert!(
+                    matches!(&result, Err(Error::Xml(message)) if message == "incomplete XML document"),
+                    "{xml:?}: {result:?}"
+                );
+            }
         }
     }
 
@@ -1965,6 +1990,7 @@ mod tests {
         let sheet = worksheet("<sheetData/>");
         let mut inputs: Vec<Vec<u8>> = [
             MALFORMED_XML,
+            ROOTLESS_XML,
             WELL_FORMED_XML,
             NAMESPACE_VIOLATIONS,
             NAMESPACE_DECLARATIONS,

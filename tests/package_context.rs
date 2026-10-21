@@ -864,6 +864,35 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     );
 }
 
+#[test]
+fn every_part_without_a_root_element_is_incomplete_xml() {
+    for part in [
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/worksheets/sheet1.xml",
+        "xl/sharedStrings.xml",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/tables/table1.xml",
+    ] {
+        for rootless in ["", "<!--comment-->", "<?xml version='1.0'?>"] {
+            let mut parts = every_part();
+            assert!(parts.insert(part.into(), rootless.into()).is_some());
+            // Opening the workbook, reading its cells, and editing the table
+            // body parse every part.
+            let result = Workbook::from_bytes(archive(&parts)).and_then(|mut book| {
+                book.get_cells("Data", ["A1", "A2"])?;
+                book.set_cell("Data", "A2", 5)
+            });
+            assert!(
+                matches!(&result, Err(Error::Xml(message)) if message.ends_with("incomplete XML document")),
+                "{part} {rootless:?}: {result:?}"
+            );
+        }
+    }
+}
+
 /// A Data worksheet whose A1 is the shared string at index 0 and A2 a number,
 /// in an Excel table on A1:A2 whose header row is A1.
 fn every_part() -> BTreeMap<String, Vec<u8>> {
