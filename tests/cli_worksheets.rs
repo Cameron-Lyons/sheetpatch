@@ -289,6 +289,143 @@ fn cells_lines_prefixed_with_a_sheet_name_are_patch_rows() {
 }
 
 #[test]
+fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
+    let directory = TempDir::new();
+    // Reads accept any error token and longer text than edits may write.
+    let long = "x".repeat(32_768);
+    let values = format!(
+        "<sheetData><row r='1'><c r='A1' t='e'><v>#FOO!</v></c>\
+         <c r='B1' t='inlineStr'><is><t>{long}</t></is></c><c r='C1'><v>1</v></c></row></sheetData>"
+    );
+    // A spilled array formula, shared and data-table formula ranges with
+    // followers that have no formula of their own, and a merged range whose
+    // follower stores a value.
+    let ranges = "<sheetData>\
+        <row r='1'><c r='A1'><f t='array' ref='A1:A2'>SEQUENCE(2)</f><v>1</v></c>\
+        <c r='B1'><f t='shared' ref='B1:B2' si='0'>A1</f><v>1</v></c>\
+        <c r='C1'><f t='dataTable' ref='C1:C2' dt2D='0' dtr='0' r1='E1'/><v>3</v></c>\
+        <c r='D1'><v>5</v></c><c r='E1'><v>7</v></c></row>\
+        <row r='2'><c r='A2'><v>2</v></c><c r='B2'><v>2</v></c><c r='C2'><v>4</v></c>\
+        <c r='D2'><v>6</v></c></row></sheetData>\
+        <mergeCells count='1'><mergeCell ref='D1:D2'/></mergeCells>";
+    let path = saved(
+        &directory,
+        "in.xlsx",
+        &[
+            ("Values", "", &values),
+            ("Copy", "", "<sheetData/>"),
+            ("Ranges", "", ranges),
+        ],
+    );
+    let path = text(&path);
+    let invalid = |message: &str| {
+        Some((
+            2,
+            format!(
+                "sheetpatch: Patch line 1: invalid cell value: {message}\nRun 'sheetpatch help patch' for the format.\n"
+            ),
+        ))
+    };
+    let protected = |cell: &str, reason: &str| {
+        Some((
+            1,
+            format!(
+                "sheetpatch: Patch line 1: protected cell: worksheet \"Ranges\": {cell} {reason}\n"
+            ),
+        ))
+    };
+    let formula = "contains a formula";
+    let range = "belongs to a formula range";
+    for (source, target, expected) in [
+        // These values cannot be written to any worksheet.
+        (
+            "Values",
+            "Copy",
+            vec![
+                (
+                    "A1",
+                    invalid("error values must be an Excel error code such as #N/A or #DIV/0!"),
+                ),
+                (
+                    "B1",
+                    invalid("text exceeds Excel's 32,767 UTF-16 code unit limit"),
+                ),
+                ("C1", None),
+            ],
+        ),
+        // Rewriting protected cells is refused even without a change.
+        (
+            "Ranges",
+            "Ranges",
+            vec![
+                ("A1", protected("A1", formula)),
+                ("B1", protected("B1", formula)),
+                ("C1", protected("C1", formula)),
+                ("D1", None),
+                ("E1", None),
+                ("A2", protected("A2", range)),
+                ("B2", protected("B2", range)),
+                ("C2", protected("C2", range)),
+                ("D2", protected("D2", "is merged into another cell's range")),
+            ],
+        ),
+    ] {
+        let listed = success(&["cells", path, source]);
+        let lines: Vec<&str> = listed.lines().collect();
+        assert_eq!(lines.len(), expected.len(), "{listed}");
+        for (line, (cell, refusal)) in lines.into_iter().zip(expected) {
+            assert!(line.starts_with(&format!("{cell}\t")), "{line}");
+            let row = format!("{target}\t{line}\n");
+            let output = cli(&["patch", "--check", path, "-"], row.as_bytes());
+            match refusal {
+                None => {
+                    assert!(output.status.success(), "{cell}");
+                    assert_eq!(output.stdout, b"Validated 1 patch row.\n");
+                }
+                Some((code, message)) => {
+                    assert_eq!(output.status.code(), Some(code), "{cell}");
+                    assert!(output.stdout.is_empty());
+                    assert_eq!(String::from_utf8(output.stderr).unwrap(), message);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn patch_fields_are_raw_so_quotes_are_stored_as_written() {
+    let directory = TempDir::new();
+    let input = saved(&directory, "in.xlsx", &[("Data", "", "<sheetData/>")]);
+    let output = directory.join("out.xlsx");
+    // Rows quoted like CSV fields or shell words keep their quotes.
+    let patch = "Data\tA1\ttext\t\"x \"\"y\"\"\"\nData\tA2\ttext\t'z'\n";
+    let applied = cli(
+        &["patch", text(&input), text(&output), "-"],
+        patch.as_bytes(),
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(
+        success(&["get", "--json", text(&output), "Data", "A1:A2"]),
+        concat!(
+            "[{\"sheet\":\"Data\",\"cell\":\"A1\",\"type\":\"text\",\"value\":\"\\\"x \\\"\\\"y\\\"\\\"\\\"\",\"formula\":null,\"style_index\":null},",
+            "{\"sheet\":\"Data\",\"cell\":\"A2\",\"type\":\"text\",\"value\":\"'z'\",\"formula\":null,\"style_index\":null}]\n"
+        )
+    );
+    // A quoted sheet name names a different worksheet.
+    assert_eq!(
+        failure(
+            &["patch", "--check", text(&input), "-"],
+            b"\"Data\"\tA1\ttext\tx\n"
+        ),
+        "sheetpatch: Patch line 1: worksheet not found: \"\\\"Data\\\"\"\n"
+    );
+}
+
+#[test]
 fn get_ranges_read_sparse_sheets_row_by_row() {
     let directory = TempDir::new();
     let path = saved(&directory, "sparse.xlsx", &[("Data", "", SPARSE)]);
