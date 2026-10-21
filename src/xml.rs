@@ -2,10 +2,17 @@
 
 use crate::{Error, Result};
 use quick_xml::{
-    events::{BytesDecl, BytesRef, BytesStart, Event, attributes::Attribute},
+    events::{BytesDecl, BytesRef, BytesStart, Event, attributes::Attribute as XmlAttribute},
     name::{Namespace, NamespaceError, NamespaceResolver, QName, ResolveResult},
 };
-use std::{borrow::Cow, collections::HashMap, fmt::Write as _};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    hash::Hash,
+    ops::Range,
+    sync::Arc,
+};
 
 // NsReader checks the reserved `xml` binding against its raw spelling before
 // returning an event. A character reference in that URI is legal XML, so use
@@ -258,6 +265,106 @@ impl<T: Clone> NamespaceCache<T> {
     }
 }
 
+/// Document-local identity of a normalized namespace URI; zero is unbound.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct NamespaceId(u32);
+
+impl NamespaceId {
+    const NONE: Self = Self(0);
+
+    pub(crate) fn is_unbound(self) -> bool {
+        self == Self::NONE
+    }
+}
+
+/// The normalized namespace URIs a parser has resolved, each with its ID.
+pub(crate) struct NamespacePool {
+    // Resolve inherited bindings by prefix without revisiting a potentially
+    // large URI. Nested declarations retain the surrounding scope's cache.
+    prefixes: NamespaceCache<NamespaceId>,
+    raw: HashMap<String, NamespaceId>,
+    canonical: HashMap<Arc<str>, NamespaceId>,
+    values: Vec<Arc<str>>,
+}
+
+impl NamespacePool {
+    pub(crate) fn new() -> Self {
+        Self {
+            prefixes: NamespaceCache::default(),
+            raw: HashMap::new(),
+            canonical: HashMap::new(),
+            values: vec![Arc::from("")],
+        }
+    }
+
+    /// The namespace of an element or attribute name in the reader's scope.
+    pub(crate) fn resolve(
+        &mut self,
+        reader: &NamespaceReader<'_>,
+        name: QName<'_>,
+        attribute: bool,
+    ) -> Result<NamespaceId> {
+        if let Some(id) = self.prefixes.get(reader, name, attribute) {
+            return Ok(id);
+        }
+        let (namespace, _) = if attribute {
+            reader.resolver().resolve_attribute(name)
+        } else {
+            reader.resolver().resolve_element(name)
+        };
+        let id = self.resolve_uncached(namespace)?;
+        self.prefixes.insert(reader, name, attribute, id);
+        Ok(id)
+    }
+
+    fn resolve_uncached(&mut self, result: ResolveResult<'_>) -> Result<NamespaceId> {
+        match result {
+            ResolveResult::Unbound => Ok(NamespaceId::NONE),
+            ResolveResult::Bound(raw) => {
+                if let Some(&id) = self.raw.get(raw.as_ref()) {
+                    return Ok(id);
+                }
+                let value = namespace(ResolveResult::Bound(raw))?;
+                let id = if value.is_empty() {
+                    NamespaceId::NONE
+                } else {
+                    self.intern(value.as_str())?
+                };
+                self.raw.insert(raw.as_ref().to_owned(), id);
+                Ok(id)
+            }
+            unknown => namespace(unknown).map(|_| NamespaceId::NONE),
+        }
+    }
+
+    /// The ID of a normalized, non-empty URI, which it receives if it has none.
+    pub(crate) fn intern(&mut self, uri: &str) -> Result<NamespaceId> {
+        if let Some(&id) = self.canonical.get(uri) {
+            return Ok(id);
+        }
+        let id = NamespaceId(
+            u32::try_from(self.values.len())
+                .map_err(|_| Error::Unsupported("too many XML namespaces".into()))?,
+        );
+        // Only the URI table shares strings; elements carry plain IDs,
+        // avoiding reference-count operations on the hot path.
+        let uri: Arc<str> = uri.into();
+        self.values.push(Arc::clone(&uri));
+        self.canonical.insert(uri, id);
+        Ok(id)
+    }
+
+    /// The normalized URI with this ID, empty when unbound.
+    pub(crate) fn uri(&self, id: NamespaceId) -> &Arc<str> {
+        &self.values[id.0 as usize]
+    }
+
+    /// The ID of a normalized URI that this pool has resolved.
+    pub(crate) fn id(&self, uri: &str) -> Option<NamespaceId> {
+        self.canonical.get(uri).copied()
+    }
+}
+
 pub(crate) fn valid_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
@@ -349,7 +456,7 @@ pub(crate) fn reference(reference: &BytesRef<'_>) -> Result<char> {
 /// Every caller has already checked the document's literal characters with
 /// `valid_text`. Only a value that normalization changed can therefore hold
 /// a character that XML forbids, which a character reference introduced.
-pub(crate) fn attribute_value<'a>(attribute: &Attribute<'a>) -> Result<Cow<'a, str>> {
+pub(crate) fn attribute_value<'a>(attribute: &XmlAttribute<'a>) -> Result<Cow<'a, str>> {
     let value = attribute
         .normalized_value_with(
             quick_xml::XmlVersion::Implicit1_0,
@@ -466,7 +573,7 @@ pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
 
 // Checks one declaration's normalized value. `prefix` is `None` for a default
 // namespace declaration (`xmlns`), and the declared prefix for `xmlns:prefix`.
-pub(crate) fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
+fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
     const XML: &str = "http://www.w3.org/XML/1998/namespace";
     const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
     if prefix == Some("xmlns")
@@ -526,7 +633,7 @@ pub(crate) fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
 pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
     match result {
         ResolveResult::Bound(ns) => {
-            let attribute = Attribute {
+            let attribute = XmlAttribute {
                 key: QName("xmlns"),
                 value: Cow::Borrowed(ns.as_ref()),
             };
@@ -537,6 +644,444 @@ pub(crate) fn namespace(result: ResolveResult<'_>) -> Result<String> {
             Err(Error::Xml(format!("unbound namespace prefix {prefix}")))
         }
     }
+}
+
+const BYTE_ORDER_MARK: &[u8] = &[0xef, 0xbb, 0xbf];
+
+/// The rules every XML part follows as a whole: its size, encoding and
+/// characters, its declaration, one root element, and what may appear outside
+/// it. A parser checks each event with these rules and each tag's attributes
+/// with `attribute_spans`.
+pub(crate) struct DocumentRules {
+    root_seen: bool,
+    declaration_seen: bool,
+    // The length of a leading byte order mark. quick-xml strips it without
+    // counting it in buffer_position(), so `position` adds it back.
+    bom: usize,
+}
+
+impl DocumentRules {
+    /// Checks a whole part's size, encoding and characters, and returns it as
+    /// text with the rules for its events.
+    pub(crate) fn source(xml: &[u8]) -> Result<(&str, Self)> {
+        // Pending worksheet XML is not size-limited until it is saved, so the
+        // compact records' offset range is enforced here.
+        if xml.len() >= u32::MAX as usize {
+            return Err(Error::Unsupported(
+                "XML part exceeds the 4 GiB index limit".into(),
+            ));
+        }
+        let source =
+            std::str::from_utf8(xml).map_err(|e| Error::Xml(format!("XML must be UTF-8: {e}")))?;
+        if !valid_text(source) {
+            return Err(Error::Xml("invalid XML character".into()));
+        }
+        let bom = if xml.starts_with(BYTE_ORDER_MARK) {
+            BYTE_ORDER_MARK.len()
+        } else {
+            0
+        };
+        // After the first byte order mark, U+FEFF is text before the root.
+        // The reader would silently strip it too.
+        if xml[bom..].starts_with(BYTE_ORDER_MARK) {
+            return Err(Error::Xml("text outside the XML root".into()));
+        }
+        let rules = Self {
+            root_seen: false,
+            declaration_seen: false,
+            bom,
+        };
+        Ok((source, rules))
+    }
+
+    /// A reader for the events of the text that `source` returned.
+    pub(crate) fn reader<'xml>(&self, source: &'xml str) -> NamespaceReader<'xml> {
+        let mut reader = NamespaceReader::from_str(&source[self.bom..]);
+        reader.config_mut().check_comments = true;
+        reader
+    }
+
+    /// The reader's position as an offset into the whole source.
+    pub(crate) fn position(&self, reader: &NamespaceReader<'_>) -> usize {
+        reader.buffer_position() as usize + self.bom
+    }
+
+    /// Checks an element named `name` that opens inside `depth` others.
+    // This and `event` run for nearly every event of a worksheet. Called out
+    // of line from another module, they slowed its parse by more than 10%.
+    #[inline]
+    pub(crate) fn start_element(&mut self, depth: usize, name: &str) -> Result<()> {
+        if depth >= MAX_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "XML nesting deeper than {MAX_DEPTH} elements"
+            )));
+        }
+        if depth == 0 {
+            if self.root_seen {
+                return Err(Error::Xml("multiple XML root elements".into()));
+            }
+            self.root_seen = true;
+        }
+        if !valid_qname(name) {
+            return Err(Error::Xml("invalid XML element name".into()));
+        }
+        // Namespace declarations are checked with the attributes.
+        if name.starts_with("xmlns:") {
+            return Err(Error::Xml("xmlns cannot be an element prefix".into()));
+        }
+        Ok(())
+    }
+
+    /// Checks an event other than a tag, which starts at offset `start` inside
+    /// `depth` elements. Tags are checked by `start_element` and
+    /// `attribute_spans`.
+    #[inline]
+    pub(crate) fn event(&mut self, event: &Event<'_>, start: usize, depth: usize) -> Result<()> {
+        match event {
+            Event::Text(text) => {
+                let raw = text.as_ref();
+                if raw.contains("]]>") {
+                    return Err(Error::Xml("CDATA terminator in ordinary XML text".into()));
+                }
+                if depth == 0 && !whitespace(raw) {
+                    return Err(Error::Xml("text outside the XML root".into()));
+                }
+            }
+            Event::GeneralRef(entity) => {
+                if depth == 0 {
+                    return Err(Error::Xml("entity reference outside the XML root".into()));
+                }
+                reference(entity)?;
+            }
+            Event::CData(_) if depth == 0 => {
+                return Err(Error::Xml("CDATA outside the XML root".into()));
+            }
+            Event::PI(instruction) => {
+                let target = instruction.target();
+                if !valid_name(target) || target.eq_ignore_ascii_case("xml") {
+                    return Err(Error::Xml(
+                        "invalid XML processing instruction target".into(),
+                    ));
+                }
+            }
+            Event::DocType(_) => {
+                return Err(Error::Unsupported("XML document type declarations".into()));
+            }
+            Event::Decl(declaration) => {
+                if self.root_seen || self.declaration_seen || start != self.bom {
+                    return Err(Error::Xml("misplaced XML declaration".into()));
+                }
+                self.declaration_seen = true;
+                validate_declaration(declaration)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Checks that the document is complete, with `depth` elements still open
+    /// at its end.
+    pub(crate) fn finish(&self, depth: usize) -> Result<()> {
+        if depth != 0 || !self.root_seen {
+            return Err(Error::Xml("incomplete XML document".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Converts an offset or index for a compact record. `DocumentRules::source`
+/// refuses parts of `u32::MAX` bytes or more, and every element or attribute
+/// spans several bytes, so all values fit below `u32::MAX`.
+pub(crate) fn compact(value: usize) -> u32 {
+    debug_assert!(value < u32::MAX as usize);
+    value as u32
+}
+
+// An attribute's value is its raw span unless XML normalization changed it.
+// Changed values live in a side table, which ordinary parts leave empty; this
+// index marks a value read from its span.
+const RAW_VALUE: u32 = u32::MAX;
+
+// One attribute's spans. Its name and raw value are read from the source, so
+// the record holds no pointers of its own.
+#[derive(Debug)]
+pub(crate) struct Attribute {
+    start: u32,
+    name_start: u32,
+    name_end: u32,
+    value_start: u32,
+    value_end: u32,
+    // The value's index in `Attributes::normalized`, or `RAW_VALUE`.
+    normalized: u32,
+}
+
+impl Attribute {
+    fn name<'s>(&self, xml: &'s [u8]) -> &'s [u8] {
+        &xml[self.name_start as usize..self.name_end as usize]
+    }
+}
+
+/// Recorded attributes, with the source their spans index.
+pub(crate) struct Attributes<'xml> {
+    source: &'xml str,
+    records: Vec<Attribute>,
+    normalized: Vec<Box<str>>,
+}
+
+impl<'xml> Attributes<'xml> {
+    pub(crate) fn new(source: &'xml str) -> Self {
+        Self {
+            source,
+            records: Vec::new(),
+            normalized: Vec::new(),
+        }
+    }
+
+    pub(crate) fn view(&self, index: usize) -> AttrView<'_> {
+        let record = &self.records[index];
+        // The parser checked that these spans lie on character boundaries.
+        let name = &self.source[record.name_start as usize..record.name_end as usize];
+        let value = if record.normalized == RAW_VALUE {
+            &self.source[record.value_start as usize..record.value_end as usize]
+        } else {
+            &self.normalized[record.normalized as usize]
+        };
+        AttrView {
+            name,
+            value,
+            start: record.start,
+            value_start: record.value_start,
+            value_end: record.value_end,
+        }
+    }
+
+    /// The attribute named `name` among those at `indexes`.
+    pub(crate) fn find(&self, indexes: Range<usize>, name: &str) -> Option<AttrView<'_>> {
+        // Names compare as bytes, so only a match builds a view.
+        let xml = self.source.as_bytes();
+        indexes
+            .into_iter()
+            .find(|&index| self.records[index].name(xml) == name.as_bytes())
+            .map(|index| self.view(index))
+    }
+
+    /// Discards the attributes from index `first` on, with their values.
+    pub(crate) fn truncate(&mut self, first: usize) {
+        // Normalized values are stored in attribute order, so the discarded
+        // values begin with the first discarded attribute that has one.
+        if let Some(record) = self.records[first..]
+            .iter()
+            .find(|record| record.normalized != RAW_VALUE)
+        {
+            self.normalized.truncate(record.normalized as usize);
+        }
+        self.records.truncate(first);
+    }
+}
+
+#[cfg(test)]
+impl Attributes<'_> {
+    /// How many values the side table holds.
+    pub(crate) fn normalized_len(&self) -> usize {
+        self.normalized.len()
+    }
+}
+
+/// An attribute's name and normalized value, with its spans.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttrView<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) value: &'a str,
+    start: u32,
+    value_start: u32,
+    value_end: u32,
+}
+
+impl AttrView<'_> {
+    /// The start of the whitespace that separates the attribute from the
+    /// preceding name or attribute.
+    pub(crate) fn start(&self) -> usize {
+        self.start as usize
+    }
+    pub(crate) fn value_start(&self) -> usize {
+        self.value_start as usize
+    }
+    pub(crate) fn value_end(&self) -> usize {
+        self.value_end as usize
+    }
+    /// The end of the attribute: the closing quote follows the value.
+    pub(crate) fn end(&self) -> usize {
+        self.value_end as usize + 1
+    }
+}
+
+// Large shared buffers grow by half rather than doubling. This bounds unused
+// capacity and the memory an allocator can retain across repeated sheet parses.
+// Small buffers keep Vec's usual growth policy.
+pub(crate) fn arena_push<T>(arena: &mut Vec<T>, item: T) {
+    if arena.len() == arena.capacity() && arena.capacity() >= 4096 {
+        arena.reserve_exact(arena.capacity() / 2);
+    }
+    arena.push(item);
+}
+
+/// Scratch space for one tag's duplicate checks, reused across tags so that
+/// ordinary tags allocate nothing.
+#[derive(Default)]
+pub(crate) struct AttributeChecks<'xml> {
+    // Expanded names of the tag's ordinary prefixed attributes so far.
+    expanded: Vec<(NamespaceId, &'xml str)>,
+    // Used only by tags with many attributes.
+    names: HashSet<&'xml [u8]>,
+    expanded_names: HashSet<(NamespaceId, &'xml str)>,
+}
+
+// Short lists are scanned directly. Past this length a set keeps duplicate
+// detection linear in the attribute count, so hostile tags cannot make it
+// quadratic.
+const LINEAR_SCAN_LIMIT: usize = 16;
+
+// Whether `item` repeats any of `previous`, every earlier item of one tag.
+// `set` holds them all once the list has outgrown a linear scan.
+fn repeated<T: Copy + Eq + Hash>(
+    mut previous: impl ExactSizeIterator<Item = T>,
+    set: &mut HashSet<T>,
+    item: T,
+) -> bool {
+    match previous.len() {
+        length if length < LINEAR_SCAN_LIMIT => previous.any(|earlier| earlier == item),
+        LINEAR_SCAN_LIMIT => {
+            set.clear();
+            set.extend(previous);
+            !set.insert(item)
+        }
+        _ => !set.insert(item),
+    }
+}
+
+pub(crate) fn markup(source: &str, range: Range<usize>) -> Result<&str> {
+    source
+        .get(range)
+        .ok_or_else(|| Error::Xml("XML markup splits a UTF-8 character".into()))
+}
+
+/// The only attribute scanner: it records spans and checks syntax, names,
+/// exact and expanded-name duplicates, and namespace declarations in one pass
+/// over the tag between the element name and `open_end`. Returns the indexes
+/// of the tag's attributes in `attributes`.
+pub(crate) fn attribute_spans<'xml>(
+    mut position: usize,
+    open_end: usize,
+    attributes: &mut Attributes<'xml>,
+    namespaces: &mut NamespacePool,
+    reader: &NamespaceReader<'_>,
+    checks: &mut AttributeChecks<'xml>,
+) -> Result<Range<usize>> {
+    let source = attributes.source;
+    let xml = source.as_bytes();
+    let attributes_start = attributes.records.len();
+    checks.expanded.clear();
+    loop {
+        let whitespace_start = position;
+        while position < open_end && is_space(xml[position]) {
+            position += 1;
+        }
+        // Only the tag's own `>` or `/>` ends the list. A slash anywhere
+        // else is not a terminator.
+        if position + 1 == open_end || (position + 2 == open_end && xml[position] == b'/') {
+            break;
+        }
+        if position == whitespace_start {
+            return Err(Error::Xml("missing XML attribute separator".into()));
+        }
+        let name_start = position;
+        while position < open_end && !is_space(xml[position]) && xml[position] != b'=' {
+            position += 1;
+        }
+        let name = markup(source, name_start..position)?;
+        if !valid_qname(name) {
+            return Err(Error::Xml("invalid XML attribute name".into()));
+        }
+        let earlier = attributes.records[attributes_start..]
+            .iter()
+            .map(|attribute| attribute.name(xml));
+        if repeated(earlier, &mut checks.names, name.as_bytes()) {
+            return Err(Error::Xml("duplicate XML attribute".into()));
+        }
+        while position < open_end && is_space(xml[position]) {
+            position += 1;
+        }
+        if position >= open_end || xml[position] != b'=' {
+            return Err(Error::Xml("invalid XML attribute".into()));
+        }
+        position += 1;
+        while position < open_end && is_space(xml[position]) {
+            position += 1;
+        }
+        let quote = match xml[..open_end].get(position) {
+            Some(&quote @ (b'\'' | b'"')) => quote,
+            _ => return Err(Error::Xml("unquoted XML attribute".into())),
+        };
+        let value_start = position + 1;
+        let value_end = xml[value_start..open_end]
+            .iter()
+            .position(|&byte| byte == quote)
+            .map(|length| value_start + length)
+            .ok_or_else(|| Error::Xml("unterminated XML attribute".into()))?;
+        let raw = markup(source, value_start..value_end)?;
+        if raw.contains('<') {
+            return Err(Error::Xml("less-than sign in an XML attribute".into()));
+        }
+        // XML normalizes literal attribute whitespace before expanding entity
+        // references; referenced whitespace keeps its actual value. Literal
+        // characters were validated with the whole document.
+        let value = attribute_value(&XmlAttribute {
+            key: QName(name),
+            value: Cow::Borrowed(raw),
+        })?;
+        if name == "xmlns" {
+            validate_namespace_binding(None, &value)?;
+        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+            validate_namespace_binding(Some(prefix), &value)?;
+        } else if name.contains(':') {
+            // Different prefixes bound to one namespace can still repeat an
+            // expanded name. Unprefixed attributes have no namespace.
+            let qualified = QName(name);
+            let expanded = (
+                namespaces.resolve(reader, qualified, true)?,
+                qualified.local_name().into_inner(),
+            );
+            if repeated(
+                checks.expanded.iter().copied(),
+                &mut checks.expanded_names,
+                expanded,
+            ) {
+                return Err(Error::Xml("duplicate expanded attribute name".into()));
+            }
+            checks.expanded.push(expanded);
+        }
+        // A borrowed value is the raw span itself and needs no storage.
+        let normalized = match value {
+            Cow::Borrowed(_) => RAW_VALUE,
+            Cow::Owned(value) => {
+                attributes.normalized.push(value.into_boxed_str());
+                compact(attributes.normalized.len() - 1)
+            }
+        };
+        arena_push(
+            &mut attributes.records,
+            Attribute {
+                start: compact(whitespace_start),
+                name_start: compact(name_start),
+                name_end: compact(name_start + name.len()),
+                value_start: compact(value_start),
+                value_end: compact(value_end),
+                normalized,
+            },
+        );
+        position = value_end + 1;
+    }
+    Ok(attributes_start..attributes.records.len())
 }
 
 // An ST_Xstring escape token, `_xHHHH_`, starts at `position` when this

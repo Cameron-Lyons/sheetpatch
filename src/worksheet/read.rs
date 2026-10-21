@@ -1,8 +1,8 @@
 use super::date::{DateError, excel_serial};
 use super::index::WorksheetIndex;
-use super::parse::{Element, NamespaceId, XmlDocument, parse_with};
+use super::parse::{Element, XmlDocument, parse_with};
 use super::{ReadError, invalid, unique, unsupported, xml_error};
-use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
+use crate::xml::{NamespaceId, excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
 use std::collections::HashMap;

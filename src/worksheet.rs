@@ -1,5 +1,4 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
-use crate::xml::namespace as decoded_namespace;
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 

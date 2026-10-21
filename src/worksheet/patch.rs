@@ -1,9 +1,9 @@
 use super::index::{RowEntry, WorksheetIndex, reference_range};
-use super::parse::{Attributes, Element};
+use super::parse::Element;
 use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
 use super::{protected, protection, unique, unsupported};
-use crate::xml::{excel_escaped, trim_whitespace as trim_xml_whitespace};
+use crate::xml::{Attributes, excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Error, Result};
 use std::{borrow::Cow, collections::BTreeMap};
 

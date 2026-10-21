@@ -1,7 +1,7 @@
-use super::parse::{Attributes, Element, NamespaceId, XmlDocument, parse};
+use super::parse::{Element, XmlDocument, parse};
 use super::validation::validate_ranges;
 use super::{invalid, protected, protection, unique, unsupported};
-use crate::xml::trim_whitespace as trim_xml_whitespace;
+use crate::xml::{Attributes, NamespaceId, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap};
 

@@ -1,6 +1,7 @@
-use super::parse::{Attributes, Element, NamespaceId};
+use super::parse::Element;
 use super::read::validate_rich_text_structure;
 use super::{protected, protection, unsupported};
+use crate::xml::{Attributes, NamespaceId};
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::BTreeMap;
 
