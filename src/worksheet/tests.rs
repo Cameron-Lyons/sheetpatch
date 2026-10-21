@@ -396,6 +396,23 @@ fn unsupported_containers_cannot_hide_formulas_or_merged_ranges() {
             "{input}"
         );
     }
+    // A whole cell hidden the same way is refused, even as the edit's target.
+    for body in [
+        r#"<sheetData><row r="1"><x:alternate><c r="A1"><f>1+1</f><v>2</v></c></x:alternate></row></sheetData>"#,
+        r#"<sheetData><c r="A1"><f>1+1</f><v>2</v></c></sheetData>"#,
+        r#"<sheetData/><c r="A1"><f>1+1</f><v>2</v></c>"#,
+    ] {
+        let input = sheet(body);
+        for address in ["A1", "B2"] {
+            assert!(
+                matches!(
+                    edit(&input, address, 1.0.into()),
+                    Err(Error::Unsupported(m)) if m == "cell outside a worksheet row"
+                ),
+                "{address}: {input}"
+            );
+        }
+    }
     let input = sheet(&format!(
         "{prefix}</c></row></sheetData><x:mergeCells><x:mergeCell ref=\"A1:C2\"/></x:mergeCells>"
     ));
@@ -422,6 +439,10 @@ fn markup_compatibility_branches_cannot_bypass_value_or_range_guards() {
         format!(
             "<sheetData/>{}",
             alternative("<mergeCells><mergeCell ref=\"A1:C2\"/></mergeCells>")
+        ),
+        format!(
+            "<sheetData><row r=\"1\">{}</row></sheetData>",
+            alternative("<c r=\"A1\"><f>1+6</f><v>7</v></c>")
         ),
     ] {
         let input = sheet(&body);
