@@ -5,7 +5,7 @@ use super::validation::validate_payload;
 use super::{protected, protection, unique, unsupported};
 use crate::xml::{Attributes, excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Error, Result};
-use std::{borrow::Cow, collections::BTreeMap};
+use std::collections::BTreeMap;
 
 struct Edit {
     start: usize,
@@ -16,11 +16,15 @@ struct Edit {
 /// Nonoverlapping changes against the original worksheet's absolute byte spans.
 /// Existing cell/row/extension bytes are copied only when the final XML is emitted.
 #[derive(Default)]
-struct EditPlan {
+pub(super) struct EditPlan {
     edits: Vec<Edit>,
 }
 
 impl EditPlan {
+    pub(super) fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
     fn push(&mut self, edit: Edit) {
         self.edits.push(edit);
     }
@@ -41,10 +45,8 @@ impl EditPlan {
         });
     }
 
-    fn apply(mut self, xml: &[u8]) -> Result<Cow<'_, [u8]>> {
-        if self.edits.is_empty() {
-            return Ok(Cow::Borrowed(xml));
-        }
+    /// The original XML with every planned edit applied.
+    pub(super) fn apply(mut self, xml: &[u8]) -> Result<Vec<u8>> {
         // Stable order is significant for several new cells/rows at one gap.
         self.edits.sort_by_key(|edit| (edit.start, edit.end));
         let mut position = 0;
@@ -70,7 +72,7 @@ impl EditPlan {
             position = edit.end;
         }
         output.extend_from_slice(&xml[position..]);
-        Ok(Cow::Owned(output))
+        Ok(output)
     }
 }
 
@@ -526,15 +528,15 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     ))
 }
 
-pub(super) fn patch_cells<'a, 's>(
-    xml: &'a [u8],
+pub(super) fn plan_cells<'s>(
+    xml: &[u8],
     index: &WorksheetIndex,
     cells: &BTreeMap<CellRef, CellValue>,
     shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
     date1904: bool,
-) -> Result<Cow<'a, [u8]>> {
+) -> Result<EditPlan> {
     if cells.is_empty() {
-        return Ok(Cow::Borrowed(xml));
+        return Ok(EditPlan::default());
     }
     index.validate_edits(cells)?;
     // The table is needed only to recognize rewriting a shared string's own
@@ -598,5 +600,5 @@ pub(super) fn patch_cells<'a, 's>(
     if let Some(edit) = dimension_edit(index, &changed_cells)? {
         edits.push(edit);
     }
-    edits.apply(xml)
+    Ok(edits)
 }

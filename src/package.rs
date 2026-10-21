@@ -7,7 +7,6 @@ use crate::{
     },
 };
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt, fs,
     io::Write,
@@ -775,13 +774,19 @@ impl Workbook {
             // Shared strings only recognize rewriting a cell's current text,
             // so a table that cannot be loaded leaves such an edit a change.
             let worksheet = PreparedWorksheet::parse(current).map_err(in_sheet)?;
-            let Cow::Owned(patched) = worksheet
-                .patch_cells(&cells, || self.loaded_shared_strings(), self.date1904)
+            let Some(patch) = worksheet
+                .plan_cells(&cells, || self.loaded_shared_strings(), self.date1904)
                 .map_err(in_sheet)?
             else {
                 continue;
             };
-            self.check_table_headers(index, worksheet, &cells)?;
+            // A worksheet's first change resolves its tables, reading its
+            // whole relationships part. That happens before the edited XML is
+            // written, so that the part is never held with both the index and
+            // the output. A patch error still comes first.
+            let headers = self.table_headers(index);
+            let patched = patch.apply().map_err(in_sheet)?;
+            self.check_table_headers(index, &worksheet, headers?, &cells)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -794,34 +799,21 @@ impl Workbook {
     // Excel requires each table header cell's text to equal its table column's
     // name, and repairs or removes a table whose header differs. An edit may
     // rewrite a header cell's current value, as it reads, but not change it.
-    // `worksheet` is the edited worksheet as it was before the edits. Errors
-    // name the worksheet or the package part they concern.
+    // `worksheet` is the edited worksheet as it was before the edits, and
+    // `headers` its tables' header rows. Errors name the worksheet or the
+    // package part they concern.
     fn check_table_headers(
         &self,
         index: usize,
-        worksheet: PreparedWorksheet<'_>,
+        worksheet: &PreparedWorksheet<'_>,
+        headers: &[CellRange],
         cells: &BTreeMap<CellRef, CellValue>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
-        // A worksheet's first change resolves its tables, which can read and
-        // parse many relationships. The index is released meanwhile and
-        // rebuilt only for an edit in a header; once the tables are known, it
-        // is kept for the header reads instead.
-        let xml = worksheet.xml();
-        let retained = if self.sheet_xml[index].table_headers.get().is_some() {
-            Some(worksheet)
-        } else {
-            drop(worksheet);
-            None
-        };
-        let edits = header_cells(cells, self.table_headers(index)?);
+        let edits = header_cells(cells, headers);
         if edits.is_empty() {
             return Ok(());
         }
-        let worksheet = match retained {
-            Some(worksheet) => worksheet,
-            None => PreparedWorksheet::parse(xml).map_err(|error| sheet.context(error))?,
-        };
         let mut changed_header = None;
         // Keep one value at a time: many headers can refer to the same long
         // shared string. Validate all reads before reporting the first changed
