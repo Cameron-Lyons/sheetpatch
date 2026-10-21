@@ -1,87 +1,12 @@
 //! Regressions for worksheet text decoding, value validation, and new cells.
-use std::{collections::BTreeMap, io::Read};
+mod common;
 
-use flate2::read::DeflateDecoder;
+use common::{payloads, stored_archive};
 use sheetpatch::{CellEdit, CellValue, Error, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
-
-fn stored_archive(parts: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut archive = Vec::new();
-    let mut directory = Vec::new();
-    for &(name, content) in parts {
-        let offset = archive.len() as u32;
-        let crc = crc32fast::hash(content);
-        archive.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        for value in [20u16, 0, 0, 0, 0] {
-            archive.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, content.len() as u32, content.len() as u32] {
-            archive.extend_from_slice(&value.to_le_bytes());
-        }
-        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        archive.extend_from_slice(&0u16.to_le_bytes());
-        archive.extend_from_slice(name.as_bytes());
-        archive.extend_from_slice(content);
-        directory.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        for value in [20u16, 20, 0, 0, 0, 0] {
-            directory.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, content.len() as u32, content.len() as u32] {
-            directory.extend_from_slice(&value.to_le_bytes());
-        }
-        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        for _ in 0..4 {
-            directory.extend_from_slice(&0u16.to_le_bytes());
-        }
-        directory.extend_from_slice(&0u32.to_le_bytes());
-        directory.extend_from_slice(&offset.to_le_bytes());
-        directory.extend_from_slice(name.as_bytes());
-    }
-    let offset = archive.len() as u32;
-    archive.extend_from_slice(&directory);
-    archive.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-    for value in [0u16, 0, parts.len() as u16, parts.len() as u16] {
-        archive.extend_from_slice(&value.to_le_bytes());
-    }
-    archive.extend_from_slice(&(directory.len() as u32).to_le_bytes());
-    archive.extend_from_slice(&offset.to_le_bytes());
-    archive.extend_from_slice(&0u16.to_le_bytes());
-    archive
-}
-
-fn payloads(archive: &[u8]) -> BTreeMap<String, Vec<u8>> {
-    let u16_at = |at| u16::from_le_bytes(archive[at..at + 2].try_into().unwrap()) as usize;
-    let u32_at = |at| u32::from_le_bytes(archive[at..at + 4].try_into().unwrap()) as usize;
-    let end = archive.len() - 22;
-    assert_eq!(&archive[end..end + 4], b"PK\x05\x06");
-    let mut at = u32_at(end + 16);
-    let mut parts = BTreeMap::new();
-    for _ in 0..u16_at(end + 10) {
-        assert_eq!(&archive[at..at + 4], b"PK\x01\x02");
-        let name_len = u16_at(at + 28);
-        let name = String::from_utf8(archive[at + 46..at + 46 + name_len].to_vec()).unwrap();
-        let local = u32_at(at + 42);
-        let start = local + 30 + u16_at(local + 26) + u16_at(local + 28);
-        let compressed = &archive[start..start + u32_at(at + 20)];
-        let bytes = match u16_at(at + 10) {
-            0 => compressed.to_vec(),
-            8 => {
-                let mut bytes = Vec::new();
-                DeflateDecoder::new(compressed)
-                    .read_to_end(&mut bytes)
-                    .unwrap();
-                bytes
-            }
-            method => panic!("unexpected compression: {method}"),
-        };
-        parts.insert(name, bytes);
-        at += 46 + name_len + u16_at(at + 30) + u16_at(at + 32);
-    }
-    parts
-}
 
 /// A one-sheet workbook named `Data`, optionally with a shared-string table.
 fn workbook(body: &str, shared_strings: Option<&str>) -> Workbook {
