@@ -1271,7 +1271,7 @@ impl Archive {
 
     /// Parse the local header at `start` as an obsolete record that compaction
     /// understands, ending by `gap_end`, the end of the gap holding it.
-    /// `Ok(None)` means it is not one; names and extra fields that
+    /// `Ok(None)` means it is not one; name encodings and extra fields that
     /// `Archive::new` would refuse in an active member are errors.
     fn obsolete_header(
         &self,
