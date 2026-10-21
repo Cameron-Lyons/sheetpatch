@@ -3,7 +3,7 @@ use super::validation::validate_ranges;
 use super::{at_cell, protected, protection, unique, unsupported};
 use crate::xml::trim_whitespace as trim_xml_whitespace;
 use crate::{CellRef, CellValue, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Copy)]
 pub(super) struct Range {
@@ -114,10 +114,9 @@ pub(super) struct RowEntry {
     pub(super) cells: std::ops::Range<usize>,
 }
 
-// Formula cells and the ranges their groups protect.
+// Formula groups: the ranges they protect, and any group missing its range.
 #[derive(Default)]
 struct Formulas {
-    cells: HashSet<CellRef>,
     ranges: Vec<Range>,
     // Each shared-formula index maps to its first cell and whether any
     // member of the group carries the group's reference range.
@@ -127,7 +126,6 @@ struct Formulas {
 
 impl Formulas {
     fn add(&mut self, address: CellRef, formula: &Element, attributes: &Attributes) -> Result<()> {
-        self.cells.insert(address);
         let range = formula
             .attr(attributes, "ref")
             .map(|attribute| reference_range(attribute.value))
@@ -364,7 +362,6 @@ pub(super) struct WorksheetIndex<'a> {
     pub(super) namespace: NamespaceId,
     pub(super) data_index: usize,
     pub(super) rows: Vec<RowEntry>,
-    pub(super) formula_cells: HashSet<CellRef>,
     pub(super) formula_ranges: Vec<Range>,
     pub(super) merged_ranges: Vec<Range>,
     /// The first formula cell whose shared, array, or data-table group lacks a
@@ -414,7 +411,6 @@ impl<'a> WorksheetIndex<'a> {
             namespace,
             data_index,
             rows,
-            formula_cells: formulas.cells,
             formula_ranges: formulas.ranges,
             merged_ranges,
             incomplete_formula_group,
@@ -449,6 +445,16 @@ impl<'a> WorksheetIndex<'a> {
         Some(cells[cell].1)
     }
 
+    // Whether an existing cell has a main-namespace formula child, the same
+    // test that reads use. A new cell has none.
+    fn has_formula(&self, address: CellRef) -> bool {
+        self.cell(address).is_some_and(|cell| {
+            self.elements[cell]
+                .children(&self.elements)
+                .any(|child| self.elements[child].is(self.source, self.namespace, "f"))
+        })
+    }
+
     pub(super) fn validate_edits(&self, cells: &BTreeMap<CellRef, CellValue>) -> Result<()> {
         // Without the group's range, any edited cell could be a hidden member.
         if let Some(cell) = self.incomplete_formula_group {
@@ -457,7 +463,7 @@ impl<'a> WorksheetIndex<'a> {
             )));
         }
         for &cell in cells.keys() {
-            if self.formula_cells.contains(&cell) {
+            if self.has_formula(cell) {
                 return Err(protected(cell, protection::FORMULA));
             }
         }

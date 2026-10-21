@@ -241,6 +241,35 @@ fn rejects_formula_cells_and_formula_followers() {
 }
 
 #[test]
+fn formula_cells_are_those_with_a_main_namespace_formula_child() {
+    let input = sheet(&format!(
+        "<sheetData><row r='1'><c r='A1'><v>1</v></c><c r='B1'><x:f>foreign</x:f><v>2</v></c><c r='C1'><v>3</v><f>C2</f></c></row><row r='3'><c r='A3' xmlns:s='{TRANSITIONAL}'><s:f>1</s:f></c><c r='B3'/></row></sheetData>"
+    ));
+    let edits = |addresses: &[&str]| {
+        let cells = addresses
+            .iter()
+            .map(|address| (address.parse().unwrap(), CellValue::Number(9.0)))
+            .collect();
+        patch_cells(input.as_bytes(), &cells, || None, false).map(Cow::into_owned)
+    };
+    for address in ["A1", "B1", "B3", "A2", "D1", "C3"] {
+        assert!(edits(&[address]).is_ok(), "{address}");
+    }
+    // Edits are checked in row-major order, so the first formula cell is named.
+    for (addresses, formula) in [
+        (&["A1", "C1", "A3"][..], "C1"),
+        (&["B3", "A3", "B1"], "A3"),
+        (&["D9", "A3", "A2", "C1"], "C1"),
+    ] {
+        let result = edits(addresses).map(|xml| String::from_utf8(xml).unwrap());
+        assert!(
+            protected_cell(result, formula, "contains a formula"),
+            "{addresses:?}"
+        );
+    }
+}
+
+#[test]
 fn shared_formula_indices_use_their_numeric_identity() {
     let input = sheet(
         "<sheetData><row r='1'><c r='A1'><f t='shared' si='1' ref='A1:B1'>1</f><v>1</v></c><c r='B1'><f t='shared' si='01'/><v>1</v></c><c r='C1'><v>1</v></c></row></sheetData>",
