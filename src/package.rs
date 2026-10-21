@@ -966,8 +966,9 @@ impl Workbook {
     /// with contiguous local records stays contiguous; edited records do not
     /// accumulate as obsolete copies. Central-directory offsets may change.
     /// Without edits this returns the original bytes. Pending edits are retained.
-    /// Changed worksheets are recompressed; one larger than 2 MiB is compressed
-    /// in 1 MiB segments on up to eight threads, including the calling thread.
+    /// Changed worksheets keep their compression method; a deflated one larger
+    /// than 2 MiB is compressed in 1 MiB segments on up to eight threads,
+    /// including the calling thread.
     ///
     /// # Errors
     ///
@@ -1018,6 +1019,7 @@ impl Workbook {
 
     /// Serialize a compact archive, removing obsolete ZIP records.
     /// Opaque ZIP prefixes or gaps cause an error. Pending edits are retained.
+    /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
     /// # Errors
     ///
