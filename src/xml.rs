@@ -363,6 +363,12 @@ impl NamespacePool {
     pub(crate) fn id(&self, uri: &str) -> Option<NamespaceId> {
         self.canonical.get(uri).copied()
     }
+
+    /// How many distinct URI spellings this pool has resolved, which bounds
+    /// its size. A parser that keeps no IDs can start a new pool past a limit.
+    pub(crate) fn spellings(&self) -> usize {
+        self.raw.len()
+    }
 }
 
 pub(crate) fn valid_char(c: char) -> bool {
@@ -526,7 +532,7 @@ pub(crate) fn trim_whitespace(text: &str) -> &str {
     text.trim_matches([' ', '\t', '\r', '\n'])
 }
 
-pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
+fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
     let raw = start.as_ref().as_bytes();
     let name_length = start.name().as_ref().len();
     let mut quote = None;
@@ -548,31 +554,10 @@ pub(crate) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<()> {
     Ok(())
 }
 
-// Namespace constraints apply to normalized attribute values. quick-xml's
-// resolver also checks reserved bindings, but does so against the raw spelling
-// and permits prefix undeclarations used by Namespaces in XML 1.1.
-pub(crate) fn validate_namespaces(start: &BytesStart<'_>) -> Result<()> {
-    if start.name().as_ref().starts_with("xmlns:") {
-        return Err(Error::Xml("xmlns cannot be an element prefix".into()));
-    }
-    for attribute in start.attributes() {
-        let attribute = attribute.map_err(|e| Error::Xml(e.to_string()))?;
-        let name = attribute.key.as_ref();
-        let prefix = if name == "xmlns" {
-            None
-        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-            Some(prefix)
-        } else {
-            continue;
-        };
-        let value = attribute_value(&attribute)?;
-        validate_namespace_binding(prefix, &value)?;
-    }
-    Ok(())
-}
-
 // Checks one declaration's normalized value. `prefix` is `None` for a default
 // namespace declaration (`xmlns`), and the declared prefix for `xmlns:prefix`.
+// quick-xml's resolver also checks reserved bindings, but does so against the
+// raw spelling and permits prefix undeclarations used by Namespaces in XML 1.1.
 fn validate_namespace_binding(prefix: Option<&str>, value: &str) -> Result<()> {
     const XML: &str = "http://www.w3.org/XML/1998/namespace";
     const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
@@ -650,8 +635,9 @@ const BYTE_ORDER_MARK: &[u8] = &[0xef, 0xbb, 0xbf];
 
 /// The rules every XML part follows as a whole: its size, encoding and
 /// characters, its declaration, one root element, and what may appear outside
-/// it. A parser checks each event with these rules and each tag's attributes
-/// with `attribute_spans`.
+/// it. Both parsers check each event with these rules and each tag's
+/// attributes with `attribute_spans`, so they accept exactly the same parts and
+/// report the same errors.
 pub(crate) struct DocumentRules {
     root_seen: bool,
     declaration_seen: bool,
@@ -876,6 +862,11 @@ impl<'xml> Attributes<'xml> {
             self.normalized.truncate(record.normalized as usize);
         }
         self.records.truncate(first);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+        self.normalized.clear();
     }
 }
 
@@ -1459,36 +1450,6 @@ mod tests {
                 NamespaceError::TooManyBindings(2)
             ))
         ));
-    }
-
-    #[test]
-    fn namespace_constraints_use_decoded_values_and_xml_10_rules() {
-        for raw in [
-            "tag xmlns:p=''",
-            "tag xmlns:p='http://www.w3.org/XML/1998/namespac&#101;'",
-            "tag xmlns:p='http://www.w3.org/2000/xmlns&#47;'",
-            "tag xmlns='http://www.w3.org/XML/1998/namespac&#101;'",
-            "tag xmlns='http://www.w3.org/2000/xmlns&#47;'",
-            "tag xmlns:xml='urn:incorrect'",
-            "tag xmlns:xmlns='urn:incorrect'",
-            "xmlns:tag",
-        ] {
-            let name_len = raw.find(' ').unwrap_or(raw.len());
-            assert!(
-                matches!(
-                    validate_namespaces(&BytesStart::from_content(raw, name_len)),
-                    Err(Error::Xml(_))
-                ),
-                "{raw}"
-            );
-        }
-        for raw in [
-            "tag xmlns=''",
-            "tag xmlns:p='urn&#58;correct'",
-            "tag xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'",
-        ] {
-            validate_namespaces(&BytesStart::from_content(raw, 3)).unwrap();
-        }
     }
 
     #[test]

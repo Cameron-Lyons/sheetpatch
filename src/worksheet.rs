@@ -161,6 +161,13 @@ fn unique<T>(
     Ok(first)
 }
 
+/// Parses `xml` as any XML part, with every check of the worksheet parser,
+/// for tests that compare the package parser with it.
+#[cfg(test)]
+pub(crate) fn parse_xml(xml: &[u8]) -> Result<()> {
+    parse::parse(xml).map(drop)
+}
+
 #[cfg(test)]
 fn patch_cells<'xml, 'strings>(
     xml: &'xml [u8],

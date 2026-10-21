@@ -4,8 +4,8 @@ use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
     xml::{
-        MAX_DEPTH, NamespaceCache, NamespaceReader, excel_text, namespace, trim_whitespace,
-        valid_qname,
+        AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, NamespaceReader,
+        attribute_spans, excel_text, trim_whitespace,
     },
 };
 use quick_xml::{
@@ -14,9 +14,8 @@ use quick_xml::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
-    ops::Deref,
     rc::Rc,
+    sync::Arc,
 };
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -45,7 +44,15 @@ pub(super) struct DiscoveredSheet {
 pub(super) fn discover(archive: &Archive) -> Result<PackageMetadata> {
     validate_content_types(archive)?;
     let office = office_document(archive)?;
-    let workbook = xml_nodes(&archive.read(&office.path)?, workbook_node)?;
+    let workbook = {
+        let xml = archive.read(&office.path)?;
+        let part = part_xml(&xml, workbook_node)?;
+        let root = &part.nodes[0];
+        if part.process_content && root.local == "workbook" && main_namespace(&root.namespace) {
+            reject_promoted_workbook_properties(&xml)?;
+        }
+        part.nodes
+    };
     let (sheets_index, date1904) = workbook_properties(&workbook)?;
     let rels_path = part_path(archive, &relationships_path(&office.uri))?;
     let rels = relationships(&archive.read(&rels_path)?)?;
@@ -458,12 +465,12 @@ fn workbook_node(depth: usize, namespace: &str, local: &str, parent: Option<&Nod
 }
 
 struct Attribute {
-    namespace: Rc<str>,
+    namespace: Arc<str>,
     local: String,
     value: String,
 }
 struct Node {
-    namespace: Rc<str>,
+    namespace: Arc<str>,
     local: String,
     attributes: Vec<Attribute>,
     /// The parent's index when the parent was retained.
@@ -478,260 +485,120 @@ impl Node {
     }
 }
 
-// Hash a URI once per binding, including when checking expanded attribute
-// names. The fingerprint speeds lookup; exact URI equality still decides it.
-#[derive(Clone)]
-struct NamespaceName {
-    uri: Rc<str>,
-    fingerprint: u64,
+/// A package part's retained elements, and whether any element of the part
+/// has a non-empty mc:ProcessContent attribute.
+struct PartXml {
+    nodes: Vec<Node>,
+    process_content: bool,
 }
 
-impl NamespaceName {
-    fn new(uri: Rc<str>) -> Self {
-        let mut hash = DefaultHasher::new();
-        uri.hash(&mut hash);
-        Self {
-            uri,
-            fingerprint: hash.finish(),
-        }
-    }
-}
+// Parts use few namespaces. Past this many spellings a parser that keeps no
+// namespace IDs starts a new pool, so that distinct declarations cannot grow
+// it without bound.
+const NAMESPACE_LIMIT: usize = 64;
 
-impl Deref for NamespaceName {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.uri
-    }
-}
-
-impl PartialEq for NamespaceName {
-    fn eq(&self, other: &Self) -> bool {
-        self.fingerprint == other.fingerprint
-            && (Rc::ptr_eq(&self.uri, &other.uri) || self.uri == other.uri)
-    }
-}
-
-impl Eq for NamespaceName {}
-
-impl Hash for NamespaceName {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.fingerprint.hash(state);
-    }
-}
-
-// Normalized namespace URIs by their raw spelling. Parts use few namespaces;
-// the limit keeps distinct declarations from growing the cache without bound.
-struct Namespaces {
-    cache: HashMap<String, NamespaceName>,
-    bindings: NamespaceCache<NamespaceName>,
-    unbound: NamespaceName,
-}
-
-impl Namespaces {
-    const CACHE_LIMIT: usize = 64;
-
-    fn resolve(
-        &mut self,
-        reader: &NamespaceReader<'_>,
-        name: QName<'_>,
-        attribute: bool,
-    ) -> Result<NamespaceName> {
-        if let Some(uri) = self.bindings.get(reader, name, attribute) {
-            return Ok(uri);
-        }
-        let result = if attribute {
-            reader.resolver().resolve_attribute(name).0
-        } else {
-            reader.resolver().resolve_element(name).0
-        };
-        let uri = match result {
-            ResolveResult::Bound(raw) => {
-                if let Some(uri) = self.cache.get(raw.as_ref()) {
-                    uri.clone()
-                } else {
-                    let uri = NamespaceName::new(namespace(ResolveResult::Bound(raw))?.into());
-                    // Reuse equivalent escaped spellings within the bounded
-                    // cache, so aliases share the cheap pointer equality path.
-                    let uri = self
-                        .cache
-                        .values()
-                        .find(|cached| **cached == uri)
-                        .cloned()
-                        .unwrap_or(uri);
-                    if self.cache.len() < Self::CACHE_LIMIT {
-                        self.cache.insert(raw.as_ref().to_owned(), uri.clone());
-                    }
-                    uri
-                }
-            }
-            other => {
-                namespace(other)?;
-                self.unbound.clone()
-            }
-        };
-        self.bindings.insert(reader, name, attribute, uri.clone());
-        Ok(uri)
-    }
-}
-
-/// Parses and validates a whole package part, keeping its root and the
-/// elements that `retain` selects. Memory therefore grows with the retained
-/// elements, not with unrelated markup.
 fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
-    let xml = std::str::from_utf8(bytes)
-        .map_err(|e| Error::Xml(format!("package XML must be UTF-8: {e}")))?;
-    if !crate::xml::valid_text(xml) {
-        return Err(Error::Xml("invalid XML character".into()));
-    }
-    // After the first byte order mark, U+FEFF is text outside the root. The
-    // reader would silently discard a second one.
-    let xml = xml.strip_prefix('\u{feff}').unwrap_or(xml);
-    if xml.starts_with('\u{feff}') {
-        return Err(Error::Xml("text outside XML root".into()));
-    }
-    let mut reader = NamespaceReader::from_str(xml);
-    reader.config_mut().check_comments = true;
-    let mut namespaces = Namespaces {
-        cache: HashMap::new(),
-        bindings: NamespaceCache::default(),
-        unbound: NamespaceName::new(Rc::from("")),
-    };
+    part_xml(bytes, retain).map(|part| part.nodes)
+}
+
+/// Parses and validates a whole package part with the worksheet parser's
+/// rules, keeping its root and the elements that `retain` selects when they
+/// start. Memory therefore grows with the retained elements, not with
+/// unrelated markup.
+fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
+    let (source, mut rules) = DocumentRules::source(bytes)?;
+    let mut reader = rules.reader(source);
+    let mut namespaces = NamespacePool::new();
+    // One tag's attributes at a time; only retained elements copy theirs.
+    let mut attributes = Attributes::new(source);
+    let mut checks = AttributeChecks::default();
     let mut nodes = Vec::new();
     // Each open element's index among the retained nodes, if it was retained.
     let mut stack: Vec<Option<usize>> = Vec::new();
-    let mut roots = 0;
-    let mut declaration_seen = false;
-    let mut has_process_content = false;
+    let mut process_content = false;
     loop {
-        let event_start = reader.buffer_position();
+        let start = rules.position(&reader);
         let event = reader.read_event().map_err(Error::xml)?;
-        let is_empty = matches!(event, Event::Empty(_));
+        let end = rules.position(&reader);
         match event {
-            Event::Start(e) | Event::Empty(e) => {
-                if stack.is_empty() {
-                    roots += 1;
-                }
-                if stack.len() >= MAX_DEPTH {
-                    return Err(Error::Unsupported(format!(
-                        "XML nesting deeper than {MAX_DEPTH} elements"
-                    )));
-                }
-                if !valid_qname(e.name().as_ref()) {
-                    return Err(Error::Xml("invalid XML element name".into()));
-                }
-                crate::xml::validate_namespaces(&e)?;
-                crate::xml::validate_attribute_spacing(&e)?;
-                let namespace = namespaces.resolve(&reader, e.name(), false)?;
-                let local = e.local_name();
+            Event::Start(ref tag) | Event::Empty(ref tag) => {
+                let name = tag.name();
+                rules.start_element(stack.len(), name.as_ref())?;
+                let namespace = namespaces.resolve(&reader, name, false)?;
+                let local = tag.local_name();
                 let parent = stack.last().copied().flatten();
                 let keep = stack.is_empty()
                     || retain(
                         stack.len(),
-                        &namespace,
+                        namespaces.uri(namespace),
                         local.as_ref(),
                         parent.map(|index| &nodes[index]),
                     );
-                let mut attributes = Vec::new();
-                // quick-xml rejects repeated attribute names. Distinct prefixes
-                // can still expand to one namespace and local name.
-                let mut expanded = HashSet::new();
-                for attr in e.attributes() {
-                    let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
-                    let name = attr.key.as_ref();
-                    if !valid_qname(name) {
-                        return Err(Error::Xml("invalid XML attribute name".into()));
-                    }
-                    if attr.value.contains('<') {
-                        return Err(Error::Xml("literal '<' in XML attribute value".into()));
-                    }
-                    let attribute_local = attr.key.local_name();
-                    let attribute_namespace = namespaces.resolve(&reader, attr.key, true)?;
-                    if name.contains(':')
-                        && !name.starts_with("xmlns:")
-                        && !expanded
-                            .insert((attribute_namespace.clone(), attribute_local.into_inner()))
+                attributes.clear();
+                let spans = attribute_spans(
+                    start + 1 + name.as_ref().len(),
+                    end,
+                    &mut attributes,
+                    &mut namespaces,
+                    &reader,
+                    &mut checks,
+                )?;
+                let mut kept = Vec::new();
+                for attribute in spans.map(|index| attributes.view(index)) {
+                    let qualified = QName(attribute.name);
+                    let attribute_local = qualified.local_name().into_inner();
+                    // Namespace declarations are not attributes of a node, and
+                    // the attributes of an element that is not retained matter
+                    // only as mc:ProcessContent.
+                    if qualified.as_namespace_binding().is_some()
+                        || !(keep || attribute_local == "ProcessContent")
                     {
-                        return Err(Error::Xml("duplicate XML attribute".into()));
+                        continue;
                     }
-                    let value = crate::xml::attribute_value(&attr)?;
-                    has_process_content |= &*attribute_namespace == COMPATIBILITY_NS
-                        && attribute_local.as_ref() == "ProcessContent"
-                        && !trim_whitespace(&value).is_empty();
+                    let id = namespaces.resolve(&reader, qualified, true)?;
+                    let attribute_namespace = namespaces.uri(id);
+                    process_content |= &**attribute_namespace == COMPATIBILITY_NS
+                        && attribute_local == "ProcessContent"
+                        && !trim_whitespace(attribute.value).is_empty();
                     if keep {
-                        attributes.push(Attribute {
-                            namespace: attribute_namespace.uri,
-                            local: attribute_local.into_inner().to_owned(),
-                            value: value.into_owned(),
+                        kept.push(Attribute {
+                            namespace: Arc::clone(attribute_namespace),
+                            local: attribute_local.to_owned(),
+                            value: attribute.value.to_owned(),
                         });
                     }
                 }
                 let index = keep.then(|| {
                     nodes.push(Node {
-                        namespace: namespace.uri,
+                        namespace: Arc::clone(namespaces.uri(namespace)),
                         local: local.as_ref().to_owned(),
-                        attributes,
+                        attributes: kept,
                         parent,
                     });
                     nodes.len() - 1
                 });
-                if !is_empty {
+                if matches!(event, Event::Start(_)) {
                     stack.push(index);
+                }
+                // Nodes hold their URIs, and no ID outlives its tag.
+                if namespaces.spellings() > NAMESPACE_LIMIT {
+                    namespaces = NamespacePool::new();
                 }
             }
             Event::End(_) => {
                 if stack.pop().is_none() {
-                    return Err(Error::Xml("unexpected closing tag".into()));
-                }
-            }
-            Event::Decl(d) => {
-                if event_start != 0 || roots != 0 || declaration_seen {
-                    return Err(Error::Xml("misplaced XML declaration".into()));
-                }
-                declaration_seen = true;
-                crate::xml::validate_declaration(&d)?;
-            }
-            Event::DocType(_) => {
-                return Err(Error::Unsupported(
-                    "DTD declarations are not supported".into(),
-                ));
-            }
-            Event::Text(e) => {
-                if e.as_ref().contains("]]>") {
-                    return Err(Error::Xml("CDATA terminator in XML text".into()));
-                }
-                if stack.is_empty() && !crate::xml::whitespace(e.as_ref()) {
-                    return Err(Error::Xml("text outside XML root".into()));
-                }
-            }
-            Event::CData(_) if stack.is_empty() => {
-                return Err(Error::Xml("content outside XML root".into()));
-            }
-            Event::GeneralRef(e) => {
-                if stack.is_empty() {
-                    return Err(Error::Xml("content outside XML root".into()));
-                }
-                crate::xml::reference(&e)?;
-            }
-            Event::PI(e) => {
-                let target = e.target();
-                if !crate::xml::valid_name(target) || target.eq_ignore_ascii_case("xml") {
-                    return Err(Error::Xml(
-                        "invalid XML processing-instruction target".into(),
-                    ));
+                    return Err(Error::Xml("unmatched closing XML tag".into()));
                 }
             }
             Event::Eof => break,
-            _ => (),
+            _ => rules.event(&event, start, stack.len())?,
         }
     }
-    if roots != 1 || !stack.is_empty() {
-        return Err(Error::Xml("expected one complete XML root".into()));
-    }
-    if has_process_content && nodes[0].local == "workbook" && main_namespace(&nodes[0].namespace) {
-        reject_promoted_workbook_properties(xml)?;
-    }
-    Ok(nodes)
+    rules.finish(stack.len())?;
+    Ok(PartXml {
+        nodes,
+        process_content,
+    })
 }
 
 // ProcessContent can promote children of an ignored vendor wrapper into the
@@ -739,13 +606,13 @@ fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
 // This follows possible workbook-level paths, not a general MC processor.
 #[derive(Default)]
 struct CompatibilityNames {
-    names: HashMap<NamespaceName, HashSet<Rc<str>>>,
-    added: Vec<(NamespaceName, Rc<str>)>,
+    names: HashMap<NamespaceId, HashSet<Rc<str>>>,
+    added: Vec<(NamespaceId, Rc<str>)>,
 }
 
 impl CompatibilityNames {
-    fn insert(&mut self, namespace: NamespaceName, local: &str) {
-        let names = self.names.entry(namespace.clone()).or_default();
+    fn insert(&mut self, namespace: NamespaceId, local: &str) {
+        let names = self.names.entry(namespace).or_default();
         if !names.contains(local) {
             let local: Rc<str> = local.into();
             names.insert(Rc::clone(&local));
@@ -753,9 +620,9 @@ impl CompatibilityNames {
         }
     }
 
-    fn matches(&self, namespace: &NamespaceName, local: &str) -> bool {
+    fn matches(&self, namespace: NamespaceId, local: &str) -> bool {
         self.names
-            .get(namespace)
+            .get(&namespace)
             .is_some_and(|names| names.contains(local) || names.contains("*"))
     }
 
@@ -769,9 +636,23 @@ impl CompatibilityNames {
             }
         }
     }
+
+    // Moves every name to its namespace's ID in a new pool. The names keep
+    // their order, so earlier checkpoints remain valid.
+    fn renumber(&mut self, previous: &NamespacePool, pool: &mut NamespacePool) -> Result<()> {
+        self.names.clear();
+        for (namespace, local) in &mut self.added {
+            *namespace = pool.intern(previous.uri(*namespace))?;
+            self.names
+                .entry(*namespace)
+                .or_default()
+                .insert(Rc::clone(local));
+        }
+        Ok(())
+    }
 }
 
-fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
+fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
     #[derive(Clone, Copy)]
     enum Parent {
         Workbook,
@@ -779,12 +660,8 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
         AlternateContent(bool),
         Opaque,
     }
-    let mut reader = NamespaceReader::from_str(xml);
-    let mut namespaces = Namespaces {
-        cache: HashMap::new(),
-        bindings: NamespaceCache::default(),
-        unbound: NamespaceName::new(Rc::from("")),
-    };
+    let mut reader = NamespaceReader::from_reader(xml);
+    let mut namespaces = NamespacePool::new();
     // Namespace / expanded-name lookup stays bounded even for long inherited
     // rule lists. Only newly inserted names need removing when a scope closes.
     let mut rules: [CompatibilityNames; 2] = Default::default();
@@ -794,6 +671,16 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(e) | Event::Empty(e) => {
+                // As in part_xml, the pool starts over past a limit. The rules
+                // in scope hold IDs, so they move to the new pool, and the
+                // limit grows with them to keep that work linear.
+                let live: usize = rules.iter().map(|names| names.added.len()).sum();
+                if namespaces.spellings() > NAMESPACE_LIMIT + live {
+                    let previous = std::mem::replace(&mut namespaces, NamespacePool::new());
+                    for names in &mut rules {
+                        names.renumber(&previous, &mut namespaces)?;
+                    }
+                }
                 let parent = stack.last().map(|frame| frame.0);
                 let checkpoint = rules.each_ref().map(|names| names.added.len());
                 let ns = namespaces.resolve(&reader, e.name(), false)?;
@@ -804,7 +691,8 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
                     for attr in e.attributes() {
                         let attr = attr.map_err(|error| Error::Xml(error.to_string()))?;
                         let name = attr.key.local_name();
-                        if &*namespaces.resolve(&reader, attr.key, true)? != COMPATIBILITY_NS {
+                        let attribute_namespace = namespaces.resolve(&reader, attr.key, true)?;
+                        if &**namespaces.uri(attribute_namespace) != COMPATIBILITY_NS {
                             continue;
                         }
                         let name = name.as_ref();
@@ -836,11 +724,12 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
                         }
                     }
                 }
+                let uri: &str = namespaces.uri(ns);
                 let current = match parent {
                     None => Parent::Workbook,
                     Some(Parent::Workbook | Parent::Promoted) => {
                         if matches!(parent, Some(Parent::Promoted))
-                            && main_namespace(&ns)
+                            && main_namespace(uri)
                             && local.as_ref() == "workbookPr"
                         {
                             return Err(Error::Unsupported(
@@ -848,12 +737,12 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
                                     .into(),
                             ));
                         }
-                        if &*ns == COMPATIBILITY_NS && local.as_ref() == "AlternateContent" {
+                        if uri == COMPATIBILITY_NS && local.as_ref() == "AlternateContent" {
                             Parent::AlternateContent(matches!(parent, Some(Parent::Promoted)))
-                        } else if !main_namespace(&ns)
-                            && &*ns != COMPATIBILITY_NS
-                            && rules[0].matches(&ns, "*")
-                            && rules[1].matches(&ns, local.as_ref())
+                        } else if !main_namespace(uri)
+                            && uri != COMPATIBILITY_NS
+                            && rules[0].matches(ns, "*")
+                            && rules[1].matches(ns, local.as_ref())
                         {
                             Parent::Promoted
                         } else {
@@ -861,7 +750,7 @@ fn reject_promoted_workbook_properties(xml: &str) -> Result<()> {
                         }
                     }
                     Some(Parent::AlternateContent(promoted))
-                        if &*ns == COMPATIBILITY_NS
+                        if uri == COMPATIBILITY_NS
                             && matches!(local.as_ref(), "Choice" | "Fallback") =>
                     {
                         if promoted {
@@ -1163,19 +1052,6 @@ mod tests {
     use crate::Workbook;
 
     #[test]
-    fn namespace_fingerprint_collisions_keep_exact_uri_equality() {
-        let first = NamespaceName::new(Rc::from("urn:first"));
-        let collision = NamespaceName {
-            uri: Rc::from("urn:other"),
-            fingerprint: first.fingerprint,
-        };
-        let mut attributes = HashSet::new();
-        assert!(attributes.insert((first, "value")));
-        assert!(attributes.insert((collision, "value")));
-        assert!(!attributes.insert((NamespaceName::new(Rc::from("urn:first")), "value")));
-    }
-
-    #[test]
     fn resolve_relative_and_absolute_part_uris() {
         assert_eq!(
             resolve_target("books/main.xml", "../tabs/sheet%201.xml").unwrap(),
@@ -1383,53 +1259,89 @@ mod tests {
             }
         }
     }
+    // Parts both parsers refuse.
+    const MALFORMED_XML: &[&str] = &[
+        "<Relationships>",
+        "<a/><b/>",
+        "<!DOCTYPE a><a/>",
+        "<a/><p:b/>",
+        "text<a/>",
+        "<a><?xml version='1.0'?></a>",
+        "<a>&unknown;</a>",
+        "<a>&#0;</a>",
+        "<a x='&#0;'/>",
+        "<a 0bad='one'/>",
+        "<a x='<'/>",
+        "<a x='one'y='two'/>",
+        "<a><0bad/></a>",
+        "\u{a0}<a/>",
+        "<?0bad instruction?><a/>",
+        "<?XML version='1.0'?><a/>",
+        " <?xml version='1.0'?><a/>",
+        "<!--comment--><?xml version='1.0'?><a/>",
+        "<?xml version='1.0' standalone='invalid'?><a/>",
+        "<?xml version='1.0' version='1.0'?><a/>",
+        "<?xml version='1.0' ignored='one'?><a/>",
+        "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>",
+        "<?xml version='1.0'encoding='UTF-8'?><a/>",
+        // Elements that are not retained are validated all the same.
+        "<a xmlns:p='urn:u' xmlns:q='urn:u'><b><c p:x='1' q:x='2'/></b></a>",
+        "<a><b><c q:x='1'/></b></a>",
+        "<a><b>&#1;</b></a>",
+        "\u{feff}\u{feff}<a/>",
+        "<a>]]></a>",
+        "<a/>&amp;",
+        "<a/><![CDATA[x]]>",
+        "<a x='&#1;'/>",
+        "<a>\u{1}</a>",
+        "<a></b>",
+    ];
+
     #[test]
     fn malformed_xml_has_no_partial_document() {
-        for xml in [
-            "<Relationships>",
-            "<a/><b/>",
-            "<!DOCTYPE a><a/>",
-            "<a/><p:b/>",
-            "text<a/>",
-            "<a><?xml version='1.0'?></a>",
-            "<a>&unknown;</a>",
-            "<a>&#0;</a>",
-            "<a x='&#0;'/>",
-            "<a 0bad='one'/>",
-            "<a x='<'/>",
-            "<a x='one'y='two'/>",
-            "<a><0bad/></a>",
-            "\u{a0}<a/>",
-            "<?0bad instruction?><a/>",
-            "<?XML version='1.0'?><a/>",
-            " <?xml version='1.0'?><a/>",
-            "<!--comment--><?xml version='1.0'?><a/>",
-            "<?xml version='1.0' standalone='invalid'?><a/>",
-            "<?xml version='1.0' version='1.0'?><a/>",
-            "<?xml version='1.0' ignored='one'?><a/>",
-            "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>",
-            "<?xml version='1.0'encoding='UTF-8'?><a/>",
-            // Elements that are not retained are validated all the same.
-            "<a xmlns:p='urn:u' xmlns:q='urn:u'><b><c p:x='1' q:x='2'/></b></a>",
-            "<a><b><c q:x='1'/></b></a>",
-            "<a><b>&#1;</b></a>",
-            "\u{feff}\u{feff}<a/>",
-            "<a>]]></a>",
-            "<a/>&amp;",
-            "<a/><![CDATA[x]]>",
-            "<a x='&#1;'/>",
-            "<a>\u{1}</a>",
-            "<a></b>",
-        ] {
+        for xml in MALFORMED_XML {
             assert!(xml_nodes(xml.as_bytes(), root_only).is_err(), "{xml}");
         }
     }
 
+    // Namespace constraints apply to normalized values, with the rules of
+    // Namespaces in XML 1.0.
+    const NAMESPACE_VIOLATIONS: &[&str] = &[
+        "<tag xmlns:p=''/>",
+        "<tag xmlns:p='http://www.w3.org/XML/1998/namespac&#101;'/>",
+        "<tag xmlns:p='http://www.w3.org/2000/xmlns&#47;'/>",
+        "<tag xmlns='http://www.w3.org/XML/1998/namespac&#101;'/>",
+        "<tag xmlns='http://www.w3.org/2000/xmlns&#47;'/>",
+        "<tag xmlns:xml='urn:incorrect'/>",
+        "<tag xmlns:xmlns='urn:incorrect'/>",
+        "<xmlns:tag/>",
+    ];
+    const NAMESPACE_DECLARATIONS: &[&str] = &[
+        "<tag xmlns=''/>",
+        "<tag xmlns:p='urn&#58;correct'/>",
+        "<tag xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'/>",
+    ];
+
     #[test]
-    fn package_xml_errors_use_the_worksheet_parser_variants() {
-        let nested = |depth| format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
-        xml_nodes(nested(256).as_bytes(), root_only).unwrap();
-        for (xml, expected) in [
+    fn namespace_constraints_use_decoded_values_and_xml_10_rules() {
+        for xml in NAMESPACE_VIOLATIONS {
+            assert!(
+                matches!(xml_nodes(xml.as_bytes(), root_only), Err(Error::Xml(_))),
+                "{xml}"
+            );
+        }
+        for xml in NAMESPACE_DECLARATIONS {
+            xml_nodes(xml.as_bytes(), root_only).unwrap();
+        }
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth))
+    }
+
+    // Parts refused with the variant the worksheet parser reports.
+    fn variant_cases() -> [(Vec<u8>, Error); 5] {
+        [
             (nested(257).into_bytes(), Error::Unsupported(String::new())),
             (b"<a>\xff</a>".to_vec(), Error::Xml(String::new())),
             (
@@ -1444,7 +1356,13 @@ mod tests {
                 b"<!DOCTYPE a><a/>".to_vec(),
                 Error::Unsupported(String::new()),
             ),
-        ] {
+        ]
+    }
+
+    #[test]
+    fn package_xml_errors_use_the_worksheet_parser_variants() {
+        xml_nodes(nested(256).as_bytes(), root_only).unwrap();
+        for (xml, expected) in variant_cases() {
             let error = xml_nodes(&xml, root_only).err().unwrap();
             assert_eq!(
                 std::mem::discriminant(&error),
@@ -1517,14 +1435,302 @@ mod tests {
             ]
         );
     }
+
+    // Parts both parsers accept.
+    const WELL_FORMED_XML: &[&str] = &[
+        "\u{feff}<?xml version='1.0' encoding='UTF-8' standalone='yes'?><a/>",
+        "<?xml version='1.0' standalone='no'?><a/>",
+        "<?xml-stylesheet href='style.xsl'?><a xmlns:雪='urn:vendor' 雪:属性='value'/>",
+    ];
+
     #[test]
     fn complete_xml_supports_bom_declarations_and_unicode_names() {
-        for xml in [
-            "\u{feff}<?xml version='1.0' encoding='UTF-8' standalone='yes'?><a/>",
-            "<?xml version='1.0' standalone='no'?><a/>",
-            "<?xml-stylesheet href='style.xsl'?><a xmlns:雪='urn:vendor' 雪:属性='value'/>",
-        ] {
+        for xml in WELL_FORMED_XML {
             assert!(xml_nodes(xml.as_bytes(), root_only).is_ok(), "{xml}");
         }
+    }
+
+    // The worksheet tests' XML cases, as worksheet bodies.
+    const WORKSHEET_BODIES: &[&str] = &[
+        "<sheetData 0bad='one'/>",
+        "<sheetData><0bad/></sheetData>",
+        "<sheetData><x:bad:name/></sheetData>",
+        "<sheetData><?0bad data?></sheetData>",
+        "<sheetData><?XML data?></sheetData>",
+        "<sheetData/><x:a>]]></x:a>",
+        "<sheetData/><x:a v='a<b'/>",
+        "<sheetData/><x:a v='&#1;'/>",
+        "<sheetData/><x:a>\u{1}</x:a>",
+        "<sheetData xmlns:p='' />",
+        "<sheetData xmlns:p='http://www.w3.org/XML/1998/namespac&#101;' />",
+        "<sheetData xmlns:p='http://www.w3.org/2000/xmlns&#47;' />",
+        "<sheetData/><x:foreign xmlns='http://www.w3.org/XML/1998/namespac&#101;'/>",
+        "<sheetData/><x:foreign xmlns='http://www.w3.org/2000/xmlns&#47;'/>",
+        "<sheetData/><xmlns:invalid/>",
+        "<sheetData xmlns:p='urn:&nbsp;'/>",
+        "<sheetData xmlns:xml='http:&sol;&sol;www.w3.org/XML/1998/namespace'/>",
+        "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><t>a&nbsp;b</t></is></c></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' x:flag='&amp;&#160;'/></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' t='n' t='b'/></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1't='n'/></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1'><v>&unknown;</v></c></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' xmlns:a='urn:x' xmlns:b='urn&#58;x' a:flag='one' b:flag='two'/></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' xmlns:a='urn:x' xmlns:b='urn&#58;x' a:first='one' a:flag='two' b:flag='three'/></row></sheetData>",
+        "<sheetData><row r='1'><c r='A1' missing:flag='one'/></row></sheetData>",
+        "<sheetData/><x:t /xml:space='preserve'>text</x:t>",
+        "<sheetData/><x:t xml:space='preserve'/ >text</x:t>",
+        "<sheetData/><x:t xml:space='preserve' / >text</x:t>",
+        "<sheetData/><x:t xml:space='preserve'/x:a='1'>text</x:t>",
+        "<sheetData/><x:t xml:space='preserve' /x:a='1'/>",
+        "<sheetData/><x:t xml:space='preserve'x:a='1'/>",
+        "<sheetData/><x:t x:a='1' x:a='2'/>",
+        "<sheetData/><x:t x:a=1/>",
+        "<sheetData/><x:t x:a/>",
+        "<sheetData/><x:t xml:space='preserve' />",
+        "<sheetData/><x:t\txml:space = 'preserve'\r\n/>",
+        "<sheetData/><x:t x:a='1/>'>text</x:t>",
+        "<sheetData/><x:t\n>text</x:t\n>",
+        "<?vendor:tool untouched?><sheetData/><x:外 x:À·='keep'/><x:\u{10000} x:\u{200c}start='keep'/>",
+        "<sheetData/><sheetData/>",
+    ];
+
+    // Declarations in place of the worksheet's `<?xml version="1.0"?>`.
+    const WORKSHEET_DECLARATIONS: &[&str] = &[
+        " <?xml version='1.0'?>",
+        "<!--first--><?xml version='1.0'?>",
+        "<?xml version='1.0' version='1.0'?>",
+        "<?xml version='1.0' standalone='maybe'?>",
+        "<?xml version='1.0' standalone='yes' encoding='UTF-8'?>",
+        "<?xml version='1.0' unknown='value'?>",
+        "<?xml version='1.0' encoding='UTF-16'?>",
+        "<?xml version='1.1'?>",
+        "<?xml version='2.0'?>",
+        "<?xml version='1.0' encoding='utf-8' standalone='yes'?>\r\n",
+        "\u{feff}<?xml version='1.0'?>",
+        "\u{feff}\u{feff}<?xml version='1.0'?>",
+    ];
+
+    // The review's differential probe of attribute, declaration, namespace,
+    // reference and markup edge cases.
+    const EDGE_CASES: &[&str] = &[
+        "<a b = 'x'/>",
+        "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+        "<p:a xmlns:p='u'><p:b xmlns:p=''/></p:a>",
+        "<a x='&#x20;'/>",
+        "<a\tb='1'/>",
+        "<a b='1'\n/>",
+        "<a b='&lt;'/>",
+        "<a b=\"'\"/>",
+        "<a:b/>",
+        "<a xml:lang='en'/>",
+        "<a xmlns:a='urn:x' a:xmlns='1'/>",
+        "<a b='1' b='2'/>",
+        "<a><!-- a -- b --></a>",
+        "<a><![CDATA[x]]></a>",
+        "<a>]]&gt;</a>",
+        "<a>\r\n</a>",
+        "<?xml-stylesheet?><a/>",
+        "<?xmlfoo?><a/>",
+        "<a/><?xml version='1.0'?>",
+        "<a/><!-- c -->",
+        "<a/><?pi?>",
+        "<a/>\n",
+        "<a b='x'/c='y'/>",
+        "<a b='x' / >",
+        "<a / >",
+        "<a b='x'/ >",
+        "<a =\"x\"/>",
+        "<a xmlns:p='urn:a' xmlns:q='urn:%61'><b p:x='1' q:x='2'/></a>",
+        "<a xmlns:p='urn:a' xmlns:q='urn:&#97;'><b p:x='1' q:x='2'/></a>",
+        "<a xmlns:p='&#x20;urn:a' xmlns:q='urn:a'><b p:x='1' q:x='2'/></a>",
+        "<a xmlns:p=' urn:a' xmlns:q='urn:a'><b p:x='1' q:x='2'/></a>",
+        "<a xmlns:p='urn:a'><b xmlns:p='urn:b' p:x='1'/></a>",
+        "<a xmlns='urn:a' xmlns=''/>",
+        "<a xmlns:p='urn:a' p:p='1' xmlns:p='urn:b'/>",
+        "<a xmlns='&#0;'/>",
+        "<a xmlns='&#1;'/>",
+        "<a>&#xD800;</a>",
+        "<a>&#65536;</a>",
+        "<a>&#x110000;</a>",
+        "<a>&amp;&lt;&gt;&quot;&apos;</a>",
+        "<a b='&unknown;'/>",
+        "<a b='&#38;'/>",
+        "<a b='&#38;#0;'/>",
+        "<a b='&#60;'/>",
+        "<a>&#60;</a>",
+        "<a><b/></a >",
+        "<a ><b/></a>",
+        "< a/>",
+        "<a></ a>",
+        "<a>\u{fffe}</a>",
+        "<a b='\u{fffe}'/>",
+        "<a\u{a0}b='1'/>",
+        "<a b\u{a0}='1'/>",
+        "<?xml  version='1.0'  ?><a/>",
+        "<?xml\tversion='1.0'?><a/>",
+        "<?xml version = '1.0'?><a/>",
+        "\u{feff} <a/>",
+        "<a><?xml-x?></a>",
+        "<a><?x y?></a>",
+        "<a><!---></a>",
+        "<a><!-- --->",
+        "<a><!-- - --></a>",
+        "<a xmlns:b='urn:b'><b:c xmlns:b='urn:c'/><b:c/></a>",
+        "<a>x<!DOCTYPE a></a>",
+        "<a><![CDATA[]]]]><![CDATA[>]]></a>",
+        "<a>]]]]></a>",
+        "<a>]]&#62;</a>",
+        "<a>&#93;]></a>",
+        "<a b='>'/>",
+        "<a b=\"/>\" />",
+        "<a b='&#9;&#10;&#13;'/>",
+        "<a b='\t\n\r'/>",
+        "<a xmlns:a='urn:a' xmlns:A='urn:a' a:x='1' A:x='2'/>",
+        "<a xmlns:a='http://www.w3.org/XML/1998/namespace'/>",
+        "<a xml:x='1' xmlns:p='http://www.w3.org/XML/1998/namespace' />",
+        "<a xmlns=' http://www.w3.org/2000/xmlns/'/>",
+        "<a:b xmlns:a='urn:a'></a:b>",
+        "<a:b xmlns:a='urn:a'></b>",
+        "<a>\u{85}\u{2028}</a>",
+        "<a/>\u{feff}",
+        "<a>\u{feff}</a>",
+        "<a b='1' c='2' d='3' e='4' f='5' g='6' h='7' i='8' j='9' k='10' l='11' m='12' n='13' o='14' p='15' q='16' r='17' b='18'/>",
+        "<a xmlns:x='urn:x' xmlns:y='urn:x' x:a1='' x:a2='' x:a3='' x:a4='' x:a5='' x:a6='' x:a7='' x:a8='' x:a9='' x:a10='' x:a11='' x:a12='' x:a13='' x:a14='' x:a15='' x:a16='' x:a17='' y:a1=''/>",
+    ];
+
+    // Package parts and worksheets share one validating parser core, so every
+    // part gets the same result, variant and message from either parser.
+    #[test]
+    fn package_and_worksheet_parsers_agree_on_every_case() {
+        let worksheet = |body: &str| {
+            format!(
+                "<?xml version=\"1.0\"?><worksheet xmlns=\"{MAIN_NS}\" xmlns:x=\"urn:custom\">{body}</worksheet>"
+            )
+        };
+        let sheet = worksheet("<sheetData/>");
+        let mut inputs: Vec<Vec<u8>> = [
+            MALFORMED_XML,
+            WELL_FORMED_XML,
+            NAMESPACE_VIOLATIONS,
+            NAMESPACE_DECLARATIONS,
+            EDGE_CASES,
+        ]
+        .concat()
+        .iter()
+        .map(|xml| xml.as_bytes().to_vec())
+        .collect();
+        inputs.extend(variant_cases().map(|(xml, _)| xml));
+        inputs.push(nested(256).into_bytes());
+        inputs.extend(
+            WORKSHEET_BODIES
+                .iter()
+                .map(|body| worksheet(body).into_bytes()),
+        );
+        inputs.extend(WORKSHEET_DECLARATIONS.iter().map(|declaration| {
+            sheet
+                .replace("<?xml version=\"1.0\"?>", declaration)
+                .into_bytes()
+        }));
+        for (prefix, suffix) in [
+            ("\u{a0}", ""),
+            ("", "\u{a0}"),
+            ("", "<worksheet/>"),
+            ("", "&amp;"),
+            ("", "<![CDATA[x]]>"),
+        ] {
+            inputs.push(format!("{prefix}{sheet}{suffix}").into_bytes());
+        }
+        let deep = format!("{}{}", "<x:a>".repeat(256), "</x:a>".repeat(256));
+        inputs.push(worksheet(&deep).into_bytes());
+        let mut invalid = sheet.clone().into_bytes();
+        invalid.insert(invalid.len() - 2, 0xff);
+        inputs.push(invalid);
+        for xml in &inputs {
+            let package = xml_nodes(xml, root_only).map(drop);
+            let worksheet = crate::worksheet::parse_xml(xml);
+            assert_eq!(
+                package.map_err(|error| format!("{error:?}")),
+                worksheet.map_err(|error| format!("{error:?}")),
+                "{}",
+                String::from_utf8_lossy(xml)
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_pool_restarts_keep_every_check_and_retained_namespace() {
+        let padding: String = (0..3 * NAMESPACE_LIMIT)
+            .map(|n| format!("<x:a xmlns:x='urn:{n}' x:n='{n}'/>"))
+            .collect();
+        // Retained elements that declare namespaces of their own make the
+        // pool start over inside their tags, too.
+        let relationships: String = (0..3 * NAMESPACE_LIMIT)
+            .map(|n| {
+                format!(
+                    "<p:Relationship xmlns:p='{PACKAGE_NS}' xmlns:z='urn:z{n}' z:n='{n}' Id='r{n}' Type='t' Target='{n}'/>"
+                )
+            })
+            .collect();
+        let rels = format!(
+            "<Relationships xmlns='{PACKAGE_NS}'>{padding}<Relationship Id='a' Type='t' Target='b'/>{relationships}</Relationships>"
+        );
+        let nodes = xml_nodes(rels.as_bytes(), relationship_node).unwrap();
+        let retained: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let vendor = node
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.local == "n")
+                    .map(|attribute| (&*attribute.namespace, attribute.value.as_str()));
+                (&*node.namespace, node.attr("", "Target"), vendor)
+            })
+            .collect();
+        let targets: Vec<_> = (0..3 * NAMESPACE_LIMIT).map(|n| n.to_string()).collect();
+        let vendors: Vec<_> = (0..3 * NAMESPACE_LIMIT)
+            .map(|n| format!("urn:z{n}"))
+            .collect();
+        let expected: Vec<_> = [(PACKAGE_NS, None, None), (PACKAGE_NS, Some("b"), None)]
+            .into_iter()
+            .chain((0..3 * NAMESPACE_LIMIT).map(|n| {
+                (
+                    PACKAGE_NS,
+                    Some(targets[n].as_str()),
+                    Some((vendors[n].as_str(), targets[n].as_str())),
+                )
+            }))
+            .collect();
+        assert_eq!(retained, expected);
+        // An inherited binding still expands to the same name afterwards.
+        let duplicate =
+            format!("<a xmlns:p='urn:same'>{padding}<b xmlns:q='urn:same' p:x='1' q:x='2'/></a>");
+        assert!(matches!(
+            xml_nodes(duplicate.as_bytes(), root_only),
+            Err(Error::Xml(message)) if message == "duplicate expanded attribute name"
+        ));
+        let process_content =
+            format!("<a xmlns:m='{COMPATIBILITY_NS}'>{padding}<b m:ProcessContent='x:y'/></a>");
+        assert!(
+            part_xml(process_content.as_bytes(), root_only)
+                .unwrap()
+                .process_content
+        );
+    }
+
+    #[test]
+    fn promoted_workbook_properties_are_found_after_the_namespace_pool_restarts() {
+        // Each direct child of the workbook resolves a new namespace, and the
+        // rules declared on the root must survive every restart.
+        let padding: String = (0..3 * NAMESPACE_LIMIT)
+            .map(|n| format!("<a xmlns='urn:{n}'/>"))
+            .collect();
+        let workbook = format!(
+            "<workbook xmlns='{MAIN_NS}' xmlns:mc='{COMPATIBILITY_NS}' xmlns:v='urn:v' mc:Ignorable='v' mc:ProcessContent='v:w'>{padding}<v:w><workbookPr date1904='1'/></v:w></workbook>"
+        );
+        assert!(matches!(
+            reject_promoted_workbook_properties(workbook.as_bytes()),
+            Err(Error::Unsupported(message)) if message.contains("ProcessContent")
+        ));
+        reject_promoted_workbook_properties(workbook.replace("v:w>", "v:x>").as_bytes()).unwrap();
     }
 }
