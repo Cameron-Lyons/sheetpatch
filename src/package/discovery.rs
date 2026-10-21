@@ -539,6 +539,19 @@ struct PartXml {
 // without bound.
 const NAMESPACE_LIMIT: usize = 64;
 
+// The most attribute records and namespace spellings that package parsing has
+// held at once on this thread, for tests of its memory bounds.
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SPELLING_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_peak(peak: &'static std::thread::LocalKey<std::cell::Cell<usize>>, value: usize) {
+    peak.set(peak.get().max(value));
+}
+
 fn xml_nodes(bytes: &[u8], retain: Retain) -> Result<Vec<Node>> {
     part_xml(bytes, retain).map(|part| part.nodes)
 }
@@ -675,6 +688,11 @@ fn walk_part<'xml, T>(
                 if matches!(event, Event::Start(_)) {
                     stack.push(value);
                 }
+                #[cfg(test)]
+                {
+                    record_peak(&ATTRIBUTE_PEAK, attributes.records_len());
+                    record_peak(&SPELLING_PEAK, namespaces.spellings());
+                }
                 // Visitors keep URIs, not IDs, past their tags.
                 if namespaces.spellings() > NAMESPACE_LIMIT {
                     namespaces.clear();
@@ -769,6 +787,8 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
                 // in scope hold IDs, so they move to the other pool, and the
                 // limit grows with them to keep that work linear.
                 let live: usize = rules.iter().map(|names| names.added.len()).sum();
+                #[cfg(test)]
+                record_peak(&SPELLING_PEAK, namespaces.spellings());
                 if namespaces.spellings() > NAMESPACE_LIMIT + live {
                     previous.clear();
                     std::mem::swap(&mut namespaces, &mut previous);
@@ -2061,6 +2081,33 @@ mod tests {
                 .unwrap()
                 .process_content
         );
+    }
+
+    #[test]
+    fn package_parsing_holds_one_tag_of_attributes_and_a_bounded_namespace_pool() {
+        // Each tag binds a new namespace and has three attributes.
+        let padding: String = (0..10 * NAMESPACE_LIMIT)
+            .map(|n| format!("<x:a xmlns:x='urn:{n}' b='1' c='2'/>"))
+            .collect();
+        let xml = format!("<Types xmlns='{CONTENT_TYPES_NS}'>{padding}</Types>");
+        ATTRIBUTE_PEAK.set(0);
+        SPELLING_PEAK.set(0);
+        xml_nodes(xml.as_bytes(), root_only).unwrap();
+        assert_eq!(ATTRIBUTE_PEAK.get(), 3);
+        // The pool starts over once a tag takes it past the limit.
+        assert_eq!(SPELLING_PEAK.get(), NAMESPACE_LIMIT + 1);
+
+        // Each child of a workbook using mc:ProcessContent resolves a new
+        // namespace. The limit grows by the two rules in scope.
+        let padding: String = (0..10 * NAMESPACE_LIMIT)
+            .map(|n| format!("<a xmlns='urn:{n}'/>"))
+            .collect();
+        let workbook = format!(
+            "<workbook xmlns='{MAIN_NS}' xmlns:mc='{COMPATIBILITY_NS}' xmlns:v='urn:v' mc:Ignorable='v' mc:ProcessContent='v:w'>{padding}</workbook>"
+        );
+        SPELLING_PEAK.set(0);
+        reject_promoted_workbook_properties(workbook.as_bytes()).unwrap();
+        assert_eq!(SPELLING_PEAK.get(), NAMESPACE_LIMIT + 2 + 1);
     }
 
     #[test]

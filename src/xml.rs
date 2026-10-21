@@ -885,6 +885,11 @@ impl<'xml> Attributes<'xml> {
 
 #[cfg(test)]
 impl Attributes<'_> {
+    /// How many attributes are recorded.
+    pub(crate) fn records_len(&self) -> usize {
+        self.records.len()
+    }
+
     /// How many values the side table holds.
     pub(crate) fn normalized_len(&self) -> usize {
         self.normalized.len()
