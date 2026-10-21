@@ -1160,10 +1160,24 @@ fn rejects_invalid_xml_names_and_non_xml_whitespace_outside_root() {
         sheet("<sheetData><?XML data?></sheetData>"),
         format!("\u{a0}{}", sheet("<sheetData/>")),
         format!("{}\u{a0}", sheet("<sheetData/>")),
+        format!("{}<worksheet/>", sheet("<sheetData/>")),
+        sheet("<sheetData/><x:a>]]></x:a>"),
+        sheet("<sheetData/><x:a v='a<b'/>"),
+        format!("{}&amp;", sheet("<sheetData/>")),
+        format!("{}<![CDATA[x]]>", sheet("<sheetData/>")),
+        sheet("<sheetData/><x:a v='&#1;'/>"),
+        sheet("<sheetData/><x:a>\u{1}</x:a>"),
     ] {
         assert!(
             matches!(edit(&input, "A1", 2.0.into()), Err(Error::Xml(_))),
             "accepted malformed XML: {input}"
+        );
+        assert!(
+            matches!(
+                read_cell(input.as_bytes(), "A1".parse().unwrap(), None),
+                Err(Error::Xml(_))
+            ),
+            "read malformed XML: {input}"
         );
     }
 }
