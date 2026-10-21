@@ -295,22 +295,36 @@ fn undecodable_old_values_do_not_block_replacements() {
         "<c r='B1' t='str'><v>_xD800_</v></c>",
         "<c r='C1' t='e'><v>#_xDC00_</v></c>",
         "<c r='D1' t='inlineStr'><is><r><t>ok</t></r><r><t>_xDEAD_</t></r></is></c>",
+        "<c r='E1' t='s'><v>0</v></c>",
     );
-    let mut book = workbook(&row(cells), None);
+    let mut book = workbook(&row(cells), Some("<si><t>_xD83D_</t></si>"));
+    // An unpaired surrogate is valid but has no Rust string.
+    let unpaired = "unpaired UTF-16 surrogate in Excel text escape";
     for address in ["A1", "B1", "C1", "D1"] {
-        assert!(matches!(book.get_cell("Data", address), Err(Error::Xml(_))));
+        assert!(matches!(
+            book.get_cell("Data", address),
+            Err(Error::Unsupported(message))
+                if message == format!("worksheet \"Data\": {address}: {unpaired}")
+        ));
     }
+    assert!(matches!(
+        book.get_cell("Data", "E1"),
+        Err(Error::Unsupported(message))
+            if message == format!("part \"xl/sharedStrings.xml\": string 0: {unpaired}")
+    ));
     book.set_cell("Data", "A1", "fixed").unwrap();
     book.set_cell("Data", "B1", "also fixed").unwrap();
     book.set_cell("Data", "C1", CellValue::Error("#N/A".into()))
         .unwrap();
     book.set_cell("Data", "D1", CellValue::Error("#REF!".into()))
         .unwrap();
+    book.set_cell("Data", "E1", "fixed too").unwrap();
     let book = reopened(&book);
     assert_eq!(value(&book, "A1"), CellValue::from("fixed"));
     assert_eq!(value(&book, "B1"), CellValue::from("also fixed"));
     assert_eq!(value(&book, "C1"), CellValue::Error("#N/A".into()));
     assert_eq!(value(&book, "D1"), CellValue::Error("#REF!".into()));
+    assert_eq!(value(&book, "E1"), CellValue::from("fixed too"));
 
     // Positive control: other value types already replaced such cells.
     let mut book = workbook(&row(cells), None);
@@ -755,7 +769,8 @@ fn duplicate_text_in_one_rich_text_run_cannot_produce_false_no_ops() {
     assert!(matches!(
         book.get_cell("Data", "A1"),
         Err(Error::Unsupported(message))
-            if message == "part \"xl/sharedStrings.xml\": rich text run has multiple text elements"
+            if message
+                == "part \"xl/sharedStrings.xml\": string 0: rich text run has multiple text elements"
     ));
     // Explicit replacement repairs an unreadable shared-string cell without
     // rewriting the shared table or mistaking the concatenation for a no-op.

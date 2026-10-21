@@ -193,6 +193,50 @@ fn failed_batch_reads_emit_no_partial_results() {
 }
 
 #[test]
+fn an_undecodable_shared_string_refuses_only_reads_of_cells_that_use_it() {
+    let directory = TempDir::new();
+    let path = directory.join("unpaired-surrogate.xlsx");
+    let mut parts = common::payloads(&fs::read(FIXTURE).unwrap());
+    let namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    // String 1 is an unpaired surrogate escape: valid, but not a Rust string.
+    parts.insert(
+        "xl/sharedStrings.xml".into(),
+        format!("<sst xmlns='{namespace}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
+            .into_bytes(),
+    );
+    parts.insert(
+        "xl/worksheets/sheet1.xml".into(),
+        format!(
+            "<worksheet xmlns='{namespace}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c><c r='C1'><v>3</v></c></row></sheetData></worksheet>"
+        )
+        .into_bytes(),
+    );
+    let entries: Vec<_> = parts
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.as_slice()))
+        .collect();
+    fs::write(&path, common::stored_archive(&entries)).unwrap();
+    let path = path.to_str().unwrap();
+    assert_eq!(success(&["get", path, "Data", "A1", "C1"]), "Name\n3\n");
+    assert_eq!(success(&["cells", path, "Data", "A1"]), "A1\ttext\tName\n");
+    for args in [
+        vec!["get", path, "Data", "B1"],
+        vec!["get", "--json", path, "Data", "A1:C1"],
+        vec!["cells", path, "Data"],
+    ] {
+        let output = cli(&args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "sheetpatch: unsupported: part \"xl/sharedStrings.xml\": string 1: \
+             unpaired UTF-16 surrogate in Excel text escape\n",
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn malformed_late_values_emit_nothing_after_many_shared_strings() {
     let directory = TempDir::new();
     let path = directory.join("late-error.xlsx");

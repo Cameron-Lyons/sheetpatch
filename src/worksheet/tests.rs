@@ -1475,9 +1475,12 @@ fn shared_string_tables_return_each_decoded_string_exactly() {
     let table = read_shared_strings(format!("<sst xmlns='{TRANSITIONAL}'>{body}</sst>").as_bytes())
         .unwrap();
     for (index, text) in expected.iter().enumerate() {
-        assert_eq!(table.get(index), Some(text.as_str()), "{index}");
+        assert!(
+            matches!(table.get(index), Some(Ok(entry)) if entry == text),
+            "{index}"
+        );
     }
-    assert_eq!(table.get(expected.len()), None);
+    assert!(table.get(expected.len()).is_none());
     assert_eq!(table, expected);
 }
 
@@ -1543,12 +1546,13 @@ fn hidden_rich_text_cannot_produce_a_partial_scalar_read() {
             read_cell(inline.as_bytes(), "A1".parse().unwrap(), None),
             Err(Error::Unsupported(_))
         ));
-        let table =
-            format!("<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:custom'><si>{payload}</si></sst>");
-        assert!(matches!(
-            read_shared_strings(table.as_bytes()),
-            Err(Error::Unsupported(_))
-        ));
+        // In the shared-string table, only that entry is refused.
+        let table = format!(
+            "<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:custom'><si>{payload}</si><si><t>next</t></si></sst>"
+        );
+        let table = read_shared_strings(table.as_bytes()).unwrap();
+        assert!(matches!(table.get(0), Some(Err(Error::Unsupported(_)))));
+        assert!(matches!(table.get(1), Some(Ok("next"))));
     }
 }
 
@@ -1649,7 +1653,13 @@ fn no_op_patches_borrow_the_original_xml() {
 fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
     // Clearing an existing payload is a change even when it reads as blank;
     // every other edit is a no-op only if a read returns the same value.
-    let strings = SharedStrings::from_iter(["first", " 2"]);
+    let strings = read_shared_strings(
+        format!(
+            "<sst xmlns='{TRANSITIONAL}'><si><t>first</t></si><si><t xml:space='preserve'> 2</t></si><si><t>_xD800_</t></si></sst>"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
     let address: CellRef = "A1".parse().unwrap();
     let values = [
         CellValue::Blank,
@@ -1663,6 +1673,7 @@ fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
         " 2".into(),
         " 2A".into(),
         "2".into(),
+        "".into(),
         CellValue::Error("#N/A".into()),
     ];
     for cell in [
@@ -1684,6 +1695,7 @@ fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
         "<c r='A1' t='s'><v> 0 </v></c>",
         "<c r='A1' t='s'><v>1</v></c>",
         "<c r='A1' t='s'><v>2</v></c>",
+        "<c r='A1' t='s'><v>3</v></c>",
         "<c r='A1' t='x'><v>2</v></c>",
     ] {
         let input = sheet(&format!("<sheetData><row r='1'>{cell}</row></sheetData>"));
@@ -2179,7 +2191,8 @@ fn read_errors_name_the_cell() {
         sheet("<sheetData><row r='2'><c r='B2' t='str'><v>_xD800_</v></c></row></sheetData>");
     assert!(matches!(
         read_cell(input.as_bytes(), "B2".parse().unwrap(), None),
-        Err(Error::Xml(error)) if error.starts_with("B2: ")
+        Err(Error::Unsupported(error))
+            if error == "B2: unpaired UTF-16 surrogate in Excel text escape"
     ));
     let input = sheet("<sheetData><row r='2'><c r='B2' t='s'><v>5</v></c></row></sheetData>");
     assert!(matches!(
@@ -2196,6 +2209,33 @@ fn read_errors_name_the_cell() {
     assert!(matches!(
         loaded,
         Err(ReadError::SharedStrings(Error::Xml(error))) if error == "shared strings"
+    ));
+    // So does a string the table cannot decode, which only cells that use it
+    // fail to read. The table's loader names its part.
+    let strings = read_shared_strings(
+        format!("<sst xmlns='{TRANSITIONAL}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
+            .as_bytes(),
+    )
+    .unwrap();
+    let input = sheet(
+        "<sheetData><row r='2'><c r='A2' t='s'><v>0</v></c><c r='B2' t='s'><v>1</v></c></row></sheetData>",
+    );
+    let read = |address: &str| {
+        read_cells(
+            input.as_bytes(),
+            &[address.parse().unwrap()],
+            || Ok(Some(&strings)),
+            false,
+        )
+        .map(|mut cells| cells.remove(0).value)
+    };
+    assert_eq!(read("A2").unwrap(), CellValue::from("Name"));
+    assert!(matches!(
+        read("B2"),
+        Err(ReadError::UndecodableString {
+            index: 1,
+            error: Error::Unsupported(error),
+        }) if error == "unpaired UTF-16 surrogate in Excel text escape"
     ));
     // A cell's own problems are the worksheet's, even when they concern the
     // table: here, its absence.
@@ -2248,13 +2288,45 @@ fn shared_strings_stream_without_changing_error_precedence() {
             format!("{unsupported}<x:e><si/></x:e><!DOCTYPE x>"),
             "document type",
         ),
-        // Otherwise the first string that cannot be decoded is reported.
-        (format!("{undecodable}{unsupported}"), "UTF-16"),
-        (format!("{unsupported}{undecodable}"), "elements inside"),
     ] {
         let error = read_shared_strings(table(&body).as_bytes()).unwrap_err();
         assert!(error.to_string().contains(expected), "{body}: {error:?}");
     }
+    // Otherwise strings that cannot be decoded fail only their own reads,
+    // each with its own error, and later strings keep their indexes.
+    let surrogate = "unpaired UTF-16 surrogate in Excel text escape";
+    let elements = "elements inside a simple cell text value";
+    for (body, errors) in [
+        (
+            format!("{undecodable}{unsupported}<si><t>after</t></si>"),
+            [surrogate, elements],
+        ),
+        (
+            format!("{unsupported}{undecodable}<si><t>after</t></si>"),
+            [elements, surrogate],
+        ),
+    ] {
+        let strings = read_shared_strings(table(&body).as_bytes()).unwrap();
+        for (index, expected) in errors.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    strings.get(index),
+                    Some(Err(Error::Unsupported(message))) if message == expected
+                ),
+                "{body}: {index}"
+            );
+        }
+        assert!(matches!(strings.get(2), Some(Ok("after"))), "{body}");
+        assert!(strings.get(3).is_none(), "{body}");
+    }
+    // Each distinct error is kept once, however many entries share it.
+    let many = format!("{undecodable}{unsupported}").repeat(1_000);
+    let strings = read_shared_strings(table(&many).as_bytes()).unwrap();
+    assert_eq!(strings.error_count(), 2);
+    assert!(matches!(
+        strings.get(1_999),
+        Some(Err(Error::Unsupported(message))) if message == elements
+    ));
     let wrong_root =
         format!("<worksheet xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{unsupported}</worksheet>");
     assert!(matches!(

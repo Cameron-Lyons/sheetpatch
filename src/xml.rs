@@ -536,7 +536,9 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
         (excel_escape_prefix_at(bytes, position) && bytes.get(position + 6) == Some(&b'_'))
             .then(|| u16::from_str_radix(&text[position + 2..position + 6], 16).unwrap())
     };
-    let invalid = || Error::Xml("invalid UTF-16 Excel text escape".into());
+    // A lone surrogate is valid ST_Xstring, but no Rust string can hold it,
+    // so it is unsupported rather than malformed.
+    let unpaired = || Error::Unsupported("unpaired UTF-16 surrogate in Excel text escape".into());
     // Copy ordinary UTF-8 spans directly instead of converting the entire
     // value to a temporary UTF-16 buffer merely because it has an underscore.
     let mut output = String::with_capacity(text.len());
@@ -548,14 +550,14 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
             let character = if (0xd800..=0xdbff).contains(&unit) {
                 let low = unit_at(position)
                     .filter(|low| (0xdc00..=0xdfff).contains(low))
-                    .ok_or_else(invalid)?;
+                    .ok_or_else(unpaired)?;
                 position += 7;
                 char::from_u32(
                     0x10000 + ((u32::from(unit) - 0xd800) << 10) + u32::from(low) - 0xdc00,
                 )
-                .ok_or_else(invalid)?
+                .ok_or_else(unpaired)?
             } else {
-                char::from_u32(u32::from(unit)).ok_or_else(invalid)?
+                char::from_u32(u32::from(unit)).ok_or_else(unpaired)?
             };
             output.push(character);
         } else {
@@ -884,6 +886,16 @@ mod tests {
         assert_eq!(excel_text("_X0041_雪").unwrap(), "_X0041_雪");
         assert_eq!(excel_text("_XD83D__XDE00_").unwrap(), "_XD83D__XDE00_");
         assert_eq!(excel_text("_XD800_").unwrap(), "_XD800_");
-        assert!(excel_text("_xD800_").is_err());
+        // A lone surrogate is valid ST_Xstring, which a Rust string cannot hold.
+        for text in ["_xD800_", "_xDBFF_x", "_xDC00_", "_xD83D__xD83D__xDE00_"] {
+            assert!(
+                matches!(
+                    excel_text(text),
+                    Err(Error::Unsupported(message))
+                        if message == "unpaired UTF-16 surrogate in Excel text escape"
+                ),
+                "{text}"
+            );
+        }
     }
 }

@@ -1,5 +1,5 @@
 //! Validated OOXML package discovery and relationship target resolution.
-use super::{Sheet, SheetVisibility, in_part};
+use super::{Sheet, SheetVisibility, in_part, prefixed};
 use crate::{
     CellRange, CellRef, Error, Result,
     archive::Archive,
@@ -337,19 +337,21 @@ fn sheets(
     let mut sheets = Vec::new();
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    for node in nodes {
-        if node.local != "sheet" || node.namespace != *namespace {
-            continue;
-        }
+    let sheet_nodes = nodes
+        .iter()
+        .filter(|node| node.local == "sheet" && node.namespace == *namespace);
+    for (position, node) in (1usize..).zip(sheet_nodes) {
         if node.parent != Some(sheets_index) {
             return Err(Error::InvalidWorkbook(
                 "sheet outside workbook sheets".into(),
             ));
         }
+        // A name that cannot be decoded is reported by its sheet's position.
         let name = excel_text(
             node.attr("", "name")
                 .ok_or_else(|| Error::InvalidWorkbook("sheet lacks a name".into()))?,
-        )?;
+        )
+        .map_err(|error| prefixed(error, format_args!("name of sheet {position}")))?;
         if !names.insert(name.clone()) {
             return Err(Error::InvalidWorkbook("duplicate sheet name".into()));
         }

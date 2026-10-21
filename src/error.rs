@@ -106,6 +106,30 @@ impl Error {
     pub(crate) fn xml(error: quick_xml::Error) -> Self {
         Self::Xml(error.to_string())
     }
+
+    // A copy with the same variant and message, for an error that is kept
+    // and reported again. `io::Error` is not `Clone`, so an I/O error's copy
+    // keeps its kind and message but not its source.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Io(error) => Self::Io(io::Error::new(error.kind(), error.to_string())),
+            Self::Xml(message) => Self::Xml(message.clone()),
+            Self::InvalidWorkbook(message) => Self::InvalidWorkbook(message.clone()),
+            Self::InvalidCellReference(address) => Self::InvalidCellReference(address.clone()),
+            Self::InvalidValue(message) => Self::InvalidValue(message.clone()),
+            Self::SheetNotFound(name) => Self::SheetNotFound(name.clone()),
+            Self::ProtectedCell {
+                sheet,
+                cell,
+                reason,
+            } => Self::ProtectedCell {
+                sheet: sheet.clone(),
+                cell: *cell,
+                reason: reason.clone(),
+            },
+            Self::Unsupported(message) => Self::Unsupported(message.clone()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +171,34 @@ mod tests {
         assert_eq!(plain.to_string(), "I/O error: missing");
         assert!(plain.source().is_none());
         assert!(Error::Io(io::ErrorKind::NotFound.into()).source().is_none());
+    }
+
+    #[test]
+    fn duplicates_keep_the_variant_and_message() {
+        let errors = [
+            Error::Io(io::Error::other(Wrapper(Cause))),
+            Error::Io(io::ErrorKind::OutOfMemory.into()),
+            Error::Xml("xml".into()),
+            Error::InvalidWorkbook("invalid".into()),
+            Error::InvalidCellReference("A0".into()),
+            Error::InvalidValue("value".into()),
+            Error::SheetNotFound("Data".into()),
+            Error::ProtectedCell {
+                sheet: "Data".into(),
+                cell: CellRef::new(2, 3).unwrap(),
+                reason: "contains a formula".into(),
+            },
+            Error::Unsupported("unsupported".into()),
+        ];
+        for error in &errors {
+            let copy = error.duplicate();
+            assert_eq!(std::mem::discriminant(&copy), std::mem::discriminant(error));
+            assert_eq!(copy.to_string(), error.to_string());
+        }
+        assert!(matches!(
+            Error::Io(io::ErrorKind::OutOfMemory.into()).duplicate(),
+            Error::Io(error) if error.kind() == io::ErrorKind::OutOfMemory
+        ));
     }
 
     #[test]

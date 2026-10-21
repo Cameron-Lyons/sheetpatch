@@ -87,14 +87,16 @@ impl<'xml> PreparedWorksheet<'xml> {
     }
 }
 
-/// Why a read failed: a problem in the worksheet itself, or a failure to load
-/// the shared-string table a `t="s"` cell needed. The table's errors come
-/// from its loader, which names that part, so only worksheet errors need the
-/// worksheet's name.
+/// Why a read failed: a problem in the worksheet itself, a failure to load
+/// the shared-string table a `t="s"` cell needed, or an entry of that table
+/// that cannot be decoded. The table's load errors come from its loader,
+/// which names that part, so only worksheet errors need the worksheet's name.
+/// An entry's error concerns the table too, and needs its part and index.
 #[derive(Debug)]
 pub(crate) enum ReadError {
     Worksheet(Error),
     SharedStrings(Error),
+    UndecodableString { index: usize, error: Error },
 }
 
 impl From<Error> for ReadError {
@@ -200,7 +202,9 @@ fn read_cell(
     read_cells(xml, &[cell], || Ok(shared_strings), false)
         .map(|mut cells| cells.remove(0))
         .map_err(|error| match error {
-            ReadError::Worksheet(error) | ReadError::SharedStrings(error) => error,
+            ReadError::Worksheet(error)
+            | ReadError::SharedStrings(error)
+            | ReadError::UndecodableString { error, .. } => error,
         })
 }
 

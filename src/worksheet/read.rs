@@ -5,6 +5,7 @@ use super::{ReadError, at_cell, invalid, unique, unsupported, xml_error};
 use crate::xml::{excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
+use std::collections::HashMap;
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
@@ -140,14 +141,22 @@ fn is_string_table(document: &XmlDocument) -> bool {
 
 /// Decodes each string as its `si` element completes and then releases that
 /// subtree, so the parse holds one string's markup rather than the whole
-/// table while still validating every event. Decoding errors are reported
-/// only after the rest of the part is known to be valid, giving them the same
-/// precedence as when the full table was indexed first.
+/// table while still validating every event.
+///
+/// An entry that cannot be decoded, such as one with an unpaired UTF-16
+/// surrogate escape or with text in an unsupported container, is recorded
+/// with its error, so that only reads of that entry fail. Problems that
+/// concern the whole table still fail it: a malformed or unsupported
+/// document, the wrong root, mixed dialects, or an `si` inside another
+/// element, which could shift the indexes of the entries after it. A table
+/// too large to index is reported only after the rest of the part is known
+/// to be valid.
 pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
     let mut strings = SharedStrings::default();
+    let mut distinct_errors = HashMap::new();
     let mut hidden_string = false;
     let mut mixed_namespace = false;
-    let mut decode_error = None;
+    let mut table_error = None;
     let document = parse_with(xml, |document, index| {
         if hidden_string || mixed_namespace || !is_string_table(document) {
             return true;
@@ -165,12 +174,14 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
         }
         if !hidden_string
             && !mixed_namespace
-            && decode_error.is_none()
+            && table_error.is_none()
             && elements[index].is(source, namespace, "si")
-            && let Err(error) =
-                rich_text(source, elements, index, namespace).and_then(|text| strings.push(&text))
+            && let Err(error) = match rich_text(source, elements, index, namespace) {
+                Ok(text) => strings.push(&text),
+                Err(error) => strings.push_undecodable(error, &mut distinct_errors),
+            }
         {
-            decode_error = Some(error);
+            table_error = Some(error);
         }
         true
     })?;
@@ -185,11 +196,13 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
     if hidden_string {
         return Err(unsupported("shared string outside the shared-string table"));
     }
-    if let Some(error) = decode_error {
+    if let Some(error) = table_error {
         return Err(error);
     }
     strings.text.shrink_to_fit();
     strings.ends.shrink_to_fit();
+    strings.undecodable.shrink_to_fit();
+    strings.errors.shrink_to_fit();
     Ok(strings)
 }
 
@@ -197,31 +210,76 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
 /// and the offset where each string ends. One buffer and four bytes per string
 /// replace a separately allocated `String` for each, which costs more than the
 /// XML of a short or empty entry. Decoded text is never longer than its XML,
-/// which `parse_with` limits to less than 4 GiB, so offsets fit in 32 bits.
+/// which `parse_with` limits to less than 4 GiB, and every entry takes several
+/// bytes of it, so offsets and indexes fit in 32 bits.
 #[derive(Debug, Default)]
 pub(crate) struct SharedStrings {
     text: String,
     ends: Vec<u32>,
+    // The entries that cannot be decoded, in index order, each with the
+    // position of its error in `errors`. Such an entry holds no text.
+    undecodable: Vec<(u32, u32)>,
+    // Each distinct decoding error once, so that a table of many damaged
+    // entries costs little more than their indexes.
+    errors: Vec<Error>,
 }
 
 impl SharedStrings {
-    /// The string at `index`, or `None` past the end of the table.
-    pub(crate) fn get(&self, index: usize) -> Option<&str> {
+    /// The string at `index`, or the error that kept that entry from being
+    /// decoded. `None` past the end of the table.
+    pub(crate) fn get(&self, index: usize) -> Option<std::result::Result<&str, &Error>> {
         let end = *self.ends.get(index)? as usize;
+        if let Ok(position) = self
+            .undecodable
+            .binary_search_by_key(&index, |&(entry, _)| entry as usize)
+        {
+            return Some(Err(&self.errors[self.undecodable[position].1 as usize]));
+        }
         let start = index
             .checked_sub(1)
             .map_or(0, |previous| self.ends[previous] as usize);
         // Each offset ends a whole string, so it is a character boundary.
-        Some(&self.text[start..end])
+        Some(Ok(&self.text[start..end]))
     }
 
     fn push(&mut self, text: &str) -> Result<()> {
-        let end = u32::try_from(self.text.len() + text.len())
-            .map_err(|_| unsupported("shared-string text exceeds the 4 GiB index limit"))?;
+        let end = index_limit(self.text.len() + text.len())?;
         self.text.push_str(text);
         self.ends.push(end);
         Ok(())
     }
+
+    // Records the next entry as undecodable. `distinct` holds the position
+    // of each error already recorded, by its display.
+    fn push_undecodable(
+        &mut self,
+        error: Error,
+        distinct: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        let entry = index_limit(self.ends.len())?;
+        let next = index_limit(self.errors.len())?;
+        self.push("")?;
+        let errors = &mut self.errors;
+        let position = *distinct.entry(error.to_string()).or_insert_with(|| {
+            errors.push(error);
+            next
+        });
+        self.undecodable.push((entry, position));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl SharedStrings {
+    /// How many distinct decoding errors the table holds.
+    pub(super) fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+}
+
+fn index_limit(value: usize) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| unsupported("shared-string table exceeds the 4 GiB index limit"))
 }
 
 #[cfg(test)]
@@ -243,7 +301,9 @@ impl<S: AsRef<str>> PartialEq<Vec<S>> for SharedStrings {
             && strings
                 .iter()
                 .enumerate()
-                .all(|(index, text)| self.get(index) == Some(text.as_ref()))
+                .all(|(index, text)| {
+                    matches!(self.get(index), Some(Ok(entry)) if entry == text.as_ref())
+                })
     }
 }
 
@@ -406,12 +466,22 @@ pub(super) fn cell_content<'a>(
                         "{address}: shared-string cell, but the workbook has no shared-string table"
                     ))
                 })?;
-            let text = strings.get(position).ok_or_else(|| {
-                invalid(format!(
-                    "{address}: shared-string index {position} is out of bounds"
-                ))
-            })?;
-            CellValue::Text(text.to_owned())
+            match strings.get(position) {
+                Some(Ok(text)) => CellValue::Text(text.to_owned()),
+                // Only the cells that use an undecodable entry fail.
+                Some(Err(error)) => {
+                    return Err(ReadError::UndecodableString {
+                        index: position,
+                        error: error.duplicate(),
+                    });
+                }
+                None => {
+                    return Err(invalid(format!(
+                        "{address}: shared-string index {position} is out of bounds"
+                    ))
+                    .into());
+                }
+            }
         }
     };
     Ok(CellContent {

@@ -53,15 +53,6 @@ impl Sheet {
             error => prefixed(error, format_args!("worksheet {:?}", self.name)),
         }
     }
-
-    // Like `context`, but a failure to load the shared-string table already
-    // names that part and is not the worksheet's.
-    fn read_context(&self, error: ReadError) -> Error {
-        match error {
-            ReadError::Worksheet(error) => self.context(error),
-            ReadError::SharedStrings(error) => error,
-        }
-    }
 }
 
 // Names the package part an error concerns, such as the shared-string table
@@ -196,6 +187,14 @@ impl SheetVisibility {
 /// Messages about a worksheet name it, and messages about another part, such
 /// as a shared-string table that cannot be loaded, name that part's path in
 /// the archive instead.
+///
+/// Text with an unpaired UTF-16 surrogate escape, such as `_xD83D_` alone,
+/// is valid but cannot be returned as a Rust string, so reading it returns
+/// [`Error::Unsupported`]. In the shared-string table this concerns only
+/// that entry: reads of cells that use it fail with a message naming the
+/// part and the entry's index, such as
+/// `part "xl/sharedStrings.xml": string 1: …`, while other cells read
+/// normally. Rewriting such a cell counts as a change.
 pub struct Workbook {
     archive: Archive,
     sheets: Vec<Sheet>,
@@ -379,7 +378,7 @@ impl WorksheetView<'_> {
                 || self.workbook.shared_strings(),
                 self.workbook.date1904,
             )
-            .map_err(|error| self.sheet.read_context(error))
+            .map_err(|error| self.workbook.read_context(self.sheet, error))
     }
 
     /// Read multiple addresses, retaining input order and duplicate requests.
@@ -424,7 +423,7 @@ impl WorksheetView<'_> {
                 || self.workbook.shared_strings(),
                 self.workbook.date1904,
             )
-            .map_err(|error| self.sheet.read_context(error))
+            .map_err(|error| self.workbook.read_context(self.sheet, error))
     }
 }
 
@@ -531,8 +530,9 @@ impl Workbook {
     ///
     /// Returns [`Error::Unsupported`] for packages outside the supported scope,
     /// such as legacy `.xls` and password-encrypted (OLE compound) files,
-    /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, and encrypted
-    /// ZIP entries. Returns [`Error::InvalidWorkbook`] or [`Error::Xml`] for a
+    /// binary `.xlsb` workbooks, ZIP64 or multi-disk archives, encrypted
+    /// ZIP entries, and a sheet name with an unpaired UTF-16 surrogate
+    /// escape, which names the sheet's position in the workbook. Returns [`Error::InvalidWorkbook`] or [`Error::Xml`] for a
     /// damaged or ambiguous archive or package metadata. Worksheet XML is
     /// checked when a worksheet is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
@@ -826,7 +826,7 @@ impl Workbook {
         for (cell, value) in edits {
             let current = worksheet
                 .read_cell(cell, || self.shared_strings(), self.date1904)
-                .map_err(|error| sheet.read_context(error))?;
+                .map_err(|error| self.read_context(sheet, error))?;
             if current.value != *value {
                 changed_header.get_or_insert(cell);
             }
@@ -927,7 +927,7 @@ impl Workbook {
             || self.shared_strings(),
             self.date1904,
         )
-        .map_err(|error| sheet.read_context(error))
+        .map_err(|error| self.read_context(sheet, error))
     }
 
     /// Prepare a worksheet for repeated reads using a single validated XML index.
@@ -1025,6 +1025,23 @@ impl Workbook {
             discovery::table_headers(&self.archive, &self.sheet_xml[index].uri, &mut parts)?;
         drop(parts);
         Ok(cache.get_or_init(|| headers))
+    }
+
+    // Like `Sheet::context`, but the shared-string table's errors are not the
+    // worksheet's. A failure to load the table already names that part; an
+    // entry that cannot be decoded is named with its part and index.
+    fn read_context(&self, sheet: &Sheet, error: ReadError) -> Error {
+        match error {
+            ReadError::Worksheet(error) => sheet.context(error),
+            ReadError::SharedStrings(error) => error,
+            ReadError::UndecodableString { index, error } => {
+                let error = prefixed(error, format_args!("string {index}"));
+                match &self.shared_strings_path {
+                    Some(path) => in_part(path, error),
+                    None => error,
+                }
+            }
+        }
     }
 
     // The shared-string table, or `None` for a workbook without one. Errors

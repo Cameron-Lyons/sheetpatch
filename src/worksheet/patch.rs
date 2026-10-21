@@ -193,10 +193,11 @@ fn unchanged_value<'s>(
     }
     match decode_payload(xml, index, cell, payload, current.date1904) {
         Ok(StoredValue::Value(old)) => old == *value,
-        // The table is loaded only to compare text.
+        // The table is loaded only to compare text. An entry that cannot be
+        // decoded, like a table that cannot be loaded, leaves a change.
         Ok(StoredValue::SharedString(position)) => match value {
             CellValue::Text(text) => (current.shared_strings)()
-                .and_then(|strings| strings.get(position))
+                .and_then(|strings| strings.get(position)?.ok())
                 .is_some_and(|old| old == text.as_str()),
             _ => false,
         },
