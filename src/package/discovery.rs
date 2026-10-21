@@ -79,7 +79,11 @@ pub(super) fn table_headers(
     let in_rels = |error| in_part(&rels_path, error);
     let mut headers = Vec::new();
     let mut tables = HashSet::new();
-    let mut targets = HashSet::new();
+    // Targets already resolved, keyed by the worksheet directory segments they
+    // keep and their ASCII-lowercased appended path. Part lookup ignores ASCII
+    // case, so spellings with one key name the same part.
+    let mut resolved = HashSet::new();
+    let mut base = None;
     let relationships = archive
         .read(&rels_path)
         .and_then(|xml| relationships(&xml))
@@ -94,20 +98,27 @@ pub(super) fn table_headers(
                 relationship.id
             ))));
         }
-        // This worksheet's source URI is fixed. Reusing a target that already
-        // resolved avoids rescanning a long inherited path for every alias.
-        // Check external mode first, even when the target spelling repeats.
-        if targets.contains(relationship.target.as_str()) {
+        // This worksheet's source URI is fixed and can be long. Normalizing a
+        // target against its segments costs only the target's length, so only
+        // the first relationship with each key builds and looks up the path.
+        // Check external mode first, even when the target repeats.
+        let target = escaped_target(&relationship.target).map_err(in_rels)?;
+        if base.is_none() {
+            base = Some(TargetBase::new(worksheet_uri).map_err(in_rels)?);
+        }
+        let base = base.as_ref().expect("initialized above");
+        let (kept, appended) = base.normalize(&target).map_err(in_rels)?;
+        let key = (kept, appended.to_ascii_lowercase());
+        if resolved.contains(&key) {
             continue;
         }
-        let path =
-            resolve_part_target(archive, worksheet_uri, &relationship.target).map_err(in_rels)?;
+        let path = part_path(archive, &base.join(kept, &appended)).map_err(in_rels)?;
         if !archive.contains(&path) {
             return Err(in_rels(Error::InvalidWorkbook(format!(
                 "missing table part {path}"
             ))));
         }
-        targets.insert(relationship.target);
+        resolved.insert(key);
         // Different relationship IDs and URI spellings can name one part.
         // Validate every relationship, but read each resolved table only once.
         if !tables.insert(path.clone()) {
@@ -947,6 +958,14 @@ fn relationships_path(part: &str) -> String {
     }
 }
 fn resolve_target(source: &str, target: &str) -> Result<String> {
+    let target = escaped_target(target)?;
+    let base = TargetBase::new(source)?;
+    let (kept, appended) = base.normalize(&target)?;
+    Ok(base.join(kept, &appended))
+}
+
+// Validates an internal target's syntax and normalizes its escapes.
+fn escaped_target(target: &str) -> Result<String> {
     if target.is_empty()
         || target.starts_with("//")
         || target.contains(['\\', '#', '?', '\0'])
@@ -959,56 +978,100 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
             "invalid internal relationship target {target}"
         )));
     }
-    let target = escape_path(target)?;
-    let source = escape_path(source)?;
-    let mut parts: Vec<&str> = if target.starts_with('/') {
-        Vec::new()
-    } else {
-        source
+    escape_path(target)
+}
+
+/// The escaped directory segments of a source part, against which its
+/// relationship targets resolve.
+struct TargetBase {
+    segments: Vec<String>,
+    first_empty: Option<usize>,
+}
+
+impl TargetBase {
+    fn new(source: &str) -> Result<Self> {
+        let source = escape_path(source)?;
+        let segments: Vec<String> = source
             .rsplit_once('/')
-            .map(|(p, _)| p.split('/').collect())
-            .unwrap_or_default()
-    };
-    // Empty URI segments are significant: removing them changes both direct
-    // lookup and which segment a following '..' removes. Only the leading '/'
-    // denotes the package root. Retain a terminal directory separator after
-    // removing '.' or '..', so it cannot alias a file part.
-    let mut segments = target
-        .strip_prefix('/')
-        .unwrap_or(&target)
-        .split('/')
-        .peekable();
-    while let Some(part) = segments.next() {
-        match part {
-            "." => {
-                if segments.peek().is_none() {
-                    parts.push("");
+            .map(|(directory, _)| directory.split('/').map(str::to_owned).collect())
+            .unwrap_or_default();
+        let first_empty = segments.iter().position(String::is_empty);
+        Ok(Self {
+            segments,
+            first_empty,
+        })
+    }
+
+    /// The number of leading directory segments an escaped target keeps, and
+    /// the path it appends to them. This costs the target's length, not the
+    /// source's.
+    fn normalize(&self, target: &str) -> Result<(usize, String)> {
+        let mut kept = if target.starts_with('/') {
+            0
+        } else {
+            self.segments.len()
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        // Empty URI segments are significant: removing them changes both direct
+        // lookup and which segment a following '..' removes. Only the leading '/'
+        // denotes the package root. Retain a terminal directory separator after
+        // removing '.' or '..', so it cannot alias a file part.
+        let mut segments = target
+            .strip_prefix('/')
+            .unwrap_or(target)
+            .split('/')
+            .peekable();
+        while let Some(part) = segments.next() {
+            match part {
+                "." => {
+                    if segments.peek().is_none() {
+                        parts.push("");
+                    }
                 }
+                ".." => {
+                    // Appended segments are removed before kept ones.
+                    if parts.pop().is_none() {
+                        if kept == 0 {
+                            return Err(Error::InvalidWorkbook(
+                                "relationship target escapes package root".into(),
+                            ));
+                        }
+                        kept -= 1;
+                    }
+                    if segments.peek().is_none() {
+                        parts.push("");
+                    }
+                }
+                value => parts.push(value),
             }
-            ".." => {
-                if parts.pop().is_none() {
-                    return Err(Error::InvalidWorkbook(
-                        "relationship target escapes package root".into(),
-                    ));
-                }
-                if segments.peek().is_none() {
-                    parts.push("");
-                }
-            }
-            value => parts.push(value),
         }
+        if kept == 0 && parts.is_empty() {
+            return Err(Error::InvalidWorkbook(
+                "relationship target names no part".into(),
+            ));
+        }
+        if self.first_empty.is_some_and(|index| index < kept) || parts.iter().any(|p| p.is_empty())
+        {
+            return Err(Error::InvalidWorkbook(
+                "relationship target contains an empty part-name segment".into(),
+            ));
+        }
+        Ok((kept, parts.join("/")))
     }
-    if parts.is_empty() {
-        return Err(Error::InvalidWorkbook(
-            "relationship target names no part".into(),
-        ));
+
+    fn join(&self, kept: usize, appended: &str) -> String {
+        let mut path = String::new();
+        for segment in &self.segments[..kept] {
+            path.push_str(segment);
+            path.push('/');
+        }
+        if appended.is_empty() {
+            path.pop();
+        } else {
+            path.push_str(appended);
+        }
+        path
     }
-    if parts.iter().any(|part| part.is_empty()) {
-        return Err(Error::InvalidWorkbook(
-            "relationship target contains an empty part-name segment".into(),
-        ));
-    }
-    Ok(parts.join("/"))
 }
 
 // ZIP item names in OPC retain URI escapes rather than storing decoded file
@@ -1152,6 +1215,111 @@ mod tests {
             "",
         ] {
             assert!(resolve_target("books/main.xml", target).is_err());
+        }
+    }
+
+    // The resolver before targets were normalized against a reusable base.
+    fn reference_resolve_target(source: &str, target: &str) -> Result<String> {
+        if target.is_empty()
+            || target.starts_with("//")
+            || target.contains(['\\', '#', '?', '\0'])
+            || target
+                .split('/')
+                .next()
+                .is_some_and(|segment| segment.contains(':'))
+        {
+            return Err(Error::InvalidWorkbook(format!(
+                "invalid internal relationship target {target}"
+            )));
+        }
+        let target = escape_path(target)?;
+        let source = escape_path(source)?;
+        let mut parts: Vec<&str> = if target.starts_with('/') {
+            Vec::new()
+        } else {
+            source
+                .rsplit_once('/')
+                .map(|(p, _)| p.split('/').collect())
+                .unwrap_or_default()
+        };
+        let mut segments = target
+            .strip_prefix('/')
+            .unwrap_or(&target)
+            .split('/')
+            .peekable();
+        while let Some(part) = segments.next() {
+            match part {
+                "." => {
+                    if segments.peek().is_none() {
+                        parts.push("");
+                    }
+                }
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(Error::InvalidWorkbook(
+                            "relationship target escapes package root".into(),
+                        ));
+                    }
+                    if segments.peek().is_none() {
+                        parts.push("");
+                    }
+                }
+                value => parts.push(value),
+            }
+        }
+        if parts.is_empty() {
+            return Err(Error::InvalidWorkbook(
+                "relationship target names no part".into(),
+            ));
+        }
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(Error::InvalidWorkbook(
+                "relationship target contains an empty part-name segment".into(),
+            ));
+        }
+        Ok(parts.join("/"))
+    }
+
+    #[test]
+    fn resolution_against_a_target_base_matches_the_reference_resolver() {
+        let sources = [
+            "",
+            "a.xml",
+            "xl/workbook.xml",
+            "xl/worksheets/sheet1.xml",
+            "a/b/c/d.xml",
+            "x%20y/%C3%A9/s.xml",
+            "a/b/",
+            "a//b/c.xml",
+        ];
+        let atoms = [
+            "a", "B", ".", "..", "", "%41", "%62", "c%20d", "t.xml", "%C3%A9", "x:y", "%2F", "%",
+            "~", "A",
+        ];
+        let mut state: u64 = 0x1234_5678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for _ in 0..100_000 {
+            let source = sources[next() % sources.len()];
+            let mut target = String::new();
+            if next() % 5 == 0 {
+                target.push('/');
+            }
+            for index in 0..1 + next() % 6 {
+                if index > 0 {
+                    target.push('/');
+                }
+                target.push_str(atoms[next() % atoms.len()]);
+            }
+            assert_eq!(
+                resolve_target(source, &target).map_err(|error| error.to_string()),
+                reference_resolve_target(source, &target).map_err(|error| error.to_string()),
+                "source {source:?}, target {target:?}"
+            );
         }
     }
 

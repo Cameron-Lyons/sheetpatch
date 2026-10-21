@@ -511,6 +511,64 @@ fn many_repeated_table_targets_share_long_source_uris() {
 }
 
 #[test]
+fn alternate_table_target_spellings_share_long_source_uris() {
+    let mut parts = parts("ref='A1:B3'");
+    let directory = format!("xl/{}", "nested".repeat(10_000));
+    let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+    parts.insert(format!("{directory}/sheet1.xml"), worksheet);
+    let table = parts.remove(TABLE_PATH).unwrap();
+    parts.insert(format!("{directory}/table1.xml"), table);
+    let relationships = parts.remove(SHEET_RELS).unwrap();
+    // Every alias spells table1.xml differently, by letter case, escapes of
+    // unreserved letters, and dot segments, so none repeats a spelling.
+    let spell = |c: char, choice: usize| match choice {
+        0 => c.to_string(),
+        1 => c.to_ascii_uppercase().to_string(),
+        2 => format!("%{:02x}", c as u32),
+        _ => format!("%{:02X}", c as u32),
+    };
+    let aliases = (0..16_384usize)
+        .map(|index| {
+            let mut rest = index;
+            let name: String = "table1.xml"
+                .chars()
+                .map(|c| {
+                    if !c.is_ascii_alphabetic() {
+                        return c.to_string();
+                    }
+                    let choice = rest % 4;
+                    rest /= 4;
+                    spell(c, choice)
+                })
+                .collect();
+            let prefix = ["", "./", "d/../", "./d/./../"][index % 4];
+            format!(
+                "<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{prefix}{name}'/>"
+            )
+        })
+        .collect::<String>();
+    parts.insert(
+        format!("{directory}/_rels/sheet1.xml.rels"),
+        relationships
+            .replace("../tables/table1.xml", "table1.xml")
+            .replace("</Relationships>", &format!("{aliases}</Relationships>")),
+    );
+    let workbook_relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *workbook_relationships = workbook_relationships.replace(
+        "Target='worksheets/sheet1.xml'",
+        &format!("Target='/{directory}/sheet1.xml'"),
+    );
+
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
 fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
     for suffix in ["%41", "%", "%2F"] {
         let mut parts = parts("ref='A1:B3'");
