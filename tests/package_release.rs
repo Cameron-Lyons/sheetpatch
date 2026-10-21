@@ -425,6 +425,61 @@ fn sheets_sharing_one_worksheet_part_are_rejected() {
 }
 
 #[test]
+fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
+    // A sheet is bound through its relationship Id, so a duplicate Id would
+    // bind it to whichever target came last, whatever their order.
+    let sheets = format!("<sheets>{SHEET}</sheets>");
+    let duplicate = worksheet_relationship("one", "worksheets/sheet2.xml", "");
+    let strings = |id: &str| {
+        format!(
+            "<Relationship Id='{id}' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/>"
+        )
+    };
+    for (rels, expected) in [
+        (
+            format!("{RELATIONSHIP}{duplicate}"),
+            "duplicate relationship id",
+        ),
+        (
+            format!("{duplicate}{RELATIONSHIP}"),
+            "duplicate relationship id",
+        ),
+        (
+            worksheet_relationship("other", "worksheets/sheet1.xml", ""),
+            "missing relationship for sheet Data",
+        ),
+        (
+            worksheet_relationship("one", "worksheets/absent.xml", ""),
+            "missing worksheet part xl/worksheets/absent.xml",
+        ),
+        (
+            format!("{RELATIONSHIP}{}{}", strings("s1"), strings("s2")),
+            "expected at most one internal shared-string relationship",
+        ),
+    ] {
+        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        assert!(
+            matches!(&error, Some(Error::InvalidWorkbook(message)) if message == expected),
+            "{rels}: {error:?}"
+        );
+    }
+    // The namespace prefix is declared, so the root is what is rejected.
+    let document = format!(
+        "<document xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{SHEET}</sheets></document>"
+    );
+    let error = Workbook::from_bytes(fixture(
+        &sheets,
+        RELATIONSHIP,
+        &[("xl/workbook.xml", &document)],
+    ))
+    .err();
+    assert!(
+        matches!(&error, Some(Error::InvalidWorkbook(message)) if message == "officeDocument is not a SpreadsheetML workbook"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn external_sheet_relationships_are_rejected() {
     let sheets = format!("<sheets>{SHEET}</sheets>");
     let internal = worksheet_relationship("one", "worksheets/sheet1.xml", " TargetMode='Internal'");
