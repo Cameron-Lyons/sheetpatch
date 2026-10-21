@@ -1237,7 +1237,8 @@ impl Archive {
         for &index in &self.local_order {
             let entry = &self.entries[index];
             while position < entry.local_record.start {
-                position = self.orphan_end(position, &mut stored_descriptors)?;
+                position =
+                    self.orphan_end(position, entry.local_record.start, &mut stored_descriptors)?;
             }
             if position != entry.local_record.start {
                 return Err(unsupported(
@@ -1247,7 +1248,7 @@ impl Archive {
             position = entry.local_record.end;
         }
         while position < self.central_start {
-            position = self.orphan_end(position, &mut stored_descriptors)?;
+            position = self.orphan_end(position, self.central_start, &mut stored_descriptors)?;
         }
         if position != self.central_start {
             return Err(unsupported(
@@ -1257,52 +1258,81 @@ impl Archive {
         Ok(())
     }
 
+    /// Parse the local header at `start` as an obsolete record that compaction
+    /// understands, ending by `gap_end`, the end of the gap holding it.
+    /// `Ok(None)` means it is not one; names and extra fields that
+    /// `Archive::new` would refuse in an active member are errors.
+    fn obsolete_header(
+        &self,
+        start: usize,
+        gap_end: usize,
+    ) -> Result<Option<(LocalHeader<'_>, Codec, &str)>> {
+        let Some(header) = local_header(&self.original, start, gap_end)? else {
+            return Ok(None);
+        };
+        // Reject unsupported obsolete records before scanning their names.
+        // Fake headers can otherwise use nonzero method/flag bytes to make
+        // many overlapping long names pass the NUL check below.
+        if header.flags & ENCRYPTION_FLAGS != 0 {
+            return Ok(None);
+        }
+        let Some(codec) = Codec::of(header.flags, header.method) else {
+            return Ok(None);
+        };
+        if header.sizes.compressed_size == u32::MAX || header.sizes.size == u32::MAX {
+            return Ok(None);
+        }
+        // Archive::new refuses member names containing NUL. Check before
+        // decoding and hashing: false headers in stored data can overlap
+        // thousands of long candidate names, with an early NUL in each
+        // following header.
+        if header.raw_name.contains(&0) {
+            return Ok(None);
+        }
+        let name = member_name(header.raw_name, header.flags)?;
+        let Some(&index) = self.index.get(name) else {
+            return Ok(None);
+        };
+        if self.entries[index].method != header.method {
+            return Ok(None);
+        }
+        check_extra(header.extra, name)?;
+        Ok(Some((header, codec, name)))
+    }
+
     fn orphan_end(
         &self,
         start: usize,
+        gap_end: usize,
         stored_descriptors: &mut Option<StoredDescriptors>,
     ) -> Result<usize> {
         let opaque = || {
             unsupported("cannot compact opaque ZIP prefix, gaps, or unrecognized obsolete records")
         };
         let bytes = &self.original;
-        let Some(LocalHeader {
-            flags,
-            method,
-            sizes: header,
-            raw_name,
-            extra,
-            data_start,
-        }) = local_header(bytes, start, self.central_start)?
+        let Some((
+            LocalHeader {
+                flags,
+                sizes: header,
+                data_start,
+                ..
+            },
+            codec,
+            name,
+        )) = self.obsolete_header(start, gap_end)?
         else {
             return Err(opaque());
         };
-        if flags & ENCRYPTION_FLAGS != 0 {
-            return Err(opaque());
-        }
-        let Some(codec) = Codec::of(flags, method) else {
-            return Err(opaque());
-        };
-        if header.compressed_size == u32::MAX || header.size == u32::MAX {
-            return Err(opaque());
-        }
-        let name = member_name(raw_name, flags)?;
-        let Some(&index) = self.index.get(name) else {
-            return Err(opaque());
-        };
-        if self.entries[index].method != method {
-            return Err(opaque());
-        }
-        check_extra(extra, name)?;
+        // An obsolete record ends within its gap, which bounds every search.
         let has_descriptor = flags & FLAG_DESCRIPTOR != 0;
         let actual = match codec {
             Codec::Deflated => {
                 let end = if has_descriptor && header.compressed_size == 0 {
-                    self.central_start
+                    gap_end
                 } else {
                     add(data_start, header.compressed_size as usize)?
                 };
-                if end > self.central_start {
+                if end > gap_end {
                     return Err(opaque());
                 }
                 inspect_deflate(&bytes[data_start..end], name)?
@@ -1310,11 +1340,11 @@ impl Archive {
             Codec::Stored if has_descriptor && header.compressed_size == 0 => {
                 let descriptors =
                     stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
-                return self.stored_orphan_end(data_start, header, name, descriptors);
+                return self.stored_orphan_end(data_start, gap_end, header, name, descriptors);
             }
             Codec::Stored => {
                 let end = add(data_start, header.compressed_size as usize)?;
-                if end > self.central_start || header.compressed_size as usize > MAX_READ {
+                if end > gap_end || header.compressed_size as usize > MAX_READ {
                     return Err(opaque());
                 }
                 Sizes {
@@ -1329,7 +1359,7 @@ impl Archive {
         }
         let data_end = add(data_start, actual.compressed_size as usize)?;
         if has_descriptor {
-            descriptor_end(bytes, data_end, self.central_start, actual, name).map_err(not_obsolete)
+            descriptor_end(bytes, data_end, gap_end, actual, name).map_err(not_obsolete)
         } else {
             Ok(data_end)
         }
@@ -1429,36 +1459,13 @@ impl Archive {
             // and flags that compaction retains without decoding.
             return true;
         }
-        let Ok(Some(header)) = local_header(&self.original, start, gap_end) else {
-            return false;
-        };
-        // Reject unsupported obsolete records before scanning their names.
-        // Fake headers can otherwise use nonzero method/flag bytes to make
-        // many overlapping long names pass the NUL check below.
-        if header.flags & ENCRYPTION_FLAGS != 0 || Codec::of(header.flags, header.method).is_none()
-        {
-            return false;
-        }
-        // Archive::new refuses member names containing NUL. Check before
-        // decoding and hashing: false headers in stored data can overlap
-        // thousands of long candidate names, with an early NUL in each
-        // following header.
-        if header.raw_name.contains(&0) {
-            return false;
-        }
-        let Ok(name) = member_name(header.raw_name, header.flags) else {
-            return false;
-        };
-        let Some(&index) = self.index.get(name) else {
-            return false;
-        };
-        let entry = &self.entries[index];
-        header.method == entry.method && check_extra(header.extra, name).is_ok()
+        matches!(self.obsolete_header(start, gap_end), Ok(Some(_)))
     }
 
     fn stored_orphan_end(
         &self,
         data_start: usize,
+        gap_end: usize,
         header: Sizes,
         name: &str,
         descriptors: &StoredDescriptors,
@@ -1485,7 +1492,7 @@ impl Archive {
         let end = descriptor_end(
             &self.original,
             descriptor.data_end,
-            self.central_start,
+            gap_end,
             descriptor.sizes,
             name,
         )
@@ -2624,6 +2631,32 @@ mod tests {
                 Err(Error::Unsupported(message)) if message.contains("ambiguous stored ZIP")
             ));
             assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn obsolete_header_candidates_with_zip64_sizes_are_payload() {
+        // As above, but the false header declares a ZIP64 compressed size,
+        // which no obsolete record compaction removes can have. So its
+        // preceding descriptor is payload too, and only one remains.
+        for signed in [false, true] {
+            let mut payload = b"prefix".to_vec();
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            let mut false_header = fixture(false)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
+            set_u32(&mut false_header, 18, u32::MAX);
+            payload.extend_from_slice(&false_header);
+            payload.extend_from_slice(b"remaining obsolete payload");
+            let archive =
+                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), b"new".to_vec())]);
+            let appended = Archive::new(append(&archive, &changes)).unwrap();
+            let mut compacted = Vec::new();
+            appended
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(compacted, archive.write(&changes).unwrap());
         }
     }
 
