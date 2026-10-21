@@ -436,11 +436,11 @@ impl Workbook {
             }
         }
         // Devices and pipes have no useful length; reading stops at the limit.
-        let mut workbook = Self::from_bytes(archive::read_archive(file, bytes)?)?;
+        let mut workbook = Self::from_bytes(archive::read_archive(&file, bytes)?)?;
         // Pipes and devices carry no meaningful file permissions to inherit.
         workbook.source_permissions = metadata
             .is_file()
-            .then(|| SourcePermissions::new(&metadata));
+            .then(|| SourcePermissions::new(&file, &metadata));
         Ok(workbook)
     }
 
@@ -1053,10 +1053,13 @@ impl Workbook {
     /// subject to the operating system's umask or default ACL rules,
     /// and the same group rule: it gets the source file's group when the
     /// process may assign it, and otherwise its group bits are cleared.
-    /// Owner, ACLs, and extended attributes are not copied. A directory's default
-    /// ACL can grant additional users access to new and replacement files,
-    /// even when their permission bits match the original; on Linux it takes
-    /// precedence over the umask. Setuid, setgid
+    /// Owner, ACLs, and extended attributes are not copied. On Linux, the group
+    /// permission bits of a file with an access ACL are those of the owning
+    /// group's own entry, as limited by the ACL's mask, and its named user and
+    /// group entries are dropped; other platforms use the file's mode bits as
+    /// they are. A directory's default ACL can grant additional users access
+    /// to new and replacement files, even when their permission bits match the
+    /// original; on Linux it takes precedence over the umask. Setuid, setgid
     /// and sticky bits are never applied; writing the contents would clear
     /// setuid and setgid anyway.
     ///

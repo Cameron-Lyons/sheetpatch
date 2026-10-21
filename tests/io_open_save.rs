@@ -320,6 +320,39 @@ mod permissions {
         assert_eq!(mode(&input), 0o750);
     }
 
+    /// Share `path` with one other user through an access ACL. The ACL's mask,
+    /// rw-, then takes the place of the group mode bits, while the owning
+    /// group's own entry keeps the old group bits. Returns false when
+    /// `setfacl` is missing or the filesystem refuses ACLs.
+    #[cfg(target_os = "linux")]
+    fn share_with_one_user(path: &Path) -> bool {
+        Command::new("setfacl")
+            .args(["-m", "u:65534:rw"])
+            .arg(path)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn access_acl_masks_do_not_become_group_permissions() {
+        let directory = TempDir::new();
+        let umask = umask(&directory);
+        let input = source(&directory, 0o600);
+        if !share_with_one_user(&input) {
+            return;
+        }
+        assert_eq!(mode(&input), 0o660);
+        let mut workbook = Workbook::open(&input).unwrap();
+        workbook.set_cell("Data", "A1", "edited").unwrap();
+        // The owning group had no access, so neither copy gives it any.
+        let saved = directory.join("saved.xlsx");
+        workbook.save(&saved).unwrap();
+        assert_eq!(mode(&saved), 0o600 & !umask);
+        workbook.save(&input).unwrap();
+        assert_eq!(mode(&input), 0o600);
+    }
+
     #[test]
     fn existing_destinations_keep_their_own_permissions() {
         let directory = TempDir::new();
