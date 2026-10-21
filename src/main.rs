@@ -1527,6 +1527,63 @@ mod tests {
     }
 
     #[test]
+    fn buffered_read_output_stops_before_stored_text_over_the_budget() {
+        // Records the length of each write. The buffered prefix is written
+        // with one write_all, so it is the first write.
+        struct Writes(Vec<usize>);
+        impl Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.push(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let long = "x".repeat(1000);
+        let sheet = format!(
+            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
+             <c r='B1' t='inlineStr'><is><t>{long}</t></is></c>\
+             <c r='C1'><f>{long}</f><v>2</v></c></row></sheetData></worksheet>"
+        );
+        let mut parts = common::payloads(&std::fs::read(FIXTURE).unwrap());
+        parts.insert("xl/worksheets/sheet1.xml".into(), sheet.into_bytes());
+        let entries: Vec<_> = parts
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let workbook = Workbook::from_bytes(common::stored_archive(&entries)).unwrap();
+        let view = workbook.prepare_sheet("Data").unwrap();
+        let cell = |address: &str| address.parse::<CellRef>().unwrap();
+        // Long text in either format, and a long formula, which only JSON
+        // output repeats. Plain output of C1 fits.
+        for (cells, json, buffered) in [
+            ([cell("A1"), cell("B1")], false, false),
+            ([cell("A1"), cell("B1")], true, false),
+            ([cell("A1"), cell("C1")], true, false),
+            ([cell("A1"), cell("C1")], false, true),
+        ] {
+            for records in [false, true] {
+                let format = CellOutput {
+                    sheet: "Data",
+                    json,
+                    records,
+                    escape: Escape::Exact,
+                };
+                let mut output = Writes(Vec::new());
+                write_read_cells(&view, &cells, 200, &mut output, format).unwrap();
+                let prefix = output.0[0];
+                assert!(
+                    prefix <= 200,
+                    "{cells:?} json={json}: prefix of {prefix} bytes"
+                );
+                // Output that fits is the prefix, and any closing bracket.
+                assert_eq!(output.0.len() == 1 + usize::from(json), buffered);
+            }
+        }
+    }
+
+    #[test]
     fn terminal_lists_escape_every_control_in_sheet_names() {
         let directory = common::TempDir::new();
         let path = directory.join("names.xlsx");
