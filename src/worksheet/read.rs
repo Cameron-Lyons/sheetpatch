@@ -360,8 +360,14 @@ pub(super) fn read_cells<'a>(
         loaded_strings = Some(strings);
         Ok(strings)
     };
-    cells
-        .iter()
-        .map(|&cell| cell_content(xml, index, cell, &mut load_strings, date1904))
-        .collect()
+    // Reserve every result at once, so that a batch too large for memory is
+    // an error rather than an aborting allocation partway through.
+    let mut contents = Vec::new();
+    contents
+        .try_reserve_exact(cells.len())
+        .map_err(|_| Error::Io(std::io::ErrorKind::OutOfMemory.into()))?;
+    for &cell in cells {
+        contents.push(cell_content(xml, index, cell, &mut load_strings, date1904)?);
+    }
+    Ok(contents)
 }

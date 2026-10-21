@@ -310,13 +310,22 @@ impl WorksheetView<'_> {
     /// It is computed from the cells themselves rather than the worksheet's
     /// stored `<dimension>`, which other tools can leave stale.
     ///
+    /// A single formatted cell far from the data, such as a style applied to
+    /// the worksheet's last row, can make the range cover the whole grid of
+    /// 17,179,869,184 cells. Reading a range returns one result for each of
+    /// its cells, so check [`CellRange::cell_count`] before reading one, or
+    /// read the cells that exist with [`Self::cells`].
+    ///
     /// ```
     /// # let bytes = include_bytes!("../tests/fixtures/libreoffice.xlsx").to_vec();
     /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
-    /// let range = book.prepare_sheet("Data")?.used_range().unwrap();
+    /// let sheet = book.prepare_sheet("Data")?;
+    /// let range = sheet.used_range().unwrap();
     /// assert_eq!(range.to_string(), "A1:E1");
-    /// let values = book.get_cells_at("Data", range.cells())?;
-    /// assert_eq!(values.len(), 5);
+    /// if range.cell_count() <= 10_000 {
+    ///     let values = sheet.get_cells_at(range)?;
+    ///     assert_eq!(values.len(), 5);
+    /// }
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
     pub fn used_range(&self) -> Option<CellRange> {
@@ -373,7 +382,9 @@ impl WorksheetView<'_> {
     ///
     /// Returns [`Error::InvalidCellReference`] for the first invalid address,
     /// before reading any cell, and otherwise fails like [`Self::get_cell`]
-    /// for the first cell that cannot be read.
+    /// for the first cell that cannot be read. Results that cannot be
+    /// allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -383,16 +394,21 @@ impl WorksheetView<'_> {
     }
 
     /// Read typed addresses, retaining input order and duplicate requests.
-    /// A [`CellRange`] reads its cells in row-major order.
+    /// A [`CellRange`] reads its cells in row-major order, one result for
+    /// each cell, and one read returns at most 16,777,216 (2²⁴) cells.
     ///
     /// # Errors
     ///
-    /// Fails like [`Self::get_cell`] for the first cell that cannot be read.
+    /// Returns [`Error::Unsupported`] when more than 16,777,216 cells are
+    /// requested, before reading any cell, and otherwise fails like
+    /// [`Self::get_cell`] for the first cell that cannot be read. Results
+    /// that cannot be allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells_at(
         &self,
         cells: impl IntoIterator<Item = CellRef>,
     ) -> Result<Vec<CellContent>> {
-        self.read_cells(&cells.into_iter().collect::<Vec<_>>())
+        self.read_cells(&collect_cells(cells)?)
     }
 
     fn read_cells(&self, cells: &[CellRef]) -> Result<Vec<CellContent>> {
@@ -411,6 +427,41 @@ fn parse_addresses<S: AsRef<str>>(addresses: impl IntoIterator<Item = S>) -> Res
         .into_iter()
         .map(|address| address.as_ref().parse())
         .collect()
+}
+
+// The most cells one typed batch read returns: sixteen whole columns, and
+// sixteen times the CLI's `get` limit. A worksheet part is read only up to
+// 64 MiB, and each cell element needs an explicit reference of its own, so
+// every cell of a worksheet as read fits. The addresses and results of a full
+// read take a little over 1 GiB besides their text, where a range over the
+// whole grid would need more than a terabyte.
+const MAX_READ_CELLS: usize = 1 << 24;
+
+// Collects typed addresses for a batch read, refusing a request over the limit
+// before reading any cell. A range's exact size hint is checked before any
+// address is stored, and other iterators are cut off at the limit.
+fn collect_cells(cells: impl IntoIterator<Item = CellRef>) -> Result<Vec<CellRef>> {
+    let too_many = || {
+        Error::Unsupported(format!(
+            "too many cells: one read returns at most {MAX_READ_CELLS}"
+        ))
+    };
+    let cells = cells.into_iter();
+    let (expected, _) = cells.size_hint();
+    if expected > MAX_READ_CELLS {
+        return Err(too_many());
+    }
+    let mut collected = Vec::new();
+    collected
+        .try_reserve_exact(expected)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+    for cell in cells {
+        if collected.len() == MAX_READ_CELLS {
+            return Err(too_many());
+        }
+        collected.push(cell);
+    }
+    Ok(collected)
 }
 
 impl Workbook {
@@ -808,7 +859,8 @@ impl Workbook {
     /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
     /// [`Error::InvalidCellReference`] for the first invalid address, before
     /// reading any cell, and otherwise fails like [`Self::get_cell`] for the
-    /// first cell that cannot be read.
+    /// first cell that cannot be read. Results that cannot be allocated
+    /// return [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, sheet: &str, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -823,21 +875,24 @@ impl Workbook {
     /// Input order and duplicates are retained; missing cells return blanks.
     /// An empty batch still requires an existing worksheet. No A1 string
     /// conversions are needed, and a [`CellRange`] reads its cells in
-    /// row-major order.
+    /// row-major order, one result for each cell. One read returns at most
+    /// 16,777,216 (2²⁴) cells.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, and
-    /// otherwise fails like [`Self::get_cell`] for the first cell that cannot
-    /// be read.
+    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
+    /// [`Error::Unsupported`] when more than 16,777,216 cells are requested,
+    /// before reading any cell, and otherwise fails like [`Self::get_cell`]
+    /// for the first cell that cannot be read. Results that cannot be
+    /// allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells_at(
         &self,
         sheet: &str,
         cells: impl IntoIterator<Item = CellRef>,
     ) -> Result<Vec<CellContent>> {
         let index = self.sheet_index(sheet)?;
-        let cells: Vec<CellRef> = cells.into_iter().collect();
-        self.read_cells_in_sheet(index, &cells)
+        self.read_cells_in_sheet(index, &collect_cells(cells)?)
     }
 
     fn read_cells_in_sheet(&self, index: usize, cells: &[CellRef]) -> Result<Vec<CellContent>> {
