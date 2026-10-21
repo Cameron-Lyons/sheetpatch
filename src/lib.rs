@@ -10,6 +10,11 @@ mod package;
 mod worksheet;
 mod xml;
 
+// The integration tests' independent ZIP reader and writer.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 pub use cell::{CellContent, CellEdit, CellRange, CellRangeIter, CellRef, CellValue};
 pub use error::{Error, Result};
 pub use package::{Sheet, SheetVisibility, Workbook, WorksheetView};

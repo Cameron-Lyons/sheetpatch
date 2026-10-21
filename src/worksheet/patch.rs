@@ -168,7 +168,8 @@ fn new_cell(
 }
 
 // The workbook-wide inputs that decide whether an edit rewrites a cell's
-// current value: its shared strings, loaded on first use, and date system.
+// current value: its shared strings, loaded only to compare text, and its
+// date system.
 struct CurrentValues<F> {
     shared_strings: F,
     date1904: bool,
@@ -529,7 +530,7 @@ pub(super) fn patch_cells<'a, 's>(
     xml: &'a [u8],
     index: &WorksheetIndex,
     cells: &BTreeMap<CellRef, CellValue>,
-    mut shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
+    shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
     date1904: bool,
 ) -> Result<Cow<'a, [u8]>> {
     if cells.is_empty() {
@@ -537,11 +538,10 @@ pub(super) fn patch_cells<'a, 's>(
     }
     index.validate_edits(cells)?;
     // The table is needed only to recognize rewriting a shared string's own
-    // text. Load it at most once; a table that is absent or fails to load
-    // leaves such edits as changes.
-    let mut loaded_strings = None;
+    // text; a table that is absent or fails to load leaves such edits as
+    // changes. The workbook loads it once and keeps it.
     let mut current = CurrentValues {
-        shared_strings: || *loaded_strings.get_or_insert_with(&mut shared_strings),
+        shared_strings,
         date1904,
     };
     let data = &index.elements[index.data_index];

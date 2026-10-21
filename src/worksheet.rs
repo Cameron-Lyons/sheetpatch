@@ -53,10 +53,11 @@ impl<'xml> PreparedWorksheet<'xml> {
         read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
     }
 
-    /// Reads cells in request order. Shared strings are loaded at most once,
-    /// only for a requested `t="s"` cell; the loader returns `None` for a
-    /// workbook without a table. `date1904` selects the workbook's date
-    /// system for ISO 8601 (`t="d"`) cells, which read as Excel serials.
+    /// Reads cells in request order. The shared-string loader is called only
+    /// for requested `t="s"` cells, and returns `None` for a workbook without
+    /// a table; the workbook loads its table once and keeps it. `date1904`
+    /// selects the workbook's date system for ISO 8601 (`t="d"`) cells, which
+    /// read as Excel serials.
     pub(crate) fn read_cells<'strings>(
         &self,
         cells: &[CellRef],
@@ -71,7 +72,7 @@ impl<'xml> PreparedWorksheet<'xml> {
     /// the edits. Every public edit path validates its values before reaching
     /// the worksheet, so they are not checked again here.
     ///
-    /// Shared strings are loaded at most once, only to recognize rewriting a
+    /// The shared-string loader is called only to recognize rewriting a
     /// `t="s"` cell's current text; a table that is absent or fails to load
     /// leaves such an edit as a change. `date1904` likewise recognizes
     /// rewriting an ISO 8601 (`t="d"`) cell's serial. Returns the original

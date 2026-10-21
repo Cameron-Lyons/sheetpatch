@@ -860,7 +860,7 @@ fn only_xml_version_10_is_supported() {
 }
 
 #[test]
-fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
+fn shared_strings_are_loaded_only_for_text_over_shared_cells() {
     let input = sheet(
         "<sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c><c r='C1'><v>3</v></c></row></sheetData>",
     );
@@ -871,6 +871,7 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
             .collect()
     };
     let strings = SharedStrings::from_iter(["first", "second"]);
+    // The loader is asked for each comparison; the workbook keeps the table.
     let mut loads = 0;
     let unchanged = patch_cells(
         input.as_bytes(),
@@ -887,7 +888,7 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
     )
     .unwrap();
     assert!(matches!(unchanged, Cow::Borrowed(_)));
-    assert_eq!(loads, 1);
+    assert_eq!(loads, 2);
     // Numbers, blanks, and text over other cells never need the table.
     let changed = patch_cells(
         input.as_bytes(),
@@ -901,20 +902,14 @@ fn shared_strings_load_once_per_patch_and_only_for_text_over_shared_cells() {
     )
     .unwrap();
     assert!(matches!(changed, Cow::Owned(_)));
-    // A table that is absent or fails to load is attempted once and leaves
-    // each edit as a change.
-    let mut loads = 0;
+    // A table that is absent or fails to load leaves each edit as a change.
     let changed = patch_cells(
         input.as_bytes(),
         &cells(&[("A1", "first".into()), ("B1", "second".into())]),
-        || {
-            loads += 1;
-            None
-        },
+        || None,
         false,
     )
     .unwrap();
-    assert_eq!(loads, 1);
     assert_eq!(
         changed.as_ref(),
         edit(&input, "A1", "first".into())
@@ -1391,7 +1386,7 @@ fn reads_values_formulas_styles_and_preserves_requested_order() {
 }
 
 #[test]
-fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
+fn shared_strings_are_loaded_only_for_requested_shared_cells() {
     let input = sheet(
         r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row></sheetData>"#,
     );
@@ -1404,12 +1399,14 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
     .unwrap();
     assert_eq!(numeric[0].value, CellValue::Number(7.0));
 
+    // The loader is asked for each shared cell; the workbook keeps the table.
     let strings = SharedStrings::from_iter(["first", "second"]);
     let mut loads = 0;
     let contents = read_cells(
         input.as_bytes(),
         &[
             "B1".parse().unwrap(),
+            "A1".parse().unwrap(),
             "C1".parse().unwrap(),
             "B1".parse().unwrap(),
         ],
@@ -1420,13 +1417,13 @@ fn shared_strings_load_only_for_requested_cells_and_once_per_read() {
         false,
     )
     .unwrap();
-    assert_eq!(loads, 1);
+    assert_eq!(loads, 3);
     assert_eq!(
         contents
             .into_iter()
             .map(|cell| cell.value)
             .collect::<Vec<_>>(),
-        vec!["first".into(), "second".into(), "first".into()]
+        vec!["first".into(), 7.0.into(), "second".into(), "first".into()]
     );
 }
 

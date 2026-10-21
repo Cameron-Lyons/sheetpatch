@@ -501,15 +501,6 @@ pub(super) fn read_cells<'a>(
     if cells.is_empty() {
         return Ok(Vec::new());
     }
-    let mut loaded_strings = None;
-    let mut load_strings = || {
-        if let Some(strings) = loaded_strings {
-            return Ok(strings);
-        }
-        let strings = shared_strings()?;
-        loaded_strings = Some(strings);
-        Ok(strings)
-    };
     // Reserve every result at once, so that a batch too large for memory is
     // an error rather than an aborting allocation partway through.
     let mut contents = Vec::new();
@@ -517,7 +508,13 @@ pub(super) fn read_cells<'a>(
         .try_reserve_exact(cells.len())
         .map_err(|_| Error::Io(std::io::ErrorKind::OutOfMemory.into()))?;
     for &cell in cells {
-        contents.push(cell_content(xml, index, cell, &mut load_strings, date1904)?);
+        contents.push(cell_content(
+            xml,
+            index,
+            cell,
+            &mut shared_strings,
+            date1904,
+        )?);
     }
     Ok(contents)
 }
