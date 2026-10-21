@@ -589,6 +589,13 @@ impl Archive {
         for _ in 0..count {
             let central = central_header(&original, position, end)?;
             let name = central.name;
+            if name.is_empty() {
+                return Err(invalid("empty ZIP member name"));
+            }
+            // Python's zipfile truncates names at NUL.
+            if name.contains('\0') {
+                return Err(invalid(format!("ZIP member name contains NUL: {name}")));
+            }
             // Some readers treat '\' as '/', so such a name can alias another
             // member for them. OPC part names cannot contain it.
             if name.contains('\\') {
@@ -596,11 +603,8 @@ impl Archive {
                     "ZIP member name contains a backslash: {name}"
                 )));
             }
-            if name.is_empty()
-                || name.contains('\0')
-                || index.insert(name.to_owned(), entries.len()).is_some()
-            {
-                return Err(invalid("empty, invalid, or duplicate ZIP member name"));
+            if index.insert(name.to_owned(), entries.len()).is_some() {
+                return Err(invalid(format!("duplicate ZIP member: {name}")));
             }
             check_extra(central.extra, name)?;
             // OPC part names compare without ASCII case, including the hex
@@ -1148,9 +1152,10 @@ impl Archive {
         {
             return false;
         }
-        // Accepted member names cannot contain NUL. Check before decoding and
-        // hashing: false headers in stored data can overlap thousands of long
-        // candidate names, with an early NUL in each following header.
+        // Archive::new refuses member names containing NUL. Check before
+        // decoding and hashing: false headers in stored data can overlap
+        // thousands of long candidate names, with an early NUL in each
+        // following header.
         if header.raw_name.contains(&0) {
             return false;
         }
@@ -2395,6 +2400,28 @@ mod tests {
         let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
         assert_eq!(updated.read("part.xml").unwrap(), b"updated");
         assert_eq!(updated.read("embedded").unwrap(), inner);
+    }
+
+    #[test]
+    fn rejects_empty_nul_and_duplicate_member_names() {
+        // Python truncates names at NUL, and readers differ on which of two
+        // duplicate members they select.
+        for (bytes, expected) in [
+            (named_fixture(b"", 0, false), "empty ZIP member name"),
+            (
+                named_fixture(b"a\0b.xml", 0, false),
+                "ZIP member name contains NUL: a\0b.xml",
+            ),
+            (
+                combine(fixture(false), fixture(true)),
+                "duplicate ZIP member: part.xml",
+            ),
+        ] {
+            assert!(matches!(
+                Archive::new(bytes),
+                Err(Error::InvalidWorkbook(message)) if message == expected
+            ));
+        }
     }
 
     #[test]
