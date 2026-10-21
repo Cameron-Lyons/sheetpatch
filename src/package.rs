@@ -310,8 +310,8 @@ impl WorksheetView<'_> {
     /// It is computed from the cells themselves rather than the worksheet's
     /// stored `<dimension>`, which other tools can leave stale.
     ///
-    /// A single formatted cell far from the data, such as a style applied to
-    /// the worksheet's last row, can make the range cover the whole grid of
+    /// A single formatted cell far from the data, such as a style-only cell
+    /// at `XFD1048576`, can make the range cover the whole grid of
     /// 17,179,869,184 cells. Reading a range returns one result for each of
     /// its cells, so check [`CellRange::cell_count`] before reading one, or
     /// read the cells that exist with [`Self::cells`].
