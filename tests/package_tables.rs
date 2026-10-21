@@ -569,6 +569,33 @@ fn alternate_table_target_spellings_share_long_source_uris() {
 }
 
 #[test]
+fn table_targets_appending_one_path_to_different_directories_stay_distinct() {
+    // Both targets append tables/table1.xml, one to the worksheet's xl/
+    // directory and one to the package root, so they name different parts.
+    let mut parts = parts("ref='A1:B3'");
+    let rels = parts.get_mut(SHEET_RELS).unwrap();
+    *rels = rels.replace(
+        "</Relationships>",
+        &format!("<Relationship Id='root' Type='{OFFICE_NS}/table' Target='/tables/table1.xml'/></Relationships>"),
+    );
+    let error = book(&parts).set_cell("Data", "B2", 7).unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidWorkbook(message)
+            if message == &format!("part {SHEET_RELS:?}: missing table part tables/table1.xml")),
+        "{error}"
+    );
+
+    parts.insert(
+        "tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' ref='C1:C3'/>"),
+    );
+    let mut both = book(&parts);
+    assert_refused(both.set_cell("Data", "C1", "beside"), "C1");
+    assert_refused(both.set_cell("Data", "B1", "Total"), "B1");
+    both.set_cell("Data", "B2", 7).unwrap();
+}
+
+#[test]
 fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
     for suffix in ["%41", "%", "%2F"] {
         let mut parts = parts("ref='A1:B3'");
