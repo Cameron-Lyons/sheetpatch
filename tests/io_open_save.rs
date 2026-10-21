@@ -1,45 +1,14 @@
 //! File-system behavior of `Workbook::open`, `save`, and `save_compact`.
+mod common;
+
+use common::TempDir;
 use sheetpatch::{Error, Workbook};
-use std::{
-    fs, io,
-    path::PathBuf,
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{fs, io, process::Command};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/libreoffice.xlsx"
 );
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sheetpatch-io-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    fn entries(&self) -> usize {
-        fs::read_dir(&self.0).unwrap().count()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn assert_invalid_input<T: std::fmt::Debug>(result: Result<T, Error>, message: &str) {
     match result {
@@ -168,7 +137,7 @@ mod permissions {
     use super::*;
     use std::{
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     fn mode(path: &Path) -> u32 {
@@ -189,7 +158,7 @@ mod permissions {
     }
 
     fn source(directory: &TempDir, permissions: u32) -> PathBuf {
-        let path = directory.join(&format!("source-{permissions:o}.xlsx"));
+        let path = directory.join(format!("source-{permissions:o}.xlsx"));
         fs::copy(FIXTURE, &path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(permissions)).unwrap();
         path
@@ -202,10 +171,10 @@ mod permissions {
         for permissions in [0o600, 0o640, 0o644] {
             let mut workbook = Workbook::open(source(&directory, permissions)).unwrap();
             workbook.set_cell("Data", "A1", "edited").unwrap();
-            let saved = directory.join(&format!("saved-{permissions:o}.xlsx"));
+            let saved = directory.join(format!("saved-{permissions:o}.xlsx"));
             workbook.save(&saved).unwrap();
             assert_eq!(mode(&saved), permissions & !umask);
-            let compact = directory.join(&format!("compact-{permissions:o}.xlsx"));
+            let compact = directory.join(format!("compact-{permissions:o}.xlsx"));
             workbook.save_compact(&compact).unwrap();
             assert_eq!(mode(&compact), permissions & !umask);
             let reopened = Workbook::open(&saved).unwrap();
@@ -256,11 +225,16 @@ mod permissions {
         fs::metadata(path).unwrap().gid()
     }
 
-    /// The user's groups other than the one its new files receive.
+    /// The user's groups other than the one its new files receive; none when
+    /// `id` is missing or fails, so tests that need one are skipped.
     fn other_groups(default: u32) -> Vec<u32> {
-        let output = Command::new("id").arg("-G").output().unwrap();
-        String::from_utf8(output.stdout)
-            .unwrap()
+        let groups = Command::new("id")
+            .arg("-G")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .unwrap_or_default();
+        groups
             .split_whitespace()
             .filter_map(|gid| gid.parse().ok())
             .filter(|&gid| gid != default)
@@ -318,6 +292,39 @@ mod permissions {
         assert_eq!(mode(&saved), 0o755);
         workbook.save(&input).unwrap();
         assert_eq!(mode(&input), 0o750);
+    }
+
+    /// Share `path` with one other user through an access ACL. The ACL's mask,
+    /// rw-, then takes the place of the group mode bits, while the owning
+    /// group's own entry keeps the old group bits. Returns false when
+    /// `setfacl` is missing or the filesystem refuses ACLs.
+    #[cfg(target_os = "linux")]
+    fn share_with_one_user(path: &Path) -> bool {
+        Command::new("setfacl")
+            .args(["-m", "u:65534:rw"])
+            .arg(path)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn access_acl_masks_do_not_become_group_permissions() {
+        let directory = TempDir::new();
+        let umask = umask(&directory);
+        let input = source(&directory, 0o600);
+        if !share_with_one_user(&input) {
+            return;
+        }
+        assert_eq!(mode(&input), 0o660);
+        let mut workbook = Workbook::open(&input).unwrap();
+        workbook.set_cell("Data", "A1", "edited").unwrap();
+        // The owning group had no access, so neither copy gives it any.
+        let saved = directory.join("saved.xlsx");
+        workbook.save(&saved).unwrap();
+        assert_eq!(mode(&saved), 0o600 & !umask);
+        workbook.save(&input).unwrap();
+        assert_eq!(mode(&input), 0o600);
     }
 
     #[test]

@@ -301,6 +301,11 @@ impl TempDir {
     pub fn join(&self, name: impl AsRef<Path>) -> PathBuf {
         self.0.join(name)
     }
+
+    /// The number of entries directly inside the directory.
+    pub fn entries(&self) -> usize {
+        fs::read_dir(&self.0).unwrap().count()
+    }
 }
 
 impl Drop for TempDir {

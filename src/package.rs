@@ -424,11 +424,11 @@ impl Workbook {
         let metadata = file.metadata()?;
         // Devices and pipes have no useful length; reading stops at the limit.
         let file_len = metadata.is_file().then_some(metadata.len());
-        let mut workbook = Self::from_bytes(archive::read_archive(file, file_len)?)?;
+        let mut workbook = Self::from_bytes(archive::read_archive(&file, file_len)?)?;
         // Pipes and devices carry no meaningful file permissions to inherit.
         workbook.source_permissions = metadata
             .is_file()
-            .then(|| SourcePermissions::new(&metadata));
+            .then(|| SourcePermissions::new(&file, &metadata));
         Ok(workbook)
     }
 
@@ -1032,7 +1032,12 @@ impl Workbook {
 
     /// Save through a temporary file in the destination directory, then rename.
     /// The original destination is retained if generation or writing fails.
-    /// Using the input path as destination is supported.
+    /// Using the input path as destination is supported. The temporary file is
+    /// hidden and named after the destination: `.{name}.sheetpatch-{pid}-{n}.tmp`,
+    /// where `{name}` is at most 32 bytes of the destination's file name, up to
+    /// any colon. If the process is killed while saving, the destination is
+    /// untouched, but this incomplete copy can remain beside it and is safe to
+    /// delete.
     /// Saving does not clear pending edits or replace the retained original.
     /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
@@ -1050,12 +1055,17 @@ impl Workbook {
     /// subject to the operating system's umask or default ACL rules,
     /// and the same group rule: it gets the source file's group when the
     /// process may assign it, and otherwise its group bits are cleared.
-    /// Owner, ACLs, and extended attributes are not copied. A directory's default
-    /// ACL can grant additional users access to new and replacement files,
-    /// even when their permission bits match the original; on Linux it takes
-    /// precedence over the umask. Setuid, setgid
-    /// and sticky bits are never applied; writing the contents would clear
-    /// setuid and setgid anyway.
+    /// Owner, ACLs, and extended attributes are not copied. On Linux, the group
+    /// permission bits of a file with an access ACL hold the ACL's mask. A new
+    /// or replacement file that inherits an access ACL from the destination
+    /// directory's default ACL gets that mask as its own; any other file gets
+    /// the permissions of the owning group's own entry, as limited by the mask.
+    /// Other platforms use the file's mode bits as they are. A directory's
+    /// default ACL can grant additional users access to new and replacement
+    /// files, even when their permission bits match the original; on Linux it
+    /// takes precedence over the umask. Setuid, setgid and sticky bits are
+    /// never applied; writing the contents would clear setuid and setgid
+    /// anyway.
     ///
     /// # Errors
     ///
