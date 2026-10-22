@@ -442,6 +442,10 @@ impl FusedIterator for CellRangeIter {}
 /// # Ok::<(), sheetpatch::Error>(())
 /// ```
 #[derive(Clone, Debug, Default, PartialEq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "a closed set of SpreadsheetML value types; see above"
+)]
 pub enum CellValue {
     /// Text, written as an inline string without creating a formula.
     Text(String),

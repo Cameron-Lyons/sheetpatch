@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

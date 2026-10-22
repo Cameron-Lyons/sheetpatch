@@ -26,3 +26,23 @@ harness = false
 [profile.release]
 lto = "thin"
 strip = true
+
+# Clippy checks for the rules of the Google Rust Style Guide that it can
+# detect (https://google.github.io/styleguide/rustguide.html). The library's
+# API lints are set in src/lib.rs, and `unwrap` is linted in src/lib.rs and
+# src/main.rs, outside tests.
+[lints.clippy]
+# Types are imported and used unqualified, and functions are called through
+# their module, such as `mem::take`, rather than through a full path.
+absolute_paths = "warn"
+# No glob imports other than `use super::*` in a test module.
+enum_glob_use = "warn"
+wildcard_imports = "warn"
+# `write!` appends to a string rather than `push_str(&format!(..))`.
+format_push_string = "warn"
+# Assertions outside `#[test]` functions say why they hold.
+missing_assert_message = "warn"
+# A `for` loop rather than `Iterator::for_each`.
+needless_for_each = "warn"
+# Every `unsafe` block explains why it is sound in a `SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
