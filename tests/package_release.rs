@@ -101,8 +101,44 @@ fn duplicate_decoded_names_are_rejected_for_all_sheet_types() {
         );
         assert!(Workbook::from_bytes(fixture(&sheets, &rels, &[])).is_err());
     }
-    let invalid = "<sheets><sheet name='_xD800_' sheetId='1' r:id='one'/></sheets>";
-    assert!(Workbook::from_bytes(fixture(invalid, RELATIONSHIP, &[])).is_err());
+}
+
+#[test]
+fn sheet_names_with_unpaired_surrogate_escapes_are_unsupported_by_position() {
+    // Such a name is valid, but no Rust string can hold it, so the workbook
+    // cannot be opened. The error names the sheet's position in tab order,
+    // counting sheets of every type.
+    let rels = format!(
+        "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NS}/chartsheet' Target='worksheets/sheet2.xml'/><Relationship Id='three' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet3.xml'/>"
+    );
+    let third = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let replacements = [("xl/worksheets/sheet3.xml", third.as_str())];
+    let sheets = |first: &str, third: &str| {
+        format!(
+            "<sheets><sheet name='{first}' sheetId='1' r:id='one'/><sheet name='Chart' sheetId='2' r:id='two'/><sheet name='{third}' sheetId='3' r:id='three'/></sheets>"
+        )
+    };
+    // With each escape paired, the same workbook opens.
+    let paired = "_xD83D__xDE00_";
+    let workbook = Workbook::from_bytes(fixture(&sheets(paired, "Data"), &rels, &replacements));
+    assert_eq!(workbook.unwrap().sheets()[0].name(), "😀");
+    for (first, third, position) in [
+        ("_xD800_", "Data", 1),
+        ("_xD83D__xD83D__xDE00_", "Data", 1),
+        (paired, "Data _xDE00_", 3),
+    ] {
+        let error =
+            Workbook::from_bytes(fixture(&sheets(first, third), &rels, &replacements)).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::Unsupported(message) if *message == format!(
+                    "name of sheet {position}: unpaired UTF-16 surrogate in Excel text escape"
+                )
+            ),
+            "{first} {third}: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -422,6 +458,61 @@ fn sheets_sharing_one_worksheet_part_are_rejected() {
             "{target}: {error:?}"
         );
     }
+}
+
+#[test]
+fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
+    // A sheet is bound through its relationship Id, so a duplicate Id would
+    // bind it to whichever target came last, whatever their order.
+    let sheets = format!("<sheets>{SHEET}</sheets>");
+    let duplicate = worksheet_relationship("one", "worksheets/sheet2.xml", "");
+    let strings = |id: &str| {
+        format!(
+            "<Relationship Id='{id}' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/>"
+        )
+    };
+    for (rels, expected) in [
+        (
+            format!("{RELATIONSHIP}{duplicate}"),
+            "duplicate relationship id",
+        ),
+        (
+            format!("{duplicate}{RELATIONSHIP}"),
+            "duplicate relationship id",
+        ),
+        (
+            worksheet_relationship("other", "worksheets/sheet1.xml", ""),
+            "missing relationship for sheet Data",
+        ),
+        (
+            worksheet_relationship("one", "worksheets/absent.xml", ""),
+            "missing worksheet part xl/worksheets/absent.xml",
+        ),
+        (
+            format!("{RELATIONSHIP}{}{}", strings("s1"), strings("s2")),
+            "expected at most one internal shared-string relationship",
+        ),
+    ] {
+        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        assert!(
+            matches!(&error, Some(Error::InvalidWorkbook(message)) if message == expected),
+            "{rels}: {error:?}"
+        );
+    }
+    // The namespace prefix is declared, so the root is what is rejected.
+    let document = format!(
+        "<document xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{SHEET}</sheets></document>"
+    );
+    let error = Workbook::from_bytes(fixture(
+        &sheets,
+        RELATIONSHIP,
+        &[("xl/workbook.xml", &document)],
+    ))
+    .err();
+    assert!(
+        matches!(&error, Some(Error::InvalidWorkbook(message)) if message == "officeDocument is not a SpreadsheetML workbook"),
+        "{error:?}"
+    );
 }
 
 #[test]

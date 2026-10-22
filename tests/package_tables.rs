@@ -205,6 +205,156 @@ fn edits_that_keep_a_header_value_are_no_ops() {
 }
 
 #[test]
+fn unchanged_headers_leave_the_rest_of_a_batch_on_a_pending_sheet_as_it_is() {
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace("<sheetData>", "<dimension ref='A1:C3'/><sheetData>");
+    let original = archive(&parts);
+    let body = [
+        ("Data", "B2", CellValue::from(8)),
+        ("Data", "A4", CellValue::from("below")),
+        ("Notes", "A1", CellValue::from(true)),
+    ];
+    let headers = [
+        ("Data", "A1", CellValue::from("Name")),
+        ("Data", "B1", CellValue::from("Amount")),
+    ];
+    let edits = |edits: &[(&str, &str, CellValue)]| {
+        edits
+            .iter()
+            .map(|(sheet, cell, value)| CellEdit::new(*sheet, cell, value.clone()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut expected = Workbook::from_bytes(original.clone()).unwrap();
+    let mut book = Workbook::from_bytes(original).unwrap();
+    for book in [&mut expected, &mut book] {
+        // Widening the dimension moves the header cells in the pending XML.
+        book.set_cell("Data", "D9", "pending").unwrap();
+    }
+    expected.apply_edits(edits(&body)).unwrap();
+    let pending = expected.to_bytes().unwrap();
+    book.apply_edits(edits(&[&headers[..], &body[..]].concat()))
+        .unwrap();
+    assert_eq!(book.to_bytes().unwrap(), pending);
+    // A changed header still refuses the whole transaction.
+    let changed = ("Data", "B1", CellValue::from("Total"));
+    assert_refused(
+        book.apply_edits(edits(&[&body[..], std::slice::from_ref(&changed)].concat())),
+        "B1",
+    );
+    assert_refused(
+        book.set_cells("Data", [("B2", CellValue::from(9)), ("B1", changed.2)]),
+        "B1",
+    );
+    assert_eq!(book.to_bytes().unwrap(), pending);
+}
+
+#[test]
+fn header_checks_agree_before_and_after_the_tables_are_resolved() {
+    // A worksheet's first change resolves its tables, which later batches
+    // reuse. Each sequence of batches runs both ways and must agree.
+    let plain = parts("ref='A1:B3'");
+    let mut unreadable = plain.clone();
+    let sheet = unreadable.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace(
+        "<c r='B1' t='inlineStr'>",
+        "<c r='B1' t='inlineStr' s='bad'>",
+    );
+    let batches: [&[(&str, CellValue)]; 4] = [
+        &[
+            ("A1", "Name".into()),
+            ("B1", "Amount".into()),
+            ("B2", 8.into()),
+        ],
+        &[("B3", 9.into()), ("A1", "Label".into())],
+        &[("A1", "Name".into()), ("B1", "Amount".into())],
+        &[("B1", "Amount".into()), ("A3", "z".into())],
+    ];
+    let outcomes = |parts: &BTreeMap<String, String>, resolved: bool| {
+        let mut book = book(parts);
+        if resolved {
+            book.set_cell("Data", "B2", 7).unwrap();
+            book.reset_changes();
+        }
+        batches
+            .iter()
+            .map(|&batch| {
+                let result = book.set_cells("Data", batch.iter().cloned());
+                (
+                    result.map_err(|error| error.to_string()),
+                    book.to_bytes().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let refusal = format!("protected cell: worksheet \"Data\": A1 {REFUSAL}");
+    let unreadable_header = "invalid workbook: worksheet \"Data\": B1: invalid cell style index";
+    for (parts, expected) in [
+        (&plain, [Ok(()), Err(refusal.as_str()), Ok(()), Ok(())]),
+        (
+            &unreadable,
+            [
+                Err(unreadable_header),
+                Err(refusal.as_str()),
+                Ok(()),
+                Err(unreadable_header),
+            ],
+        ),
+    ] {
+        let first = outcomes(parts, false);
+        let results: Vec<_> = first
+            .iter()
+            .map(|(result, _)| result.as_ref().map_err(String::as_str).copied())
+            .collect();
+        assert_eq!(results, expected);
+        assert_eq!(outcomes(parts, true), first);
+    }
+}
+
+#[test]
+fn tables_are_resolved_after_the_edits_are_checked_and_before_headers_are_read() {
+    // B2 holds a formula, and the header B1 a shared-string index that is out
+    // of bounds. The table part is missing, so resolving the tables fails.
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet
+        .replace("<c r='B2'><v>5</v></c>", "<c r='B2'><f>2+3</f><v>5</v></c>")
+        .replace(
+            "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+            "<c r='B1' t='s'><v>1</v></c>",
+        );
+    let complete = parts.clone();
+    parts.remove(TABLE_PATH);
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    // A refused edit is reported before the tables are needed.
+    let error = book.set_cells("Data", [("B3", 8), ("B2", 7)]).unwrap_err();
+    assert!(
+        matches!(&error, Error::ProtectedCell { cell, reason, .. }
+            if cell.to_string() == "B2" && reason == "contains a formula"),
+        "{error:?}"
+    );
+    // A batch that changes nothing does not need them.
+    book.set_cell("Data", "A1", "Name").unwrap();
+    // A change does, and their error precedes reading the edited header.
+    let missing = format!("invalid workbook: part {SHEET_RELS:?}: missing table part {TABLE_PATH}");
+    for batch in [&[("B3", "8")][..], &[("B1", "Total"), ("B3", "8")]] {
+        let error = book.set_cells("Data", batch.iter().copied()).unwrap_err();
+        assert_eq!(error.to_string(), missing, "{batch:?}");
+    }
+    assert_eq!(book.to_bytes().unwrap(), original);
+    // With its table, the header edit fails reading the header instead.
+    let mut book = self::book(&complete);
+    let error = book
+        .set_cells("Data", [("B1", "Total"), ("B3", "8")])
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid workbook: worksheet \"Data\": B1: shared-string index 1 is out of bounds"
+    );
+}
+
+#[test]
 fn tables_without_a_header_row_leave_the_first_row_editable() {
     let mut book = book(&parts("ref='A1:B3' headerRowCount='0'"));
     book.set_cell("Data", "A1", "first").unwrap();
@@ -423,6 +573,54 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
 }
 
 #[test]
+fn a_table_part_shared_by_worksheets_protects_each_of_them() {
+    let mut shared = parts("ref='A1:B3'");
+    let data = shared["xl/worksheets/sheet1.xml"].clone();
+    shared.insert("xl/worksheets/sheet2.xml".into(), data);
+    let rels = shared[SHEET_RELS].clone();
+    shared.insert("xl/worksheets/_rels/sheet2.xml.rels".into(), rels);
+
+    // In separate calls, the second worksheet reuses the first one's table.
+    let mut separate = book(&shared);
+    assert_refused(separate.set_cell("Data", "A1", "Changed"), "A1");
+    assert_refused_in("Notes", separate.set_cell("Notes", "B1", "Changed"), "B1");
+    separate.set_cell("Notes", "B2", 1).unwrap();
+    separate.set_cell("Notes", "B1", "Amount").unwrap();
+
+    let mut together = book(&shared);
+    assert_refused_in(
+        "Notes",
+        together.apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "A1", "Changed").unwrap(),
+        ]),
+        "A1",
+    );
+    assert!(!together.has_changes());
+    together
+        .apply_edits([
+            CellEdit::new("Data", "B2", 3).unwrap(),
+            CellEdit::new("Notes", "B3", 4).unwrap(),
+        ])
+        .unwrap();
+
+    // A table part that cannot be read is reported again for each worksheet,
+    // naming the part rather than the worksheet.
+    let mut broken = shared.clone();
+    broken.insert(TABLE_PATH.into(), format!("<table xmlns='{MAIN_NS}'/>"));
+    let mut broken = book(&broken);
+    for sheet in ["Data", "Notes", "Data"] {
+        let error = broken.set_cell(sheet, "B2", 1).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidWorkbook(message)
+                if message == &format!("part {TABLE_PATH:?}: table lacks a ref")),
+            "{sheet}: {error}"
+        );
+    }
+    assert!(!broken.has_changes());
+}
+
+#[test]
 fn many_repeated_table_targets_share_long_source_uris() {
     let mut parts = parts("ref='A1:B3'");
     let directory = format!("xl/{}", "nested".repeat(10_000));
@@ -460,6 +658,91 @@ fn many_repeated_table_targets_share_long_source_uris() {
     book.set_cell("Data", "B2", 7).unwrap();
     let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
     assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
+fn alternate_table_target_spellings_share_long_source_uris() {
+    let mut parts = parts("ref='A1:B3'");
+    let directory = format!("xl/{}", "nested".repeat(10_000));
+    let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
+    parts.insert(format!("{directory}/sheet1.xml"), worksheet);
+    let table = parts.remove(TABLE_PATH).unwrap();
+    parts.insert(format!("{directory}/table1.xml"), table);
+    let relationships = parts.remove(SHEET_RELS).unwrap();
+    // Every alias spells table1.xml differently, by letter case, escapes of
+    // unreserved letters, and dot segments, so none repeats a spelling.
+    let spell = |c: char, choice: usize| match choice {
+        0 => c.to_string(),
+        1 => c.to_ascii_uppercase().to_string(),
+        2 => format!("%{:02x}", c as u32),
+        _ => format!("%{:02X}", c as u32),
+    };
+    let aliases = (0..16_384usize)
+        .map(|index| {
+            let mut rest = index;
+            let name: String = "table1.xml"
+                .chars()
+                .map(|c| {
+                    if !c.is_ascii_alphabetic() {
+                        return c.to_string();
+                    }
+                    let choice = rest % 4;
+                    rest /= 4;
+                    spell(c, choice)
+                })
+                .collect();
+            let prefix = ["", "./", "d/../", "./d/./../"][index % 4];
+            format!(
+                "<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{prefix}{name}'/>"
+            )
+        })
+        .collect::<String>();
+    parts.insert(
+        format!("{directory}/_rels/sheet1.xml.rels"),
+        relationships
+            .replace("../tables/table1.xml", "table1.xml")
+            .replace("</Relationships>", &format!("{aliases}</Relationships>")),
+    );
+    let workbook_relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *workbook_relationships = workbook_relationships.replace(
+        "Target='worksheets/sheet1.xml'",
+        &format!("Target='/{directory}/sheet1.xml'"),
+    );
+
+    let original = archive(&parts);
+    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
+    assert_eq!(book.to_bytes().unwrap(), original);
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
+fn table_targets_appending_one_path_to_different_directories_stay_distinct() {
+    // Both targets append tables/table1.xml, one to the worksheet's xl/
+    // directory and one to the package root, so they name different parts.
+    let mut parts = parts("ref='A1:B3'");
+    let rels = parts.get_mut(SHEET_RELS).unwrap();
+    *rels = rels.replace(
+        "</Relationships>",
+        &format!("<Relationship Id='root' Type='{OFFICE_NS}/table' Target='/tables/table1.xml'/></Relationships>"),
+    );
+    let error = book(&parts).set_cell("Data", "B2", 7).unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidWorkbook(message)
+            if message == &format!("part {SHEET_RELS:?}: missing table part tables/table1.xml")),
+        "{error}"
+    );
+
+    parts.insert(
+        "tables/table1.xml".into(),
+        format!("<table xmlns='{MAIN_NS}' ref='C1:C3'/>"),
+    );
+    let mut both = book(&parts);
+    assert_refused(both.set_cell("Data", "C1", "beside"), "C1");
+    assert_refused(both.set_cell("Data", "B1", "Total"), "B1");
+    both.set_cell("Data", "B2", 7).unwrap();
 }
 
 #[test]

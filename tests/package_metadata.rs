@@ -481,6 +481,80 @@ fn sheets_are_found_by_exact_name() {
 }
 
 #[test]
+fn sheets_in_compatibility_branches_are_unsupported_and_misplaced_ones_invalid() {
+    let compatibility = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+    let data = "<sheet name='Data' sheetId='1' r:id='one'/>";
+    let other = "<sheet name='Other' sheetId='2' r:id='two'/>";
+    let sheets = format!("<sheets>{data}{other}</sheets>");
+    let branches = |choice: &str, fallback: &str| {
+        format!(
+            "<mc:AlternateContent xmlns:mc='{compatibility}'><mc:Choice Requires='x'>{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>"
+        )
+    };
+    let open = |replacement: &str| {
+        let mut parts = parts("", "", "");
+        let workbook = parts.get_mut("xl/workbook.xml").unwrap();
+        assert!(workbook.contains(&sheets));
+        *workbook = workbook.replace(&sheets, replacement);
+        Workbook::from_bytes(stored(&parts)).err()
+    };
+    // A reader that picks either branch sees a valid workbook, but which
+    // sheets it lists depends on the branch.
+    for (replacement, expected) in [
+        (
+            format!("<sheets>{data}{}</sheets>", branches(other, other)),
+            "sheet inside a markup-compatibility branch",
+        ),
+        (
+            format!("<sheets>{}{other}</sheets>", branches(data, "")),
+            "sheet inside a markup-compatibility branch",
+        ),
+        (
+            branches(&sheets, &sheets),
+            "sheets inside a markup-compatibility branch",
+        ),
+        (
+            format!("{sheets}{}", branches(&sheets, "")),
+            "sheets inside a markup-compatibility branch",
+        ),
+        (
+            format!("{sheets}{}", branches(data, "")),
+            "sheet inside a markup-compatibility branch",
+        ),
+    ] {
+        let error = open(&replacement);
+        assert!(
+            matches!(&error, Some(Error::Unsupported(message)) if message == expected),
+            "{replacement}: {error:?}"
+        );
+    }
+    // Outside a branch, a misplaced sheet or a second sheets element is
+    // invalid whatever a reader selects.
+    for (replacement, expected) in [
+        (
+            format!("<sheets>{data}</sheets>{other}"),
+            "sheet outside workbook sheets",
+        ),
+        (
+            format!(
+                "<sheets>{data}<mc:AlternateContent xmlns:mc='{compatibility}'>{other}</mc:AlternateContent></sheets>"
+            ),
+            "sheet outside workbook sheets",
+        ),
+        (
+            format!("<sheets>{data}</sheets><sheets>{other}</sheets>"),
+            "workbook must contain exactly one direct sheets element",
+        ),
+    ] {
+        let error = open(&replacement);
+        assert!(
+            matches!(&error, Some(Error::InvalidWorkbook(message)) if message == expected),
+            "{replacement}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn signed_packages_are_reported_before_any_edit() {
     let book = Workbook::from_bytes(archive("", "", "")).unwrap();
     assert!(!book.is_signed());

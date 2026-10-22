@@ -1,87 +1,12 @@
 //! Regressions for worksheet text decoding, value validation, and new cells.
-use std::{collections::BTreeMap, io::Read};
+mod common;
 
-use flate2::read::DeflateDecoder;
+use common::{payloads, stored_archive};
 use sheetpatch::{CellEdit, CellValue, Error, Workbook};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
-
-fn stored_archive(parts: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut archive = Vec::new();
-    let mut directory = Vec::new();
-    for &(name, content) in parts {
-        let offset = archive.len() as u32;
-        let crc = crc32fast::hash(content);
-        archive.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        for value in [20u16, 0, 0, 0, 0] {
-            archive.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, content.len() as u32, content.len() as u32] {
-            archive.extend_from_slice(&value.to_le_bytes());
-        }
-        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        archive.extend_from_slice(&0u16.to_le_bytes());
-        archive.extend_from_slice(name.as_bytes());
-        archive.extend_from_slice(content);
-        directory.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        for value in [20u16, 20, 0, 0, 0, 0] {
-            directory.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in [crc, content.len() as u32, content.len() as u32] {
-            directory.extend_from_slice(&value.to_le_bytes());
-        }
-        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        for _ in 0..4 {
-            directory.extend_from_slice(&0u16.to_le_bytes());
-        }
-        directory.extend_from_slice(&0u32.to_le_bytes());
-        directory.extend_from_slice(&offset.to_le_bytes());
-        directory.extend_from_slice(name.as_bytes());
-    }
-    let offset = archive.len() as u32;
-    archive.extend_from_slice(&directory);
-    archive.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-    for value in [0u16, 0, parts.len() as u16, parts.len() as u16] {
-        archive.extend_from_slice(&value.to_le_bytes());
-    }
-    archive.extend_from_slice(&(directory.len() as u32).to_le_bytes());
-    archive.extend_from_slice(&offset.to_le_bytes());
-    archive.extend_from_slice(&0u16.to_le_bytes());
-    archive
-}
-
-fn payloads(archive: &[u8]) -> BTreeMap<String, Vec<u8>> {
-    let u16_at = |at| u16::from_le_bytes(archive[at..at + 2].try_into().unwrap()) as usize;
-    let u32_at = |at| u32::from_le_bytes(archive[at..at + 4].try_into().unwrap()) as usize;
-    let end = archive.len() - 22;
-    assert_eq!(&archive[end..end + 4], b"PK\x05\x06");
-    let mut at = u32_at(end + 16);
-    let mut parts = BTreeMap::new();
-    for _ in 0..u16_at(end + 10) {
-        assert_eq!(&archive[at..at + 4], b"PK\x01\x02");
-        let name_len = u16_at(at + 28);
-        let name = String::from_utf8(archive[at + 46..at + 46 + name_len].to_vec()).unwrap();
-        let local = u32_at(at + 42);
-        let start = local + 30 + u16_at(local + 26) + u16_at(local + 28);
-        let compressed = &archive[start..start + u32_at(at + 20)];
-        let bytes = match u16_at(at + 10) {
-            0 => compressed.to_vec(),
-            8 => {
-                let mut bytes = Vec::new();
-                DeflateDecoder::new(compressed)
-                    .read_to_end(&mut bytes)
-                    .unwrap();
-                bytes
-            }
-            method => panic!("unexpected compression: {method}"),
-        };
-        parts.insert(name, bytes);
-        at += 46 + name_len + u16_at(at + 30) + u16_at(at + 32);
-    }
-    parts
-}
 
 /// A one-sheet workbook named `Data`, optionally with a shared-string table.
 fn workbook(body: &str, shared_strings: Option<&str>) -> Workbook {
@@ -370,22 +295,36 @@ fn undecodable_old_values_do_not_block_replacements() {
         "<c r='B1' t='str'><v>_xD800_</v></c>",
         "<c r='C1' t='e'><v>#_xDC00_</v></c>",
         "<c r='D1' t='inlineStr'><is><r><t>ok</t></r><r><t>_xDEAD_</t></r></is></c>",
+        "<c r='E1' t='s'><v>0</v></c>",
     );
-    let mut book = workbook(&row(cells), None);
+    let mut book = workbook(&row(cells), Some("<si><t>_xD83D_</t></si>"));
+    // An unpaired surrogate is valid but has no Rust string.
+    let unpaired = "unpaired UTF-16 surrogate in Excel text escape";
     for address in ["A1", "B1", "C1", "D1"] {
-        assert!(matches!(book.get_cell("Data", address), Err(Error::Xml(_))));
+        assert!(matches!(
+            book.get_cell("Data", address),
+            Err(Error::Unsupported(message))
+                if message == format!("worksheet \"Data\": {address}: {unpaired}")
+        ));
     }
+    assert!(matches!(
+        book.get_cell("Data", "E1"),
+        Err(Error::Unsupported(message))
+            if message == format!("part \"xl/sharedStrings.xml\": string 0: {unpaired}")
+    ));
     book.set_cell("Data", "A1", "fixed").unwrap();
     book.set_cell("Data", "B1", "also fixed").unwrap();
     book.set_cell("Data", "C1", CellValue::Error("#N/A".into()))
         .unwrap();
     book.set_cell("Data", "D1", CellValue::Error("#REF!".into()))
         .unwrap();
+    book.set_cell("Data", "E1", "fixed too").unwrap();
     let book = reopened(&book);
     assert_eq!(value(&book, "A1"), CellValue::from("fixed"));
     assert_eq!(value(&book, "B1"), CellValue::from("also fixed"));
     assert_eq!(value(&book, "C1"), CellValue::Error("#N/A".into()));
     assert_eq!(value(&book, "D1"), CellValue::Error("#REF!".into()));
+    assert_eq!(value(&book, "E1"), CellValue::from("fixed too"));
 
     // Positive control: other value types already replaced such cells.
     let mut book = workbook(&row(cells), None);
@@ -727,6 +666,9 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         // Excel's day zero holds times without a date.
         ("1899-12-31", 0.0),
         ("1899-12-31T12:00:00", 0.5),
+        // Months of 30 days.
+        ("2024-04-30", 45_412.0),
+        ("2024-06-15", 45_458.0),
     ];
     let body: String = cells
         .iter()
@@ -754,6 +696,9 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         ("2024-01-15T00:00:00+01:00", true),
         ("2024-01-15-05:00", true),
         ("2023-02-29", false),
+        ("2024-04-31", false),
+        ("2023-09-31", false),
+        ("2024-06-00", false),
         ("2024-13-01", false),
         ("2024-01-15T24:00", false),
         ("2024-01-15T00:60", false),
@@ -824,7 +769,8 @@ fn duplicate_text_in_one_rich_text_run_cannot_produce_false_no_ops() {
     assert!(matches!(
         book.get_cell("Data", "A1"),
         Err(Error::Unsupported(message))
-            if message == "part \"xl/sharedStrings.xml\": rich text run has multiple text elements"
+            if message
+                == "part \"xl/sharedStrings.xml\": string 0: rich text run has multiple text elements"
     ));
     // Explicit replacement repairs an unreadable shared-string cell without
     // rewriting the shared table or mistaking the concatenation for a no-op.
@@ -960,7 +906,6 @@ fn edit_refusals_name_the_cell() {
     );
     for (address, message) in [
         ("B1", "B1: unfamiliar XML inside the cell value payload"),
-        ("C1", "C1: cell has multiple value payloads"),
         (
             "D1",
             "D1: unfamiliar attributes inside the cell value payload",
@@ -972,6 +917,14 @@ fn edit_refusals_name_the_cell() {
             message
         );
     }
+    // Two payloads leave the cell's value ambiguous, which makes the
+    // workbook invalid rather than the edit unsupported.
+    let error = book.set_cell("Data", "C1", 5).unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidWorkbook(message)
+            if message == "worksheet \"Data\": C1: cell has multiple value payloads"),
+        "{error:?}"
+    );
     let mut book = workbook(
         "<sheetData><row r='1' spans='x'><c r='A1'><v>1</v></c></row></sheetData>",
         None,

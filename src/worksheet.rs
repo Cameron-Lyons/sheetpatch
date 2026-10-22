@@ -1,7 +1,8 @@
 //! Namespace-aware XML edits against byte spans, without reserializing the sheet.
-use crate::xml::namespace as decoded_namespace;
 use crate::{CellContent, CellRef, CellValue, Error, Result};
-use std::{borrow::Cow, collections::BTreeMap};
+#[cfg(test)]
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
@@ -14,10 +15,11 @@ mod read;
 mod validation;
 
 use index::WorksheetIndex;
-pub(crate) use read::read_shared_strings;
+pub(crate) use read::{SharedStrings, read_shared_strings};
 
-/// A validated worksheet index retained only for the lifetime of an explicit view.
-/// All spans borrow the immutable XML supplied at construction.
+/// A validated worksheet index retained only for the lifetime of an explicit
+/// view or of one worksheet's edits. All spans borrow the immutable XML
+/// supplied at construction.
 pub(crate) struct PreparedWorksheet<'xml> {
     xml: &'xml [u8],
     index: WorksheetIndex<'xml>,
@@ -41,34 +43,91 @@ impl<'xml> PreparedWorksheet<'xml> {
     pub(crate) fn read_cell<'strings>(
         &self,
         cell: CellRef,
-        mut shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+        mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> std::result::Result<CellContent, ReadError> {
         read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
     }
 
-    /// Reads cells in request order. Shared strings are loaded at most once,
-    /// only for a requested `t="s"` cell; the loader returns `None` for a
-    /// workbook without a table. `date1904` selects the workbook's date
-    /// system for ISO 8601 (`t="d"`) cells, which read as Excel serials.
+    /// Reads cells in request order. The shared-string loader is called only
+    /// for requested `t="s"` cells, and returns `None` for a workbook without
+    /// a table; the workbook loads its table once and keeps it. `date1904`
+    /// selects the workbook's date system for ISO 8601 (`t="d"`) cells, which
+    /// read as Excel serials.
     pub(crate) fn read_cells<'strings>(
         &self,
         cells: &[CellRef],
-        shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+        shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> std::result::Result<Vec<CellContent>, ReadError> {
         read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
     }
+
+    /// Plans writing `cells` into the indexed XML, or returns `None` when
+    /// nothing changes. The plan holds only the new markup; its `apply`
+    /// writes the edited XML. This worksheet is left unchanged, so its reads
+    /// still return the cells as they were before the edits. Every public
+    /// edit path validates its values before reaching the worksheet, so they
+    /// are not checked again here.
+    ///
+    /// The shared-string loader is called only to recognize rewriting a
+    /// `t="s"` cell's current text; a table that is absent or fails to load,
+    /// or an entry it cannot decode, leaves such an edit as a change.
+    /// `date1904` likewise recognizes rewriting an ISO 8601 (`t="d"`) cell's
+    /// serial.
+    pub(crate) fn plan_cells<'strings>(
+        &self,
+        cells: &BTreeMap<CellRef, CellValue>,
+        shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
+        date1904: bool,
+    ) -> Result<Option<CellPatch<'xml>>> {
+        debug_assert!(cells.values().all(|value| value.validate().is_ok()));
+        let plan = patch::plan_cells(self.xml, &self.index, cells, shared_strings, date1904)?;
+        Ok((!plan.is_empty()).then_some(CellPatch {
+            xml: self.xml,
+            plan,
+        }))
+    }
+
+    /// Returns the indexed XML with `cells` written, or the original XML,
+    /// borrowed, when nothing changes.
+    #[cfg(test)]
+    pub(crate) fn patch_cells<'strings>(
+        &self,
+        cells: &BTreeMap<CellRef, CellValue>,
+        shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
+        date1904: bool,
+    ) -> Result<Cow<'xml, [u8]>> {
+        match self.plan_cells(cells, shared_strings, date1904)? {
+            Some(patch) => patch.apply().map(Cow::Owned),
+            None => Ok(Cow::Borrowed(self.xml)),
+        }
+    }
 }
 
-/// Why a read failed: a problem in the worksheet itself, or a failure to load
-/// the shared-string table a `t="s"` cell needed. The table's errors come
-/// from its loader, which names that part, so only worksheet errors need the
-/// worksheet's name.
+/// The planned edits of a batch that changes a worksheet.
+pub(crate) struct CellPatch<'xml> {
+    xml: &'xml [u8],
+    plan: patch::EditPlan,
+}
+
+impl CellPatch<'_> {
+    /// Writes the edited worksheet XML.
+    pub(crate) fn apply(self) -> Result<Vec<u8>> {
+        self.plan.apply(self.xml)
+    }
+}
+
+/// Why a read failed: a problem in the worksheet itself, a failure to load
+/// the shared-string table a `t="s"` cell needed, or an entry of that table
+/// that cannot be decoded. The table's load errors come from its loader,
+/// which names that part, so only worksheet errors need the worksheet's name.
+/// An entry's error concerns the table too, and needs its part and index.
 #[derive(Debug)]
 pub(crate) enum ReadError {
     Worksheet(Error),
     SharedStrings(Error),
+    UndecodableString { index: usize, error: Error },
 }
 
 impl From<Error> for ReadError {
@@ -77,32 +136,10 @@ impl From<Error> for ReadError {
     }
 }
 
-/// Parses and patches a worksheet. Every public edit path validates its values
-/// before reaching the worksheet, so they are not checked again here.
-///
-/// Shared strings are loaded at most once, only to recognize rewriting a
-/// `t="s"` cell's current text; a table that is absent or fails to load leaves
-/// such an edit as a change. `date1904` likewise recognizes rewriting an ISO
-/// 8601 (`t="d"`) cell's serial. Returns the original XML, borrowed, when
-/// nothing changes.
-pub(crate) fn patch_cells<'xml, 'strings>(
-    xml: &'xml [u8],
-    cells: &BTreeMap<CellRef, CellValue>,
-    shared_strings: impl FnMut() -> Option<&'strings [String]>,
-    date1904: bool,
-) -> Result<Cow<'xml, [u8]>> {
-    if cells.is_empty() {
-        return Ok(Cow::Borrowed(xml));
-    }
-    debug_assert!(cells.values().all(|value| value.validate().is_ok()));
-    let index = WorksheetIndex::parse(xml)?;
-    patch::patch_cells(xml, &index, cells, shared_strings, date1904)
-}
-
 pub(crate) fn read_cells<'strings>(
     xml: &[u8],
     cells: &[CellRef],
-    shared_strings: impl FnMut() -> Result<Option<&'strings [String]>>,
+    shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
     date1904: bool,
 ) -> std::result::Result<Vec<CellContent>, ReadError> {
     if cells.is_empty() {
@@ -143,23 +180,33 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }
 
-// Names the cell an error concerns, retaining the error's variant. A
-// protected-cell refusal names its cell in a field instead.
-fn at_cell(cell: CellRef, error: Error) -> Error {
-    match error {
-        Error::Unsupported(message) => unsupported(format!("{cell}: {message}")),
-        Error::InvalidWorkbook(message) => invalid(format!("{cell}: {message}")),
-        Error::Xml(message) => xml_error(format!("{cell}: {message}")),
-        error => error,
-    }
-}
-
-fn unique<T>(mut items: impl Iterator<Item = T>, message: &'static str) -> Result<Option<T>> {
+// At most one item, or `error()` when there are more.
+fn unique<T>(
+    mut items: impl Iterator<Item = T>,
+    error: impl FnOnce() -> Error,
+) -> Result<Option<T>> {
     let first = items.next();
     if items.next().is_some() {
-        return Err(unsupported(message));
+        return Err(error());
     }
     Ok(first)
+}
+
+/// Parses `xml` as any XML part, with every check of the worksheet parser,
+/// for tests that compare the package parser with it.
+#[cfg(test)]
+pub(crate) fn parse_xml(xml: &[u8]) -> Result<()> {
+    parse::parse(xml).map(drop)
+}
+
+#[cfg(test)]
+fn patch_cells<'xml, 'strings>(
+    xml: &'xml [u8],
+    cells: &BTreeMap<CellRef, CellValue>,
+    shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
+    date1904: bool,
+) -> Result<Cow<'xml, [u8]>> {
+    PreparedWorksheet::parse(xml)?.patch_cells(cells, shared_strings, date1904)
 }
 
 #[cfg(test)]
@@ -174,11 +221,17 @@ fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-fn read_cell(xml: &[u8], cell: CellRef, shared_strings: Option<&[String]>) -> Result<CellContent> {
+fn read_cell(
+    xml: &[u8],
+    cell: CellRef,
+    shared_strings: Option<&SharedStrings>,
+) -> Result<CellContent> {
     read_cells(xml, &[cell], || Ok(shared_strings), false)
         .map(|mut cells| cells.remove(0))
         .map_err(|error| match error {
-            ReadError::Worksheet(error) | ReadError::SharedStrings(error) => error,
+            ReadError::Worksheet(error)
+            | ReadError::SharedStrings(error)
+            | ReadError::UndecodableString { error, .. } => error,
         })
 }
 

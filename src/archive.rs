@@ -9,10 +9,14 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
     io::{Read, Write},
+    num::NonZero,
     ops::Range,
 };
 
-use flate2::{Compression, Decompress, FlushDecompress, Status, write::DeflateEncoder};
+use flate2::{
+    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
+    write::DeflateEncoder,
+};
 
 use crate::{Error, Result};
 
@@ -31,6 +35,10 @@ const END_LEN: usize = 22;
 const ZIP64_LOCATOR_LEN: usize = 20;
 const DESCRIPTOR_LEN: usize = 12;
 const SIGNED_DESCRIPTOR_LEN: usize = 16;
+/// The bytes before EOF that the end-record rules examine: an end record with
+/// the longest comment, and a ZIP64 locator before it. This is also the tail
+/// window in which libzip before 1.11 looks for end records.
+const END_TAIL_LEN: usize = ZIP64_LOCATOR_LEN + END_LEN + u16::MAX as usize;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DESCRIPTOR: u16 = 0x0008;
@@ -39,7 +47,7 @@ const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
 const FLAG_UTF8: u16 = 0x0800;
 const FLAG_MASKED_HEADERS: u16 = 0x2000;
 // Patched data is not encryption: active patched members stay opaque, while
-// compaction refuses to discard obsolete ones (`FLAG_PATCHED` at those sites).
+// compaction refuses to discard obsolete ones (both through `Codec::of`).
 const ENCRYPTION_FLAGS: u16 = FLAG_ENCRYPTED | FLAG_STRONG_ENCRYPTION | FLAG_MASKED_HEADERS;
 
 const STORED: u16 = 0;
@@ -52,10 +60,15 @@ const MAX_READ: usize = 64 * 1024 * 1024;
 /// The length of the largest possible ZIP32 archive: the central directory's
 /// offset and size are each below `u32::MAX`, and only a 22-byte end record
 /// and a comment of at most 64 KiB follow it.
-pub(crate) const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
+const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
 // Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
 // produces archives about as small as the default level 6, several times faster.
 const DEFLATE_LEVEL: u32 = 4;
+// Replacements longer than two segments are deflated in segments of this
+// length, several at once. Each segment starts without the previous one's
+// history, which costs about 0.1% in size.
+const DEFLATE_SEGMENT: usize = 1 << 20;
+const MAX_DEFLATE_THREADS: usize = 8;
 
 pub(crate) trait PartChanges {
     // Names are unique; iteration order is also the validation error order.
@@ -163,10 +176,32 @@ struct StoredDescriptor {
     sizes: Sizes,
 }
 
+/// How member data is decoded and replacements are encoded. Patched data and
+/// other compression methods stay opaque: preserved, but never read or replaced.
+#[derive(Clone, Copy)]
+enum Codec {
+    Stored,
+    Deflated,
+}
+
+impl Codec {
+    fn of(flags: u16, method: u16) -> Option<Self> {
+        if flags & FLAG_PATCHED != 0 {
+            return None;
+        }
+        match method {
+            STORED => Some(Self::Stored),
+            DEFLATED => Some(Self::Deflated),
+            _ => None,
+        }
+    }
+}
+
 struct ChangePlan<'a> {
-    // Keep only changed entry indexes and borrowed payloads, ordered by their
-    // physical local-record positions for a single merge during emission.
-    data: Vec<(usize, &'a [u8])>,
+    // Keep only changed entry indexes, their codecs and borrowed payloads,
+    // ordered by their physical local-record positions for a single merge
+    // during emission.
+    data: Vec<(usize, Codec, &'a [u8])>,
 }
 
 #[derive(Clone, Copy)]
@@ -187,6 +222,15 @@ fn unsupported(message: impl Into<String>) -> Error {
     Error::Unsupported(message.into())
 }
 
+/// Compaction cannot prove a record in a gap obsolete. Readers never see the
+/// gap, so this refuses the operation rather than reporting an invalid archive.
+fn not_obsolete(error: Error) -> Error {
+    match error {
+        Error::InvalidWorkbook(message) => unsupported(format!("cannot compact: {message}")),
+        error => error,
+    }
+}
+
 fn zip64() -> Error {
     unsupported("ZIP64 workbooks are not supported")
 }
@@ -198,21 +242,35 @@ fn over_read_limit(member: impl Display) -> Error {
     ))
 }
 
-pub(crate) fn archive_too_large() -> Error {
+fn archive_too_large() -> Error {
     unsupported("input exceeds the largest possible ZIP32 archive")
 }
 
-/// Append everything `reader` yields to `bytes`, refusing input longer than
-/// any ZIP32 archive once that much has been read.
-pub(crate) fn read_archive(reader: impl Read, bytes: Vec<u8>) -> Result<Vec<u8>> {
-    read_at_most(reader, bytes, MAX_ARCHIVE_LEN)
+/// Read everything `reader` yields, refusing input longer than any ZIP32
+/// archive. A regular file's length, `file_len`, is refused before reading
+/// when too large and otherwise reserved exactly; other input is refused once
+/// that much has been read.
+pub(crate) fn read_archive(reader: impl Read, file_len: Option<u64>) -> Result<Vec<u8>> {
+    read_at_most(reader, file_len, MAX_ARCHIVE_LEN)
 }
 
-fn read_at_most(reader: impl Read, mut bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
-    let start = bytes.len();
+fn read_at_most(reader: impl Read, file_len: Option<u64>, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Some(len) = file_len {
+        if len > limit {
+            return Err(archive_too_large());
+        }
+        // Fall back to an unsized read on targets where the length does not
+        // fit in memory; reading then reports the allocation failure.
+        if let Ok(len) = usize::try_from(len) {
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        }
+    }
     // One byte past the limit shows that the input is too long.
     reader.take(limit + 1).read_to_end(&mut bytes)?;
-    if (bytes.len() - start) as u64 > limit {
+    if bytes.len() as u64 > limit {
         return Err(archive_too_large());
     }
     Ok(bytes)
@@ -319,39 +377,163 @@ fn shadows_end_record(ending: &[u8]) -> bool {
 }
 
 /// Locate the end-of-central-directory record. It must be the only record
-/// that ends at EOF with its comment.
+/// that ends at EOF with its comment, and the only one readers could select.
 fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < END_LEN {
         return Err(invalid("file is not a ZIP workbook"));
     }
-    // A valid EOCD ends at EOF, including its comment. Multiple matching
-    // EOCDs would make the member index ambiguous and are rejected.
-    let search_start = bytes.len().saturating_sub(END_LEN + u16::MAX as usize);
-    let mut endings = Vec::new();
-    for offset in (search_start..=bytes.len() - END_LEN).rev() {
-        if u32_at(bytes, offset)? == END {
-            let comment = u16_at(bytes, offset + 20)? as usize;
-            if add(add(offset, END_LEN)?, comment)? == bytes.len() {
-                endings.push(offset);
-            }
+    let (end, decoy_directories) = locate_end_record(bytes, 0)?;
+    for directory in decoy_directories {
+        if u32_at(bytes, directory)? == CENTRAL {
+            return Err(invalid("ambiguous ZIP end-of-directory records"));
         }
     }
-    let end = match endings.as_slice() {
-        [end] => *end,
-        [] => {
+    Ok(end)
+}
+
+/// Offsets in `tail`, the end of an archive, of end-record signatures whose
+/// record and comment end exactly at EOF, last first. A comment of at most
+/// 64 KiB puts every such record in the last `END_LEN + u16::MAX` bytes.
+fn end_record_candidates(tail: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let first = tail.len().saturating_sub(END_LEN + u16::MAX as usize);
+    (first..=tail.len().saturating_sub(END_LEN))
+        .rev()
+        .filter(|&offset| {
+            u32_at(tail, offset).ok() == Some(END)
+                && u16_at(tail, offset + 20)
+                    .is_ok_and(|comment| offset + END_LEN + comment as usize == tail.len())
+        })
+}
+
+/// Apply the end-record rules to `tail`, the last bytes of an archive that
+/// has `base` bytes before them. `tail` must hold the whole archive or at
+/// least its last `END_TAIL_LEN` bytes, since every rule is relative to EOF
+/// except where a decoy record's directory starts.
+///
+/// Returns the offset in `tail` of the end record, which must be the only
+/// record that ends at EOF with its comment and the only one readers scanning
+/// back from EOF could select. Also returns the directory offsets of earlier
+/// records that libzip could select instead: the archive is ambiguous if a
+/// central-directory header starts at any of them.
+fn locate_end_record(tail: &[u8], base: usize) -> Result<(usize, Vec<usize>)> {
+    // Multiple records ending at EOF would make the member index ambiguous.
+    let mut candidates = end_record_candidates(tail);
+    let end = match (candidates.next(), candidates.next()) {
+        (Some(end), None) => end,
+        (None, _) => {
             return Err(invalid(
                 "ZIP end-of-directory record is missing or truncated",
             ));
         }
-        _ => return Err(invalid("ambiguous ZIP end-of-directory records")),
+        (Some(_), Some(_)) => return Err(invalid("ambiguous ZIP end-of-directory records")),
     };
     // Fixed fields may legitimately hold the signature's bytes, for example a
     // central directory at offset 0x06054b50. That matters only when the
     // comment leaves room for a complete record after the signature.
-    if hides_end_record(&bytes[end..]) {
+    if hides_end_record(&tail[end..]) {
         return Err(invalid("ambiguous ZIP end-of-directory records"));
     }
-    Ok(end)
+    // libzip before 1.11 instead scans its tail window forward and keeps the
+    // first record whose directory it can read, unless a later one spans more
+    // local data. Report every earlier record it could select.
+    let window = tail.len().saturating_sub(END_TAIL_LEN);
+    let mut decoy_directories = Vec::new();
+    for offset in window..end {
+        if let Some(directory) = decoy_directory(tail, base, offset)? {
+            decoy_directories.push(directory);
+        }
+    }
+    Ok((end, decoy_directories))
+}
+
+/// The directory offset of a record at `offset` in `tail`, the end of an
+/// archive with `base` bytes before it, if a reader scanning forward could
+/// select it as the end record once its directory starts with a
+/// central-directory header: a complete single-disk record for a nonempty
+/// directory, with a comment that ends by EOF, whose directory ends before the
+/// record. Such a reader never prefers an empty directory.
+///
+/// A Stored embedded ZIP's own end record normally fails the header test,
+/// because its directory offset is relative to the embedded archive.
+fn decoy_directory(tail: &[u8], base: usize, offset: usize) -> Result<Option<usize>> {
+    let record_end = add(offset, END_LEN)?;
+    if record_end > tail.len() || u32_at(tail, offset)? != END {
+        return Ok(None);
+    }
+    let entries = u16_at(tail, offset + 10)?;
+    let comment_end = add(record_end, u16_at(tail, offset + 20)? as usize)?;
+    let central_start = u32_at(tail, offset + 16)? as usize;
+    // These bytes need not be a record. On 32-bit targets their directory can
+    // end past the address space, and then it does not end before the record.
+    let central_end = central_start.checked_add(u32_at(tail, offset + 12)? as usize);
+    let record_start = add(base, offset)?;
+    let selectable = u16_at(tail, offset + 4)? == 0
+        && u16_at(tail, offset + 6)? == 0
+        && u16_at(tail, offset + 8)? == entries
+        && entries != 0
+        && comment_end <= tail.len()
+        && central_end.is_some_and(|central_end| central_end <= record_start);
+    Ok(selectable.then_some(central_start))
+}
+
+/// Refuse output that readers could interpret differently from its own end
+/// record, the last one in `tail`. `tail` holds the output's last bytes after
+/// `base` earlier ones, as [`locate_end_record`] requires: `local_len` bytes
+/// of local records, then the central directory and end record. `reemit`
+/// writes the local records again, for reading back earlier bytes.
+fn check_end_records(
+    tail: &[u8],
+    base: usize,
+    local_len: usize,
+    reemit: impl FnOnce(&mut Probe) -> Result<()>,
+) -> Result<()> {
+    debug_assert!(base == 0 || tail.len() >= END_TAIL_LEN);
+    let ambiguous = || {
+        unsupported(
+            "saving would make the ZIP end-of-directory record ambiguous: the saved \
+             archive would contain another end-of-directory record that readers could select",
+        )
+    };
+    // Rewritten local offsets, sizes and checksums can form a record, and so
+    // can bytes that a save moves to a new distance from EOF. Records whose
+    // comment reaches EOF would make this crate refuse its own output.
+    let (end, decoy_directories) = locate_end_record(tail, base).map_err(|_| ambiguous())?;
+    if end >= ZIP64_LOCATOR_LEN
+        && tail[end - ZIP64_LOCATOR_LEN..].starts_with(&ZIP64_LOCATOR.to_le_bytes())
+    {
+        return Err(unsupported(
+            "saving would make the archive look like ZIP64: the saved archive would have a \
+             ZIP64 end-of-directory locator signature before its end record",
+        ));
+    }
+    let central = CENTRAL.to_le_bytes();
+    let mut earlier = Vec::new();
+    for directory in decoy_directories {
+        match directory
+            .checked_sub(base)
+            .and_then(|offset| tail.get(offset..offset + central.len()))
+        {
+            Some(bytes) if bytes == central => return Err(ambiguous()),
+            Some(_) => {}
+            None => earlier.push(directory),
+        }
+    }
+    // Output before `tail` is no longer held. Records that point there are
+    // rare: in ordinary workbooks only a Stored embedded ZIP's own end record,
+    // whose directory offset is relative to that ZIP. Emission is
+    // deterministic, so write the output again and read those bytes back.
+    if !earlier.is_empty() {
+        earlier.sort_unstable();
+        earlier.dedup();
+        let mut probe = Probe::new(earlier);
+        reemit(&mut probe)?;
+        debug_assert_eq!(probe.position, base + local_len);
+        probe.write_all(&tail[local_len..])?;
+        if probe.words.iter().any(|&(_, word)| word == central) {
+            return Err(ambiguous());
+        }
+    }
+    Ok(())
 }
 
 /// Return the central directory's start and entry count from the EOCD.
@@ -487,7 +669,104 @@ fn emit<W: Write>(writer: &mut W, position: &mut usize, bytes: &[u8]) -> Result<
     Ok(())
 }
 
+/// Passes output on to a writer, keeping the last `len` bytes written.
+struct KeepTail<'a, W> {
+    writer: &'a mut W,
+    len: usize,
+    tail: Vec<u8>,
+}
+
+impl<'a, W: Write> KeepTail<'a, W> {
+    fn new(writer: &'a mut W, len: usize) -> Self {
+        Self {
+            writer,
+            len,
+            tail: Vec::new(),
+        }
+    }
+
+    fn into_tail(mut self) -> Vec<u8> {
+        let excess = self.tail.len().saturating_sub(self.len);
+        self.tail.drain(..excess);
+        self.tail
+    }
+}
+
+impl<W: Write> Write for KeepTail<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        let kept = &bytes[written.saturating_sub(self.len)..written];
+        // Trim only once the buffer doubles, so each byte moves at most once.
+        if self.tail.len() + kept.len() > 2 * self.len {
+            self.tail.drain(..self.tail.len() + kept.len() - self.len);
+        }
+        self.tail.extend_from_slice(kept);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Discards output, recording the four bytes at each of some offsets.
+struct Probe {
+    position: usize,
+    /// Each offset, in ascending order, and the bytes written there.
+    words: Vec<(usize, [u8; 4])>,
+}
+
+impl Probe {
+    fn new(offsets: Vec<usize>) -> Self {
+        debug_assert!(offsets.is_sorted());
+        Self {
+            position: 0,
+            words: offsets.into_iter().map(|offset| (offset, [0; 4])).collect(),
+        }
+    }
+}
+
+impl Write for Probe {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let start = self.position;
+        self.position += bytes.len();
+        let first = self
+            .words
+            .partition_point(|&(offset, _)| offset + 4 <= start);
+        for (offset, word) in &mut self.words[first..] {
+            if *offset >= self.position {
+                break;
+            }
+            for (index, byte) in word.iter_mut().enumerate() {
+                if let Some(&value) = (*offset + index)
+                    .checked_sub(start)
+                    .and_then(|at| bytes.get(at))
+                {
+                    *byte = value;
+                }
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Entry {
+    fn codec(&self) -> Result<Codec> {
+        Codec::of(self.flags, self.method).ok_or_else(|| {
+            let name = &self.name;
+            if self.flags & FLAG_PATCHED != 0 {
+                unsupported(format!("patched ZIP member data in {name}"))
+            } else {
+                let method = self.method;
+                unsupported(format!("ZIP compression method {method} in {name}"))
+            }
+        })
+    }
+
     /// Validate a member's local record against its central header.
     fn new(bytes: &[u8], central: &CentralHeader<'_>, central_start: usize) -> Result<Self> {
         let name = central.name;
@@ -553,11 +832,22 @@ impl Archive {
         for _ in 0..count {
             let central = central_header(&original, position, end)?;
             let name = central.name;
-            if name.is_empty()
-                || name.contains('\0')
-                || index.insert(name.to_owned(), entries.len()).is_some()
-            {
-                return Err(invalid("empty, invalid, or duplicate ZIP member name"));
+            if name.is_empty() {
+                return Err(invalid("empty ZIP member name"));
+            }
+            // Python's zipfile truncates names at NUL.
+            if name.contains('\0') {
+                return Err(invalid(format!("ZIP member name contains NUL: {name}")));
+            }
+            // Some readers treat '\' as '/', so such a name can alias another
+            // member for them. OPC part names cannot contain it.
+            if name.contains('\\') {
+                return Err(invalid(format!(
+                    "ZIP member name contains a backslash: {name}"
+                )));
+            }
+            if index.insert(name.to_owned(), entries.len()).is_some() {
+                return Err(invalid(format!("duplicate ZIP member: {name}")));
             }
             check_extra(central.extra, name)?;
             // OPC part names compare without ASCII case, including the hex
@@ -622,17 +912,15 @@ impl Archive {
             .get(name)
             .map(|&index| &self.entries[index])
             .ok_or_else(|| invalid(format!("ZIP member is missing: {name}")))?;
-        if entry.flags & FLAG_PATCHED != 0 {
-            return Err(unsupported(format!("patched ZIP member data in {name}")));
-        }
+        let codec = entry.codec()?;
         let sizes = entry.sizes;
         if sizes.size as usize > MAX_READ {
             return Err(over_read_limit(format_args!("ZIP member {name}")));
         }
         let compressed = &self.original[entry.data.clone()];
-        let output = match entry.method {
-            STORED => compressed.to_vec(),
-            DEFLATED => {
+        let output = match codec {
+            Codec::Stored => compressed.to_vec(),
+            Codec::Deflated => {
                 let mut decoder = Decompress::new(false);
                 // The declared length also bounds malformed streams that expand
                 // beyond their header, rather than trusting that header.
@@ -649,11 +937,6 @@ impl Archive {
                     )));
                 }
                 output
-            }
-            method => {
-                return Err(unsupported(format!(
-                    "ZIP compression method {method} in {name}"
-                )));
             }
         };
         if output.len() != sizes.size as usize || crc32(&output) != sizes.crc {
@@ -672,9 +955,9 @@ impl Archive {
     ///
     /// Only one changed member's compressed payload is held in memory at a
     /// time. As with `Write::write_all`, a writer error may leave partial output,
-    /// and so may the rare refusal of an ambiguous end record, which can only be
-    /// detected once the directory offset is known. The writer is flushed before
-    /// success is reported.
+    /// and so may the rare refusal of output whose last bytes would form another
+    /// end record or a ZIP64 locator, which can only be detected once every local
+    /// record is written. The writer is flushed before success is reported.
     pub(crate) fn write_to<W: Write>(
         &self,
         changes: &impl PartChanges,
@@ -705,6 +988,39 @@ impl Archive {
                 false
             }
         };
+        let mut output = KeepTail::new(writer, self.local_tail_len());
+        let (mut position, offsets, replacements) =
+            self.emit_local_records(plan, &mut output, preserve_gaps)?;
+        let local_tail = output.into_tail();
+        self.emit_directory(
+            writer,
+            &mut position,
+            &local_tail,
+            &offsets,
+            &replacements,
+            |probe| {
+                self.emit_local_records(plan, probe, preserve_gaps)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// How many bytes of local records the end-record check needs: the
+    /// directory and end record, which keep their input length, may not fill
+    /// the `END_TAIL_LEN` bytes before EOF.
+    fn local_tail_len(&self) -> usize {
+        END_TAIL_LEN.saturating_sub(self.original.len() - self.central_start)
+    }
+
+    /// Write every local record, and the gaps between them when
+    /// `preserve_gaps`. Returns the directory offset, each member's new
+    /// local-record offset, and the new sizes of replaced members.
+    fn emit_local_records<W: Write>(
+        &self,
+        plan: &ChangePlan<'_>,
+        writer: &mut W,
+        preserve_gaps: bool,
+    ) -> Result<(usize, Vec<u32>, Vec<Option<Sizes>>)> {
         let mut position = 0;
         let mut original_position = 0;
         let mut replacements = vec![None; self.entries.len()];
@@ -724,9 +1040,9 @@ impl Archive {
                 )?;
             }
             offsets[index] = zip32(position, "ZIP local-record offset")?;
-            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
                 replacements[index] =
-                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
+                    Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
             } else {
                 emit(
                     writer,
@@ -743,7 +1059,7 @@ impl Archive {
                 &self.original[original_position..self.central_start],
             )?;
         }
-        self.emit_directory(writer, &mut position, &offsets, &replacements)
+        Ok((position, offsets, replacements))
     }
 
     /// Reproduce pre-1.0 append saves to exercise migration and compaction.
@@ -756,21 +1072,36 @@ impl Archive {
         let mut plan = self.validate_changes(changes)?;
         // Legacy appends emit replacements in central-directory order.
         plan.data.sort_unstable_by_key(|change| change.0);
+        // These saves only build test inputs, so the end-record check reads
+        // all of their local records from memory.
+        let mut local = Vec::new();
         let mut position = 0;
-        emit(writer, &mut position, &self.original[..self.central_start])?;
+        emit(
+            &mut local,
+            &mut position,
+            &self.original[..self.central_start],
+        )?;
         let mut replacements = vec![None; self.entries.len()];
         let mut offsets = Vec::with_capacity(self.entries.len());
         let mut pending = plan.data.iter().peekable();
         for (index, entry) in self.entries.iter().enumerate() {
-            if let Some(&(_, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
                 offsets.push(zip32(position, "ZIP local-record offset")?);
                 replacements[index] =
-                    Some(self.emit_replacement(entry, data, writer, &mut position)?);
+                    Some(self.emit_replacement(entry, codec, data, &mut local, &mut position)?);
             } else {
                 offsets.push(entry.local_record.start as u32);
             }
         }
-        self.emit_directory(writer, &mut position, &offsets, &replacements)
+        writer.write_all(&local)?;
+        self.emit_directory(
+            writer,
+            &mut position,
+            &local,
+            &offsets,
+            &replacements,
+            |probe| Ok(probe.write_all(&local)?),
+        )
     }
 
     /// Remove obsolete local records from earlier append saves. Unknown gaps
@@ -802,39 +1133,29 @@ impl Archive {
             if data.len() > MAX_READ {
                 return Err(over_read_limit(format_args!("ZIP member {name}")));
             }
-            let entry = &self.entries[index];
-            if entry.flags & FLAG_PATCHED != 0 {
-                return Err(unsupported(format!("patched ZIP member data in {name}")));
-            }
-            let method = entry.method;
-            if !matches!(method, STORED | DEFLATED) {
-                return Err(unsupported(format!(
-                    "ZIP compression method {method} in {name}"
-                )));
-            }
-            plan.data.push((index, data));
+            let codec = self.entries[index].codec()?;
+            plan.data.push((index, codec, data));
         }
         plan.data
-            .sort_unstable_by_key(|&(index, _)| self.entries[index].local_record.start);
+            .sort_unstable_by_key(|&(index, ..)| self.entries[index].local_record.start);
         Ok(plan)
     }
 
     fn emit_replacement<W: Write>(
         &self,
         entry: &Entry,
+        codec: Codec,
         data: &[u8],
         writer: &mut W,
         position: &mut usize,
     ) -> Result<Sizes> {
         let size = zip32(data.len(), "ZIP member size")?;
-        let compressed = if entry.method == STORED {
-            Cow::Borrowed(data)
-        } else {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
-            encoder.write_all(data)?;
-            Cow::Owned(encoder.finish()?)
+        let compressed = match codec {
+            Codec::Stored => vec![Cow::Borrowed(data)],
+            Codec::Deflated => deflate(data)?.into_iter().map(Cow::Owned).collect(),
         };
-        let compressed_size = zip32(compressed.len(), "compressed ZIP member size")?;
+        let compressed_len = compressed.iter().map(|piece| piece.len()).sum();
+        let compressed_size = zip32(compressed_len, "compressed ZIP member size")?;
         let sizes = Sizes {
             crc: crc32(data),
             compressed_size,
@@ -846,21 +1167,30 @@ impl Archive {
         set_u16(&mut header, 6, entry.flags & !FLAG_DESCRIPTOR);
         sizes.write(&mut header, 14);
         zip32(
-            add(add(*position, original_header.len())?, compressed.len())?,
+            add(add(*position, original_header.len())?, compressed_len)?,
             "ZIP local-record area",
         )?;
         emit(writer, position, &header)?;
         emit(writer, position, &original_header[LOCAL_HEADER_LEN..])?;
-        emit(writer, position, &compressed)?;
+        for piece in &compressed {
+            emit(writer, position, piece)?;
+        }
         Ok(sizes)
     }
 
+    /// Write the central directory and end record after local records ending
+    /// at `position`, unless readers could misread the output's last bytes.
+    /// `local_tail` holds the last local-record bytes written: all of them, or
+    /// at least those within `END_TAIL_LEN` bytes of EOF. `reemit` writes every
+    /// local record again, for reading back earlier output.
     fn emit_directory<W: Write>(
         &self,
         writer: &mut W,
         position: &mut usize,
+        local_tail: &[u8],
         offsets: &[u32],
         replacements: &[Option<Sizes>],
+        reemit: impl FnOnce(&mut Probe) -> Result<()>,
     ) -> Result<()> {
         let central_start = zip32(*position, "ZIP central-directory offset")?;
         // Central records are copied whole, so the directory keeps its size,
@@ -884,6 +1214,11 @@ impl Archive {
                  back through the archive comment would select",
             ));
         }
+        // Build the directory after the last local bytes, which the check of
+        // the output's end needs, and write it only once that check passes.
+        let mut tail =
+            Vec::with_capacity(local_tail.len() + self.original.len() - self.central_start);
+        tail.extend_from_slice(local_tail);
         for (index, entry) in self.entries.iter().enumerate() {
             let record = &self.original[entry.central.clone()];
             let mut header = [0; CENTRAL_HEADER_LEN];
@@ -895,11 +1230,14 @@ impl Archive {
             // The local offset is the only field compaction changes for an
             // untouched member; comments, extras and all other metadata survive.
             set_u32(&mut header, 42, offsets[index]);
-            emit(writer, position, &header)?;
-            emit(writer, position, &record[CENTRAL_HEADER_LEN..])?;
+            tail.extend_from_slice(&header);
+            tail.extend_from_slice(&record[CENTRAL_HEADER_LEN..]);
         }
-        debug_assert_eq!(*position - central_start as usize, central_size as usize);
-        emit(writer, position, &ending)
+        debug_assert_eq!(tail.len() - local_tail.len(), central_size as usize);
+        tail.extend_from_slice(&ending);
+        let base = *position - local_tail.len();
+        check_end_records(&tail, base, local_tail.len(), reemit)?;
+        emit(writer, position, &tail[local_tail.len()..])
     }
 
     /// Require every byte before the central directory to belong to an active
@@ -910,7 +1248,8 @@ impl Archive {
         for &index in &self.local_order {
             let entry = &self.entries[index];
             while position < entry.local_record.start {
-                position = self.orphan_end(position, &mut stored_descriptors)?;
+                position =
+                    self.orphan_end(position, entry.local_record.start, &mut stored_descriptors)?;
             }
             if position != entry.local_record.start {
                 return Err(unsupported(
@@ -920,7 +1259,7 @@ impl Archive {
             position = entry.local_record.end;
         }
         while position < self.central_start {
-            position = self.orphan_end(position, &mut stored_descriptors)?;
+            position = self.orphan_end(position, self.central_start, &mut stored_descriptors)?;
         }
         if position != self.central_start {
             return Err(unsupported(
@@ -930,63 +1269,100 @@ impl Archive {
         Ok(())
     }
 
+    /// Parse the local header at `start` as an obsolete record that compaction
+    /// understands, ending by `gap_end`, the end of the gap holding it.
+    /// `Ok(None)` means it is not one; name encodings and extra fields that
+    /// `Archive::new` would refuse in an active member are errors.
+    fn obsolete_header(
+        &self,
+        start: usize,
+        gap_end: usize,
+    ) -> Result<Option<(LocalHeader<'_>, Codec, &str)>> {
+        let Some(header) = local_header(&self.original, start, gap_end)? else {
+            return Ok(None);
+        };
+        // Reject unsupported obsolete records before scanning their names.
+        // Fake headers can otherwise use nonzero method/flag bytes to make
+        // many overlapping long names pass the NUL check below.
+        if header.flags & ENCRYPTION_FLAGS != 0 {
+            return Ok(None);
+        }
+        let Some(codec) = Codec::of(header.flags, header.method) else {
+            return Ok(None);
+        };
+        if header.sizes.compressed_size == u32::MAX || header.sizes.size == u32::MAX {
+            return Ok(None);
+        }
+        // Archive::new refuses member names containing NUL. Check before
+        // decoding and hashing: false headers in stored data can overlap
+        // thousands of long candidate names, with an early NUL in each
+        // following header.
+        if header.raw_name.contains(&0) {
+            return Ok(None);
+        }
+        let name = member_name(header.raw_name, header.flags)?;
+        let Some(&index) = self.index.get(name) else {
+            return Ok(None);
+        };
+        if self.entries[index].method != header.method {
+            return Ok(None);
+        }
+        check_extra(header.extra, name)?;
+        Ok(Some((header, codec, name)))
+    }
+
     fn orphan_end(
         &self,
         start: usize,
+        gap_end: usize,
         stored_descriptors: &mut Option<StoredDescriptors>,
     ) -> Result<usize> {
         let opaque = || {
             unsupported("cannot compact opaque ZIP prefix, gaps, or unrecognized obsolete records")
         };
         let bytes = &self.original;
-        let Some(LocalHeader {
-            flags,
-            method,
-            sizes: header,
-            raw_name,
-            extra,
-            data_start,
-        }) = local_header(bytes, start, self.central_start)?
+        let Some((
+            LocalHeader {
+                flags,
+                sizes: header,
+                data_start,
+                ..
+            },
+            codec,
+            name,
+        )) = self.obsolete_header(start, gap_end)?
         else {
             return Err(opaque());
         };
-        if flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0 || !matches!(method, STORED | DEFLATED) {
-            return Err(opaque());
-        }
-        if header.compressed_size == u32::MAX || header.size == u32::MAX {
-            return Err(opaque());
-        }
-        let name = member_name(raw_name, flags)?;
-        let Some(&index) = self.index.get(name) else {
-            return Err(opaque());
-        };
-        if self.entries[index].method != method {
-            return Err(opaque());
-        }
-        check_extra(extra, name)?;
+        // An obsolete record ends within its gap, which bounds every search.
         let has_descriptor = flags & FLAG_DESCRIPTOR != 0;
-        let actual = if method == DEFLATED {
-            let end = if has_descriptor && header.compressed_size == 0 {
-                self.central_start
-            } else {
-                add(data_start, header.compressed_size as usize)?
-            };
-            if end > self.central_start {
-                return Err(opaque());
+        let actual = match codec {
+            Codec::Deflated => {
+                let end = if has_descriptor && header.compressed_size == 0 {
+                    gap_end
+                } else {
+                    add(data_start, header.compressed_size as usize)?
+                };
+                if end > gap_end {
+                    return Err(opaque());
+                }
+                inspect_deflate(&bytes[data_start..end], name)?
             }
-            inspect_deflate(&bytes[data_start..end], name)?
-        } else if has_descriptor && header.compressed_size == 0 {
-            let descriptors = stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
-            return self.stored_orphan_end(data_start, header, name, descriptors);
-        } else {
-            let end = add(data_start, header.compressed_size as usize)?;
-            if end > self.central_start || header.compressed_size as usize > MAX_READ {
-                return Err(opaque());
+            Codec::Stored if has_descriptor && header.compressed_size == 0 => {
+                let descriptors =
+                    stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
+                return self.stored_orphan_end(data_start, gap_end, header, name, descriptors);
             }
-            Sizes {
-                crc: crc32(&bytes[data_start..end]),
-                compressed_size: header.compressed_size,
-                size: header.compressed_size,
+            Codec::Stored => {
+                let end = add(data_start, header.compressed_size as usize)?;
+                if end > gap_end || header.compressed_size as usize > MAX_READ {
+                    return Err(opaque());
+                }
+                Sizes {
+                    crc: crc32(&bytes[data_start..end]),
+                    compressed_size: header.compressed_size,
+                    size: header.compressed_size,
+                }
             }
         };
         if !header.matches(actual, has_descriptor) {
@@ -994,7 +1370,7 @@ impl Archive {
         }
         let data_end = add(data_start, actual.compressed_size as usize)?;
         if has_descriptor {
-            descriptor_end(bytes, data_end, self.central_start, actual, name)
+            descriptor_end(bytes, data_end, gap_end, actual, name).map_err(not_obsolete)
         } else {
             Ok(data_end)
         }
@@ -1094,36 +1470,13 @@ impl Archive {
             // and flags that compaction retains without decoding.
             return true;
         }
-        let Ok(Some(header)) = local_header(&self.original, start, gap_end) else {
-            return false;
-        };
-        // Reject unsupported obsolete records before scanning their names.
-        // Fake headers can otherwise use nonzero method/flag bytes to make
-        // many overlapping long names pass the NUL check below.
-        if header.flags & (ENCRYPTION_FLAGS | FLAG_PATCHED) != 0
-            || !matches!(header.method, STORED | DEFLATED)
-        {
-            return false;
-        }
-        // Accepted member names cannot contain NUL. Check before decoding and
-        // hashing: false headers in stored data can overlap thousands of long
-        // candidate names, with an early NUL in each following header.
-        if header.raw_name.contains(&0) {
-            return false;
-        }
-        let Ok(name) = member_name(header.raw_name, header.flags) else {
-            return false;
-        };
-        let Some(&index) = self.index.get(name) else {
-            return false;
-        };
-        let entry = &self.entries[index];
-        header.method == entry.method && check_extra(header.extra, name).is_ok()
+        matches!(self.obsolete_header(start, gap_end), Ok(Some(_)))
     }
 
     fn stored_orphan_end(
         &self,
         data_start: usize,
+        gap_end: usize,
         header: Sizes,
         name: &str,
         descriptors: &StoredDescriptors,
@@ -1143,20 +1496,21 @@ impl Archive {
         if !header.matches(descriptor.sizes, true)
             || crc32(&self.original[data_start..descriptor.data_end]) != descriptor.sizes.crc
         {
-            return Err(invalid(format!(
-                "obsolete ZIP size or checksum mismatch in {name}"
+            return Err(unsupported(format!(
+                "cannot compact obsolete ZIP record with a size or checksum mismatch in {name}"
             )));
         }
         let end = descriptor_end(
             &self.original,
             descriptor.data_end,
-            self.central_start,
+            gap_end,
             descriptor.sizes,
             name,
-        )?;
+        )
+        .map_err(not_obsolete)?;
         if end != descriptor.end {
-            return Err(invalid(format!(
-                "conflicting obsolete ZIP descriptor in {name}"
+            return Err(unsupported(format!(
+                "cannot compact conflicting obsolete ZIP descriptor in {name}"
             )));
         }
         Ok(end)
@@ -1165,6 +1519,116 @@ impl Archive {
 
 fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
+}
+
+fn deflate_segment_len() -> usize {
+    #[cfg(test)]
+    if let Some(len) = tests::SEGMENT_OVERRIDE.get() {
+        return len;
+    }
+    DEFLATE_SEGMENT
+}
+
+/// Deflate `data` as one raw stream, returned in pieces to write in order.
+/// Data longer than two segments is split into segments compressed on up to
+/// `MAX_DEFLATE_THREADS` threads; the bytes do not depend on how many run.
+fn deflate(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let segment = deflate_segment_len();
+    if data.len() <= 2 * segment {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
+        encoder.write_all(data)?;
+        return Ok(vec![encoder.finish()?]);
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(MAX_DEFLATE_THREADS)
+        .min(data.len().div_ceil(segment));
+    deflate_segments(data, segment, threads)
+}
+
+/// Deflate nonempty `data` in segments of `segment` bytes, compressed one by
+/// one in contiguous groups on `threads` threads, the calling thread among
+/// them. A group whose thread cannot be started is compressed by the calling
+/// thread instead.
+fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<Vec<u8>>> {
+    let segments: Vec<_> = data.chunks(segment).collect();
+    let last = segments.len() - 1;
+    let compress = |first: usize, group: &[&[u8]]| -> Result<Vec<Vec<u8>>> {
+        group
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| deflate_segment(segment, first + index == last))
+            .collect()
+    };
+    let per_thread = segments.len().div_ceil(threads);
+    let mut groups = segments
+        .chunks(per_thread)
+        .enumerate()
+        .map(|(index, group)| (index * per_thread, group));
+    let (first, group) = groups.next().expect("data is nonempty");
+    std::thread::scope(|scope| {
+        let others: Vec<_> = groups
+            .map(|(first, group)| {
+                let thread = spawn_scoped(scope, move || compress(first, group));
+                (first, group, thread)
+            })
+            .collect();
+        let mut output = compress(first, group)?;
+        for (first, group, thread) in others {
+            output.extend(match thread {
+                Ok(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?,
+                Err(_) => compress(first, group)?,
+            });
+        }
+        Ok(output)
+    })
+}
+
+/// Start a thread in `scope`, which fails like any thread start, for example
+/// under a limit on the user's processes.
+fn spawn_scoped<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    run: impl FnOnce() -> T + Send + 'scope,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    if tests::SPAWN_FAILS.get() {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    std::thread::Builder::new().spawn_scoped(scope, run)
+}
+
+/// Deflate one segment of a stream. Every segment but the last ends with a
+/// sync flush, which byte-aligns it without ending the stream, so the next
+/// segment's blocks can follow it.
+fn deflate_segment(data: &[u8], last: bool) -> Result<Vec<u8>> {
+    let mut compressor = Compress::new(Compression::new(DEFLATE_LEVEL), false);
+    let flush = if last {
+        FlushCompress::Finish
+    } else {
+        FlushCompress::Sync
+    };
+    let mut output = Vec::with_capacity(data.len() / 2 + 64);
+    loop {
+        let consumed = compressor.total_in() as usize;
+        let status = compressor
+            .compress_vec(&data[consumed..], &mut output, flush)
+            .map_err(std::io::Error::other)?;
+        // A flush is complete once a call consumed all input and left room
+        // in the output; until then the compressor may hold pending bytes.
+        // Stopping early would silently truncate the stream, which saves
+        // never read back.
+        let done = if last {
+            status == Status::StreamEnd
+        } else {
+            compressor.total_in() as usize == data.len() && output.len() < output.capacity()
+        };
+        if done {
+            return Ok(output);
+        }
+        output.reserve(output.capacity());
+    }
 }
 
 fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
@@ -1181,8 +1645,8 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
                 FlushDecompress::None,
             )
             .map_err(|error| {
-                invalid(format!(
-                    "invalid obsolete deflate stream in {name}: {error}"
+                unsupported(format!(
+                    "cannot compact invalid obsolete deflate stream in {name}: {error}"
                 ))
             })?;
         if decoder.total_out() > MAX_READ as u64 {
@@ -1199,8 +1663,8 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
             });
         }
         if decoder.total_in() == previous_in && decoder.total_out() == previous_out {
-            return Err(invalid(format!(
-                "incomplete obsolete deflate stream in {name}"
+            return Err(unsupported(format!(
+                "cannot compact incomplete obsolete deflate stream in {name}"
             )));
         }
     }
@@ -1208,7 +1672,19 @@ fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use crate::common;
+
+    thread_local! {
+        /// Replaces `DEFLATE_SEGMENT` in saves on the current thread, so that
+        /// small replacements are deflated in many segments.
+        pub(super) static SEGMENT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Makes the compression threads of saves on the current thread fail
+        /// to start, as they can under a limit on the user's processes.
+        pub(super) static SPAWN_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
 
     fn append(archive: &Archive, changes: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1464,6 +1940,176 @@ mod tests {
         let end = bytes.len() - 29;
         set_u32(&mut bytes, end + 16, 1);
         assert!(Archive::new(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_archives_other_readers_could_interpret_differently() {
+        // fixture(false) has its local header at 0..38 with the name at 30,
+        // data at 38..45, the central record at 45..99, and the end record
+        // with its comment at 99..128. Member names have their own tests,
+        // such as rejects_empty_nul_and_duplicate_member_names.
+        const DIRECTORY: usize = 45;
+        const END_RECORD: usize = 99;
+        const ZIP64_EXTRA: [u8; 12] = [1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let base = Archive::new(fixture(false)).unwrap();
+        assert_eq!((base.central_start, base.end), (DIRECTORY, END_RECORD));
+        let edited = |surgery: fn(&mut Vec<u8>)| {
+            let mut bytes = fixture(false);
+            surgery(&mut bytes);
+            bytes
+        };
+        let mut fewer_entries = combine(fixture(false), decorate_fixture(b"keep.xml", false));
+        let end = Archive::new(fewer_entries.clone()).unwrap().end;
+        set_u16(&mut fewer_entries, end + 8, 1);
+        set_u16(&mut fewer_entries, end + 10, 1);
+        let multi_disk = || unsupported("multi-disk ZIP workbooks are not supported");
+        let cases = [
+            // Local and central headers must agree.
+            (
+                "local header offset",
+                edited(|b| set_u32(b, DIRECTORY + 42, 1)),
+                invalid("invalid ZIP local header for part.xml"),
+            ),
+            (
+                "local method",
+                edited(|b| set_u16(b, 8, DEFLATED)),
+                invalid("conflicting ZIP headers for part.xml"),
+            ),
+            (
+                "local name",
+                edited(|b| b[30] = b'P'),
+                invalid("conflicting ZIP member name for part.xml"),
+            ),
+            (
+                "local checksum",
+                edited(|b| b[14] ^= 0xff),
+                invalid("conflicting ZIP sizes or checksum for part.xml"),
+            ),
+            (
+                "stored sizes",
+                edited(|b| {
+                    set_u32(b, 22, 6);
+                    set_u32(b, DIRECTORY + 24, 6);
+                }),
+                invalid("invalid stored ZIP member size for part.xml"),
+            ),
+            (
+                "data past the directory",
+                edited(|b| {
+                    for at in [18, 22, DIRECTORY + 20, DIRECTORY + 24] {
+                        set_u32(b, at, 100);
+                    }
+                }),
+                invalid("ZIP member part.xml exceeds local-record bounds"),
+            ),
+            // The directory must fill the space before the end record with
+            // exactly the counted records.
+            (
+                "directory bounds",
+                edited(|b| set_u32(b, END_RECORD + 16, 44)),
+                invalid("ZIP central-directory bounds are inconsistent"),
+            ),
+            (
+                "more entries than records",
+                edited(|b| {
+                    set_u16(b, END_RECORD + 8, 2);
+                    set_u16(b, END_RECORD + 10, 2);
+                }),
+                invalid("truncated or invalid ZIP central-directory entry"),
+            ),
+            (
+                "fewer entries than records",
+                fewer_entries,
+                invalid("ZIP central-directory entry count is inconsistent"),
+            ),
+            // Multi-disk archives.
+            (
+                "end record disk",
+                edited(|b| set_u16(b, END_RECORD + 4, 1)),
+                multi_disk(),
+            ),
+            (
+                "end record directory disk",
+                edited(|b| set_u16(b, END_RECORD + 6, 1)),
+                multi_disk(),
+            ),
+            (
+                "end record disk entries",
+                edited(|b| set_u16(b, END_RECORD + 8, 0)),
+                multi_disk(),
+            ),
+            (
+                "central disk",
+                edited(|b| set_u16(b, DIRECTORY + 34, 1)),
+                multi_disk(),
+            ),
+            // ZIP64 locators, sentinels and extra fields.
+            (
+                "ZIP64 locator",
+                edited(|b| set_u32(b, END_RECORD - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR)),
+                zip64(),
+            ),
+            (
+                "end record entry sentinel",
+                edited(|b| {
+                    set_u16(b, END_RECORD + 8, u16::MAX);
+                    set_u16(b, END_RECORD + 10, u16::MAX);
+                }),
+                zip64(),
+            ),
+            (
+                "end record size sentinel",
+                edited(|b| set_u32(b, END_RECORD + 12, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central disk sentinel",
+                edited(|b| set_u16(b, DIRECTORY + 34, u16::MAX)),
+                zip64(),
+            ),
+            (
+                "central compressed size sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 20, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central size sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 24, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central offset sentinel",
+                edited(|b| set_u32(b, DIRECTORY + 42, u32::MAX)),
+                zip64(),
+            ),
+            (
+                "central ZIP64 extra",
+                edited(|b| {
+                    b.splice(END_RECORD..END_RECORD, ZIP64_EXTRA);
+                    set_u16(b, DIRECTORY + 30, 12);
+                    set_u32(b, END_RECORD + 12 + 12, 54 + 12);
+                }),
+                zip64(),
+            ),
+            (
+                "local ZIP64 extra",
+                edited(|b| {
+                    b.splice(38..38, ZIP64_EXTRA);
+                    set_u16(b, 28, 12);
+                    set_u32(b, END_RECORD + 12 + 16, (DIRECTORY + 12) as u32);
+                }),
+                zip64(),
+            ),
+        ];
+        for (case, bytes, expected) in cases {
+            match (Archive::new(bytes), &expected) {
+                (Err(Error::InvalidWorkbook(actual)), Error::InvalidWorkbook(message))
+                | (Err(Error::Unsupported(actual)), Error::Unsupported(message)) => {
+                    assert_eq!(actual, *message, "{case}");
+                }
+                (result, _) => panic!("{case}: {:?} instead of {expected:?}", result.err()),
+            }
+        }
     }
 
     fn deflate_fixture(compressed: &[u8]) -> Vec<u8> {
@@ -1769,10 +2415,19 @@ mod tests {
     #[test]
     fn rejects_bad_changes_before_streaming_any_bytes() {
         let archive = Archive::new(decorate_fixture(b"part.xml", true)).unwrap();
+        let opaque = |result: Result<()>| {
+            matches!(
+                result,
+                Err(Error::Unsupported(message))
+                    if message == "ZIP compression method 99 in part.xml"
+            )
+        };
+        assert!(opaque(archive.read("part.xml").map(drop)));
         for name in ["part.xml", "missing.xml"] {
             let changes = BTreeMap::from([(name.into(), b"changed".to_vec())]);
             let mut output = Vec::new();
-            assert!(archive.write_to(&changes, &mut output).is_err());
+            let result = archive.write_to(&changes, &mut output);
+            assert_eq!(opaque(result), name == "part.xml");
             assert!(output.is_empty());
             assert!(archive.compact_to(&changes, &mut output).is_err());
             assert!(output.is_empty());
@@ -1946,6 +2601,101 @@ mod tests {
         );
     }
 
+    /// Bytes from a fixed pseudo-random sequence, which deflate cannot shrink.
+    fn noise(length: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn cells(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|row| {
+                format!("<c r=\"A{row}\"><v>{}</v></c>", row * 7919 % 10007).into_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deflate_segments_form_one_stream_whatever_the_thread_count() {
+        const SEGMENT: usize = 4096;
+        for data in [noise(3 * SEGMENT + 1), cells(1000)] {
+            for length in [SEGMENT, 2 * SEGMENT + 1, 3 * SEGMENT, 3 * SEGMENT + 1] {
+                let data = &data[..length];
+                let segments = deflate_segments(data, SEGMENT, 1).unwrap();
+                assert_eq!(segments.len(), length.div_ceil(SEGMENT));
+                for threads in [2, 3, MAX_DEFLATE_THREADS] {
+                    assert_eq!(deflate_segments(data, SEGMENT, threads).unwrap(), segments);
+                }
+                // Inflating stops at the end of the last segment and not
+                // before: only that segment ends the stream.
+                let compressed = segments.concat();
+                let mut decoder = Decompress::new(false);
+                let mut output = Vec::with_capacity(length + 1);
+                let status = decoder
+                    .decompress_vec(&compressed, &mut output, FlushDecompress::Finish)
+                    .unwrap();
+                assert_eq!(status, Status::StreamEnd);
+                assert_eq!(decoder.total_in() as usize, compressed.len());
+                assert_eq!(output, data);
+            }
+        }
+    }
+
+    #[test]
+    fn segments_whose_threads_cannot_start_are_deflated_by_the_calling_thread() {
+        const SEGMENT: usize = 4096;
+        let data = cells(4000);
+        let expected = deflate_segments(&data, SEGMENT, 1).unwrap();
+        assert!(expected.len() > MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(true);
+        let inline = deflate_segments(&data, SEGMENT, MAX_DEFLATE_THREADS);
+        SPAWN_FAILS.set(false);
+        assert_eq!(inline.unwrap(), expected);
+    }
+
+    #[test]
+    fn large_replacements_are_deflated_in_segments_that_read_back_and_compact() {
+        const SEGMENT: usize = 4096;
+        SEGMENT_OVERRIDE.set(Some(SEGMENT));
+        let large = cells(4000);
+        let segments = deflate_segments(&large, SEGMENT, 1).unwrap();
+        assert!(segments.len() > MAX_DEFLATE_THREADS);
+        let archive = Archive::new(deflate_descriptor_fixture(true)).unwrap();
+        let written = archive
+            .write(&BTreeMap::from([("part.xml".into(), large.clone())]))
+            .unwrap();
+        let reopened = Archive::new(written.clone()).unwrap();
+        assert_eq!(reopened.read("part.xml").unwrap(), large);
+        // Threads compressed the segments, with the same bytes as one.
+        let entry = &reopened.entries[0];
+        assert_eq!(reopened.original[entry.data.clone()], segments.concat());
+        // An independent reader agrees, and inflating everything after the
+        // payload start stops exactly at its recorded size.
+        assert_eq!(common::payload(&written, "part.xml"), large);
+        let sizes = inspect_deflate(&reopened.original[entry.data.start..], "part.xml").unwrap();
+        assert!(sizes == entry.sizes);
+        // Compaction recognizes the multi-segment record once obsolete.
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        let appended = Archive::new(append(&reopened, &changes)).unwrap();
+        let mut compacted = Vec::new();
+        appended
+            .compact_to(&BTreeMap::new(), &mut compacted)
+            .unwrap();
+        assert_eq!(compacted, reopened.write(&changes).unwrap());
+        // Replacements of at most two segments stay one stream.
+        let small = &large[..2 * SEGMENT];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(DEFLATE_LEVEL));
+        encoder.write_all(small).unwrap();
+        assert_eq!(deflate(small).unwrap(), [encoder.finish().unwrap()]);
+    }
+
     #[test]
     fn compacts_many_stored_streaming_orphans_in_one_gap() {
         let original = combine_members((0..64).map(|index| {
@@ -2113,6 +2863,32 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_header_candidates_with_zip64_sizes_are_payload() {
+        // As above, but the false header declares a ZIP64 compressed size,
+        // which no obsolete record compaction removes can have. So its
+        // preceding descriptor is payload too, and only one remains.
+        for signed in [false, true] {
+            let mut payload = b"prefix".to_vec();
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            payload.extend_from_slice(&6u32.to_le_bytes());
+            let mut false_header = fixture(false)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
+            set_u32(&mut false_header, 18, u32::MAX);
+            payload.extend_from_slice(&false_header);
+            payload.extend_from_slice(b"remaining obsolete payload");
+            let archive =
+                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+            let changes = BTreeMap::from([("part.xml".into(), b"new".to_vec())]);
+            let appended = Archive::new(append(&archive, &changes)).unwrap();
+            let mut compacted = Vec::new();
+            appended
+                .compact_to(&BTreeMap::new(), &mut compacted)
+                .unwrap();
+            assert_eq!(compacted, archive.write(&changes).unwrap());
+        }
+    }
+
+    #[test]
     fn obsolete_header_candidates_cannot_extend_into_active_records() {
         for signed in [false, true] {
             let replacement = b"new";
@@ -2237,16 +3013,34 @@ mod tests {
 
     #[test]
     fn compaction_does_not_discard_corrupt_obsolete_records() {
-        let archive = Archive::new(fixture(true)).unwrap();
-        let mut changed = append(
-            &archive,
-            &BTreeMap::from([("part.xml".into(), b"updated".to_vec())]),
-        );
-        changed[archive.entries[0].data.start] ^= 1;
-        let archive = Archive::new(changed).unwrap();
-        let mut output = Vec::new();
-        assert!(archive.compact_to(&BTreeMap::new(), &mut output).is_err());
-        assert!(output.is_empty());
+        // A single final stored DEFLATE block holding the original payload.
+        let mut stored_block = vec![1, 7, 0, 0xf8, 0xff];
+        stored_block.extend_from_slice(b"<part/>");
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        // Corrupt the first payload byte of every encoding, or the checksum
+        // in a streaming stored header, which must be zero or match.
+        for (original, corrupt_header_byte) in [
+            (fixture(false), None),
+            (fixture(true), None),
+            (deflate_fixture(&stored_block), None),
+            (deflate_descriptor_fixture(true), None),
+            (fixture(true), Some(14)),
+        ] {
+            let archive = Archive::new(original).unwrap();
+            let mut bytes = append(&archive, &changes);
+            bytes[corrupt_header_byte.unwrap_or(archive.entries[0].data.start)] ^= 1;
+            // Readers never see the obsolete record, and saves keep it.
+            let archive = Archive::new(bytes.clone()).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"updated");
+            assert_eq!(archive.write(&BTreeMap::new()).unwrap(), bytes);
+            // Compaction cannot verify it, so it refuses to discard it.
+            let mut output = Vec::new();
+            assert!(matches!(
+                archive.compact_to(&BTreeMap::new(), &mut output),
+                Err(Error::Unsupported(message)) if message.starts_with("cannot compact")
+            ));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
@@ -2276,6 +3070,152 @@ mod tests {
                 Archive::new(bytes),
                 Err(Error::InvalidWorkbook(message))
                     if message == "ambiguous ZIP end-of-directory records"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_earlier_end_records_that_forward_scanning_readers_could_select() {
+        // libzip before 1.11 keeps the first end record in its tail window
+        // whose directory it can read. Here a stale member and its directory
+        // precede the live member, and an end record for that directory hides
+        // in the comment of the live directory's last entry.
+        let stale = Archive::new(fixture(false)).unwrap();
+        let live = Archive::new(stored_fixture(b"part.xml", b"<live/>", 0, None)).unwrap();
+        let with_decoy = |edit: fn(&mut [u8])| {
+            let mut bytes = stale.original[..stale.end].to_vec();
+            let live_start = bytes.len();
+            bytes.extend_from_slice(&live.original[..live.central_start]);
+            let central_start = bytes.len();
+            let mut decoy = stale.original[stale.end..stale.end + END_LEN].to_vec();
+            set_u16(&mut decoy, 20, 0);
+            edit(&mut decoy);
+            let mut central = live.original[live.central_start..live.end].to_vec();
+            set_u16(&mut central, 32, END_LEN as u16);
+            set_u32(&mut central, 42, live_start as u32);
+            central.extend_from_slice(&decoy);
+            bytes.extend_from_slice(&central);
+            let mut ending = live.original[live.end..].to_vec();
+            set_u32(&mut ending, 12, central.len() as u32);
+            set_u32(&mut ending, 16, central_start as u32);
+            bytes.extend_from_slice(&ending);
+            bytes
+        };
+        assert!(matches!(
+            Archive::new(with_decoy(|_| {})),
+            Err(Error::InvalidWorkbook(message))
+                if message == "ambiguous ZIP end-of-directory records"
+        ));
+        // A complete older archive followed by newer records puts the decoy
+        // right after its directory, which then ends exactly at the record.
+        let mut adjacent = stale.original[..stale.end + END_LEN].to_vec();
+        set_u16(&mut adjacent, stale.end + 20, 0);
+        let live_start = adjacent.len();
+        adjacent.extend_from_slice(&live.original[..live.central_start]);
+        let central_start = adjacent.len();
+        let mut central = live.original[live.central_start..live.end].to_vec();
+        set_u32(&mut central, 42, live_start as u32);
+        adjacent.extend_from_slice(&central);
+        let mut ending = live.original[live.end..].to_vec();
+        set_u32(&mut ending, 16, central_start as u32);
+        adjacent.extend_from_slice(&ending);
+        assert!(matches!(
+            Archive::new(adjacent),
+            Err(Error::InvalidWorkbook(message))
+                if message == "ambiguous ZIP end-of-directory records"
+        ));
+        // That reader cannot select these records, so they stay comment bytes
+        // that neither opening nor saving refuses.
+        let unreadable: [fn(&mut [u8]); 8] = [
+            // Another disk, or a directory spanning disks.
+            |decoy| set_u16(decoy, 4, 1),
+            |decoy| set_u16(decoy, 6, 1),
+            |decoy| set_u16(decoy, 8, 0),
+            // An empty directory never spans more local data than another.
+            |decoy| {
+                set_u16(decoy, 8, 0);
+                set_u16(decoy, 10, 0);
+            },
+            // A comment running past EOF.
+            |decoy| set_u16(decoy, 20, 30),
+            // A directory overlapping the record, or not starting with a
+            // central-directory header.
+            |decoy| set_u32(decoy, 12, 1000),
+            |decoy| set_u32(decoy, 16, 1),
+            // A directory ending at 4 GiB, past the address space of 32-bit
+            // targets.
+            |decoy| {
+                set_u32(decoy, 12, 0x8000_0000);
+                set_u32(decoy, 16, 0x8000_0000);
+            },
+        ];
+        let changes = BTreeMap::from([("part.xml".into(), b"<new/>".to_vec())]);
+        for edit in unreadable {
+            let archive = Archive::new(with_decoy(edit)).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"<live/>");
+            let saved = Archive::new(archive.write(&changes).unwrap()).unwrap();
+            assert_eq!(saved.read("part.xml").unwrap(), b"<new/>");
+        }
+    }
+
+    #[test]
+    fn stored_embedded_archives_do_not_make_the_end_record_ambiguous() {
+        // The embedded archive's own end record lies in the tail window, but
+        // its directory offset is relative to that archive and finds no
+        // central-directory header in this one.
+        let inner = fixture(false);
+        let original = combine(fixture(false), stored_fixture(b"embedded", &inner, 0, None));
+        let archive = Archive::new(original).unwrap();
+        let inner_end = archive.entries[1].data.start + inner.len() - 29;
+        assert_eq!(u32_at(&archive.original, inner_end).unwrap(), END);
+        assert!(archive.original.len() - inner_end < END_LEN + u16::MAX as usize);
+        assert_eq!(archive.read("embedded").unwrap(), inner);
+        let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
+        let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        assert_eq!(updated.read("part.xml").unwrap(), b"updated");
+        assert_eq!(updated.read("embedded").unwrap(), inner);
+    }
+
+    #[test]
+    fn rejects_empty_nul_and_duplicate_member_names() {
+        // Python truncates names at NUL, and readers differ on which of two
+        // duplicate members they select.
+        for (bytes, expected) in [
+            (named_fixture(b"", 0, false), "empty ZIP member name"),
+            (
+                named_fixture(b"a\0b.xml", 0, false),
+                "ZIP member name contains NUL: a\0b.xml",
+            ),
+            (
+                combine(fixture(false), fixture(true)),
+                "duplicate ZIP member: part.xml",
+            ),
+        ] {
+            assert!(matches!(
+                Archive::new(bytes),
+                Err(Error::InvalidWorkbook(message)) if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_member_names_with_backslashes() {
+        // Some readers treat '\' as '/', so for them the second member here
+        // would alias the first, and the last of the two would win.
+        let mut aliased = combine(
+            named_fixture(b"xl/part.xml", 0, false),
+            named_fixture(b"xl_part.xml", 0, false),
+        );
+        // `combine` opens its parts, so respell the second name afterwards.
+        let second = &Archive::new(aliased.clone()).unwrap().entries[1];
+        for name_start in [second.local_header.start + 30, second.central.start + 46] {
+            aliased[name_start + 2] = b'\\';
+        }
+        let message = "ZIP member name contains a backslash: xl\\part.xml";
+        for bytes in [aliased, named_fixture(b"xl\\part.xml", 0, false)] {
+            assert!(matches!(
+                Archive::new(bytes),
+                Err(Error::InvalidWorkbook(actual)) if actual == message
             ));
         }
     }
@@ -2326,6 +3266,30 @@ mod tests {
         bytes
     }
 
+    /// Emit `archive`'s directory as if zero-filled local records ended at
+    /// `position`, returning the result and the bytes written.
+    fn emit_directory_at(
+        archive: &Archive,
+        position: usize,
+        offsets: &[u32],
+        replacements: &[Option<Sizes>],
+    ) -> (Result<()>, Vec<u8>) {
+        let local_tail = vec![0; position.min(archive.local_tail_len())];
+        let mut output = Vec::new();
+        let result = archive.emit_directory(
+            &mut output,
+            &mut position.clone(),
+            &local_tail,
+            offsets,
+            replacements,
+            |probe| {
+                std::io::copy(&mut std::io::repeat(0).take(position as u64), probe)?;
+                Ok(())
+            },
+        );
+        (result, output)
+    }
+
     #[test]
     fn saves_refuse_directory_offsets_that_would_make_the_end_record_ambiguous() {
         let comment = |first: &[u8], length: usize| {
@@ -2348,9 +3312,7 @@ mod tests {
             (0x5000_0000, comment(&[7], 0x054b), false),
         ] {
             let archive = Archive::new(with_comment(fixture(false), &comment)).unwrap();
-            let mut output = Vec::new();
-            let mut position = offset as usize;
-            let result = archive.emit_directory(&mut output, &mut position, &[0], &[None]);
+            let (result, output) = emit_directory_at(&archive, offset as usize, &[0], &[None]);
             if refused {
                 assert!(matches!(
                     result,
@@ -2379,10 +3341,8 @@ mod tests {
         set_u16(&mut archive.original, archive.end + 8, 0x4b50);
         set_u16(&mut archive.original, archive.end + 10, 0x4b50);
         assert!(shadows_end_record(&archive.original[archive.end..]));
-        let mut output = Vec::new();
-        archive
-            .emit_directory(&mut output, &mut 0x100, &[0], &[None])
-            .unwrap();
+        let (result, output) = emit_directory_at(&archive, 0x100, &[0], &[None]);
+        result.unwrap();
         let end = output.len() - END_LEN - 5;
         assert!(shadows_end_record(&output[end..]));
         assert_eq!(u32_at(&output, end + 16).unwrap(), 0x100);
@@ -2401,6 +3361,283 @@ mod tests {
         }
         let bytes = end_record(1, 46, 64, &[b'c'; 100]);
         assert!(!shadows_end_record(&bytes[64..]));
+    }
+
+    fn refused_as_ambiguous(result: Result<()>) -> bool {
+        matches!(
+            result,
+            Err(Error::Unsupported(message))
+                if message.contains("would contain another end-of-directory record")
+        )
+    }
+
+    #[test]
+    fn saves_refuse_rewritten_fields_that_would_form_another_end_record() {
+        // A signature in a rewritten central-header field starts a complete
+        // record that ends at EOF when the u16 20 bytes later counts the
+        // bytes left after that record. This crate would refuse its own
+        // output, so the save is refused instead.
+        //
+        // First the field is a new checksum, at header offset 16, and the
+        // member's internal attributes, which saves copy, count the rest.
+        let mut bytes = fixture(false);
+        let central = Archive::new(bytes.clone()).unwrap().central_start;
+        let rest = bytes.len() - (central + 16) - END_LEN;
+        set_u16(&mut bytes, central + 36, rest as u16);
+        let archive = Archive::new(bytes).unwrap();
+        let new_sizes = |crc| {
+            Some(Sizes {
+                crc,
+                compressed_size: 7,
+                size: 7,
+            })
+        };
+        let (result, output) = emit_directory_at(&archive, 45, &[0], &[new_sizes(END)]);
+        assert!(refused_as_ambiguous(result));
+        assert!(output.is_empty());
+        let (result, output) = emit_directory_at(&archive, 45, &[0], &[new_sizes(END + 1)]);
+        result.unwrap();
+        assert_eq!(end_record_candidates(&output).count(), 1);
+
+        // Then the field is a new local-record offset, at header offset 42,
+        // and name bytes 16..18, "00", count the rest: the archive comment.
+        // Local records of about 101 MB would move a member that far, so
+        // emit the directory from there.
+        let name = b"xl/media/image0000.png";
+        let rest = u16::from_le_bytes(*b"00") as usize;
+        let comment = vec![b'c'; 42 + END_LEN + rest - (CENTRAL_HEADER_LEN + name.len() + END_LEN)];
+        let archive = Archive::new(with_comment(named_fixture(name, 0, false), &comment)).unwrap();
+        let position = END as usize + 0x100;
+        let (result, output) = emit_directory_at(&archive, position, &[END], &[None]);
+        assert!(refused_as_ambiguous(result));
+        assert!(output.is_empty());
+        let (result, output) = emit_directory_at(&archive, position, &[END + 1], &[None]);
+        result.unwrap();
+        assert_eq!(end_record_candidates(&output).count(), 1);
+    }
+
+    #[test]
+    fn saves_refuse_offsets_that_would_form_a_zip64_locator() {
+        // When the last central record's name, extra field and comment take
+        // 16 bytes, its local-record offset is the 4 bytes 20 before the end
+        // record, where readers look for a ZIP64 locator. Local records of
+        // about 118 MB would move a member that far.
+        for (name, offset, refused) in [
+            (b"docProps/app.xml".as_slice(), ZIP64_LOCATOR, true),
+            (b"docProps/app.xml", ZIP64_LOCATOR + 1, false),
+            // With a 17-byte name those bytes start inside the offset.
+            (b"docProps/app.xmlx", ZIP64_LOCATOR, false),
+        ] {
+            let archive = Archive::new(named_fixture(name, 0, false)).unwrap();
+            let position = offset as usize + 0x100;
+            let (result, output) = emit_directory_at(&archive, position, &[offset], &[None]);
+            if refused {
+                assert!(matches!(
+                    result,
+                    Err(Error::Unsupported(message)) if message.contains("ZIP64")
+                ));
+                assert!(output.is_empty());
+            } else {
+                result.unwrap();
+                let end = output.len() - END_LEN - b"comment".len();
+                assert_ne!(
+                    u32_at(&output, end - ZIP64_LOCATOR_LEN).unwrap(),
+                    ZIP64_LOCATOR
+                );
+            }
+        }
+    }
+
+    /// `bytes` with `comment` as its last central-directory entry's comment.
+    fn with_entry_comment(bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+        let archive = Archive::new(bytes).unwrap();
+        let record = archive.entries.last().unwrap().central.clone();
+        let old = u16_at(&archive.original, record.start + 32).unwrap() as usize;
+        let mut bytes = archive.original[..record.end - old].to_vec();
+        set_u16(&mut bytes, record.start + 32, comment.len() as u16);
+        bytes.extend_from_slice(comment);
+        let mut ending = archive.original[archive.end..].to_vec();
+        set_u32(
+            &mut ending,
+            12,
+            (bytes.len() - archive.central_start) as u32,
+        );
+        bytes.extend_from_slice(&ending);
+        bytes
+    }
+
+    /// A complete end record for a one-entry directory of `size` bytes at
+    /// `directory`, which libzip before 1.11 selects if a central-directory
+    /// header starts there and the directory ends by the record.
+    fn decoy(directory: usize, size: usize) -> Vec<u8> {
+        let mut decoy = vec![0; END_LEN];
+        set_u32(&mut decoy, 0, END);
+        set_u16(&mut decoy, 8, 1);
+        set_u16(&mut decoy, 10, 1);
+        set_u32(&mut decoy, 12, size as u32);
+        set_u32(&mut decoy, 16, directory as u32);
+        decoy
+    }
+
+    #[test]
+    fn saves_refuse_end_records_that_forward_scanning_readers_could_select() {
+        let filler = |signature_at: usize| {
+            let mut filler = vec![0; END_TAIL_LEN + 4096];
+            set_u32(&mut filler, signature_at, CENTRAL);
+            filler
+        };
+        // Replacing part.xml at offset 0 moves everything after it. Four more
+        // bytes move the directory from 45 onto a decoy pointing at 49, and
+        // with a long member after part.xml, its central-directory signature
+        // from 183 onto a decoy pointing at 187. That decoy's directory lies
+        // before the output's last END_TAIL_LEN bytes. The third decoy's
+        // directory spans part.xml's central header and ends exactly where
+        // the decoy, that entry's comment, starts.
+        let cases = [
+            with_entry_comment(fixture(false), &decoy(49, CENTRAL_HEADER_LEN)),
+            with_entry_comment(
+                combine(
+                    fixture(false),
+                    stored_fixture(b"fill.bin", &filler(100), 0, None),
+                ),
+                &decoy(
+                    45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100,
+                    CENTRAL_HEADER_LEN,
+                ),
+            ),
+            with_entry_comment(
+                fixture(false),
+                &decoy(49, CENTRAL_HEADER_LEN + b"part.xml".len()),
+            ),
+        ];
+        for original in cases {
+            let archive = Archive::new(original).unwrap();
+            assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
+            for (replacement, refused) in
+                [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)]
+            {
+                let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
+                for compact in [false, true] {
+                    let mut output = Vec::new();
+                    let result = if compact {
+                        archive.compact_to(&changes, &mut output)
+                    } else {
+                        archive.write_to(&changes, &mut output)
+                    };
+                    if refused {
+                        assert!(refused_as_ambiguous(result));
+                        // Only the local records were written.
+                        assert_eq!(output.len(), archive.central_start + 4);
+                    } else {
+                        result.unwrap();
+                        let reopened = Archive::new(output).unwrap();
+                        assert_eq!(reopened.read("part.xml").unwrap(), replacement);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saves_check_records_in_untouched_members_longer_than_the_kept_tail() {
+        // An untouched stored member longer than the bytes the end-record
+        // check keeps is written in one piece. It holds an end record whose
+        // comment reaches EOF once the member after it grows by four bytes.
+        let layout = |comment: u16| {
+            let mut data = vec![b'x'; 70_000];
+            let at = data.len() - 100;
+            set_u32(&mut data, at, END);
+            set_u16(&mut data, at + 20, comment);
+            let bytes = combine(stored_fixture(b"big.bin", &data, 0, None), fixture(false));
+            (bytes, at)
+        };
+        let (bytes, at) = layout(0);
+        let record = Archive::new(bytes.clone()).unwrap().entries[0].data.start + at;
+        let (original, _) = layout((bytes.len() + 4 - record - END_LEN) as u16);
+        let archive = Archive::new(original).unwrap();
+        assert!(archive.entries[0].local_record.len() > archive.local_tail_len());
+        for (replacement, refused) in [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)] {
+            let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
+            let mut output = Vec::new();
+            let result = archive.write_to(&changes, &mut output);
+            if refused {
+                assert!(refused_as_ambiguous(result));
+            } else {
+                result.unwrap();
+                let reopened = Archive::new(output).unwrap();
+                assert_eq!(reopened.read("part.xml").unwrap(), replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_reads_back_earlier_output_without_obsolete_records() {
+        // A pre-1.0 append save leaves part.xml's first record obsolete
+        // before a long member with a central-directory signature in its
+        // data. Compaction drops that 45-byte record, moving the signature
+        // onto a decoy in the last entry's comment. The signature lies before
+        // the output's kept tail, so only the records written again show it.
+        let mut filler = vec![0; END_TAIL_LEN + 4096];
+        set_u32(&mut filler, 100, CENTRAL);
+        let base = Archive::new(combine(
+            fixture(false),
+            stored_fixture(b"fill.bin", &filler, 0, None),
+        ))
+        .unwrap();
+        let changes = BTreeMap::from([("part.xml".into(), b"<part/>abcd".to_vec())]);
+        let appended = append(&base, &changes);
+        let moved = LOCAL_HEADER_LEN + b"fill.bin".len() + 100;
+        for (directory, refused) in [(moved, true), (moved + 1, false)] {
+            let original =
+                with_entry_comment(appended.clone(), &decoy(directory, CENTRAL_HEADER_LEN));
+            let archive = Archive::new(original).unwrap();
+            let mut output = Vec::new();
+            let result = archive.compact_to(&BTreeMap::new(), &mut output);
+            if refused {
+                assert!(refused_as_ambiguous(result));
+            } else {
+                result.unwrap();
+                let compacted = Archive::new(output).unwrap();
+                assert_eq!(compacted.entries[1].local_record.start, 0);
+                assert_eq!(compacted.read("part.xml").unwrap(), b"<part/>abcd");
+            }
+        }
+    }
+
+    #[test]
+    fn kept_tails_are_the_last_bytes_written_whatever_the_write_lengths() {
+        // Accepts at most three bytes per write, like a pipe.
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let length = bytes.len().min(3);
+                self.0.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn keep(writer: &mut impl Write, len: usize, piece: usize, data: &[u8]) -> Vec<u8> {
+            let mut output = KeepTail::new(writer, len);
+            for chunk in data.chunks(piece) {
+                output.write_all(chunk).unwrap();
+            }
+            output.into_tail()
+        }
+        let data: Vec<u8> = (0..=255).cycle().take(300).collect();
+        for len in [0, 1, 10, 100] {
+            let expected = &data[data.len() - len..];
+            // Writes shorter than, as long as, and longer than the tail.
+            for piece in [1, len.max(2) - 1, len.max(1), len + 1, data.len()] {
+                let mut written = Vec::new();
+                assert_eq!(keep(&mut written, len, piece, &data), expected);
+                assert_eq!(written, data);
+                let mut written = ShortWriter(Vec::new());
+                assert_eq!(keep(&mut written, len, piece, &data), expected);
+                assert_eq!(written.0, data);
+            }
+        }
     }
 
     fn unicode_path(raw_name: &[u8], name: &[u8], version: u8) -> Vec<u8> {
@@ -2526,7 +3763,7 @@ mod tests {
     #[test]
     fn stream_reads_stop_one_byte_past_the_limit() {
         let input = b"0123456789";
-        assert_eq!(read_at_most(&input[..], Vec::new(), 10).unwrap(), input);
+        assert_eq!(read_at_most(&input[..], None, 10).unwrap(), input);
         let too_long = |result: Result<Vec<u8>>| {
             matches!(
                 result,
@@ -2534,16 +3771,16 @@ mod tests {
                     if message == "input exceeds the largest possible ZIP32 archive"
             )
         };
-        assert!(too_long(read_at_most(&input[..], Vec::new(), 9)));
+        assert!(too_long(read_at_most(&input[..], None, 9)));
         // An endless stream is not read beyond the limit.
-        assert!(too_long(read_at_most(
-            std::io::repeat(0),
-            Vec::new(),
-            1 << 16
-        )));
-        // Reserved capacity in the buffer does not count as input.
-        let reserved = Vec::with_capacity(64);
-        assert_eq!(read_at_most(&input[..], reserved, 10).unwrap(), input);
+        assert!(too_long(read_at_most(std::io::repeat(0), None, 1 << 16)));
+        // A file length over the limit is refused before reading, although
+        // these 10 bytes would fit. One within the limit only reserves
+        // capacity, so a stale length changes neither the result nor the limit.
+        assert!(too_long(read_at_most(&input[..], Some(11), 10)));
+        assert_eq!(read_at_most(&input[..], Some(10), 10).unwrap(), input);
+        assert_eq!(read_at_most(&input[..], Some(4), 10).unwrap(), input);
+        assert!(too_long(read_at_most(std::io::repeat(0), Some(4), 10)));
         assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
     }
 

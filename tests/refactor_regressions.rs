@@ -46,6 +46,42 @@ fn fixture_with_replacements(replacements: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn workbooks_and_their_views_can_be_used_across_catch_unwind() {
+    use sheetpatch::{CellContent, CellRange, CellRangeIter, Sheet, SheetVisibility};
+    use std::panic::{RefUnwindSafe, UnwindSafe, catch_unwind};
+    fn unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+    unwind_safe::<Workbook>();
+    unwind_safe::<WorksheetView<'_>>();
+    unwind_safe::<Sheet>();
+    unwind_safe::<SheetVisibility>();
+    unwind_safe::<CellRef>();
+    unwind_safe::<CellRange>();
+    unwind_safe::<CellRangeIter>();
+    unwind_safe::<CellValue>();
+    unwind_safe::<CellContent>();
+    unwind_safe::<CellEdit>();
+    // The workbook keeps the error of a shared-string table that cannot be
+    // loaded, and of each entry that cannot be decoded.
+    for strings in [
+        "<sst".to_owned(),
+        format!("<sst xmlns='{MAIN_NS}'><si><t>_xD83D_</t></si></sst>"),
+    ] {
+        let book = Workbook::from_bytes(fixture_with_replacements(&[(
+            "xl/sharedStrings.xml",
+            strings.as_bytes(),
+        )]))
+        .unwrap();
+        assert!(
+            catch_unwind(|| book.get_cell("Data", "C1"))
+                .unwrap()
+                .is_err()
+        );
+        let view = book.prepare_sheet("Data").unwrap();
+        assert!(catch_unwind(|| view.get_cell("C1")).unwrap().is_err());
+    }
+}
+
+#[test]
 fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Workbook>();
@@ -256,16 +292,39 @@ fn empty_sheet_expansion_retains_whitespace_and_sorts_new_rows_and_cells() {
 
 #[test]
 fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() {
+    // Malformed ranges and formula groups make the workbook invalid; content
+    // hidden in a vendor container is unsupported.
     let cases = [
-        "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><mergeCells><mergeCell ref='B1:A1'/></mergeCells>",
-        "<sheetData><row r='1'><c r='A1'><f t='shared' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><f t='shared' si='bad' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><v>1</v><extLst><ext uri='keep'><v:foreign><f>1</f></v:foreign></ext></extLst></c></row></sheetData>",
-        "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><v:foreign><mergeCells><mergeCell ref='A1:B1'/></mergeCells></v:foreign>",
-        "<sheetData><v:foreign><row r='1'><c r='A1'><v>1</v></c></row></v:foreign></sheetData>",
-        "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><v:foreign><t>hidden</t></v:foreign></is></c></row></sheetData>",
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><mergeCells><mergeCell ref='B1:A1'/></mergeCells>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><f t='shared' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><f t='shared' si='bad' ref='A1:B1'>1</f><v>1</v></c></row></sheetData>",
+            true,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v><extLst><ext uri='keep'><v:foreign><f>1</f></v:foreign></ext></extLst></c></row></sheetData>",
+            false,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData><v:foreign><mergeCells><mergeCell ref='A1:B1'/></mergeCells></v:foreign>",
+            false,
+        ),
+        (
+            "<sheetData><v:foreign><row r='1'><c r='A1'><v>1</v></c></row></v:foreign></sheetData>",
+            false,
+        ),
+        (
+            "<sheetData><row r='1'><c r='A1' t='inlineStr'><is><v:foreign><t>hidden</t></v:foreign></is></c></row></sheetData>",
+            false,
+        ),
     ];
-    for body in cases {
+    for (body, invalid) in cases {
         let sheet = format!("<worksheet xmlns='{MAIN_NS}' xmlns:v='urn:vendor'>{body}</worksheet>");
         let original = fixture_with_replacements(&[(DATA_PATH, sheet.as_bytes())]);
         let book = Workbook::from_bytes(original.clone()).unwrap();
@@ -275,7 +334,14 @@ fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() 
             Err(error) => error,
         };
         assert_eq!(prepared.to_string(), direct.to_string(), "{body}");
-        assert!(matches!(direct, Error::Unsupported(_)), "{body}: {direct}");
+        if invalid {
+            assert!(
+                matches!(direct, Error::InvalidWorkbook(_)),
+                "{body}: {direct}"
+            );
+        } else {
+            assert!(matches!(direct, Error::Unsupported(_)), "{body}: {direct}");
+        }
         assert_eq!(book.to_bytes().unwrap(), original);
         assert!(!book.has_changes());
     }
