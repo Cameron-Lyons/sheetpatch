@@ -134,6 +134,14 @@ impl Error {
         }
     }
 
+    // Names the package part an error concerns, such as the shared-string
+    // table or a table part read while serving a worksheet operation,
+    // retaining the error's variant. Such errors are never attributed to the
+    // worksheet.
+    pub(crate) fn in_part(self, path: &str) -> Self {
+        self.context(format_args!("part {path:?}"))
+    }
+
     // Names what an error concerns, such as a cell, worksheet, or part, by
     // prefixing its message and retaining its variant. Every variant is
     // listed, so a new one must be classified here.

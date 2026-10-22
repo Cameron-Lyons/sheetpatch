@@ -1,4 +1,4 @@
-use super::{STRICT, TRANSITIONAL, xml_error};
+use super::errors;
 use crate::xml::{
     AttrView, AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, arena_push,
     attribute_spans, compact, markup,
@@ -6,6 +6,9 @@ use crate::xml::{
 use crate::{Error, Result};
 use quick_xml::events::Event;
 use std::ops::Range;
+
+pub(super) const TRANSITIONAL: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub(super) const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
 
 // Records store byte offsets and arena indexes as u32, which keeps a large
 // part's index compact. `DocumentRules::source` refuses parts of u32::MAX
@@ -235,7 +238,7 @@ pub(super) fn parse_with<'xml>(
             Event::End(_) => {
                 let index = stack
                     .pop()
-                    .ok_or_else(|| xml_error("unmatched closing XML tag"))?;
+                    .ok_or_else(|| errors::xml_error("unmatched closing XML tag"))?;
                 let children_end = compact(document.elements.len());
                 let element = &mut document.elements[index];
                 element.close_start = compact(start);
@@ -256,4 +259,11 @@ pub(super) fn parse_with<'xml>(
     }
     rules.finish(stack.len())?;
     Ok(document)
+}
+
+/// Parses `xml` as any XML part, with every check of the worksheet parser,
+/// for tests that compare the package parser with it.
+#[cfg(test)]
+pub(crate) fn parse_xml(xml: &[u8]) -> Result<()> {
+    parse(xml).map(drop)
 }

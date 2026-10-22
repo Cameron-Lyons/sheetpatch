@@ -2,7 +2,7 @@ use super::index::{RowEntry, WorksheetIndex, reference_range};
 use super::parse::Element;
 use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
 use super::validation::validate_payload;
-use super::{protected, protection, unique, unsupported};
+use super::{errors, protection};
 use crate::xml::{Attributes, excel_escaped, trim_whitespace as trim_xml_whitespace};
 use crate::{CellRef, CellValue, Error, Result};
 use std::collections::BTreeMap;
@@ -53,17 +53,17 @@ impl EditPlan {
         let mut length = 0usize;
         for edit in &self.edits {
             if edit.start < position || edit.end < edit.start || edit.end > xml.len() {
-                return Err(unsupported("overlapping XML edits"));
+                return Err(errors::unsupported("overlapping XML edits"));
             }
             length = length
                 .checked_add(edit.start - position)
                 .and_then(|length| length.checked_add(edit.bytes.len()))
-                .ok_or_else(|| unsupported("patched XML exceeds addressable memory"))?;
+                .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
             position = edit.end;
         }
         length = length
             .checked_add(xml.len() - position)
-            .ok_or_else(|| unsupported("patched XML exceeds addressable memory"))?;
+            .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
         let mut output = Vec::with_capacity(length);
         position = 0;
         for edit in self.edits {
@@ -242,10 +242,10 @@ fn patched_cell<'s>(
     // even a cell-level link may not survive a value change. Without interpreting
     // those records, keep both links and their original payload intact.
     if cell.attr(attributes, "vm").is_some() {
-        return Err(protected(address, protection::VALUE_METADATA));
+        return Err(errors::protected(address, protection::VALUE_METADATA));
     }
     if cell.attr(attributes, "cm").is_some() {
-        return Err(protected(address, protection::CELL_METADATA));
+        return Err(errors::protected(address, protection::CELL_METADATA));
     }
     let value_bytes = payload(source, cell, value);
     if let Some(kind) = attribute_edit(cell, attributes, "t", value_type(value)) {
@@ -287,7 +287,7 @@ fn spans_edit(
     let Some(attribute) = row.attr(attributes, "spans") else {
         return Ok(None);
     };
-    let invalid = || unsupported(format!("row {row_number}: invalid row spans"));
+    let invalid = || errors::unsupported(format!("row {row_number}: invalid row spans"));
     let mut spans = Vec::new();
     for span in attribute
         .value
@@ -305,7 +305,9 @@ fn spans_edit(
         spans.push((first, last));
     }
     if spans.is_empty() {
-        return Err(unsupported(format!("row {row_number}: empty row spans")));
+        return Err(errors::unsupported(format!(
+            "row {row_number}: empty row spans"
+        )));
     }
     spans.sort_unstable();
     let mut first = spans[0].0;
@@ -351,7 +353,9 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
         return Ok(RowStyle::ColumnDefault);
     }
     if !matches!(custom_format, Some("1" | "true")) {
-        return Err(unsupported(format!("{cell}: invalid row format flag")));
+        return Err(errors::unsupported(format!(
+            "{cell}: invalid row format flag"
+        )));
     }
     let Some(style) = row.attr(attributes, "s") else {
         return Ok(RowStyle::Custom(0));
@@ -359,7 +363,7 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
     trim_xml_whitespace(style.value)
         .parse::<u32>()
         .map(RowStyle::Custom)
-        .map_err(|_| unsupported(format!("{cell}: invalid row style index")))
+        .map_err(|_| errors::unsupported(format!("{cell}: invalid row style index")))
 }
 
 // One row's edits, in column order.
@@ -495,23 +499,23 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
         return Ok(None);
     }
     let (source, elements) = (index.source, &index.elements);
-    let dimension = unique(
+    let dimension = errors::unique(
         elements[0]
             .children(elements)
             .map(|child| &elements[child])
             .filter(|element| element.is(source, index.namespace, "dimension")),
-        || unsupported("multiple worksheet dimensions"),
+        || errors::unsupported("multiple worksheet dimensions"),
     )?;
     let Some(dimension) = dimension else {
         return Ok(None);
     };
     let reference = dimension
         .attr(&index.attributes, "ref")
-        .ok_or_else(|| unsupported("dimension without a reference"))?;
+        .ok_or_else(|| errors::unsupported("dimension without a reference"))?;
     // Reads ignore the dimension, so a malformed reference refuses only the
     // edits that may need to widen it, like a malformed `spans` hint.
     let old = reference_range(reference.value).map_err(|error| match error {
-        Error::InvalidWorkbook(message) => unsupported(message),
+        Error::InvalidWorkbook(message) => errors::unsupported(message),
         error => error,
     })?;
     let range = changed_cells

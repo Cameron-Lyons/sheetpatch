@@ -1,6 +1,6 @@
 use super::parse::Element;
 use super::read::validate_rich_text_structure;
-use super::{protected, protection, unsupported};
+use super::{errors, protection};
 use crate::xml::{Attributes, NamespaceId};
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::BTreeMap;
@@ -16,7 +16,9 @@ pub(super) fn validate_payload(
 ) -> Result<()> {
     let element = &elements[index];
     if element.namespace != namespace || element.opaque_markup {
-        return Err(unsupported("unfamiliar XML inside the cell value payload"));
+        return Err(errors::unsupported(
+            "unfamiliar XML inside the cell value payload",
+        ));
     }
     if element.local_name(source) == "is" {
         // The same hidden text that makes a scalar read ambiguous must not be
@@ -35,7 +37,9 @@ fn validate_payload_element(
 ) -> Result<()> {
     let element = &elements[index];
     if element.namespace != namespace || element.opaque_markup {
-        return Err(unsupported("unfamiliar XML inside the cell value payload"));
+        return Err(errors::unsupported(
+            "unfamiliar XML inside the cell value payload",
+        ));
     }
     let allowed_attributes: &[&str] = match element.local_name(source) {
         "is" | "r" | "rPr" => &[],
@@ -47,19 +51,25 @@ fn validate_payload_element(
         "color" => &["auto", "indexed", "rgb", "theme", "tint"],
         "rFont" | "charset" | "family" | "b" | "i" | "strike" | "outline" | "shadow"
         | "condense" | "extend" | "sz" | "u" | "vertAlign" | "scheme" => &["val"],
-        _ => return Err(unsupported("unfamiliar XML inside the cell value payload")),
+        _ => {
+            return Err(errors::unsupported(
+                "unfamiliar XML inside the cell value payload",
+            ));
+        }
     };
     if element.attributes(attributes).any(|attribute| {
         attribute.name != "xmlns"
             && !attribute.name.starts_with("xmlns:")
             && !allowed_attributes.contains(&attribute.name)
     }) {
-        return Err(unsupported(
+        return Err(errors::unsupported(
             "unfamiliar attributes inside the cell value payload",
         ));
     }
     if matches!(element.local_name(source), "v" | "t") && element.has_children() {
-        return Err(unsupported("elements inside a simple cell value payload"));
+        return Err(errors::unsupported(
+            "elements inside a simple cell value payload",
+        ));
     }
     for child in element.children(elements) {
         validate_payload_element(source, elements, attributes, child, namespace)?;
@@ -119,7 +129,7 @@ pub(super) fn validate_ranges(
         } else {
             protection::FORMULA_RANGE
         };
-        protected(cell, reason)
+        errors::protected(cell, reason)
     };
     // With either dimension small, direct membership checks cost less than
     // sorting events and allocating a column index. Large batches still use

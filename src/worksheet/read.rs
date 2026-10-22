@@ -1,18 +1,38 @@
 use super::date::{DateError, excel_serial};
+use super::errors;
 use super::index::WorksheetIndex;
 use super::parse::{Element, XmlDocument, parse_with};
-use super::{ReadError, invalid, unique, unsupported, xml_error};
 use crate::xml::{NamespaceId, excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
+/// Why a read failed: a problem in the worksheet itself, a failure to load
+/// the shared-string table a `t="s"` cell needed, or an entry of that table
+/// that cannot be decoded. The table's load errors come from its loader,
+/// which names that part, so only worksheet errors need the worksheet's name.
+/// An entry's error concerns the table too, and needs its part and index.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    Worksheet(Error),
+    SharedStrings(Error),
+    UndecodableString { index: usize, error: Error },
+}
+
+impl From<Error> for ReadError {
+    fn from(error: Error) -> Self {
+        Self::Worksheet(error)
+    }
+}
+
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
 fn element_text(xml: &[u8], element: &Element) -> Result<String> {
     if element.has_children() {
-        return Err(unsupported("elements inside a simple cell text value"));
+        return Err(errors::unsupported(
+            "elements inside a simple cell text value",
+        ));
     }
     if element.empty {
         return Ok(String::new());
@@ -23,7 +43,7 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
         .iter()
         .any(|&byte| matches!(byte, b'<' | b'&' | b'\r'))
     {
-        return String::from_utf8(content.to_vec()).map_err(|e| xml_error(e.to_string()));
+        return String::from_utf8(content.to_vec()).map_err(|e| errors::xml_error(e.to_string()));
     }
     let mut text = String::new();
     // A new reader discards a leading UTF-8 byte order mark, which inside an
@@ -48,7 +68,7 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
             Event::Comment(_) | Event::PI(_) => {}
             Event::Eof => return Ok(text),
             _ => {
-                return Err(unsupported(
+                return Err(errors::unsupported(
                     "unexpected markup inside a simple cell text value",
                 ));
             }
@@ -78,7 +98,9 @@ pub(super) fn validate_rich_text_structure(
                             && elements[parent].parent() == Some(index))
                 }))
         {
-            return Err(unsupported("rich text inside an unsupported XML container"));
+            return Err(errors::unsupported(
+                "rich text inside an unsupported XML container",
+            ));
         }
         // CT_RElt permits one text element. Consumers can keep only the last
         // duplicate, so concatenating them would give reads and no-op detection
@@ -90,7 +112,9 @@ pub(super) fn validate_rich_text_structure(
                 .nth(1)
                 .is_some()
         {
-            return Err(unsupported("rich text run has multiple text elements"));
+            return Err(errors::unsupported(
+                "rich text run has multiple text elements",
+            ));
         }
     }
     Ok(())
@@ -203,15 +227,17 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
         true
     })?;
     if !is_string_table(&document) {
-        return Err(invalid("expected an OOXML shared-string table"));
+        return Err(errors::invalid("expected an OOXML shared-string table"));
     }
     if mixed_namespace {
-        return Err(unsupported(
+        return Err(errors::unsupported(
             "shared-string table mixes strict and transitional SpreadsheetML namespaces",
         ));
     }
     if hidden_string {
-        return Err(unsupported("shared string outside the shared-string table"));
+        return Err(errors::unsupported(
+            "shared string outside the shared-string table",
+        ));
     }
     if let Some(error) = table_error {
         return Err(error);
@@ -299,7 +325,7 @@ impl SharedStrings {
 
 fn index_limit(value: usize) -> Result<u32> {
     u32::try_from(value)
-        .map_err(|_| unsupported("shared-string table exceeds the 4 GiB index limit"))
+        .map_err(|_| errors::unsupported("shared-string table exceeds the 4 GiB index limit"))
 }
 
 #[cfg(test)]
@@ -337,12 +363,12 @@ pub(super) enum StoredValue {
 // The cell's `v` or `is` payload, if it has one.
 pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
     let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
-    unique(
+    errors::unique(
         cell.children(elements).filter(|&child| {
             elements[child].is(source, namespace, "v")
                 || elements[child].is(source, namespace, "is")
         }),
-        || invalid("cell has multiple value payloads"),
+        || errors::invalid("cell has multiple value payloads"),
     )
 }
 
@@ -376,13 +402,15 @@ pub(super) fn decode_payload(
         .map_or("n", |attribute| attribute.value);
     if kind == "inlineStr" {
         if !payload.is(source, namespace, "is") {
-            return Err(invalid("inline string cell without an inline payload"));
+            return Err(errors::invalid(
+                "inline string cell without an inline payload",
+            ));
         }
         let text = rich_text(source, elements, payload_index, namespace)?;
         return Ok(StoredValue::Value(CellValue::Text(text)));
     }
     if !payload.is(source, namespace, "v") {
-        return Err(invalid("non-inline cell has an inline payload"));
+        return Err(errors::invalid("non-inline cell has an inline payload"));
     }
     let text = element_text(xml, payload)?;
     // Values that their cell type cannot hold make the workbook malformed;
@@ -392,27 +420,27 @@ pub(super) fn decode_payload(
         "n" => {
             let number = trim_xml_whitespace(&text)
                 .parse::<f64>()
-                .map_err(|_| invalid("invalid numeric cell value"))?;
+                .map_err(|_| errors::invalid("invalid numeric cell value"))?;
             if !number.is_finite() {
-                return Err(invalid("non-finite numeric cell value"));
+                return Err(errors::invalid("non-finite numeric cell value"));
             }
             CellValue::Number(number)
         }
         "b" => CellValue::Bool(match trim_xml_whitespace(&text) {
             "0" | "false" => false,
             "1" | "true" => true,
-            _ => return Err(invalid("invalid boolean cell value")),
+            _ => return Err(errors::invalid("invalid boolean cell value")),
         }),
         "str" => CellValue::Text(excel_text(&text)?),
         "e" => CellValue::Error(excel_text(&text)?),
         // Dates read as the serial number Excel would store for them.
         "d" => CellValue::Number(excel_serial(trim_xml_whitespace(&text), date1904).map_err(
             |error| match error {
-                DateError::Invalid => invalid("invalid ISO 8601 date cell value"),
+                DateError::Invalid => errors::invalid("invalid ISO 8601 date cell value"),
                 DateError::TimeZoneOffset => {
-                    unsupported("ISO 8601 date cell value with a time-zone offset")
+                    errors::unsupported("ISO 8601 date cell value with a time-zone offset")
                 }
-                DateError::BeforeEpoch => unsupported(
+                DateError::BeforeEpoch => errors::unsupported(
                     "ISO 8601 date cell value before the start of the workbook's date system",
                 ),
             },
@@ -421,9 +449,9 @@ pub(super) fn decode_payload(
             return trim_xml_whitespace(&text)
                 .parse::<usize>()
                 .map(StoredValue::SharedString)
-                .map_err(|_| invalid("invalid shared-string index"));
+                .map_err(|_| errors::invalid("invalid shared-string index"));
         }
-        _ => return Err(invalid(format!("invalid cell value type {kind:?}"))),
+        _ => return Err(errors::invalid(format!("invalid cell value type {kind:?}"))),
     };
     Ok(StoredValue::Value(value))
 }
@@ -441,13 +469,13 @@ fn stored_cell(
         .map(|attribute| {
             trim_xml_whitespace(attribute.value)
                 .parse::<u32>()
-                .map_err(|_| invalid("invalid cell style index"))
+                .map_err(|_| errors::invalid("invalid cell style index"))
         })
         .transpose()?;
     let formulas = cell
         .children(elements)
         .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
-    let formula = unique(formulas, || invalid("cell has multiple formulas"))?
+    let formula = errors::unique(formulas, || errors::invalid("cell has multiple formulas"))?
         .map(|formula| element_text(xml, &elements[formula]))
         .transpose()?;
     Ok((
@@ -482,7 +510,7 @@ pub(super) fn cell_content<'a>(
             let strings = shared_strings()
                 .map_err(ReadError::SharedStrings)?
                 .ok_or_else(|| {
-                    invalid(format!(
+                    errors::invalid(format!(
                         "{address}: shared-string cell, but the workbook has no shared-string table"
                     ))
                 })?;
@@ -496,7 +524,7 @@ pub(super) fn cell_content<'a>(
                     });
                 }
                 None => {
-                    return Err(invalid(format!(
+                    return Err(errors::invalid(format!(
                         "{address}: shared-string index {position} is out of bounds"
                     ))
                     .into());

@@ -1,8 +1,43 @@
-use super::parse::{XmlDocument, parse};
+use super::parse::{STRICT, TRANSITIONAL, XmlDocument, parse};
 use super::patch::text_escaped;
 use super::validation::validate_ranges;
 use super::*;
-use crate::CellRange;
+use crate::{CellContent, CellRange, CellRef, CellValue, Error, Result};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+fn patch_cells<'xml, 'strings>(
+    xml: &'xml [u8],
+    cells: &BTreeMap<CellRef, CellValue>,
+    shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
+    date1904: bool,
+) -> Result<Cow<'xml, [u8]>> {
+    PreparedWorksheet::parse(xml)?.patch_cells(cells, shared_strings, date1904)
+}
+
+fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
+    patch_cells(
+        xml,
+        &BTreeMap::from([(cell, value.clone())]),
+        || None,
+        false,
+    )
+    .map(Cow::into_owned)
+}
+
+fn read_cell(
+    xml: &[u8],
+    cell: CellRef,
+    shared_strings: Option<&SharedStrings>,
+) -> Result<CellContent> {
+    read_cells(xml, &[cell], || Ok(shared_strings), false)
+        .map(|mut cells| cells.remove(0))
+        .map_err(|error| match error {
+            ReadError::Worksheet(error)
+            | ReadError::SharedStrings(error)
+            | ReadError::UndecodableString { error, .. } => error,
+        })
+}
 
 fn sheet(body: &str) -> String {
     format!(

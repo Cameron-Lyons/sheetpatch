@@ -1,5 +1,5 @@
 //! Validated OOXML package discovery and relationship target resolution.
-use super::{Sheet, SheetVisibility, in_part};
+use super::{Sheet, SheetVisibility};
 use crate::archive::Archive;
 use crate::xml::{
     AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, NamespaceReader,
@@ -82,11 +82,11 @@ pub(super) fn table_headers(
     parsed: &mut HashMap<String, Option<CellRange>>,
 ) -> Result<Vec<CellRange>> {
     let rels_uri = relationships_path(worksheet_uri);
-    let rels_path = part_path(archive, &rels_uri).map_err(|error| in_part(&rels_uri, error))?;
+    let rels_path = part_path(archive, &rels_uri).map_err(|error| error.in_part(&rels_uri))?;
     if !archive.contains(&rels_path) {
         return Ok(Vec::new());
     }
-    let in_rels = |error| in_part(&rels_path, error);
+    let in_rels = |error: Error| error.in_part(&rels_path);
     let mut headers = Vec::new();
     let mut tables = HashSet::new();
     // Targets already resolved, keyed by the worksheet directory segments they
@@ -137,7 +137,7 @@ pub(super) fn table_headers(
                 let header = archive
                     .read(&path)
                     .and_then(|xml| table_header(&xml))
-                    .map_err(|error| in_part(&path, error))?;
+                    .map_err(|error| error.in_part(&path))?;
                 parsed.insert(path, header);
                 header
             }
