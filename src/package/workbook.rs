@@ -244,7 +244,7 @@ impl Workbook {
     /// archive or package metadata. Worksheet XML is checked when a worksheet
     /// is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        let archive = Archive::new(bytes)?;
+        let archive = Archive::try_new(bytes)?;
         let PackageMetadata {
             sheets,
             signed,

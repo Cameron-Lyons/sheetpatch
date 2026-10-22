@@ -1,6 +1,7 @@
 use super::errors;
 use crate::xml::{
-    self, AttributeChecks, AttributeView, Attributes, DocumentRules, NamespaceId, NamespacePool,
+    self, AttributeChecks, AttributeView, Attributes, DocumentRules, NameKind, NamespaceId,
+    NamespacePool,
 };
 use crate::{Error, Result};
 use quick_xml::events::Event;
@@ -203,11 +204,10 @@ pub(super) fn parse_with<'xml>(
                 let name_end = start + 1 + tag.name().as_ref().len();
                 let name = xml::markup(source, start + 1..name_end)?;
                 rules.start_element(stack.len(), name)?;
-                let namespace = document.namespaces.resolve(
-                    &reader,
-                    tag.name(),
-                    /* attribute: */ false,
-                )?;
+                let namespace =
+                    document
+                        .namespaces
+                        .resolve(&reader, tag.name(), NameKind::Element)?;
                 let attributes = xml::attribute_spans(
                     name_end,
                     end,

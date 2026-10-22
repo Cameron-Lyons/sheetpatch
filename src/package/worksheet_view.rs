@@ -118,10 +118,12 @@ impl<'workbook> WorksheetView<'workbook> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCellReference`] for an invalid address. A cell
-    /// whose stored value is malformed or unsupported, or a shared-string
-    /// table that cannot be loaded, returns [`Error::Xml`],
-    /// [`Error::InvalidWorkbook`], or [`Error::Unsupported`], as described in
+    /// Returns [`Error::InvalidCellReference`](crate::Error::InvalidCellReference)
+    /// for an invalid address. A cell whose stored value is malformed or
+    /// unsupported, or a shared-string table that cannot be loaded, returns
+    /// [`Error::Xml`](crate::Error::Xml),
+    /// [`Error::InvalidWorkbook`](crate::Error::InvalidWorkbook), or
+    /// [`Error::Unsupported`](crate::Error::Unsupported), as described in
     /// [errors while reading](Workbook#errors-while-reading).
     pub fn get_cell(&self, address: &str) -> Result<CellContent> {
         self.get_cell_at(address.parse()?)
@@ -146,10 +148,11 @@ impl<'workbook> WorksheetView<'workbook> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCellReference`] for the first invalid address,
-    /// before reading any cell, and otherwise fails like [`Self::get_cell`]
-    /// for the first cell that cannot be read. Results that cannot be
-    /// allocated return [`Error::Io`] of kind
+    /// Returns [`Error::InvalidCellReference`](crate::Error::InvalidCellReference)
+    /// for the first invalid address, before reading any cell, and otherwise
+    /// fails like [`Self::get_cell`] for the first cell that cannot be read.
+    /// Results that cannot be allocated return
+    /// [`Error::Io`](crate::Error::Io) of kind
     /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, addresses: I) -> Result<Vec<CellContent>>
     where
@@ -165,10 +168,11 @@ impl<'workbook> WorksheetView<'workbook> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when more than 16,777,216 cells are
-    /// requested, before reading any cell, and otherwise fails like
-    /// [`Self::get_cell`] for the first cell that cannot be read. Results
-    /// that cannot be allocated return [`Error::Io`] of kind
+    /// Returns [`Error::Unsupported`](crate::Error::Unsupported) when more
+    /// than 16,777,216 cells are requested, before reading any cell, and
+    /// otherwise fails like [`Self::get_cell`] for the first cell that cannot
+    /// be read. Results that cannot be allocated return
+    /// [`Error::Io`](crate::Error::Io) of kind
     /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells_at(
         &self,

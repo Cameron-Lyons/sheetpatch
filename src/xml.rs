@@ -179,7 +179,7 @@ struct LastLookup<T> {
 /// Whether a name is an element's or an attribute's, which decides whether
 /// an unprefixed name takes the default namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NameKind {
+pub(crate) enum NameKind {
     Element,
     Attribute,
 }
@@ -317,13 +317,8 @@ impl NamespacePool {
         &mut self,
         reader: &NamespaceReader<'_>,
         name: QName<'_>,
-        attribute: bool,
+        kind: NameKind,
     ) -> Result<NamespaceId> {
-        let kind = if attribute {
-            NameKind::Attribute
-        } else {
-            NameKind::Element
-        };
         if let Some(id) = self.prefixes.get(reader, name, kind) {
             return Ok(id);
         }
@@ -1098,7 +1093,7 @@ pub(crate) fn attribute_spans<'xml>(
             // expanded name. Unprefixed attributes have no namespace.
             let qualified = QName(name);
             let expanded = ExpandedName {
-                namespace: namespaces.resolve(reader, qualified, /* attribute: */ true)?,
+                namespace: namespaces.resolve(reader, qualified, NameKind::Attribute)?,
                 local: qualified.local_name().into_inner(),
             };
             if repeated(
@@ -1487,10 +1482,10 @@ mod tests {
         };
         let mut pool = NamespacePool::new();
         let p = pool
-            .resolve(&reader, tag.name(), /* attribute: */ false)
+            .resolve(&reader, tag.name(), NameKind::Element)
             .unwrap();
         let q = pool
-            .resolve(&reader, QName("q:x"), /* attribute: */ true)
+            .resolve(&reader, QName("q:x"), NameKind::Attribute)
             .unwrap();
         assert_eq!((pool.spellings(), &**pool.uri(q)), (2, "urn:q"));
         pool.clear();
@@ -1501,12 +1496,12 @@ mod tests {
         // IDs start over: neither a cached binding nor the URI table keeps an
         // ID from before.
         assert_eq!(
-            pool.resolve(&reader, QName("q:x"), /* attribute: */ true)
+            pool.resolve(&reader, QName("q:x"), NameKind::Attribute)
                 .unwrap(),
             p
         );
         assert_eq!(
-            pool.resolve(&reader, tag.name(), /* attribute: */ false)
+            pool.resolve(&reader, tag.name(), NameKind::Element)
                 .unwrap(),
             q
         );

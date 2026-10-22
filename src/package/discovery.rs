@@ -2,7 +2,8 @@
 use super::{Sheet, SheetVisibility};
 use crate::archive::Archive;
 use crate::xml::{
-    self, AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, NamespaceReader,
+    self, AttributeChecks, Attributes, DocumentRules, NameKind, NamespaceId, NamespacePool,
+    NamespaceReader,
 };
 use crate::{CellRange, CellRef, Error, Result};
 use quick_xml::events::Event;
@@ -603,7 +604,9 @@ fn part_xml(bytes: &[u8], retain: Retain) -> Result<PartXml> {
             if qualified.as_namespace_binding().is_some() {
                 continue;
             }
-            let id = tag.namespaces.resolve(tag.reader, qualified, true)?;
+            let id = tag
+                .namespaces
+                .resolve(tag.reader, qualified, NameKind::Attribute)?;
             attributes.push(Attribute {
                 namespace: Arc::clone(tag.namespaces.uri(id)),
                 local: qualified.local_name().into_inner().to_owned(),
@@ -674,7 +677,7 @@ fn walk_part<'xml, T>(
             Event::Start(ref tag) | Event::Empty(ref tag) => {
                 let name = tag.name();
                 rules.start_element(stack.len(), name.as_ref())?;
-                let namespace = namespaces.resolve(&reader, name, false)?;
+                let namespace = namespaces.resolve(&reader, name, NameKind::Element)?;
                 attributes.clear();
                 let spans = xml::attribute_spans(
                     start + 1 + name.as_ref().len(),
@@ -694,7 +697,7 @@ fn walk_part<'xml, T>(
                     {
                         continue;
                     }
-                    let id = namespaces.resolve(&reader, qualified, true)?;
+                    let id = namespaces.resolve(&reader, qualified, NameKind::Attribute)?;
                     process_content |= &**namespaces.uri(id) == COMPATIBILITY_NAMESPACE
                         && !xml::trim_whitespace(attribute.value).is_empty();
                 }
@@ -839,7 +842,7 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
                 }
                 let parent = stack.last().map(|scope| scope.parent);
                 let checkpoint = rules.each_ref().map(|names| names.added.len());
-                let namespace = namespaces.resolve(&reader, element.name(), false)?;
+                let namespace = namespaces.resolve(&reader, element.name(), NameKind::Element)?;
                 let local = element.local_name();
                 // Rules on the wrapper itself apply before deciding whether
                 // to ignore or process that wrapper.
@@ -848,7 +851,7 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
                         let attribute = attribute.map_err(|error| Error::Xml(error.to_string()))?;
                         let name = attribute.key.local_name();
                         let attribute_namespace =
-                            namespaces.resolve(&reader, attribute.key, true)?;
+                            namespaces.resolve(&reader, attribute.key, NameKind::Attribute)?;
                         if &**namespaces.uri(attribute_namespace) != COMPATIBILITY_NAMESPACE {
                             continue;
                         }
@@ -878,7 +881,7 @@ fn reject_promoted_workbook_properties(xml: &[u8]) -> Result<()> {
                                 continue;
                             }
                             let token_namespace =
-                                namespaces.resolve(&reader, QName(token), false)?;
+                                namespaces.resolve(&reader, QName(token), NameKind::Element)?;
                             let token_name = if kind == IGNORABLE {
                                 "*"
                             } else {
@@ -1613,7 +1616,8 @@ mod tests {
     #[test]
     fn workbook_discovery_does_not_alias_invalid_relationship_paths() {
         let archive =
-            Archive::new(include_bytes!("../../tests/fixtures/libreoffice.xlsx").to_vec()).unwrap();
+            Archive::try_new(include_bytes!("../../tests/fixtures/libreoffice.xlsx").to_vec())
+                .unwrap();
         for (part, target, invalid_targets) in [
             (
                 "_rels/.rels",

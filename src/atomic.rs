@@ -508,6 +508,8 @@ mod tests {
     use super::*;
     use crate::Error;
     use std::env;
+    #[cfg(unix)]
+    use std::fs::Permissions;
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
@@ -818,7 +820,7 @@ mod tests {
         let directory = TempDir::new("private");
         let destination = directory.join("book.xlsx");
         fs::write(&destination, b"private original").unwrap();
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&destination, Permissions::from_mode(0o600)).unwrap();
         let gid = fs::metadata(&destination).unwrap().gid();
         write(&destination, None, |writer| {
             let temporary = fs::read_dir(&directory.0)?
@@ -850,7 +852,7 @@ mod tests {
         // Like `sed -i`, a rename-based save also replaces a read-only (0o400)
         // destination on Unix; Windows refuses (see the Windows-only test).
         for permissions in [0o640, 0o604, 0o644, 0o400] {
-            fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(permissions)).unwrap();
             // A private source must not override an existing file's mode.
             let source = SourcePermissions {
                 mode: Mode::from(0o600),
@@ -863,7 +865,7 @@ mod tests {
             .unwrap();
             assert_eq!(mode(&destination), permissions);
             assert_eq!(fs::metadata(&destination).unwrap().gid(), default_gid);
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(0o600)).unwrap();
         }
 
         // When the user belongs to another group, a destination in that group
@@ -873,7 +875,7 @@ mod tests {
             .find(|&gid| unix_fs::chown(&destination, None, Some(gid)).is_ok());
         if let Some(gid) = other_group {
             assert_eq!(fs::metadata(&destination).unwrap().gid(), gid);
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(0o640)).unwrap();
             replace(&destination, b"group replacement").unwrap();
             assert_eq!(fs::read(&destination).unwrap(), b"group replacement");
             assert_eq!(fs::metadata(&destination).unwrap().gid(), gid);
@@ -937,7 +939,7 @@ mod tests {
         // replacement deliberately has none of these bits.
         for permissions in [0o4755, 0o2755, 0o1755, 0o6750, 0o7777] {
             // Some systems refuse a sticky bit on a regular file.
-            if fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).is_err()
+            if fs::set_permissions(&destination, Permissions::from_mode(permissions)).is_err()
                 || mode(&destination) != permissions
             {
                 continue;
@@ -1032,7 +1034,7 @@ mod tests {
         let shared = directory.join("shared");
         fs::create_dir(&shared).unwrap();
         unix_fs::chown(&shared, None, Some(other)).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2775)).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o2775)).unwrap();
         assert_eq!(default_gid(&shared), other);
         let destination = shared.join("inherited.xlsx");
         let source = SourcePermissions {
@@ -1080,7 +1082,7 @@ mod tests {
         for permissions in [0o600, 0o604] {
             let destination = directory.join(&format!("book-{permissions:o}.xlsx"));
             fs::write(&destination, b"original").unwrap();
-            fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(permissions)).unwrap();
             if !share_with_one_user(&destination) {
                 return;
             }
@@ -1180,7 +1182,7 @@ mod tests {
         let directory = TempDir::new("acl-symlink");
         let target = directory.join("target.xlsx");
         fs::write(&target, b"original").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
         if !share_with_one_user(&target) {
             return;
         }
@@ -1326,7 +1328,7 @@ mod tests {
         let directory = TempDir::new("acl-errors");
         let path = directory.join("book.xlsx");
         fs::write(&path, b"").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o664)).unwrap();
         let metadata = fs::metadata(&path).unwrap();
         // No ACL, or no ACL support: the mode bits are the permissions.
         for error in [Errno::NODATA, Errno::NOTSUP, Errno::OPNOTSUPP] {
