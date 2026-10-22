@@ -5,16 +5,16 @@
 //! did not produce. Each test crate uses a subset of these helpers.
 #![allow(dead_code)]
 
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 
 const LOCAL_HEADER: u32 = 0x0403_4b50;
 const CENTRAL_HEADER: u32 = 0x0201_4b50;

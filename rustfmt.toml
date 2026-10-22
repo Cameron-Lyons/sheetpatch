@@ -1,0 +1,12 @@
+# Formatting follows the Google Rust Style Guide:
+# https://google.github.io/styleguide/rustguide.html#formatting-other
+max_width = 100
+hex_literal_case = "Lower"
+
+# The guide also asks for `imports_granularity = "Module"` (one module per
+# `use` statement) and `format_macro_matchers = true`. Both options are
+# unstable, so they are not set here, where stable rustfmt would warn about
+# them on every run. CI checks them with a pinned nightly rustfmt instead;
+# to apply them locally:
+#
+#   cargo +nightly fmt --all -- --config imports_granularity=Module,format_macro_matchers=true

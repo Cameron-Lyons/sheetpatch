@@ -4,19 +4,15 @@
 //! opaque gaps are copied verbatim. This avoids decoding unrelated parts and
 //! introducing unreferenced local records that some spreadsheet readers reject.
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-    fmt::Display,
-    io::{Read, Write},
-    num::NonZero,
-    ops::Range,
-};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Display;
+use std::io::{Read, Write};
+use std::num::NonZero;
+use std::ops::Range;
 
-use flate2::{
-    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
-    write::DeflateEncoder,
-};
+use flate2::write::DeflateEncoder;
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
 use crate::{Error, Result};
 

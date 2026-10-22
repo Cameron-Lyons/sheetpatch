@@ -1,24 +1,18 @@
 //! Validated OOXML package discovery and relationship target resolution.
 use super::{Sheet, SheetVisibility, in_part};
-use crate::{
-    CellRange, CellRef, Error, Result,
-    archive::Archive,
-    xml::{
-        AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, NamespaceReader,
-        attribute_spans, excel_text, trim_whitespace,
-    },
+use crate::archive::Archive;
+use crate::xml::{
+    AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, NamespaceReader,
+    attribute_spans, excel_text, trim_whitespace,
 };
-use quick_xml::{
-    events::Event,
-    name::{QName, ResolveResult},
-};
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
+use crate::{CellRange, CellRef, Error, Result};
+use quick_xml::events::Event;
+use quick_xml::name::{QName, ResolveResult};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
 
 const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const SIGNATURE_ORIGIN: &str =

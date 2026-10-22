@@ -3,12 +3,10 @@
 mod common;
 
 use common::TempDir;
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";

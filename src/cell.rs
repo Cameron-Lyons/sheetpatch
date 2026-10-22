@@ -1,5 +1,8 @@
 use crate::{Error, Result};
-use std::{borrow::Cow, fmt, iter::FusedIterator, str::FromStr};
+use std::borrow::Cow;
+use std::fmt;
+use std::iter::FusedIterator;
+use std::str::FromStr;
 
 /// An A1 address within Excel's 16,384 columns and 1,048,576 rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

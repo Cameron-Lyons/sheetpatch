@@ -3,7 +3,8 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{Error, Workbook};
-use std::{fs, io, process::Command};
+use std::process::Command;
+use std::{fs, io};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -135,10 +136,8 @@ fn workbooks_read_from_streams_match_opened_files() {
 #[cfg(unix)]
 mod permissions {
     use super::*;
-    use std::{
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        path::{Path, PathBuf},
-    };
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o7777

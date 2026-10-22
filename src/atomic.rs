@@ -1,11 +1,9 @@
 //! Write a complete replacement beside the destination before renaming it.
 use crate::Result;
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, BufWriter, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Temporary {
     path: PathBuf,

@@ -1,19 +1,15 @@
-use crate::{
-    CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result,
-    archive::{self, Archive, PartChanges},
-    atomic::SourcePermissions,
-    worksheet::{
-        PreparedWorksheet, ReadError, SharedStrings, protection, read_cells, read_shared_strings,
-    },
+use crate::archive::{self, Archive, PartChanges};
+use crate::atomic::SourcePermissions;
+use crate::worksheet::{
+    PreparedWorksheet, ReadError, SharedStrings, protection, read_cells, read_shared_strings,
 };
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt, fs,
-    io::Write,
-    panic::AssertUnwindSafe,
-    path::Path,
-    sync::{Mutex, OnceLock, PoisonError},
-};
+use crate::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
+use std::panic::AssertUnwindSafe;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::{fmt, fs};
 
 mod discovery;
 

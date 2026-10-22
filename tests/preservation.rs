@@ -1,6 +1,8 @@
 mod common;
 
-use std::{fs, io::Write, process::Command};
+use std::fs;
+use std::io::Write;
+use std::process::Command;
 
 use common::{
     TempDir, ZipLayout, archive_comment, central_directory_offset, payload, write_zip, zip_entries,
@@ -504,7 +506,8 @@ fn cli_help_version_and_usage_have_stable_exit_codes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_accepts_non_unicode_paths() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     let directory = TempDir::new();
     let input = directory.join(OsString::from_vec(b"input-\xff.xlsx".to_vec()));
@@ -531,7 +534,8 @@ fn cli_accepts_non_unicode_paths() {
 #[cfg(unix)]
 #[test]
 fn cli_rejects_non_unicode_text_without_modifying_output() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     let directory = TempDir::new();
     let input = directory.join("input.xlsx");

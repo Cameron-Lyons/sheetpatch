@@ -2,7 +2,8 @@
 use sheetpatch::{
     CellContent, CellEdit, CellRange, CellRangeIter, CellRef, CellValue, Error, Workbook,
 };
-use std::{borrow::Cow, collections::HashSet};
+use std::borrow::Cow;
+use std::collections::HashSet;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 const EXACT: u64 = 1 << 53;

@@ -1,18 +1,15 @@
 //! Shared XML invariants for values and package metadata.
 
 use crate::{Error, Result};
-use quick_xml::{
-    events::{BytesDecl, BytesRef, BytesStart, Event, attributes::Attribute as XmlAttribute},
-    name::{Namespace, NamespaceError, NamespaceResolver, QName, ResolveResult},
-};
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    fmt::Write as _,
-    hash::Hash,
-    ops::Range,
-    sync::Arc,
-};
+use quick_xml::events::attributes::Attribute as XmlAttribute;
+use quick_xml::events::{BytesDecl, BytesRef, BytesStart, Event};
+use quick_xml::name::{Namespace, NamespaceError, NamespaceResolver, QName, ResolveResult};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::hash::Hash;
+use std::ops::Range;
+use std::sync::Arc;
 
 // NsReader checks the reserved `xml` binding against its raw spelling before
 // returning an event. A character reference in that URI is legal XML, so use

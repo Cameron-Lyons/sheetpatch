@@ -1,10 +1,8 @@
 mod common;
 
 use sheetpatch::{CellValue, Error, Workbook};
-use std::{
-    collections::BTreeMap,
-    io::{self, BufWriter, Write},
-};
+use std::collections::BTreeMap;
+use std::io::{self, BufWriter, Write};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";

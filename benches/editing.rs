@@ -13,13 +13,11 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use std::{
-    collections::BTreeMap,
-    fmt::Write as _,
-    hint::black_box,
-    io,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::hint::black_box;
+use std::io;
+use std::time::{Duration, Instant};
 
 use common::{ZipEntry, ZipLayout, payloads, write_zip, zip_entries};
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};

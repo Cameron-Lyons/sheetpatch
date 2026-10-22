@@ -3,12 +3,10 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
-use std::{
-    fs,
-    io::Write,
-    path::Path,
-    process::{Command, Output, Stdio},
-};
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -284,7 +282,8 @@ fn io_errors_name_the_path_and_operation() {
 #[cfg(target_os = "linux")]
 #[test]
 fn io_errors_display_non_unicode_paths_lossily() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     let directory = TempDir::new();
     let missing = directory.join(OsString::from_vec(b"missing-\xff.xlsx".to_vec()));

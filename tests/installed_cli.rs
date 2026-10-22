@@ -5,11 +5,9 @@
 //! ```sh
 //! SHEETPATCH_INSTALLED_BINARY=/path/to/sheetpatch cargo test --test installed_cli -- --ignored
 //! ```
-use std::{
-    env,
-    io::Write,
-    process::{Command, Stdio},
-};
+use std::env;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -3,11 +3,9 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Output},
-};
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -4,7 +4,8 @@
 mod common;
 
 use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
-use std::{collections::BTreeMap, mem::discriminant};
+use std::collections::BTreeMap;
+use std::mem::discriminant;
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";

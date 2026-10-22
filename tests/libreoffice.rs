@@ -16,17 +16,17 @@
 mod common;
 
 use common::TempDir;
-use quick_xml::{NsReader, XmlVersion, events::Event, name::ResolveResult};
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    ffi::{CStr, CString, c_char, c_int, c_void},
-    fmt::Write as _,
-    fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-    path::{Path, PathBuf},
-    process::Command,
-};
+use quick_xml::events::Event;
+use quick_xml::name::ResolveResult;
+use quick_xml::{NsReader, XmlVersion};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::{env, fs};
 
 const SOURCE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

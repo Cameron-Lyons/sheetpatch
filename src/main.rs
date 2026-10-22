@@ -1,15 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::HashMap,
-    env,
-    ffi::{OsStr, OsString},
-    fmt,
-    fs::File,
-    io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write},
-    path::Path,
-    process::ExitCode,
-};
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
+use std::path::Path;
+use std::process::ExitCode;
+use std::{env, fmt};
 
 use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Workbook, WorksheetView};
 

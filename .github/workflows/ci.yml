@@ -43,6 +43,13 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Formatting
         run: cargo fmt --all -- --check
+      # The Google Rust Style Guide's one-module-per-`use` import grouping and
+      # macro-matcher formatting are unstable rustfmt options, so a pinned
+      # nightly rustfmt checks them. Installing it leaves stable the default.
+      - name: Import grouping (nightly rustfmt)
+        run: |
+          rustup toolchain install nightly-2026-10-22 --profile minimal --component rustfmt
+          cargo +nightly-2026-10-22 fmt --all -- --check --config imports_granularity=Module,format_macro_matchers=true
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       # Lints cfg(windows) code, which the Linux pass above never compiles.

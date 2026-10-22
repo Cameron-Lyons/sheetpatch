@@ -12,11 +12,9 @@
 //! oracle rather than against the crate's own parser.
 mod common;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    panic::{self, AssertUnwindSafe},
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 
 use common::{
     ZipLayout, central_directory_offset, data_descriptor_len, payload, with_data_descriptors,
@@ -24,7 +22,7 @@ use common::{
 };
 use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Workbook};
 
-const DEFAULT_SEED: u64 = 0x5EE7_5EED_2026_1011;
+const DEFAULT_SEED: u64 = 0x5ee7_5eed_2026_1011;
 
 const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
@@ -63,9 +61,9 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         Self((z ^ (z >> 31)) | 1)
     }
 
@@ -73,7 +71,7 @@ impl Rng {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
     fn below(&mut self, bound: usize) -> usize {
@@ -133,12 +131,12 @@ fn env_number(name: &str) -> Option<u64> {
 fn run_cases(test: &'static str, default_cases: usize, mut body: impl FnMut(Case, &mut Rng)) {
     let seed = env_number("SHEETPATCH_PROPERTY_SEED").unwrap_or(DEFAULT_SEED);
     let cases = env_number("SHEETPATCH_PROPERTY_CASES").map_or(default_cases, |n| n as usize);
-    let stream = test.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    let stream = test.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     for index in 0..cases {
         let case = Case { test, seed, index };
-        let mut rng = Rng::new(seed ^ stream ^ (index as u64).wrapping_mul(0xD605_BBB5_8C8A_BBFD));
+        let mut rng = Rng::new(seed ^ stream ^ (index as u64).wrapping_mul(0xd605_bbb5_8c8a_bbfd));
         if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| body(case, &mut rng))) {
             let message = panic
                 .downcast_ref::<String>()
@@ -327,7 +325,7 @@ fn number_value(rng: &mut Rng) -> f64 {
             f64::EPSILON,
             // The smallest and largest subnormal numbers.
             f64::from_bits(1),
-            f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+            f64::from_bits(0x000f_ffff_ffff_ffff),
             -f64::from_bits(1),
             45_306.75,
             1e300,

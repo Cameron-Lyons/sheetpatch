@@ -2,11 +2,9 @@
 mod common;
 
 use common::TempDir;
-use std::{
-    fs,
-    io::Write,
-    process::{Command, Output, Stdio},
-};
+use std::fs;
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -5,7 +5,8 @@ use super::{ReadError, invalid, unique, unsupported, xml_error};
 use crate::xml::{NamespaceId, excel_text, trim_whitespace as trim_xml_whitespace};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::events::Event;
-use std::{collections::HashMap, panic::AssertUnwindSafe};
+use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
