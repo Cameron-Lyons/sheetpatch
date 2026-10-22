@@ -116,36 +116,15 @@ jobs:
             cargo test --locked --all-targets --all-features --manifest-path "$manifest"
             cargo test --locked --doc --all-features --manifest-path "$manifest"
           done
+      # The ignored test inspects the installed executable. The previous step
+      # already compiled that test, so it runs without rebuilding.
       - name: Install and inspect extracted release package
         run: |
           for manifest in target/package/sheetpatch-*/Cargo.toml; do
             cargo install --locked --path "${manifest%/Cargo.toml}" --root "$RUNNER_TEMP/sheetpatch-install"
+            SHEETPATCH_INSTALLED_BINARY="$RUNNER_TEMP/sheetpatch-install/bin/sheetpatch" \
+              cargo test --locked --all-features --manifest-path "$manifest" --test installed_cli -- --ignored
           done
-          "$RUNNER_TEMP/sheetpatch-install/bin/sheetpatch" --version
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          binary = Path(os.environ["RUNNER_TEMP"]) / "sheetpatch-install/bin/sheetpatch"
-          fixture = Path("tests/fixtures/libreoffice.xlsx")
-          def read(*arguments):
-              return json.loads(subprocess.check_output([str(binary), *map(str, arguments)]))
-          sheets = read("list", "--json", fixture)
-          assert [sheet["name"] for sheet in sheets] == ["Data", "Notes"]
-          cells = read("get", "--json", fixture, "Data", "a1", "D1", "XFD1048576")
-          assert [cell["cell"] for cell in cells] == ["A1", "D1", "XFD1048576"]
-          assert cells[0]["value"] == "Original text" and cells[0]["style_index"] == 1
-          assert cells[1]["value"] == 25 and cells[1]["formula"] == "B1*2"
-          assert cells[2]["type"] == "blank" and cells[2]["value"] is None
-          checked = subprocess.run(
-              [str(binary), "patch", "--check", str(fixture), "-"],
-              input="Data\tA1\ttext\tValidated through installed CLI\n",
-              text=True, capture_output=True, check=True,
-          )
-          assert checked.stdout == "Validated 1 patch row.\n" and not checked.stderr
-          assert "--check" in subprocess.check_output([str(binary), "help", "patch"], text=True)
-          PY
 
   interoperability:
     name: LibreOffice interoperability
@@ -163,10 +142,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libreoffice-calc
-      - name: Release CLI
-        run: cargo build --locked --release
+      # The ignored test edits with the release CLI that --release builds.
       - name: Export, edit, and reopen normal and compacted workbooks
-        run: python3 scripts/check_interoperability.py --sheetpatch target/release/sheetpatch
+        run: cargo test --locked --release --test libreoffice -- --ignored
 
   advisories:
     name: Dependency advisories
