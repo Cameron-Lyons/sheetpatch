@@ -1,5 +1,8 @@
 use crate::CellRef;
-use std::{fmt, io};
+use std::error::Error as StdError;
+use std::fmt::{self, Display, Formatter};
+use std::io;
+use std::result::Result as StdResult;
 
 /// Errors are returned before an unsafe or ambiguous edit is applied.
 ///
@@ -10,6 +13,7 @@ use std::{fmt, io};
 /// Messages are written for people. Their wording is not part of the stable
 /// API and may change in any release; match on variants and fields instead.
 #[derive(Debug)]
+#[must_use]
 #[non_exhaustive]
 pub enum Error {
     /// Reading, writing, or replacing a file failed, or memory for a file's
@@ -66,32 +70,32 @@ pub enum Error {
 }
 
 /// The result of a workbook operation.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = StdResult<T, Error>;
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::Xml(e) => write!(f, "XML error: {e}"),
-            Self::InvalidWorkbook(e) => write!(f, "invalid workbook: {e}"),
-            Self::InvalidCellReference(e) => write!(f, "invalid cell reference: {e:?}"),
-            Self::InvalidValue(e) => write!(f, "invalid cell value: {e}"),
-            Self::SheetNotFound(e) => write!(f, "worksheet not found: {e:?}"),
+            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::Xml(message) => write!(f, "XML error: {message}"),
+            Self::InvalidWorkbook(message) => write!(f, "invalid workbook: {message}"),
+            Self::InvalidCellReference(address) => write!(f, "invalid cell reference: {address:?}"),
+            Self::InvalidValue(message) => write!(f, "invalid cell value: {message}"),
+            Self::SheetNotFound(name) => write!(f, "worksheet not found: {name:?}"),
             Self::ProtectedCell {
                 sheet,
                 cell,
                 reason,
             } => write!(f, "protected cell: worksheet {sheet:?}: {cell} {reason}"),
-            Self::Unsupported(e) => write!(f, "unsupported: {e}"),
+            Self::Unsupported(message) => write!(f, "unsupported: {message}"),
         }
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             // The message already includes the I/O error's own message.
-            Self::Io(e) => std::error::Error::source(e),
+            Self::Io(error) => StdError::source(error),
             _ => None,
         }
     }
@@ -145,7 +149,7 @@ impl Error {
     // Names what an error concerns, such as a cell, worksheet, or part, by
     // prefixing its message and retaining its variant. Every variant is
     // listed, so a new one must be classified here.
-    pub(crate) fn context(self, prefix: impl fmt::Display) -> Self {
+    pub(crate) fn context(self, prefix: impl Display) -> Self {
         match self {
             Self::Xml(message) => Self::Xml(format!("{prefix}: {message}")),
             Self::InvalidWorkbook(message) => Self::InvalidWorkbook(format!("{prefix}: {message}")),
@@ -163,26 +167,26 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as _;
+    use std::mem;
 
     #[derive(Debug)]
     struct Cause;
-    impl fmt::Display for Cause {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    impl Display for Cause {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             f.write_str("root cause")
         }
     }
-    impl std::error::Error for Cause {}
+    impl StdError for Cause {}
 
     #[derive(Debug)]
     struct Wrapper(Cause);
-    impl fmt::Display for Wrapper {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    impl Display for Wrapper {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             f.write_str("wrapper")
         }
     }
-    impl std::error::Error for Wrapper {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    impl StdError for Wrapper {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
             Some(&self.0)
         }
     }
@@ -220,7 +224,7 @@ mod tests {
         ];
         for error in &errors {
             let copy = error.duplicate();
-            assert_eq!(std::mem::discriminant(&copy), std::mem::discriminant(error));
+            assert_eq!(mem::discriminant(&copy), mem::discriminant(error));
             assert_eq!(copy.to_string(), error.to_string());
         }
         assert!(matches!(
@@ -240,9 +244,9 @@ mod tests {
         ];
         for error in prefixed {
             let expected = error.to_string().replacen(": ", ": B7: ", 1);
-            let kind = std::mem::discriminant(&error);
+            let kind = mem::discriminant(&error);
             let error = error.context(cell);
-            assert_eq!(std::mem::discriminant(&error), kind);
+            assert_eq!(mem::discriminant(&error), kind);
             assert_eq!(error.to_string(), expected);
         }
         assert_eq!(
@@ -265,9 +269,9 @@ mod tests {
         ];
         for error in unchanged {
             let expected = error.to_string();
-            let kind = std::mem::discriminant(&error);
+            let kind = mem::discriminant(&error);
             let error = error.context(cell);
-            assert_eq!(std::mem::discriminant(&error), kind);
+            assert_eq!(mem::discriminant(&error), kind);
             assert_eq!(error.to_string(), expected);
         }
         assert!(

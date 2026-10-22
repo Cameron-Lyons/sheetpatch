@@ -4,9 +4,10 @@ use crate::{Error, Result};
 use quick_xml::events::attributes::Attribute as XmlAttribute;
 use quick_xml::events::{BytesDecl, BytesRef, BytesStart, Event};
 use quick_xml::name::{Namespace, NamespaceError, NamespaceResolver, QName, ResolveResult};
+use quick_xml::reader::Config;
+use quick_xml::{Reader, XmlVersion, escape};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 // the same resolver with a rare retry that omits a validated, redundant `xml`
 // declaration. Events and byte positions always refer to the original input.
 pub(crate) struct NamespaceReader<'xml> {
-    reader: quick_xml::Reader<&'xml [u8]>,
+    reader: Reader<&'xml [u8]>,
     namespaces: NamespaceResolver,
     pending_pop: bool,
     scope_changes: Vec<bool>,
@@ -33,7 +34,7 @@ struct NamespaceScope {
 impl<'xml> NamespaceReader<'xml> {
     pub(crate) fn from_reader(xml: &'xml [u8]) -> Self {
         Self {
-            reader: quick_xml::Reader::from_reader(xml),
+            reader: Reader::from_reader(xml),
             namespaces: NamespaceResolver::default(),
             pending_pop: false,
             scope_changes: Vec::new(),
@@ -50,7 +51,7 @@ impl<'xml> NamespaceReader<'xml> {
         Self::from_reader(xml.as_bytes())
     }
 
-    pub(crate) fn config_mut(&mut self) -> &mut quick_xml::reader::Config {
+    pub(crate) fn config_mut(&mut self) -> &mut Config {
         self.reader.config_mut()
     }
 
@@ -75,9 +76,9 @@ impl<'xml> NamespaceReader<'xml> {
                     let attribute = attribute?;
                     if attribute.key.as_ref() == "xmlns:xml" {
                         let value = attribute.normalized_value_with(
-                            quick_xml::XmlVersion::Implicit1_0,
+                            XmlVersion::Implicit1_0,
                             1,
-                            quick_xml::escape::resolve_xml_entity,
+                            escape::resolve_xml_entity,
                         )?;
                         if value != "http://www.w3.org/XML/1998/namespace" {
                             return Err(error.into());
@@ -130,7 +131,7 @@ impl<'xml> NamespaceReader<'xml> {
                 let scope = self
                     .namespace_scopes
                     .pop()
-                    .expect("recorded namespace scope");
+                    .expect("`record_scope` pushed a scope for the tag that changed bindings");
                 for (prefix, previous) in scope.previous.into_iter().rev() {
                     if let Some(previous) = previous {
                         self.prefix_scopes.insert(prefix, previous);
@@ -160,12 +161,27 @@ impl<'xml> NamespaceReader<'xml> {
 /// restores its parent's cache. Storage stays bounded by active bindings.
 struct NamespaceCache<T> {
     scopes: Vec<CachedNamespaceScope<T>>,
-    last: (String, Option<T>),
+    last: LastLookup<T>,
 }
 
 struct CachedNamespaceScope<T> {
     id: usize,
     prefixes: HashMap<String, T>,
+}
+
+/// The prefix most recently looked up or inserted, with its value until the
+/// cache moves to another scope.
+struct LastLookup<T> {
+    prefix: String,
+    value: Option<T>,
+}
+
+/// Whether a name is an element's or an attribute's, which decides whether
+/// an unprefixed name takes the default namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameKind {
+    Element,
+    Attribute,
 }
 
 impl<T> Default for NamespaceCache<T> {
@@ -175,17 +191,20 @@ impl<T> Default for NamespaceCache<T> {
                 id: 0,
                 prefixes: HashMap::new(),
             }],
-            last: (String::new(), None),
+            last: LastLookup {
+                prefix: String::new(),
+                value: None,
+            },
         }
     }
 }
 
 impl<T: Clone> NamespaceCache<T> {
-    fn key(name: QName<'_>, attribute: bool) -> Option<&str> {
+    fn key(name: QName<'_>, kind: NameKind) -> Option<&str> {
         match name.prefix() {
             Some(prefix) => Some(prefix.into_inner()),
             // Unprefixed attributes never inherit the default namespace.
-            None if attribute => None,
+            None if kind == NameKind::Attribute => None,
             None => Some(""),
         }
     }
@@ -212,7 +231,7 @@ impl<T: Clone> NamespaceCache<T> {
                         prefixes: HashMap::new(),
                     }),
             );
-        self.last.1 = None;
+        self.last.value = None;
     }
 
     fn scope(&self, reader: &NamespaceReader<'_>, prefix: &str) -> usize {
@@ -220,16 +239,16 @@ impl<T: Clone> NamespaceCache<T> {
     }
 
     fn remember(&mut self, prefix: &str, value: T) {
-        self.last.0.clear();
-        self.last.0.push_str(prefix);
-        self.last.1 = Some(value);
+        self.last.prefix.clear();
+        self.last.prefix.push_str(prefix);
+        self.last.value = Some(value);
     }
 
-    fn get(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, attribute: bool) -> Option<T> {
-        let prefix = Self::key(name, attribute)?;
+    fn get(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, kind: NameKind) -> Option<T> {
+        let prefix = Self::key(name, kind)?;
         self.synchronize(reader);
-        if self.last.0 == prefix
-            && let Some(value) = &self.last.1
+        if self.last.prefix == prefix
+            && let Some(value) = &self.last.value
         {
             return Some(value.clone());
         }
@@ -239,8 +258,8 @@ impl<T: Clone> NamespaceCache<T> {
         Some(value)
     }
 
-    fn insert(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, attribute: bool, value: T) {
-        if let Some(prefix) = Self::key(name, attribute) {
+    fn insert(&mut self, reader: &NamespaceReader<'_>, name: QName<'_>, kind: NameKind, value: T) {
+        if let Some(prefix) = Self::key(name, kind) {
             self.synchronize(reader);
             let scope = self.scope(reader, prefix);
             self.scopes[scope]
@@ -269,8 +288,18 @@ pub(crate) struct NamespacePool {
     // large URI. Nested declarations retain the surrounding scope's cache.
     prefixes: NamespaceCache<NamespaceId>,
     raw: HashMap<String, NamespaceId>,
+    // Each URI is allocated once and shared by reference count between this
+    // map, the ID table, and callers' records that keep it past a `clear`,
+    // such as package discovery's retained nodes. Unique ownership would copy
+    // a potentially long URI into every one of them.
     canonical: HashMap<Arc<str>, NamespaceId>,
     values: Vec<Arc<str>>,
+}
+
+impl Default for NamespacePool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NamespacePool {
@@ -290,16 +319,20 @@ impl NamespacePool {
         name: QName<'_>,
         attribute: bool,
     ) -> Result<NamespaceId> {
-        if let Some(id) = self.prefixes.get(reader, name, attribute) {
+        let kind = if attribute {
+            NameKind::Attribute
+        } else {
+            NameKind::Element
+        };
+        if let Some(id) = self.prefixes.get(reader, name, kind) {
             return Ok(id);
         }
-        let (namespace, _) = if attribute {
-            reader.resolver().resolve_attribute(name)
-        } else {
-            reader.resolver().resolve_element(name)
+        let (namespace, _) = match kind {
+            NameKind::Element => reader.resolver().resolve_element(name),
+            NameKind::Attribute => reader.resolver().resolve_attribute(name),
         };
         let id = self.resolve_uncached(namespace)?;
-        self.prefixes.insert(reader, name, attribute, id);
+        self.prefixes.insert(reader, name, kind, id);
         Ok(id)
     }
 
@@ -367,8 +400,10 @@ impl NamespacePool {
     }
 }
 
-pub(crate) fn valid_char(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+pub(crate) fn valid_char(character: char) -> bool {
+    matches!(character,
+        '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' |
+        '\u{10000}'..='\u{10ffff}')
 }
 
 /// Whether XML 1.0 allows every character of `text`: exactly
@@ -460,11 +495,7 @@ pub(crate) fn reference(reference: &BytesRef<'_>) -> Result<char> {
 /// a character that XML forbids, which a character reference introduced.
 pub(crate) fn attribute_value<'a>(attribute: &XmlAttribute<'a>) -> Result<Cow<'a, str>> {
     let value = attribute
-        .normalized_value_with(
-            quick_xml::XmlVersion::Implicit1_0,
-            1,
-            quick_xml::escape::resolve_xml_entity,
-        )
+        .normalized_value_with(XmlVersion::Implicit1_0, 1, escape::resolve_xml_entity)
         .map_err(Error::xml)?;
     if let Cow::Owned(value) = &value
         && !valid_text(value)
@@ -474,8 +505,8 @@ pub(crate) fn attribute_value<'a>(attribute: &XmlAttribute<'a>) -> Result<Cow<'a
     Ok(value)
 }
 
-fn name_start(c: char) -> bool {
-    matches!(c,
+fn name_start(character: char) -> bool {
+    matches!(character,
         'A'..='Z' | '_' | 'a'..='z' |
         '\u{c0}'..='\u{d6}' | '\u{d8}'..='\u{f6}' | '\u{f8}'..='\u{2ff}' |
         '\u{370}'..='\u{37d}' | '\u{37f}'..='\u{1fff}' | '\u{200c}'..='\u{200d}' |
@@ -483,9 +514,10 @@ fn name_start(c: char) -> bool {
         '\u{f900}'..='\u{fdcf}' | '\u{fdf0}'..='\u{fffd}' | '\u{10000}'..='\u{effff}')
 }
 
-fn name_character(c: char) -> bool {
-    name_start(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{b7}' | '\u{300}'..='\u{36f}' | '\u{203f}'..='\u{2040}')
+fn name_character(character: char) -> bool {
+    name_start(character)
+        || matches!(character,
+            '-' | '.' | '0'..='9' | '\u{b7}' | '\u{300}'..='\u{36f}' | '\u{203f}'..='\u{2040}')
 }
 
 fn ncname(name: &str) -> bool {
@@ -580,7 +612,7 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
     let mut encoding_seen = false;
     let mut standalone_seen = false;
     for (index, attribute) in start.attributes().enumerate() {
-        let attribute = attribute.map_err(|e| Error::Xml(e.to_string()))?;
+        let attribute = attribute.map_err(|error| Error::Xml(error.to_string()))?;
         match attribute.key.as_ref() {
             "version" if index == 0 => {
                 version_seen = true;
@@ -613,10 +645,10 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
 // Resolve entity references before comparing URIs or expanded attribute names.
 fn namespace(result: ResolveResult<'_>) -> Result<String> {
     match result {
-        ResolveResult::Bound(ns) => {
+        ResolveResult::Bound(raw) => {
             let attribute = XmlAttribute {
                 key: QName("xmlns"),
-                value: Cow::Borrowed(ns.as_ref()),
+                value: Cow::Borrowed(raw.as_ref()),
             };
             Ok(attribute_value(&attribute)?.into_owned())
         }
@@ -653,8 +685,8 @@ impl DocumentRules {
                 "XML part exceeds the 4 GiB index limit".into(),
             ));
         }
-        let source =
-            std::str::from_utf8(xml).map_err(|e| Error::Xml(format!("XML must be UTF-8: {e}")))?;
+        let source = str::from_utf8(xml)
+            .map_err(|error| Error::Xml(format!("XML must be UTF-8: {error}")))?;
         if !valid_text(source) {
             return Err(Error::Xml("invalid XML character".into()));
         }
@@ -775,7 +807,11 @@ impl DocumentRules {
 /// refuses parts of `u32::MAX` bytes or more, and every element or attribute
 /// spans several bytes, so all values fit below `u32::MAX`.
 pub(crate) fn compact(value: usize) -> u32 {
-    debug_assert!(value < u32::MAX as usize);
+    debug_assert!(
+        value < u32::MAX as usize,
+        "offset or index {value} does not fit a compact record: `DocumentRules::source` \
+         should have refused the part"
+    );
     value as u32
 }
 
@@ -895,9 +931,9 @@ impl Attributes<'_> {
 
 /// An attribute's name and normalized value, with its spans.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AttributeView<'a> {
-    pub(crate) name: &'a str,
-    pub(crate) value: &'a str,
+pub(crate) struct AttributeView<'xml> {
+    pub(crate) name: &'xml str,
+    pub(crate) value: &'xml str,
     start: u32,
     value_start: u32,
     value_end: u32,
@@ -936,10 +972,18 @@ pub(crate) fn arena_push<T>(arena: &mut Vec<T>, item: T) {
 #[derive(Default)]
 pub(crate) struct AttributeChecks<'xml> {
     // Expanded names of the tag's ordinary prefixed attributes so far.
-    expanded: Vec<(NamespaceId, &'xml str)>,
+    expanded: Vec<ExpandedName<'xml>>,
     // Used only by tags with many attributes.
     names: HashSet<&'xml [u8]>,
-    expanded_names: HashSet<(NamespaceId, &'xml str)>,
+    expanded_names: HashSet<ExpandedName<'xml>>,
+}
+
+// A prefixed attribute's name as Namespaces in XML compares it: its
+// namespace and local part, whatever prefix spells the namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExpandedName<'xml> {
+    namespace: NamespaceId,
+    local: &'xml str,
 }
 
 // Short lists are scanned directly. Past this length a set keeps duplicate
@@ -1053,10 +1097,10 @@ pub(crate) fn attribute_spans<'xml>(
             // Different prefixes bound to one namespace can still repeat an
             // expanded name. Unprefixed attributes have no namespace.
             let qualified = QName(name);
-            let expanded = (
-                namespaces.resolve(reader, qualified, true)?,
-                qualified.local_name().into_inner(),
-            );
+            let expanded = ExpandedName {
+                namespace: namespaces.resolve(reader, qualified, /* attribute: */ true)?,
+                local: qualified.local_name().into_inner(),
+            };
             if repeated(
                 checks.expanded.iter().copied(),
                 &mut checks.expanded_names,
@@ -1105,6 +1149,8 @@ fn excel_escape_prefix_at(bytes: &[u8], position: usize) -> bool {
 // escaped as `_x005F_` where it would otherwise start a token in the output:
 // before `xHHHH_`, or before `xHHHH` and a character that is itself escaped.
 pub(crate) fn excel_escaped(text: &str) -> Cow<'_, str> {
+    use std::fmt::Write as _;
+
     if text.chars().all(|c| c != '_' && valid_char(c)) {
         return Cow::Borrowed(text);
     }
@@ -1136,9 +1182,12 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
         return Ok(text.to_owned());
     };
     let bytes = text.as_bytes();
-    let unit_at = |position| {
-        (excel_escape_prefix_at(bytes, position) && bytes.get(position + 6) == Some(&b'_'))
-            .then(|| u16::from_str_radix(&text[position + 2..position + 6], 16).unwrap())
+    let unit_at = |position: usize| {
+        if !excel_escape_prefix_at(bytes, position) || bytes.get(position + 6) != Some(&b'_') {
+            return None;
+        }
+        // The prefix test found four ASCII hex digits, which always parse.
+        u16::from_str_radix(&text[position + 2..position + 6], 16).ok()
     };
     // A lone surrogate is valid ST_Xstring, but no Rust string can hold it,
     // so it is unsupported rather than malformed.
@@ -1184,6 +1233,7 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::iter;
 
     #[test]
     fn text_scan_matches_the_character_predicate() {
@@ -1192,7 +1242,8 @@ mod tests {
         // across a boundary between full chunks. One prefix leaves its chunk
         // to be flagged by the character alone; the other flags it anyway.
         let mut text = String::new();
-        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        let characters = (0..=u32::from(char::MAX)).filter_map(char::from_u32);
+        for character in characters {
             for prefix in ["", "abc", "\u{fffd}"] {
                 text.clear();
                 text.push_str(prefix);
@@ -1229,13 +1280,14 @@ mod tests {
             "\u{ffff}",
             "\u{10ffff}",
         ];
-        for length in (0..8).chain(124..132).chain(252..260) {
+        let lengths = (0..8).chain(124..132).chain(252..260);
+        for length in lengths {
             for position in 0..=length {
                 for special in specials {
                     text.clear();
-                    text.extend(std::iter::repeat_n('a', position));
+                    text.extend(iter::repeat_n('a', position));
                     text.push_str(special);
-                    text.extend(std::iter::repeat_n('a', length - position));
+                    text.extend(iter::repeat_n('a', length - position));
                     assert_eq!(valid_text(&text), expected(&text), "{text:?}");
                 }
             }
@@ -1290,6 +1342,8 @@ mod tests {
 
     #[test]
     fn references_resolve_only_xml_10_entities_and_legal_characters() {
+        use std::fmt::Write as _;
+
         let resolve = |name: &str| match reference(&BytesRef::new(name)) {
             Ok(character) => Ok(character),
             Err(Error::Xml(message)) => Err(message),
@@ -1297,7 +1351,8 @@ mod tests {
         };
         let invalid = || Err("invalid XML character reference".to_owned());
         let mut name = String::new();
-        for codepoint in (0..=0x11_0000).chain([u32::MAX]) {
+        let codepoints = (0..=0x11_0000).chain([u32::MAX]);
+        for codepoint in codepoints {
             let expected = char::from_u32(codepoint)
                 .filter(|&c| c != '\0' && valid_char(c))
                 .map_or_else(invalid, Ok);
@@ -1384,17 +1439,23 @@ mod tests {
             match reader.read_event().unwrap() {
                 Event::Start(tag) | Event::Empty(tag) if tag.name().prefix().is_some() => {
                     let name = tag.name();
-                    let value = cache.get(&reader, name, false).unwrap_or_else(|| {
-                        let uri = namespace(reader.resolver().resolve_element(name).0).unwrap();
-                        *resolutions.entry(uri.clone()).or_insert(0) += 1;
-                        cache.insert(&reader, name, false, uri.clone());
-                        uri
-                    });
+                    let value = cache
+                        .get(&reader, name, NameKind::Element)
+                        .unwrap_or_else(|| {
+                            let uri = namespace(reader.resolver().resolve_element(name).0).unwrap();
+                            *resolutions.entry(uri.clone()).or_insert(0) += 1;
+                            cache.insert(&reader, name, NameKind::Element, uri.clone());
+                            uri
+                        });
                     assert_eq!(
-                        cache.get(&reader, QName("v:attribute"), true),
+                        cache.get(&reader, QName("v:attribute"), NameKind::Attribute),
                         Some(value.clone())
                     );
-                    assert!(cache.get(&reader, QName("attribute"), true).is_none());
+                    assert!(
+                        cache
+                            .get(&reader, QName("attribute"), NameKind::Attribute)
+                            .is_none()
+                    );
                     values.push(value);
                 }
                 Event::Eof => break,
@@ -1425,8 +1486,12 @@ mod tests {
             panic!("expected the empty root");
         };
         let mut pool = NamespacePool::new();
-        let p = pool.resolve(&reader, tag.name(), false).unwrap();
-        let q = pool.resolve(&reader, QName("q:x"), true).unwrap();
+        let p = pool
+            .resolve(&reader, tag.name(), /* attribute: */ false)
+            .unwrap();
+        let q = pool
+            .resolve(&reader, QName("q:x"), /* attribute: */ true)
+            .unwrap();
         assert_eq!((pool.spellings(), &**pool.uri(q)), (2, "urn:q"));
         pool.clear();
         assert_eq!(
@@ -1435,8 +1500,16 @@ mod tests {
         );
         // IDs start over: neither a cached binding nor the URI table keeps an
         // ID from before.
-        assert_eq!(pool.resolve(&reader, QName("q:x"), true).unwrap(), p);
-        assert_eq!(pool.resolve(&reader, tag.name(), false).unwrap(), q);
+        assert_eq!(
+            pool.resolve(&reader, QName("q:x"), /* attribute: */ true)
+                .unwrap(),
+            p
+        );
+        assert_eq!(
+            pool.resolve(&reader, tag.name(), /* attribute: */ false)
+                .unwrap(),
+            q
+        );
         assert_eq!((&**pool.uri(p), &**pool.uri(q)), ("urn:q", "urn:p"));
     }
 
