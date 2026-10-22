@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::result::Result as StdResult;
 use std::sync::{Mutex, OnceLock};
 
 /// An existing OOXML workbook with pending surgical cell edits.
@@ -120,7 +121,7 @@ pub struct Workbook {
     // `Error` is not `RefUnwindSafe` only because an `io::Error` can box any
     // source. A kept error never changes, and loading the table from memory
     // never fails with an I/O error, so the workbook stays unwind-safe.
-    shared_strings: OnceLock<std::result::Result<SharedStrings, AssertUnwindSafe<Error>>>,
+    shared_strings: OnceLock<StdResult<SharedStrings, AssertUnwindSafe<Error>>>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
@@ -262,7 +263,7 @@ impl Workbook {
                 )
             })
             .unzip();
-        let sheet_indexes = sheets
+        let sheet_indexes: BTreeMap<String, usize> = sheets
             .iter()
             .enumerate()
             .map(|(index, sheet)| (sheet.name.clone(), index))
@@ -769,7 +770,7 @@ impl Workbook {
     // Decompresses and parses the table on first use and keeps the outcome,
     // so a damaged table is not read again for every call. Concurrent first
     // uses wait for one load, which never touches this cache.
-    fn load_shared_strings(&self) -> Option<std::result::Result<&SharedStrings, &Error>> {
+    fn load_shared_strings(&self) -> Option<StdResult<&SharedStrings, &Error>> {
         let path = self.shared_strings_path.as_deref()?;
         let loaded = self.shared_strings.get_or_init(|| {
             self.archive
@@ -914,6 +915,16 @@ impl Workbook {
     }
 }
 
+// From `row` on, each column from `first_column` to `last_column` is inside
+// `delta` more table headers.
+#[derive(Clone, Copy)]
+struct HeaderEvent {
+    row: u32,
+    first_column: u16,
+    last_column: u16,
+    delta: i32,
+}
+
 // The edits inside any table header, once each and in edit order, so that
 // overlapping headers keep the read and refusal order of ordinary worksheet
 // batches. A package can relate many tables with overlapping headers, and the
@@ -930,11 +941,11 @@ fn header_cells<'a>(
         .collect();
     spans.sort_unstable();
     let mut spans = spans.into_iter();
-    let Some(mut span) = spans.next() else {
+    let Some((mut run_first, mut run_last)) = spans.next() else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    let mut search = |(first, last): (u32, u32)| {
+    let mut search = |first: u32, last: u32| {
         let first = CellRef {
             row: first,
             column: 1,
@@ -951,14 +962,14 @@ fn header_cells<'a>(
     };
     for (first, last) in spans {
         // Spans that overlap or touch form one run of rows.
-        if first > span.1 + 1 {
-            search(span);
-            span = (first, last);
+        if first > run_last + 1 {
+            search(run_first, run_last);
+            (run_first, run_last) = (first, last);
         } else {
-            span.1 = span.1.max(last);
+            run_last = run_last.max(last);
         }
     }
-    search(span);
+    search(run_first, run_last);
     // With either collection small, direct membership checks cost less than
     // sorting events and allocating a column index.
     if candidates.len() <= 8
@@ -969,13 +980,23 @@ fn header_cells<'a>(
         return candidates;
     }
     // Each header counts once in its columns, from its first row to its last.
-    let mut events: Vec<(u32, u16, u16, i32)> = Vec::with_capacity(headers.len() * 2);
+    let mut events: Vec<HeaderEvent> = Vec::with_capacity(headers.len() * 2);
     for header in headers {
         let (first, last) = (header.first(), header.last());
-        events.push((first.row, first.column, last.column, 1));
-        events.push((last.row + 1, first.column, last.column, -1));
+        events.push(HeaderEvent {
+            row: first.row,
+            first_column: first.column,
+            last_column: last.column,
+            delta: 1,
+        });
+        events.push(HeaderEvent {
+            row: last.row + 1,
+            first_column: first.column,
+            last_column: last.column,
+            delta: -1,
+        });
     }
-    events.sort_unstable_by_key(|&(row, ..)| row);
+    events.sort_unstable_by_key(|event| event.row);
     // Fenwick indexes are one-based columns. A header also updates the slot
     // after its last column, which is one past the grid's final column.
     let mut active = vec![0i32; usize::from(CellRef::MAX_COLUMN) + 2];
@@ -983,8 +1004,13 @@ fn header_cells<'a>(
     // Candidates are visited in edit order. The events of every row up to a
     // candidate's own are applied before its column is counted.
     candidates.retain(|&(cell, _)| {
-        while position < events.len() && events[position].0 <= cell.row {
-            let (_, first_column, last_column, delta) = events[position];
+        while position < events.len() && events[position].row <= cell.row {
+            let HeaderEvent {
+                first_column,
+                last_column,
+                delta,
+                ..
+            } = events[position];
             for (column, delta) in [
                 (usize::from(first_column), delta),
                 (usize::from(last_column) + 1, -delta),
