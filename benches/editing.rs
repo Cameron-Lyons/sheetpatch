@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use common::{ZipEntry, ZipLayout, payloads, write_zip, zip_entries};
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 // Default Deflate level, without optional ZIP metadata or comments.
 const LAYOUT: ZipLayout<'static> = ZipLayout::deflated(6);
@@ -98,7 +98,7 @@ fn updates(cells: usize, count: usize) -> Vec<(String, CellValue)> {
 
 fn worksheet(cells: usize, values: &BTreeMap<usize, i32>) -> Vec<u8> {
     let mut xml = format!(
-        "<worksheet xmlns=\"{MAIN_NS}\" xmlns:v=\"urn:vendor\"><dimension ref=\"A1:A{cells}\"/><sheetData>"
+        "<worksheet xmlns=\"{MAIN_NAMESPACE}\" xmlns:v=\"urn:vendor\"><dimension ref=\"A1:A{cells}\"/><sheetData>"
     );
     for row in 1..=cells {
         let value = values.get(&row).copied().unwrap_or(row as i32);
@@ -119,7 +119,7 @@ fn fixture(cells: usize) -> Vec<u8> {
 
 fn fixture_with_sheet(sheet: &[u8]) -> Vec<u8> {
     let workbook = format!(
-        "<workbook xmlns=\"{MAIN_NS}\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Data\" sheetId=\"1\" r:id=\"r1\"/></sheets></workbook>"
+        "<workbook xmlns=\"{MAIN_NAMESPACE}\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Data\" sheetId=\"1\" r:id=\"r1\"/></sheets></workbook>"
     );
     // An incompressible opaque part makes serialization exercise retained data,
     // instead of benchmarking only an unusually small, compressible worksheet.
@@ -343,7 +343,7 @@ fn table_batches(samples: usize) {
         parts.insert(
             format!("xl/tables/table{column}.xml"),
             format!(
-                "<table xmlns='{MAIN_NS}' id='{column}' name='Table{column}' displayName='Table{column}' ref='{first}:{last}'><tableColumns count='1'><tableColumn id='1' name='{column}'/></tableColumns></table>"
+                "<table xmlns='{MAIN_NAMESPACE}' id='{column}' name='Table{column}' displayName='Table{column}' ref='{first}:{last}'><tableColumns count='1'><tableColumn id='1' name='{column}'/></tableColumns></table>"
             )
             .into_bytes(),
         );
@@ -404,7 +404,7 @@ fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> 
     let base = fixture_with_sheet(sheets[0].1);
     let mut parts = payloads(&base);
     let office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    let mut workbook = format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{office}'><sheets>");
+    let mut workbook = format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{office}'><sheets>");
     let mut relationships = String::from(
         "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
     );
@@ -458,7 +458,8 @@ fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> 
 
 fn wide_worksheet(rows: u32, columns: u16, values: &BTreeMap<CellRef, i32>) -> Vec<u8> {
     let last = CellRef::try_new(rows, columns).unwrap();
-    let mut xml = format!("<worksheet xmlns='{MAIN_NS}'><dimension ref='A1:{last}'/><sheetData>");
+    let mut xml =
+        format!("<worksheet xmlns='{MAIN_NAMESPACE}'><dimension ref='A1:{last}'/><sheetData>");
     for row in 1..=rows {
         write!(xml, "<row r='{row}'>").unwrap();
         for column in 1..=columns {
@@ -578,8 +579,8 @@ fn prepared_reads(samples: usize, book: &Workbook, queries: &[CellRef], cells: u
 fn shared_string_reads(samples: usize) {
     let cells = 2_000;
     let count = 64;
-    let mut sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData>");
-    let mut strings = format!("<sst xmlns='{MAIN_NS}'>");
+    let mut sheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>");
+    let mut strings = format!("<sst xmlns='{MAIN_NAMESPACE}'>");
     for index in 0..128 {
         write!(
             strings,
@@ -723,7 +724,7 @@ fn extra_workloads(samples: usize) {
         shared_string_reads(samples);
     }
     if selected("SHEETPATCH_BENCH_CASES", "insertion") {
-        let sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let sheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
         let mut rows = String::from("<sheetData>");
         let mut edits = Vec::new();
         for row in 1..=500 {
@@ -752,7 +753,7 @@ fn extra_workloads(samples: usize) {
         // Style zero is present in the fixture and needs no cell attribute.
         let style = "0".repeat(64 * 1024);
         let prefix = format!(
-            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1' customFormat='1' s='{style}'>"
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1' customFormat='1' s='{style}'>"
         );
         let suffix = "</row></sheetData></worksheet>";
         let sheet = format!("{prefix}{suffix}");
@@ -822,7 +823,7 @@ fn extra_workloads(samples: usize) {
         // every character as an escape, exercising output growth and formatting.
         let text = "\0\u{1}\u{1f}\u{fffe}\u{ffff}".repeat(6_553) + "\0\u{1}";
         let escaped = "_x0000__x0001__x001F__xFFFE__xFFFF_".repeat(6_553) + "_x0000__x0001_";
-        let sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let sheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
         let mut rows = String::from("<sheetData>");
         let mut edits = Vec::new();
         for row in 1..=64 {

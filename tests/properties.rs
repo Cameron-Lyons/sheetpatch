@@ -24,13 +24,15 @@ use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Wo
 
 const DEFAULT_SEED: u64 = 0x5ee7_5eed_2026_1011;
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
-const CONTENT_TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
-const VENDOR_NS: &str = "urn:sheetpatch:vendor";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const STRICT_NAMESPACE: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const STRICT_OFFICE_NAMESPACE: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const CONTENT_TYPES_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/package/2006/content-types";
+const VENDOR_NAMESPACE: &str = "urn:sheetpatch:vendor";
 
 const MAX_TEXT_UNITS: usize = 32_767;
 
@@ -991,7 +993,11 @@ fn generate_sheet(
     strict: bool,
     strings: &[String],
 ) -> SheetModel {
-    let namespace = if strict { STRICT_NS } else { MAIN_NS };
+    let namespace = if strict {
+        STRICT_NAMESPACE
+    } else {
+        MAIN_NAMESPACE
+    };
     let prefixes: [&'static str; 4] = ["", "x:", "s:", "main:"];
     let names = Names {
         prefix: prefixes[if rng.chance(1, 3) {
@@ -1223,9 +1229,13 @@ fn generate_sheet(
     } else {
         ""
     };
-    let office = if strict { STRICT_OFFICE_NS } else { OFFICE_NS };
+    let office = if strict {
+        STRICT_OFFICE_NAMESPACE
+    } else {
+        OFFICE_NAMESPACE
+    };
     let root = format!(
-        "{declaration}<{} {} xmlns:r=\"{office}\" xmlns:v=\"{VENDOR_NS}\" v:mode=\"keep\">",
+        "{declaration}<{} {} xmlns:r=\"{office}\" xmlns:v=\"{VENDOR_NAMESPACE}\" v:mode=\"keep\">",
         el("worksheet"),
         names.declaration(namespace),
     );
@@ -1371,8 +1381,16 @@ struct Package {
 /// to hold many protected ranges, which otherwise happens for one in six.
 fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
     let strict = rng.chance(1, 4);
-    let namespace = if strict { STRICT_NS } else { MAIN_NS };
-    let office = if strict { STRICT_OFFICE_NS } else { OFFICE_NS };
+    let namespace = if strict {
+        STRICT_NAMESPACE
+    } else {
+        MAIN_NAMESPACE
+    };
+    let office = if strict {
+        STRICT_OFFICE_NAMESPACE
+    } else {
+        OFFICE_NAMESPACE
+    };
     let strings = rng.chance(3, 4).then(|| shared_strings(rng, namespace));
     let texts = strings.as_ref().map_or(&[][..], |strings| &strings.texts);
 
@@ -1392,7 +1410,7 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
     let mut workbook = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"{namespace}\" xmlns:r=\"{office}\"><bookViews><workbookView/></bookViews><sheets>"
     );
-    let mut relationships = format!("<Relationships xmlns=\"{PACKAGE_NS}\">");
+    let mut relationships = format!("<Relationships xmlns=\"{PACKAGE_NAMESPACE}\">");
     for (index, sheet) in sheets.iter().enumerate() {
         let id = index + 1;
         workbook.push_str(&format!(
@@ -1422,14 +1440,14 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
         (
             "[Content_Types].xml".into(),
             format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"{CONTENT_TYPES_NS}\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"bin\" ContentType=\"application/vnd.ms-office.vbaProject\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.ms-excel.sheet.macroEnabled.main+xml\"/></Types>"
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"{CONTENT_TYPES_NAMESPACE}\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"bin\" ContentType=\"application/vnd.ms-office.vbaProject\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.ms-excel.sheet.macroEnabled.main+xml\"/></Types>"
             )
             .into_bytes(),
         ),
         (
             "_rels/.rels".into(),
             format!(
-                "<Relationships xmlns=\"{PACKAGE_NS}\"><Relationship Id=\"rId1\" Type=\"{office}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
+                "<Relationships xmlns=\"{PACKAGE_NAMESPACE}\"><Relationship Id=\"rId1\" Type=\"{office}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
             )
             .into_bytes(),
         ),

@@ -8,9 +8,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 /// Values of every scalar type in a sparse sheet, with style-only cells, an
 /// empty row, and formulas with and without cached values.
@@ -40,20 +41,21 @@ fn workbook(sheets: &[(&str, &str, &str)]) -> Vec<u8> {
             "<sheet name='{name}' sheetId='{id}' r:id='s{id}'{attributes}/>"
         ));
         relationships.push_str(&format!(
-            "<Relationship Id='s{id}' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet{id}.xml'/>"
+            "<Relationship Id='s{id}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{id}.xml'/>"
         ));
         parts.push((
             format!("xl/worksheets/sheet{id}.xml"),
-            format!("<worksheet xmlns='{MAIN_NS}'>{children}</worksheet>"),
+            format!("<worksheet xmlns='{MAIN_NAMESPACE}'>{children}</worksheet>"),
         ));
     }
     let root = format!(
-        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{list}</sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{list}</sheets></workbook>"
     );
-    let rels = format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>");
+    let rels =
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>");
     let mut entries: Vec<(&str, &[u8])> = vec![
         (
             "[Content_Types].xml",

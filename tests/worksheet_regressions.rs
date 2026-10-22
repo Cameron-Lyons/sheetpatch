@@ -4,29 +4,30 @@ mod common;
 use common::{payloads, stored_archive};
 use sheetpatch::{CellEdit, CellValue, Error, Workbook};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 
 /// A one-sheet workbook named `Data`, optionally with a shared-string table.
 fn workbook(body: &str, shared_strings: Option<&str>) -> Workbook {
-    workbook_in_namespace(body, shared_strings, MAIN_NS)
+    workbook_in_namespace(body, shared_strings, MAIN_NAMESPACE)
 }
 
 fn workbook_in_namespace(body: &str, shared_strings: Option<&str>, namespace: &str) -> Workbook {
     let sheet = format!("<worksheet xmlns='{namespace}'>{body}</worksheet>");
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"
     );
     let strings_relationship = if shared_strings.is_some() {
         format!(
-            "<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/>"
+            "<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/>"
         )
     } else {
         String::new()
     };
     let relationships = format!(
-        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='data' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/>{strings_relationship}</Relationships>"
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='data' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/>{strings_relationship}</Relationships>"
     );
     let strings = shared_strings
         .map(|items| format!("<sst xmlns='{namespace}'>{items}</sst>"))
@@ -815,7 +816,7 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
     // Metadata operation flags apply to cell metadata as well as value metadata.
     // ECMA-376 18.9.10 requires disassociation on edit/clear when these are false.
     let metadata = format!(
-        "<metadata xmlns='{MAIN_NS}'><metadataTypes count='1'><metadataType name='custom' minSupportedVersion='1' cellMeta='1' edit='0' delete='0' clearContents='0'/></metadataTypes><futureMetadata name='custom' count='1'><bk><extLst><ext uri='urn:custom'><stamp xmlns='urn:custom' originalValue='1'/></ext></extLst></bk></futureMetadata><cellMetadata count='2'><bk><rc t='1' v='0'/></bk><bk><rc t='1' v='0'/></bk></cellMetadata></metadata>"
+        "<metadata xmlns='{MAIN_NAMESPACE}'><metadataTypes count='1'><metadataType name='custom' minSupportedVersion='1' cellMeta='1' edit='0' delete='0' clearContents='0'/></metadataTypes><futureMetadata name='custom' count='1'><bk><extLst><ext uri='urn:custom'><stamp xmlns='urn:custom' originalValue='1'/></ext></extLst></bk></futureMetadata><cellMetadata count='2'><bk><rc t='1' v='0'/></bk><bk><rc t='1' v='0'/></bk></cellMetadata></metadata>"
     );
     for index in ["0", "1"] {
         let original = workbook(
@@ -831,7 +832,7 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
             .unwrap()
             .replace(
                 "</Relationships>",
-                &format!("<Relationship Id='metadata' Type='{OFFICE_NS}/sheetMetadata' Target='metadata.xml'/></Relationships>"),
+                &format!("<Relationship Id='metadata' Type='{OFFICE_NAMESPACE}/sheetMetadata' Target='metadata.xml'/></Relationships>"),
             );
         parts.insert(
             "xl/_rels/workbook.xml.rels".into(),
@@ -981,9 +982,9 @@ fn values_marked_to_preserve_whitespace_can_be_rewritten_and_replaced() {
 
 #[test]
 fn namespace_prefix_caches_follow_shadowing_and_empty_element_scopes() {
-    let escaped_main = MAIN_NS.replace("/main", "/ma&#105;n");
+    let escaped_main = MAIN_NAMESPACE.replace("/main", "/ma&#105;n");
     let body = format!(
-        "<sheetData xmlns:s='{MAIN_NS}' xmlns:t='{escaped_main}' xmlns:a='urn:first' xmlns:b='urn:second'><row r='1' xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'><s:c r='A1' a:flag='1' b:flag='2'><s:v>1</s:v></s:c><s:c xmlns:s='urn:vendor' r='Z1'/><marker xmlns=''><c r='Z2'/></marker><holder xmlns='urn:vendor' xmlns:s='urn:vendor'><s:c r='Z3'/></holder><t:c r='B1' a:flag='1' b:flag='2'><t:v>2</t:v></t:c><a:marker xmlns:a='urn:second' a:flag='x'/><c r='C1' a:flag='1' b:flag='2'><v>3</v></c></row></sheetData>"
+        "<sheetData xmlns:s='{MAIN_NAMESPACE}' xmlns:t='{escaped_main}' xmlns:a='urn:first' xmlns:b='urn:second'><row r='1' xmlns:xml='http://www.w3.org/XML/1998/namespac&#101;'><s:c r='A1' a:flag='1' b:flag='2'><s:v>1</s:v></s:c><s:c xmlns:s='urn:vendor' r='Z1'/><marker xmlns=''><c r='Z2'/></marker><holder xmlns='urn:vendor' xmlns:s='urn:vendor'><s:c r='Z3'/></holder><t:c r='B1' a:flag='1' b:flag='2'><t:v>2</t:v></t:c><a:marker xmlns:a='urn:second' a:flag='x'/><c r='C1' a:flag='1' b:flag='2'><v>3</v></c></row></sheetData>"
     );
     let mut book = workbook(&body, None);
     let original = book.to_bytes().unwrap();
@@ -1031,7 +1032,7 @@ fn namespace_prefix_caches_follow_shadowing_and_empty_element_scopes() {
 fn escaped_reserved_namespace_bindings_preserve_text_and_namespace_scopes() {
     let xml_namespace = "http://www.w3.org/XML/1998/namespac&#101;";
     let body = format!(
-        "<sheetData xmlns:s='{MAIN_NS}'><row r='1' vendor='a\"b' xmlns:before='urn:first' xmlns:xml='{xml_namespace}' xmlns:after='urn:last' before:flag='keep' after:flag='keep'><s:c r='A1' t='inlineStr'><s:is><s:t xmlns:xml='{xml_namespace}' xml:space='preserve'> old </s:t></s:is></s:c><c r='B1' xmlns:s='urn:foreign' xmlns:xml='{xml_namespace}'/><s:c r='C1' t='s'><s:v>0</s:v></s:c></row></sheetData>"
+        "<sheetData xmlns:s='{MAIN_NAMESPACE}'><row r='1' vendor='a\"b' xmlns:before='urn:first' xmlns:xml='{xml_namespace}' xmlns:after='urn:last' before:flag='keep' after:flag='keep'><s:c r='A1' t='inlineStr'><s:is><s:t xmlns:xml='{xml_namespace}' xml:space='preserve'> old </s:t></s:is></s:c><c r='B1' xmlns:s='urn:foreign' xmlns:xml='{xml_namespace}'/><s:c r='C1' t='s'><s:v>0</s:v></s:c></row></sheetData>"
     );
     let strings =
         format!("<si xmlns:xml='{xml_namespace}'><t xml:space='preserve'> shared </t></si>");
@@ -1128,7 +1129,7 @@ fn hidden_rich_text_cannot_be_discarded_by_a_replacement() {
 #[test]
 fn mixed_spreadsheet_namespaces_cannot_hide_worksheet_semantics() {
     const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-    for (namespace, other) in [(MAIN_NS, STRICT), (STRICT, MAIN_NS)] {
+    for (namespace, other) in [(MAIN_NAMESPACE, STRICT), (STRICT, MAIN_NAMESPACE)] {
         // Namespace comparison uses decoded URIs, including escaped spellings.
         let other = other.replace('/', "&#47;");
         for body in [
@@ -1180,7 +1181,7 @@ fn mixed_spreadsheet_namespaces_cannot_hide_worksheet_semantics() {
 #[test]
 fn mixed_spreadsheet_namespaces_cannot_shift_or_truncate_shared_strings() {
     const STRICT: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-    for (namespace, other) in [(MAIN_NS, STRICT), (STRICT, MAIN_NS)] {
+    for (namespace, other) in [(MAIN_NAMESPACE, STRICT), (STRICT, MAIN_NAMESPACE)] {
         for strings in [
             format!("<s:si xmlns:s='{other}'><s:t>hidden entry</s:t></s:si><si><t>next</t></si>"),
             format!("<si><t>visible</t><s:t xmlns:s='{other}'>hidden text</s:t></si>"),

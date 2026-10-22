@@ -398,7 +398,7 @@ pub(super) fn decode_payload(
     let namespace = index.namespace;
     let payload = &elements[payload_index];
     let kind = cell
-        .attr(&index.attributes, "t")
+        .attribute(&index.attributes, "t")
         .map_or("n", |attribute| attribute.value);
     if kind == "inlineStr" {
         if !payload.is(source, namespace, "is") {
@@ -465,7 +465,7 @@ fn stored_cell(
 ) -> Result<(Option<u32>, Option<String>, StoredValue)> {
     let elements = &index.elements;
     let style_index = cell
-        .attr(&index.attributes, "s")
+        .attribute(&index.attributes, "s")
         .map(|attribute| {
             trim_xml_whitespace(attribute.value)
                 .parse::<u32>()

@@ -45,7 +45,7 @@ fn column_styles(
 ) -> ColumnStyles {
     let number = |column: &Element, name, default| {
         column
-            .attr(attributes, name)
+            .attribute(attributes, name)
             .map_or(Ok(default), |attribute| {
                 trim_xml_whitespace(attribute.value)
                     .parse::<u32>()
@@ -100,7 +100,7 @@ struct Formulas {
 impl Formulas {
     fn add(&mut self, address: CellRef, formula: &Element, attributes: &Attributes) -> Result<()> {
         let range = formula
-            .attr(attributes, "ref")
+            .attribute(attributes, "ref")
             .map(|attribute| reference_range(attribute.value))
             .transpose()
             .map_err(|error| error.context(address))?;
@@ -108,11 +108,11 @@ impl Formulas {
             self.ranges.push(range);
         }
         match formula
-            .attr(attributes, "t")
+            .attribute(attributes, "t")
             .map(|attribute| attribute.value)
         {
             Some("shared") => {
-                let index_reference = formula.attr(attributes, "si").ok_or_else(|| {
+                let index_reference = formula.attribute(attributes, "si").ok_or_else(|| {
                     errors::invalid(format!("{address}: shared formula without an index"))
                 })?;
                 let index = trim_xml_whitespace(index_reference.value)
@@ -161,7 +161,7 @@ fn worksheet_namespace(document: &XmlDocument) -> Result<NamespaceId> {
 // invalid.
 fn row_number(row: &Element, attributes: &Attributes, previous: u32) -> Result<u32> {
     let reference = row
-        .attr(attributes, "r")
+        .attribute(attributes, "r")
         .ok_or_else(|| errors::unsupported("rows without explicit row numbers"))?;
     let number = trim_xml_whitespace(reference.value)
         .parse::<u32>()
@@ -175,7 +175,7 @@ fn row_number(row: &Element, attributes: &Attributes, previous: u32) -> Result<u
 }
 
 fn cell_address(cell: &Element, attributes: &Attributes, row: u32) -> Result<CellRef> {
-    cell.attr(attributes, "r")
+    cell.attribute(attributes, "r")
         .ok_or_else(|| {
             errors::unsupported(format!("row {row}: cells without explicit references"))
         })?
@@ -255,7 +255,7 @@ fn merged_ranges(
                 continue;
             }
             let reference = merge
-                .attr(attributes, "ref")
+                .attribute(attributes, "ref")
                 .ok_or_else(|| errors::invalid("merged cells without a reference"))?;
             ranges.push(reference_range(reference.value)?);
         }

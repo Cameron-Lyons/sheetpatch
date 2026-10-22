@@ -1166,9 +1166,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/libreoffice.xlsx"
     );
-    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NAMESPACE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
     fn args(values: &[&str]) -> Vec<OsString> {
         std::iter::once("sheetpatch")
@@ -1192,18 +1193,19 @@ mod tests {
         let relationships: String = (0..names.len())
             .map(|index| {
                 format!(
-                    "<Relationship Id='s{index}' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet{index}.xml'/>"
+                    "<Relationship Id='s{index}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{index}.xml'/>"
                 )
             })
             .collect();
         let workbook = format!(
-            "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{sheets}</sheets></workbook>"
+            "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{sheets}</sheets></workbook>"
         );
         let root = format!(
-            "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+            "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
         );
-        let rels = format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>");
-        let worksheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let rels =
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>");
+        let worksheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
         let paths: Vec<String> = (0..names.len())
             .map(|index| format!("xl/worksheets/sheet{index}.xml"))
             .collect();
@@ -1459,7 +1461,7 @@ mod tests {
         // that the budget can end the buffered prefix before or after a cell.
         let long = "long ".repeat(12);
         let sheet = format!(
-            "<worksheet xmlns='{MAIN_NS}'><sheetData>\
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>\
              <row r='1'><c r='A1' t='s'><v>1</v></c><c r='B1'><v>12.5</v></c>\
              <c r='C1' s='1'/><c r='D1'><f>B1*2</f><v>25</v></c></row>\
              <row r='2'><c r='A2' t='inlineStr'><is><t>x&#13;&#x9b;2J&#x7f;&#9;y&#10;z</t></is></c>\
@@ -1540,7 +1542,7 @@ mod tests {
         }
         let long = "x".repeat(1000);
         let sheet = format!(
-            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
              <c r='B1' t='inlineStr'><is><t>{long}</t></is></c>\
              <c r='C1'><f>{long}</f><v>2</v></c></row></sheetData></worksheet>"
         );

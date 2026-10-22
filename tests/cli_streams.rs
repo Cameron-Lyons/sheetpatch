@@ -339,19 +339,20 @@ fn full_standard_output_reports_a_write_error() {
 /// A workbook whose 1 MiB of untouched package data outgrows any default
 /// pipe buffer.
 fn large_workbook() -> Vec<u8> {
-    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NAMESPACE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
     let root = format!(
-        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
     );
     let rels = format!(
-        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
+        "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
     );
-    let worksheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let worksheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
     let padding = vec![b'x'; 1 << 20];
     common::stored_archive(&[
         (

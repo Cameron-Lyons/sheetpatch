@@ -1013,9 +1013,10 @@ mod tests {
     use super::*;
     use crate::common;
 
-    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NAMESPACE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
     // A workbook whose Data worksheet's A1 and A2 are shared strings 0 and 1,
     // with `strings` as the body of its shared-string table.
@@ -1027,23 +1028,23 @@ mod tests {
             ),
             (
                 "_rels/.rels",
-                format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
+                format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
             ),
             (
                 "xl/workbook.xml",
-                format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"),
+                format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='data'/></sheets></workbook>"),
             ),
             (
                 "xl/_rels/workbook.xml.rels",
-                format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='data' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+                format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='data' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
             ),
             (
                 "xl/worksheets/sheet1.xml",
-                format!("<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2' t='s'><v>1</v></c></row></sheetData></worksheet>"),
+                format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2' t='s'><v>1</v></c></row></sheetData></worksheet>"),
             ),
             (
                 "xl/sharedStrings.xml",
-                format!("<sst xmlns='{MAIN_NS}'>{strings}</sst>"),
+                format!("<sst xmlns='{MAIN_NAMESPACE}'>{strings}</sst>"),
             ),
         ];
         let entries: Vec<(&str, &[u8])> = parts

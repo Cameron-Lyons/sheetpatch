@@ -1,7 +1,7 @@
 use super::errors;
 use crate::xml::{
-    AttrView, AttributeChecks, Attributes, DocumentRules, NamespaceId, NamespacePool, arena_push,
-    attribute_spans, compact, markup,
+    AttributeChecks, AttributeView, Attributes, DocumentRules, NamespaceId, NamespacePool,
+    arena_push, attribute_spans, compact, markup,
 };
 use crate::{Error, Result};
 use quick_xml::events::Event;
@@ -81,15 +81,15 @@ impl Element {
     pub(super) fn attributes<'a>(
         &self,
         attributes: &'a Attributes<'_>,
-    ) -> impl Iterator<Item = AttrView<'a>> {
+    ) -> impl Iterator<Item = AttributeView<'a>> {
         (self.attributes_start as usize..self.attributes_end as usize)
             .map(|index| attributes.view(index))
     }
-    pub(super) fn attr<'a>(
+    pub(super) fn attribute<'a>(
         &self,
         attributes: &'a Attributes<'_>,
         name: &str,
-    ) -> Option<AttrView<'a>> {
+    ) -> Option<AttributeView<'a>> {
         attributes.find(
             self.attributes_start as usize..self.attributes_end as usize,
             name,

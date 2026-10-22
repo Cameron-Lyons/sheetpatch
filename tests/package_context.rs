@@ -7,14 +7,15 @@ use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
 use std::collections::BTreeMap;
 use std::mem::discriminant;
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const CONTENT_TYPES: &str = "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/></Types>";
 const CELL: &str = "<sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData>";
 
 fn worksheet(body: &str) -> Vec<u8> {
-    format!("<worksheet xmlns='{MAIN_NS}'>{body}</worksheet>").into_bytes()
+    format!("<worksheet xmlns='{MAIN_NAMESPACE}'>{body}</worksheet>").into_bytes()
 }
 
 /// The parts of a workbook whose worksheets have the given names and XML.
@@ -29,22 +30,23 @@ fn parts(sheets: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
             "<sheet name=\"{name}\" sheetId='{number}' r:id='s{number}'/>"
         ));
         relationships.push_str(&format!(
-            "<Relationship Id='s{number}' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet{number}.xml'/>"
+            "<Relationship Id='s{number}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{number}.xml'/>"
         ));
         parts.insert(format!("xl/worksheets/sheet{number}.xml"), xml.clone());
     }
     parts.insert("[Content_Types].xml".into(), CONTENT_TYPES.into());
     parts.insert(
         "_rels/.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>").into_bytes(),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>").into_bytes(),
     );
     parts.insert(
         "xl/workbook.xml".into(),
-        format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{entries}</sheets></workbook>").into_bytes(),
+        format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{entries}</sheets></workbook>").into_bytes(),
     );
     parts.insert(
         "xl/_rels/workbook.xml.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>").into_bytes(),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>")
+            .into_bytes(),
     );
     parts
 }
@@ -187,7 +189,7 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
                 .replace(
                     "</Relationships>",
                     &format!(
-                        "<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
+                        "<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
                     ),
                 )
                 .into_bytes(),
@@ -280,7 +282,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         ),
         (
             "malformed XML",
-            format!("<worksheet xmlns='{MAIN_NS}'><sheetData></worksheet>").into_bytes(),
+            format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData></worksheet>").into_bytes(),
             Error::Xml(String::new()),
         ),
         (
@@ -290,7 +292,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         ),
         (
             "not a worksheet",
-            format!("<chartsheet xmlns='{MAIN_NS}'/>").into_bytes(),
+            format!("<chartsheet xmlns='{MAIN_NAMESPACE}'/>").into_bytes(),
             Error::InvalidWorkbook(String::new()),
         ),
         (
@@ -448,8 +450,9 @@ fn package_parts_and_worksheets_report_malformed_xml_with_the_same_variant() {
             Error::Unsupported(String::new()),
         ),
     ];
-    let sheet =
-        format!("<worksheet xmlns='{MAIN_NS}' xmlns:x='urn:x'><!--note-->{CELL}</worksheet>");
+    let sheet = format!(
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:x='urn:x'><!--note-->{CELL}</worksheet>"
+    );
     for (case, damage, expected) in &cases {
         // The worksheet is read lazily, so the error appears on first access.
         let book = book(&[("Data", damage(&sheet))]);
@@ -508,7 +511,7 @@ fn discovery_names_duplicate_targets_and_misplaced_sheets_as_invalid() {
         let mut parts = parts.clone();
         parts.insert(
             "xl/workbook.xml".into(),
-            format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'>{sheets}</workbook>")
+            format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'>{sheets}</workbook>")
                 .into_bytes(),
         );
         let error = Workbook::from_bytes(archive(&parts)).err().unwrap();
@@ -523,7 +526,7 @@ fn discovery_names_duplicate_targets_and_misplaced_sheets_as_invalid() {
 /// to an Excel table on J1:K3 whose header row is J1:K1.
 fn guarded_parts() -> BTreeMap<String, Vec<u8>> {
     let guarded = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData><row r='1'>\
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheetData><row r='1'>\
          <c r='A1'><f>1+1</f><v>2</v></c>\
          <c r='B1'><f t='shared' si='0' ref='B1:C2'>1</f><v>1</v></c><c r='C1'><f t='shared' si='0'/><v>1</v></c>\
          <c r='D1'><f t='array' ref='D1:D3'>1</f><v>1</v></c>\
@@ -537,11 +540,11 @@ fn guarded_parts() -> BTreeMap<String, Vec<u8>> {
     let mut parts = parts(&[("Alpha", worksheet(CELL)), ("Beta", guarded.into_bytes())]);
     parts.insert(
         "xl/worksheets/_rels/sheet2.xml.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='t1' Type='{OFFICE_NAMESPACE}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
     );
     parts.insert(
         "xl/tables/table1.xml".into(),
-        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='J1:K3'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Size'/></tableColumns></table>").into_bytes(),
+        format!("<table xmlns='{MAIN_NAMESPACE}' id='1' name='T' displayName='T' ref='J1:K3'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Size'/></tableColumns></table>").into_bytes(),
     );
     parts
 }
@@ -651,7 +654,7 @@ fn add_shared_strings(parts: &mut BTreeMap<String, Vec<u8>>, table: &[u8]) {
         "xl/_rels/workbook.xml.rels".into(),
         rels.replace(
             "</Relationships>",
-            &format!("<Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+            &format!("<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
         )
         .into_bytes(),
     );
@@ -673,11 +676,11 @@ fn shared_string_book(table: Option<&[u8]>) -> Workbook {
 
 #[test]
 fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
-    let table = |body: &str| format!("<sst xmlns='{MAIN_NS}'>{body}</sst>").into_bytes();
+    let table = |body: &str| format!("<sst xmlns='{MAIN_NAMESPACE}'>{body}</sst>").into_bytes();
     let cases: [(&str, Vec<u8>, Error); 4] = [
         (
             "truncated",
-            format!("<sst xmlns='{MAIN_NS}'><si><t>a</t></si>").into_bytes(),
+            format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>a</t></si>").into_bytes(),
             Error::Xml(String::new()),
         ),
         (
@@ -692,7 +695,7 @@ fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
         ),
         (
             "wrong root",
-            format!("<worksheet xmlns='{MAIN_NS}'/>").into_bytes(),
+            format!("<worksheet xmlns='{MAIN_NAMESPACE}'/>").into_bytes(),
             Error::InvalidWorkbook(String::new()),
         ),
     ];
@@ -746,7 +749,7 @@ fn table_headers_read_through_a_damaged_shared_string_table_name_that_part() {
     );
     add_shared_strings(
         &mut parts,
-        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si>").as_bytes(),
+        format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Name</t></si>").as_bytes(),
     );
     let mut book = Workbook::from_bytes(archive(&parts)).unwrap();
     let error = book.set_cell("Beta", "J1", "Other").unwrap_err();
@@ -785,7 +788,7 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     // An Excel table on A1:B2 whose headers are shared string 0, "Name", and
     // string 1, an unpaired surrogate escape: valid, but not a Rust string.
     let data = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData>\
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheetData>\
          <row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c></row>\
          <row r='2'><c r='A2' t='s'><v>1</v></c><c r='B2'><v>2</v></c></row>\
          </sheetData><tableParts count='1'><tablePart r:id='t1'/></tableParts></worksheet>"
@@ -793,16 +796,16 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     let mut parts = parts(&[("Data", data.into_bytes())]);
     add_shared_strings(
         &mut parts,
-        format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
+        format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
             .as_bytes(),
     );
     parts.insert(
         "xl/worksheets/_rels/sheet1.xml.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='t1' Type='{OFFICE_NAMESPACE}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
     );
     parts.insert(
         "xl/tables/table1.xml".into(),
-        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='A1:B2'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Other'/></tableColumns></table>").into_bytes(),
+        format!("<table xmlns='{MAIN_NAMESPACE}' id='1' name='T' displayName='T' ref='A1:B2'><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Other'/></tableColumns></table>").into_bytes(),
     );
     let original = archive(&parts);
     let mut book = Workbook::from_bytes(original.clone()).unwrap();
@@ -901,22 +904,22 @@ fn every_part_without_a_root_element_is_incomplete_xml() {
 /// in an Excel table on A1:A2 whose header row is A1.
 fn every_part() -> BTreeMap<String, Vec<u8>> {
     let data = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData>\
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheetData>\
          <row r='1'><c r='A1' t='s'><v>0</v></c></row><row r='2'><c r='A2'><v>1</v></c></row>\
          </sheetData><tableParts count='1'><tablePart r:id='t1'/></tableParts></worksheet>"
     );
     let mut parts = parts(&[("Data", data.into_bytes())]);
     add_shared_strings(
         &mut parts,
-        format!("<sst xmlns='{MAIN_NS}'><si><t>H</t></si></sst>").as_bytes(),
+        format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>H</t></si></sst>").as_bytes(),
     );
     parts.insert(
         "xl/worksheets/_rels/sheet1.xml.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='t1' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='t1' Type='{OFFICE_NAMESPACE}/table' Target='../tables/table1.xml'/></Relationships>").into_bytes(),
     );
     parts.insert(
         "xl/tables/table1.xml".into(),
-        format!("<table xmlns='{MAIN_NS}' id='1' name='T' displayName='T' ref='A1:A2'><tableColumns count='1'><tableColumn id='1' name='H'/></tableColumns></table>").into_bytes(),
+        format!("<table xmlns='{MAIN_NAMESPACE}' id='1' name='T' displayName='T' ref='A1:A2'><tableColumns count='1'><tableColumn id='1' name='H'/></tableColumns></table>").into_bytes(),
     );
     parts
 }

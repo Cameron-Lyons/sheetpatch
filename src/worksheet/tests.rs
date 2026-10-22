@@ -231,7 +231,7 @@ fn normalizes_literal_attribute_whitespace_before_character_references() {
         .find(|element| element.is(source, elements[0].namespace, "c"))
         .unwrap();
     assert_eq!(
-        cell.attr(&attributes, "x:flag").unwrap().value,
+        cell.attribute(&attributes, "x:flag").unwrap().value,
         "a b c d e\rf\ng\th"
     );
     let changed = edit(&input, "A1", 2.0.into()).unwrap();
@@ -2144,7 +2144,7 @@ fn released_subtrees_take_their_normalized_attribute_values() {
     assert_eq!(kept, [expected(0), expected(2), expected(4)]);
     assert_eq!(
         document.elements[0]
-            .attr(&document.attributes, "a")
+            .attribute(&document.attributes, "a")
             .unwrap()
             .value,
         "root\tvalue"

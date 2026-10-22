@@ -3,19 +3,20 @@ mod common;
 
 use sheetpatch::{CellRange, CellRef, CellValue, Error, Workbook};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 fn book(worksheet: &str) -> Workbook {
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
     );
     let root = format!(
-        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let rels = format!(
-        "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
+        "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
     );
     let bytes = common::stored_archive(&[
         (
@@ -71,7 +72,9 @@ fn sheets_without_cells_have_no_used_range() {
         "<sheetData><row r='5' ht='20' customHeight='1'/></sheetData>",
         "<dimension ref='A1:C3'/><sheetData><row r='1'/></sheetData>",
     ] {
-        let book = book(&format!("<worksheet xmlns='{MAIN_NS}'>{body}</worksheet>"));
+        let book = book(&format!(
+            "<worksheet xmlns='{MAIN_NAMESPACE}'>{body}</worksheet>"
+        ));
         assert!(addresses(&book).is_empty(), "{body}");
         assert_eq!(used_range(&book), None, "{body}");
     }
@@ -80,7 +83,7 @@ fn sheets_without_cells_have_no_used_range() {
 #[test]
 fn sparse_and_style_only_cells_define_the_used_range_rather_than_the_dimension() {
     let book = book(&format!(
-        "<s:worksheet xmlns:s='{MAIN_NS}'><s:dimension ref='A1'/><s:sheetData>\
+        "<s:worksheet xmlns:s='{MAIN_NAMESPACE}'><s:dimension ref='A1'/><s:sheetData>\
          <s:row r='3'><s:c r='D3' s='2'/></s:row>\
          <s:row r='7'><s:c r='B7'><s:v>1</s:v></s:c><s:c r='F7' s='1'/></s:row>\
          <s:row r='8'/>\
@@ -110,7 +113,7 @@ fn sparse_and_style_only_cells_define_the_used_range_rather_than_the_dimension()
 #[test]
 fn pending_edits_are_enumerated() {
     let mut book = book(&format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='2'><c r='B2'><v>1</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='2'><c r='B2'><v>1</v></c></row></sheetData></worksheet>"
     ));
     assert_eq!(used_range(&book).as_deref(), Some("B2"));
     // A blank value for a missing cell adds nothing; clearing a cell keeps it.
@@ -135,7 +138,7 @@ fn reads_of_a_whole_grid_range_are_refused_before_allocating() {
     // One style-only cell in the last row and column stretches the used range
     // of a two-cell worksheet over all 17,179,869,184 cells of the grid.
     let book = book(&format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData>\
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>\
          <row r='1'><c r='A1'><v>1</v></c></row>\
          <row r='1048576'><c r='XFD1048576' s='1'/></row>\
          </sheetData></worksheet>"

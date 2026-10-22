@@ -819,7 +819,7 @@ impl<'xml> Attributes<'xml> {
         }
     }
 
-    pub(crate) fn view(&self, index: usize) -> AttrView<'_> {
+    pub(crate) fn view(&self, index: usize) -> AttributeView<'_> {
         let record = &self.records[index];
         // The parser checked that these spans lie on character boundaries.
         let name = &self.source[record.name_start as usize..record.name_end as usize];
@@ -828,7 +828,7 @@ impl<'xml> Attributes<'xml> {
         } else {
             &self.normalized[record.normalized as usize]
         };
-        AttrView {
+        AttributeView {
             name,
             value,
             start: record.start,
@@ -838,7 +838,7 @@ impl<'xml> Attributes<'xml> {
     }
 
     /// The attribute named `name` among those at `indexes`.
-    pub(crate) fn find(&self, indexes: Range<usize>, name: &str) -> Option<AttrView<'_>> {
+    pub(crate) fn find(&self, indexes: Range<usize>, name: &str) -> Option<AttributeView<'_>> {
         self.position(indexes, name).map(|index| self.view(index))
     }
 
@@ -895,7 +895,7 @@ impl Attributes<'_> {
 
 /// An attribute's name and normalized value, with its spans.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AttrView<'a> {
+pub(crate) struct AttributeView<'a> {
     pub(crate) name: &'a str,
     pub(crate) value: &'a str,
     start: u32,
@@ -903,7 +903,7 @@ pub(crate) struct AttrView<'a> {
     value_end: u32,
 }
 
-impl AttrView<'_> {
+impl AttributeView<'_> {
     /// The start of the whitespace that separates the attribute from the
     /// preceding name or attribute.
     pub(crate) fn start(&self) -> usize {

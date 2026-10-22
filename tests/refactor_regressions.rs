@@ -4,23 +4,25 @@ mod common;
 use common::{payloads, stored_archive};
 use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook, WorksheetView};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const DATA_PATH: &str = "xl/worksheets/sheet1.xml";
 const DATA: &str = "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main' xmlns:v='urn:vendor'><dimension ref='A1:D1'/><sheetData><row r='1'><c r='A1' t='inlineStr' s='1'><is><t xml:space=\"preserve\">original</t></is><extLst><ext uri='keep'><v:tree><v:leaf a='1'>opaque</v:leaf></v:tree></ext></extLst></c><c r='B1'><v>2</v></c><c r='C1' t='s'><v>0</v></c><c r='D1'><f>B1*2</f><v>4</v></c></row></sheetData><v:future>keep</v:future></worksheet>";
 
 fn fixture() -> Vec<u8> {
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='data'/><sheet name='Other' sheetId='2' r:id='other'/></sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='data'/><sheet name='Other' sheetId='2' r:id='other'/></sheets></workbook>"
     );
     let relationships = format!(
-        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='data' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='other' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='data' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='other' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet2.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
     );
     let other = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>5</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>5</v></c></row></sheetData></worksheet>"
     );
-    let shared =
-        format!("<sst xmlns='{MAIN_NS}'><si><r><t>shared </t></r><r><t>☕</t></r></si></sst>");
+    let shared = format!(
+        "<sst xmlns='{MAIN_NAMESPACE}'><si><r><t>shared </t></r><r><t>☕</t></r></si></sst>"
+    );
     stored_archive(&[
         ("[Content_Types].xml", b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/></Types>"),
         ("_rels/.rels", b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='office' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
@@ -64,7 +66,7 @@ fn workbooks_and_their_views_can_be_used_across_catch_unwind() {
     // loaded, and of each entry that cannot be decoded.
     for strings in [
         "<sst".to_owned(),
-        format!("<sst xmlns='{MAIN_NS}'><si><t>_xD83D_</t></si></sst>"),
+        format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>_xD83D_</t></si></sst>"),
     ] {
         let book = Workbook::from_bytes(fixture_with_replacements(&[(
             "xl/sharedStrings.xml",
@@ -206,7 +208,7 @@ fn prepared_view_keeps_address_errors_missing_sheet_and_read_order() {
 #[test]
 fn sparse_edits_preserve_spacing_and_order_insertions_at_shared_gaps() {
     let sheet = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:v='urn:vendor'><dimension ref = 'B2:B2' /><sheetData ><row r = '2' spans = '2:2' ><c r = 'B2' t = 'b' s = '1' /><extLst><ext uri='keep'><v:tail k='unchanged'/></ext></extLst></row><row r = '4' spans = '2:2' /></sheetData><v:future a='keep'/></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:v='urn:vendor'><dimension ref = 'B2:B2' /><sheetData ><row r = '2' spans = '2:2' ><c r = 'B2' t = 'b' s = '1' /><extLst><ext uri='keep'><v:tail k='unchanged'/></ext></extLst></row><row r = '4' spans = '2:2' /></sheetData><v:future a='keep'/></worksheet>"
     );
     let original = fixture_with_replacements(&[(DATA_PATH, sheet.as_bytes())]);
     let mut book = Workbook::from_bytes(original.clone()).unwrap();
@@ -224,7 +226,7 @@ fn sparse_edits_preserve_spacing_and_order_insertions_at_shared_gaps() {
     )
     .unwrap();
     let expected = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:v='urn:vendor'><dimension ref = 'A2:C4' /><sheetData ><row r = '2' spans = '1:3' ><c r=\"A2\"><v>11</v></c><c r = 'B2' t = 'b' s = '1' ><v>1</v></c><c r=\"C2\" t=\"b\"><v>0</v></c><extLst><ext uri='keep'><v:tail k='unchanged'/></ext></extLst></row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t xml:space=\"preserve\">three</t></is></c><c r=\"C3\"><v>13</v></c></row><row r = '4' spans = '1:3' ><c r=\"A4\"><v>14</v></c><c r=\"C4\"><v>24</v></c></row></sheetData><v:future a='keep'/></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:v='urn:vendor'><dimension ref = 'A2:C4' /><sheetData ><row r = '2' spans = '1:3' ><c r=\"A2\"><v>11</v></c><c r = 'B2' t = 'b' s = '1' ><v>1</v></c><c r=\"C2\" t=\"b\"><v>0</v></c><extLst><ext uri='keep'><v:tail k='unchanged'/></ext></extLst></row><row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t xml:space=\"preserve\">three</t></is></c><c r=\"C3\"><v>13</v></c></row><row r = '4' spans = '1:3' ><c r=\"A4\"><v>14</v></c><c r=\"C4\"><v>24</v></c></row></sheetData><v:future a='keep'/></worksheet>"
     );
     let mut expected_parts = payloads(&original);
     expected_parts.insert(DATA_PATH.into(), expected.into_bytes());
@@ -251,7 +253,7 @@ fn sparse_edits_preserve_spacing_and_order_insertions_at_shared_gaps() {
 
 #[test]
 fn empty_sheet_expansion_retains_whitespace_and_sorts_new_rows_and_cells() {
-    let sheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData \t/></worksheet>");
+    let sheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData \t/></worksheet>");
     let original = fixture_with_replacements(&[(DATA_PATH, sheet.as_bytes())]);
     let mut book = Workbook::from_bytes(original.clone()).unwrap();
     book.set_cells(
@@ -266,7 +268,7 @@ fn empty_sheet_expansion_retains_whitespace_and_sorts_new_rows_and_cells() {
     )
     .unwrap();
     let expected = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData \t><row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\" t=\"inlineStr\"><is><t xml:space=\"preserve\">last</t></is></c></row><row r=\"2\"><c r=\"C2\" t=\"b\"><v>1</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData \t><row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\" t=\"inlineStr\"><is><t xml:space=\"preserve\">last</t></is></c></row><row r=\"2\"><c r=\"C2\" t=\"b\"><v>1</v></c></row></sheetData></worksheet>"
     );
     let mut expected_parts = payloads(&original);
     expected_parts.insert(DATA_PATH.into(), expected.into_bytes());
@@ -326,7 +328,8 @@ fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() 
         ),
     ];
     for (body, invalid) in cases {
-        let sheet = format!("<worksheet xmlns='{MAIN_NS}' xmlns:v='urn:vendor'>{body}</worksheet>");
+        let sheet =
+            format!("<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:v='urn:vendor'>{body}</worksheet>");
         let original = fixture_with_replacements(&[(DATA_PATH, sheet.as_bytes())]);
         let book = Workbook::from_bytes(original.clone()).unwrap();
         let direct = book.get_cell("Data", "A1").unwrap_err();
@@ -351,7 +354,7 @@ fn prepared_reads_match_direct_errors_for_malformed_ranges_and_hidden_content() 
 #[test]
 fn prepared_shared_string_errors_remain_lazy_and_match_direct_reads() {
     let strings = format!(
-        "<sst xmlns='{MAIN_NS}' xmlns:v='urn:vendor'><v:hidden><si><t>hidden entry</t></si></v:hidden><si><t>visible entry</t></si></sst>"
+        "<sst xmlns='{MAIN_NAMESPACE}' xmlns:v='urn:vendor'><v:hidden><si><t>hidden entry</t></si></v:hidden><si><t>visible entry</t></si></sst>"
     );
     let original = fixture_with_replacements(&[("xl/sharedStrings.xml", strings.as_bytes())]);
     let book = Workbook::from_bytes(original.clone()).unwrap();

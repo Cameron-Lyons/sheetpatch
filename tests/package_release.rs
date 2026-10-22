@@ -3,15 +3,16 @@ mod common;
 use sheetpatch::{CellValue, Error, Workbook};
 use std::collections::BTreeMap;
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const SHEET: &str = "<sheet name='Data' sheetId='1' r:id='one'/>";
 const RELATIONSHIP: &str = "<Relationship Id='one' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' Target='worksheets/sheet1.xml'/>";
 
 fn fixture(sheets: &str, relationships: &str, replacements: &[(&str, &str)]) -> Vec<u8> {
     let worksheet = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData></worksheet>"
     );
     let mut parts = BTreeMap::from([
         (
@@ -20,15 +21,15 @@ fn fixture(sheets: &str, relationships: &str, replacements: &[(&str, &str)]) -> 
         ),
         (
             "_rels/.rels",
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
         ),
         (
             "xl/workbook.xml",
-            format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'>{sheets}</workbook>"),
+            format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'>{sheets}</workbook>"),
         ),
         (
             "xl/_rels/workbook.xml.rels",
-            format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>"),
         ),
         ("xl/worksheets/sheet1.xml", worksheet.clone()),
         ("xl/worksheets/sheet2.xml", worksheet),
@@ -54,7 +55,7 @@ fn worksheet_names_decode_excel_escapes_and_preserve_archive_bytes() {
     let original = fixture(
         "<sheets><sheet name='Data_x0020_&amp;_xD83D__xDE00_' sheetId='1' r:id='one'/><sheet name='literal_x005F_x0041_' sheetId='2' r:id='two'/></sheets>",
         &format!(
-            "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/>"
+            "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet2.xml'/>"
         ),
         &[],
     );
@@ -97,7 +98,7 @@ fn duplicate_decoded_names_are_rejected_for_all_sheet_types() {
         let sheets =
             format!("<sheets>{SHEET}<sheet name='_x0044_ata' sheetId='2' r:id='two'/></sheets>");
         let rels = format!(
-            "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NS}/{kind}' Target='worksheets/sheet2.xml'/>"
+            "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/{kind}' Target='worksheets/sheet2.xml'/>"
         );
         assert!(Workbook::from_bytes(fixture(&sheets, &rels, &[])).is_err());
     }
@@ -109,9 +110,9 @@ fn sheet_names_with_unpaired_surrogate_escapes_are_unsupported_by_position() {
     // cannot be opened. The error names the sheet's position in tab order,
     // counting sheets of every type.
     let rels = format!(
-        "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NS}/chartsheet' Target='worksheets/sheet2.xml'/><Relationship Id='three' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet3.xml'/>"
+        "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/chartsheet' Target='worksheets/sheet2.xml'/><Relationship Id='three' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet3.xml'/>"
     );
-    let third = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let third = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
     let replacements = [("xl/worksheets/sheet3.xml", third.as_str())];
     let sheets = |first: &str, third: &str| {
         format!(
@@ -147,7 +148,7 @@ fn unrelated_sheet_types_and_foreign_elements_remain_opaque() {
         "<sheets xmlns:x='urn:vendor'>{SHEET}<x:sheet name='Opaque'/><sheet name='Chart' sheetId='2' r:id='two'/></sheets>"
     );
     let rels = format!(
-        "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NS}/chartsheet' Target='worksheets/sheet2.xml'/>"
+        "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/chartsheet' Target='worksheets/sheet2.xml'/>"
     );
     let original = fixture(&sheets, &rels, &[]);
     let workbook = Workbook::from_bytes(original.clone()).unwrap();
@@ -180,7 +181,7 @@ fn accessed_package_metadata_must_be_complete_xml_of_the_expected_type() {
 fn binary_workbooks_are_classified_independently_of_zip_name_case() {
     for name in ["xl/workbook.bin", "xl/workbook.BIN"] {
         let roots = format!(
-            "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.bin'/></Relationships>"
+            "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.bin'/></Relationships>"
         );
         let original = fixture(
             &format!("<sheets>{SHEET}</sheets>"),
@@ -196,14 +197,14 @@ fn binary_workbooks_are_classified_independently_of_zip_name_case() {
 
 #[test]
 fn namespace_character_references_are_normalized_before_discovery_and_editing() {
-    let encoded_main = MAIN_NS.replace("/main", "/&#109;ain");
-    let encoded_office = OFFICE_NS.replace("/relationships", "/relation&#115;hips");
-    let encoded_package = PACKAGE_NS.replace("/relationships", "/relation&#115;hips");
+    let encoded_main = MAIN_NAMESPACE.replace("/main", "/&#109;ain");
+    let encoded_office = OFFICE_NAMESPACE.replace("/relationships", "/relation&#115;hips");
+    let encoded_package = PACKAGE_NAMESPACE.replace("/relationships", "/relation&#115;hips");
     let workbook_xml = format!(
         "<workbook xmlns='{encoded_main}' xmlns:r='{encoded_office}'><sheets>{SHEET}</sheets></workbook>"
     );
     let root_rels = format!(
-        "<Relationships xmlns='{encoded_package}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+        "<Relationships xmlns='{encoded_package}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let worksheet_xml = format!(
         "<worksheet xmlns='{encoded_main}'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData></worksheet>"
@@ -234,8 +235,8 @@ fn namespace_character_references_are_normalized_before_discovery_and_editing() 
 #[test]
 fn duplicate_expanded_attributes_use_normalized_namespace_names() {
     let workbook_xml = format!(
-        "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}' xmlns:s='{}'><sheets><sheet name='Data' sheetId='1' r:id='one' s:id='one'/></sheets></workbook>",
-        OFFICE_NS.replace("/relationships", "/relation&#115;hips")
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}' xmlns:s='{}'><sheets><sheet name='Data' sheetId='1' r:id='one' s:id='one'/></sheets></workbook>",
+        OFFICE_NAMESPACE.replace("/relationships", "/relation&#115;hips")
     );
     let bytes = fixture(
         &format!("<sheets>{SHEET}</sheets>"),
@@ -320,21 +321,21 @@ fn escaped_part_fixture(decoded_names: bool, include_decoys: bool) -> Vec<u8> {
         "strings/Shared%20Text.xml"
     };
     let worksheet = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>7</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>7</v></c></row></sheetData></worksheet>"
     );
     let mut parts = BTreeMap::from([
         ("[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/><Override PartName='/books/Workbook%20Main.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/><Override PartName='/tabs/Sheet%20%3F.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/><Override PartName='/strings/Shared%20Text.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'/></Types>".into()),
-        ("_rels/.rels", format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='BOOKS/workbook%20main.xml'/></Relationships>")),
-        (workbook_name, format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>")),
-        (rels_name, format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='../tabs/sheet%20%3f.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='/strings/shared%20text.xml'/></Relationships>")),
+        ("_rels/.rels", format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='BOOKS/workbook%20main.xml'/></Relationships>")),
+        (workbook_name, format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>")),
+        (rels_name, format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='../tabs/sheet%20%3f.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='/strings/shared%20text.xml'/></Relationships>")),
         (sheet_name, worksheet),
-        (strings_name, format!("<sst xmlns='{MAIN_NS}'><si><t>Canonical</t></si></sst>")),
+        (strings_name, format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Canonical</t></si></sst>")),
     ]);
     if include_decoys {
-        parts.insert("tabs/Sheet ?.xml", format!("<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>99</v></c></row></sheetData></worksheet>"));
+        parts.insert("tabs/Sheet ?.xml", format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>99</v></c></row></sheetData></worksheet>"));
         parts.insert(
             "strings/Shared Text.xml",
-            format!("<sst xmlns='{MAIN_NS}'><si><t>Wrong</t></si></sst>"),
+            format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Wrong</t></si></sst>"),
         );
     }
     stored_archive(&parts)
@@ -429,7 +430,7 @@ fn workbook_relationship_parts_resolve_encoded_and_legacy_names_independently() 
 }
 
 fn worksheet_relationship(id: &str, target: &str, mode: &str) -> String {
-    format!("<Relationship Id='{id}' Type='{OFFICE_NS}/worksheet' Target='{target}'{mode}/>")
+    format!("<Relationship Id='{id}' Type='{OFFICE_NAMESPACE}/worksheet' Target='{target}'{mode}/>")
 }
 
 #[test]
@@ -468,7 +469,7 @@ fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
     let duplicate = worksheet_relationship("one", "worksheets/sheet2.xml", "");
     let strings = |id: &str| {
         format!(
-            "<Relationship Id='{id}' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/>"
+            "<Relationship Id='{id}' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/>"
         )
     };
     for (rels, expected) in [
@@ -501,7 +502,7 @@ fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
     }
     // The namespace prefix is declared, so the root is what is rejected.
     let document = format!(
-        "<document xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{SHEET}</sheets></document>"
+        "<document xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{SHEET}</sheets></document>"
     );
     let error = Workbook::from_bytes(fixture(
         &sheets,
@@ -539,18 +540,18 @@ fn external_sheet_relationships_are_rejected() {
 fn packages_need_exactly_one_internal_office_document_relationship() {
     let sheets = format!("<sheets>{SHEET}</sheets>");
     let roots = |relationships: &str| {
-        format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>")
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>")
     };
     let office = format!(
-        "<Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/>"
+        "<Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/>"
     );
     let single = roots(&office);
     assert!(
         Workbook::from_bytes(fixture(&sheets, RELATIONSHIP, &[("_rels/.rels", &single)])).is_ok()
     );
     for extra in [
-        format!("<Relationship Id='again' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/>"),
-        format!("<Relationship Id='other' Type='{OFFICE_NS}/officeDocument' Target='/xl/worksheets/sheet1.xml'/>"),
+        format!("<Relationship Id='again' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/>"),
+        format!("<Relationship Id='other' Type='{OFFICE_NAMESPACE}/officeDocument' Target='/xl/worksheets/sheet1.xml'/>"),
         "<Relationship Id='strict' Type='http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument' Target='xl/workbook.xml'/>".to_owned(),
     ] {
         let duplicated = roots(&format!("{office}{extra}"));
@@ -569,7 +570,7 @@ fn packages_need_exactly_one_internal_office_document_relationship() {
 
 #[test]
 fn equivalent_worksheet_zip_names_are_rejected_before_editing() {
-    let duplicate = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+    let duplicate = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
     let original = fixture(
         &format!("<sheets>{SHEET}</sheets>"),
         RELATIONSHIP,

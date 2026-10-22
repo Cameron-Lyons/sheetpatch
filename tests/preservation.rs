@@ -10,7 +10,7 @@ use common::{
 };
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const WORKSHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="urn:vendor" x:mode="keep"><dimension ref="A1:C2"/><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetData>
 <row r="1" ht="24" customHeight="1" x:row="retain"><c r="A1" s="3" t="s" x:cell="retain"><v>0</v><extLst><ext uri="urn:vendor"><x:cellFeature flag="true"/></ext></extLst></c><c r="B1" t="inlineStr"><is><t>Unchanged &amp; literal</t></is></c><c r="C1"><v>99</v></c></row>
@@ -30,7 +30,7 @@ fn fixture_at(
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="office" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{workbook_path}"/></Relationships>"#
     );
     let workbook = format!(
-        r#"<workbook xmlns="{MAIN_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data &amp; Notes" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029"/></workbook>"#
+        r#"<workbook xmlns="{MAIN_NAMESPACE}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data &amp; Notes" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029"/></workbook>"#
     );
     let workbook_rels = format!(
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{sheet_target}"/><Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="/xl/sharedStrings.xml"/></Relationships>"#
@@ -270,19 +270,22 @@ fn literal_ooxml_escape_sequences_and_carriage_returns_keep_their_text_meaning()
 
 #[test]
 fn edits_prefixed_transitional_and_strict_worksheets_without_changing_namespaces() {
-    for namespace in [MAIN_NS, "http://purl.oclc.org/ooxml/spreadsheetml/main"] {
+    for namespace in [
+        MAIN_NAMESPACE,
+        "http://purl.oclc.org/ooxml/spreadsheetml/main",
+    ] {
         let xml = format!(
             r#"<s:worksheet xmlns:s="{namespace}" xmlns:x="urn:foreign"><s:dimension ref="A1:B1"/><s:sheetData><s:row r="1"><s:c r="A1" s="3"><s:v>7</s:v><x:keep exact="yes"/></s:c><s:c r="B1"><s:v>8</s:v></s:c></s:row></s:sheetData><x:feature>untouched</x:feature></s:worksheet>"#
         );
         let original = fixture(&xml);
-        let original = if namespace != MAIN_NS {
+        let original = if namespace != MAIN_NAMESPACE {
             let entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
                 .into_iter()
                 .map(|entry| {
                     let bytes = payload(&original, &entry.name);
                     let bytes = if entry.name.ends_with(".xml") || entry.name.ends_with(".rels") {
                         String::from_utf8(bytes).unwrap()
-                            .replace(MAIN_NS, namespace)
+                            .replace(MAIN_NAMESPACE, namespace)
                             .replace("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "http://purl.oclc.org/ooxml/officeDocument/relationships")
                             .into_bytes()
                     } else { bytes };
@@ -332,7 +335,7 @@ fn inserts_rows_and_cells_in_order_and_expands_dimension() {
 #[test]
 fn formula_cells_and_shared_or_array_formula_ranges_are_rejected() {
     let xml = format!(
-        r#"<worksheet xmlns="{MAIN_NS}"><dimension ref="A1:D3"/><sheetData><row r="1"><c r="A1"><f t="shared" si="0" ref="A1:A3">SUM(D1:D3)</f><v>6</v></c><c r="B1"><f t="array" ref="B1:C2">TRANSPOSE(D1:D2)</f><v>1</v></c><c r="D1"><f>1+2</f><v>3</v></c></row><row r="2"><c r="A2"><f t="shared" si="0"/><v>6</v></c><c r="C2"><v>2</v></c></row></sheetData></worksheet>"#
+        r#"<worksheet xmlns="{MAIN_NAMESPACE}"><dimension ref="A1:D3"/><sheetData><row r="1"><c r="A1"><f t="shared" si="0" ref="A1:A3">SUM(D1:D3)</f><v>6</v></c><c r="B1"><f t="array" ref="B1:C2">TRANSPOSE(D1:D2)</f><v>1</v></c><c r="D1"><f>1+2</f><v>3</v></c></row><row r="2"><c r="A2"><f t="shared" si="0"/><v>6</v></c><c r="C2"><v>2</v></c></row></sheetData></worksheet>"#
     );
     let original = fixture(&xml);
     let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
@@ -764,7 +767,7 @@ fn add_other_sheet(original: &[u8], other: &str) -> Vec<u8> {
 #[test]
 fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
     let other = format!(
-        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns=\"{MAIN_NAMESPACE}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>"
     );
     let original = add_other_sheet(&fixture(WORKSHEET), &other);
     let mut book = Workbook::from_bytes(original.clone()).unwrap();
@@ -817,7 +820,7 @@ fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
 #[test]
 fn multi_sheet_transaction_rolls_back_every_sheet_on_failure() {
     let other = format!(
-        "<worksheet xmlns=\"{MAIN_NS}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns=\"{MAIN_NAMESPACE}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"
     );
     let bytes = add_other_sheet(&fixture(WORKSHEET), &other);
     let mut book = Workbook::from_bytes(bytes).unwrap();
@@ -921,7 +924,7 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
 fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
     const XML_LIMIT: usize = 64 * 1024 * 1024;
     let mut worksheet = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:x='urn:vendor'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData><x:padding>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:x='urn:vendor'><sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData><x:padding>"
     )
     .into_bytes();
     let ending = b"</x:padding></worksheet>";

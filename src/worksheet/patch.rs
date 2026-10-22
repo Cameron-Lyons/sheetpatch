@@ -82,7 +82,7 @@ fn attribute_edit(
     name: &str,
     value: Option<&str>,
 ) -> Option<Edit> {
-    if let Some(attribute) = element.attr(attributes, name) {
+    if let Some(attribute) = element.attribute(attributes, name) {
         match value {
             Some(value) if value != attribute.value => Some(Edit {
                 start: attribute.value_start(),
@@ -232,7 +232,7 @@ fn patched_cell<'s>(
     let unchanged = if let Some(child) = value_child {
         unchanged_value(xml, index, cell, child, value, current)
     } else {
-        matches!(value, CellValue::Blank) && cell.attr(attributes, "t").is_none()
+        matches!(value, CellValue::Blank) && cell.attribute(attributes, "t").is_none()
     };
     if unchanged {
         return Ok(false);
@@ -241,10 +241,10 @@ fn patched_cell<'s>(
     // has per-type edit/clear flags in the metadata part (ECMA-376 18.9.10), so
     // even a cell-level link may not survive a value change. Without interpreting
     // those records, keep both links and their original payload intact.
-    if cell.attr(attributes, "vm").is_some() {
+    if cell.attribute(attributes, "vm").is_some() {
         return Err(errors::protected(address, protection::VALUE_METADATA));
     }
-    if cell.attr(attributes, "cm").is_some() {
+    if cell.attribute(attributes, "cm").is_some() {
         return Err(errors::protected(address, protection::CELL_METADATA));
     }
     let value_bytes = payload(source, cell, value);
@@ -284,7 +284,7 @@ fn spans_edit(
     attributes: &Attributes,
     columns: impl Iterator<Item = u16>,
 ) -> Result<Option<Edit>> {
-    let Some(attribute) = row.attr(attributes, "spans") else {
+    let Some(attribute) = row.attribute(attributes, "spans") else {
         return Ok(None);
     };
     let invalid = || errors::unsupported(format!("row {row_number}: invalid row spans"));
@@ -347,7 +347,7 @@ enum RowStyle {
 fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<RowStyle> {
     let attributes = &index.attributes;
     let custom_format = row
-        .attr(attributes, "customFormat")
+        .attribute(attributes, "customFormat")
         .map(|attribute| trim_xml_whitespace(attribute.value));
     if matches!(custom_format, None | Some("0" | "false")) {
         return Ok(RowStyle::ColumnDefault);
@@ -357,7 +357,7 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
             "{cell}: invalid row format flag"
         )));
     }
-    let Some(style) = row.attr(attributes, "s") else {
+    let Some(style) = row.attribute(attributes, "s") else {
         return Ok(RowStyle::Custom(0));
     };
     trim_xml_whitespace(style.value)
@@ -510,7 +510,7 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
         return Ok(None);
     };
     let reference = dimension
-        .attr(&index.attributes, "ref")
+        .attribute(&index.attributes, "ref")
         .ok_or_else(|| errors::unsupported("dimension without a reference"))?;
     // Reads ignore the dimension, so a malformed reference refuses only the
     // edits that may need to widen it, like a malformed `spans` hint.
