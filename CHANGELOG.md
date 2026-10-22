@@ -8,6 +8,8 @@
   integration test, run with `cargo test --test libreoffice -- --ignored`,
   instead of a Python script. The published package no longer includes
   `scripts/`.
+- CI inspects the executable installed from the extracted package with the
+  ignored `tests/installed_cli.rs` instead of inline Python.
 
 ## 1.0.0 — 2026-10-22
 
