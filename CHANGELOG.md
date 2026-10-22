@@ -1,9 +1,9 @@
 # Changelog
 
-## 1.0.0 — release candidate
+## 1.0.0 — 2026-10-22
 
-The first stable release covers surgical scalar cell edits in existing OOXML
-workbooks. Compared with 0.2, it stabilizes a typed Rust API, replaces changed
+The first stable release, and the first published on crates.io, covers surgical
+scalar cell edits in existing OOXML workbooks. Compared with 0.2, it stabilizes a typed Rust API, replaces changed
 ZIP records instead of appending them, adds CLI inspection, validation, and
 standard-stream support, and refuses more inputs whose edits could be ambiguous
 or damage the workbook. See README.md for the preservation contract and
@@ -57,7 +57,7 @@ earlier 1.0.0 candidate:
 - One `get_cells_at` call reads at most 16,777,216 (2^24) cells, sixteen whole
   columns. A larger request, such as a `used_range()` that one distant
   style-only cell stretches over the whole grid, returns `Error::Unsupported`
-  before any cell is read; the previous candidate aborted the process on the
+  before any cell is read; candidate `8a97062` aborted the process on the
   failed allocation. Every cell a worksheet holds fits in one call
   (`get_cells_at(view.cells())`); split larger ranges. Batch reads, including
   `get_cells`, whose results cannot be allocated return `Error::Io` of kind
@@ -274,6 +274,10 @@ earlier 1.0.0 candidate:
   type while retaining formatting and unfamiliar sibling content.
 - Text round-trips exactly: control characters use `_xHHHH_` escapes, literal
   escape sequences stay literal, and a leading U+FEFF is preserved on read.
+- Cells whose `<v>` carries `xml:space`, as SheetJS writes text with
+  surrounding spaces or a line break, can be edited, rewritten, and cleared;
+  0.2 and earlier candidates refused them as having unfamiliar attributes in
+  the cell value. Other attributes on `<v>` are still refused.
 - The escape marker requires lowercase `x`; uppercase `_XHHHH_` stays literal
   when reading cells and sheet names, preventing an edit from being incorrectly
   treated as unchanged.
@@ -387,8 +391,8 @@ earlier 1.0.0 candidate:
 - Relationships parts are validated as they stream, and only the relationships
   that discovery uses are copied: the package's office document and signature
   origin, the workbook's sheets and shared strings, and a worksheet's tables.
-  Duplicate IDs are compared as spans of the part. Compared with the previous
-  candidate, resolving the tables of a worksheet whose relationships part lists
+  Duplicate IDs are compared as spans of the part. Compared with candidate
+  `8a97062`, resolving the tables of a worksheet whose relationships part lists
   300,000 hyperlinks takes 73 instead of 308 MiB of heap and 204 instead of
   465 ms, and opening a workbook whose own relationships part has 300,000
   entries takes 65 instead of 291 MiB and 175 instead of 421 ms.
@@ -455,7 +459,7 @@ earlier 1.0.0 candidate:
   edits are planned and before the edited XML is written, so its relationships
   part is never held with both the index and the edited XML. A CLI patch of
   10,000 body cells and a table's five unchanged header cells in a 200,000-row
-  worksheet took 1,011 ms in the previous candidate, against about 600 ms
+  worksheet took 1,011 ms in candidate `8a97062`, against about 600 ms
   without the header cells; it now takes about 450 ms either way, and a patch
   refused for renaming a header takes 396 instead of 852 ms. With 300,000
   relationships on the worksheet, the patch takes 656 instead of 1,540 ms and

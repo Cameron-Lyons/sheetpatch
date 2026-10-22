@@ -11,14 +11,14 @@ It never rebuilds the workbook from a spreadsheet object model.
 
 ## Use from Rust
 
-Requires Rust 1.88 or later. Once 1.0 is published, add the crate dependency:
+Requires Rust 1.88 or later. Add the crate dependency:
 
 ```toml
 [dependencies]
 sheetpatch = "1.0"
 ```
 
-For an unpublished checkout, use `sheetpatch = { path = "/path/to/sheetpatch" }`.
+To use a local checkout instead, use `sheetpatch = { path = "/path/to/sheetpatch" }`.
 
 ```rust,no_run
 use sheetpatch::{CellEdit, CellRange, CellRef, CellValue, Workbook};
@@ -186,30 +186,30 @@ shared strings are loaded only when a requested cell needs them.
 
 ## Use from the command line
 
-After publication, install with `cargo install sheetpatch --version 1.0.0 --locked`.
-From a checkout, use `cargo install --path . --locked` or build as shown below.
+Install with `cargo install sheetpatch --locked`. From a checkout, use
+`cargo install --path . --locked`, or run `cargo build --release --locked` and
+use `./target/release/sheetpatch` in place of `sheetpatch` below.
 
 ```sh
-cargo build --release --locked
-./target/release/sheetpatch --version
-./target/release/sheetpatch list report.xlsm
-./target/release/sheetpatch list --json report.xlsm
-./target/release/sheetpatch get report.xlsm Summary B2
-./target/release/sheetpatch get report.xlsm Summary B2 C2 D2
-./target/release/sheetpatch get report.xlsm Summary B2:D4
-./target/release/sheetpatch get --json report.xlsm Summary B2 C2:D3
-./target/release/sheetpatch cells report.xlsm Summary
-./target/release/sheetpatch cells --json report.xlsm Summary A1:F20
-./target/release/sheetpatch set report.xlsm edited.xlsm Summary B2 text 'Revised total'
-./target/release/sheetpatch set report.xlsm edited.xlsm Summary C2 number 42.5
-./target/release/sheetpatch set report.xlsm edited.xlsm Summary D2 bool true
-./target/release/sheetpatch set report.xlsm edited.xlsm Summary E2 blank
-./target/release/sheetpatch patch report.xlsm edited.xlsm edits.tsv
-./target/release/sheetpatch patch report.xlsm edited.xlsm - < edits.tsv
-./target/release/sheetpatch patch --check report.xlsm edits.tsv
-./target/release/sheetpatch patch --check report.xlsm - < edits.tsv
-./target/release/sheetpatch compact edited.xlsm compact.xlsm
-./target/release/sheetpatch help patch
+sheetpatch --version
+sheetpatch list report.xlsm
+sheetpatch list --json report.xlsm
+sheetpatch get report.xlsm Summary B2
+sheetpatch get report.xlsm Summary B2 C2 D2
+sheetpatch get report.xlsm Summary B2:D4
+sheetpatch get --json report.xlsm Summary B2 C2:D3
+sheetpatch cells report.xlsm Summary
+sheetpatch cells --json report.xlsm Summary A1:F20
+sheetpatch set report.xlsm edited.xlsm Summary B2 text 'Revised total'
+sheetpatch set report.xlsm edited.xlsm Summary C2 number 42.5
+sheetpatch set report.xlsm edited.xlsm Summary D2 bool true
+sheetpatch set report.xlsm edited.xlsm Summary E2 blank
+sheetpatch patch report.xlsm edited.xlsm edits.tsv
+sheetpatch patch report.xlsm edited.xlsm - < edits.tsv
+sheetpatch patch --check report.xlsm edits.tsv
+sheetpatch patch --check report.xlsm - < edits.tsv
+sheetpatch compact edited.xlsm compact.xlsm
+sheetpatch help patch
 ```
 
 ### Reading
@@ -308,8 +308,8 @@ both be `-`. Like `Workbook::from_reader`, standard input is read only up to the
 largest possible ZIP32 archive. Output to standard output is streamed, not atomic:
 
 ```sh
-./target/release/sheetpatch set - - Summary B2 number 5 < report.xlsm > edited.xlsm
-./target/release/sheetpatch patch report.xlsm - edits.tsv > edited.xlsm
+sheetpatch set - - Summary B2 number 5 < report.xlsm > edited.xlsm
+sheetpatch patch report.xlsm - edits.tsv > edited.xlsm
 ```
 
 `--help` (`-h`) and `--version` (`-V`) exit successfully. `help COMMAND` and
