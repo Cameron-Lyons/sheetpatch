@@ -18,15 +18,12 @@ mod common;
 use common::TempDir;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
-use quick_xml::{NsReader, XmlVersion};
+use quick_xml::{NsReader, XmlVersion, escape};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::fmt::Write as _;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{env, fs};
+use std::{env, fs, mem, ptr};
 
 const SOURCE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -83,6 +80,8 @@ fn run(command: &mut Command) {
 /// LibreOffice's `program` directory: `SHEETPATCH_LIBREOFFICE_PROGRAM`, or the
 /// directory of the resolved `libreoffice` or `soffice` launcher on `PATH`.
 fn program() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
     if let Some(program) = env::var_os("SHEETPATCH_LIBREOFFICE_PROGRAM") {
         return fs::canonicalize(&program).unwrap_or_else(|error| {
             panic!(
@@ -111,6 +110,9 @@ fn program() -> PathBuf {
 /// A `file:` URL for an absolute path, percent-encoding every byte that is not
 /// unreserved.
 fn file_uri(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
     let mut uri = String::from("file://");
     for &byte in path.as_os_str().as_bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
@@ -218,6 +220,8 @@ struct Office(*mut Handle<OfficeFunctions>);
 
 impl Office {
     fn new(program: &Path, directory: &Path) -> Self {
+        use std::os::unix::ffi::OsStrExt as _;
+
         // SAFETY: this is its binary's only test, so no other thread reads or
         // writes the environment while LibreOffice is configured.
         unsafe {
@@ -247,7 +251,7 @@ impl Office {
         type Hook =
             unsafe extern "C" fn(*const c_char, *const c_char) -> *mut Handle<OfficeFunctions>;
         // SAFETY: the symbol has this signature in LibreOfficeKitInit.h.
-        let hook = unsafe { std::mem::transmute::<*mut c_void, Hook>(hook) };
+        let hook = unsafe { mem::transmute::<*mut c_void, Hook>(hook) };
         let install = c_string(program.as_os_str().as_bytes());
         let profile = c_string(file_uri(&directory.join("profile")));
         // SAFETY: both arguments are NUL-terminated; LibreOffice copies them.
@@ -300,7 +304,7 @@ impl Office {
                 document.0,
                 url.as_ptr(),
                 format.as_ptr(),
-                std::ptr::null(),
+                ptr::null(),
             )
         };
         assert!(
@@ -349,8 +353,15 @@ const CALCEXT: &str = "urn:org:documentfoundation:names:experimental:calc:xmlns:
 struct Element {
     namespace: String,
     name: String,
-    attributes: Vec<(String, String, String)>,
+    attributes: Vec<Attribute>,
     children: Vec<Node>,
+}
+
+/// An attribute with a namespace-resolved name.
+struct Attribute {
+    namespace: String,
+    name: String,
+    value: String,
 }
 
 enum Node {
@@ -366,8 +377,8 @@ impl Element {
     fn get(&self, namespace: &str, name: &str) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|(n, local, _)| n == namespace && local == name)
-            .map(|(_, _, value)| value.as_str())
+            .find(|attribute| attribute.namespace == namespace && attribute.name == name)
+            .map(|attribute| attribute.value.as_str())
     }
 
     /// Child elements, in order.
@@ -424,7 +435,7 @@ fn namespace(result: ResolveResult<'_>) -> String {
 
 /// The root element of an XML document.
 fn parse(xml: &[u8]) -> Element {
-    let mut reader = NsReader::from_str(std::str::from_utf8(xml).unwrap());
+    let mut reader = NsReader::from_str(str::from_utf8(xml).unwrap());
     let mut open = vec![Element::default()];
     loop {
         let (resolved, event) = reader.read_resolved_event().unwrap();
@@ -440,11 +451,11 @@ fn parse(xml: &[u8]) -> Element {
                     let attribute = attribute.unwrap();
                     let (result, name) = reader.resolver().resolve_attribute(attribute.key);
                     let value = attribute.normalized_value(XmlVersion::Implicit1_0).unwrap();
-                    element.attributes.push((
-                        namespace(result),
-                        name.as_ref().to_owned(),
-                        value.into_owned(),
-                    ));
+                    element.attributes.push(Attribute {
+                        namespace: namespace(result),
+                        name: name.as_ref().to_owned(),
+                        value: value.into_owned(),
+                    });
                 }
                 if matches!(event, Event::Start(_)) {
                     open.push(element);
@@ -468,7 +479,7 @@ fn parse(xml: &[u8]) -> Element {
                 let character = reference.resolve_char_ref().unwrap();
                 let text = match character {
                     Some(character) => character.to_string(),
-                    None => quick_xml::escape::resolve_xml_entity(&reference)
+                    None => escape::resolve_xml_entity(&reference)
                         .unwrap_or_else(|| panic!("undefined XML entity {:?}", &*reference))
                         .to_owned(),
                 };
@@ -496,6 +507,14 @@ enum Value {
     Number(f64),
     Bool(bool),
     Text(String),
+}
+
+/// A cell's worksheet name and zero-based row and column.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Position<'document> {
+    sheet: &'document str,
+    row: usize,
+    column: usize,
 }
 
 fn text(value: &str) -> Value {
@@ -531,9 +550,10 @@ fn check_ods(path: &Path) {
             .iter()
             .map(|sheet| sheet.get(TABLE, "name"))
             .collect::<Vec<_>>(),
-        [Some("Data"), Some("Notes")]
+        [Some("Data"), Some("Notes")],
+        "the export lost, added, or reordered worksheets"
     );
-    let mut cells = HashMap::new();
+    let mut cells: HashMap<Position<'_>, &Element> = HashMap::new();
     for sheet in &sheets {
         let name = sheet.get(TABLE, "name").unwrap();
         let mut row_index = 0;
@@ -548,7 +568,12 @@ fn check_ods(path: &Path) {
                 }
                 let repeat = repeated(cell, "number-columns-repeated");
                 for offset in 0..repeat.min(6 - column) {
-                    cells.insert((name, row_index, column + offset), cell);
+                    let position = Position {
+                        sheet: name,
+                        row: row_index,
+                        column: column + offset,
+                    };
+                    cells.insert(position, cell);
                 }
                 column += repeat;
             }
@@ -558,7 +583,7 @@ fn check_ods(path: &Path) {
 
     let cell = |sheet: &'static str, row: usize, column: usize| {
         *cells
-            .get(&(sheet, row, column))
+            .get(&Position { sheet, row, column })
             .unwrap_or_else(|| panic!("no cell at {sheet} row {row} column {column}"))
     };
     let value = |sheet: &'static str, row: usize, column: usize| {
@@ -593,37 +618,70 @@ fn check_ods(path: &Path) {
         false
     };
 
-    assert_eq!(value("Data", 0, 0), text("=literal text"));
+    assert_eq!(
+        value("Data", 0, 0),
+        text("=literal text"),
+        "A1 lost its edited text, which must stay literal rather than become a formula"
+    );
     assert!(
         is_bold(cell("Data", 0, 0)),
         "edited cell lost its bold formatting"
     );
-    assert_eq!(value("Data", 0, 1), Value::Number(21.0));
-    assert_eq!(value("Data", 0, 2), Value::Bool(false));
+    assert_eq!(
+        value("Data", 0, 1),
+        Value::Number(21.0),
+        "B1 lost its edited number"
+    );
+    assert_eq!(
+        value("Data", 0, 2),
+        Value::Bool(false),
+        "C1 lost its edited boolean"
+    );
     // Sheetpatch retains the original cache; an independent application may
     // either keep it or recalculate on import according to its own settings.
     let cached = value("Data", 0, 3);
     assert!(
         [Value::Number(25.0), Value::Number(42.0)].contains(&cached),
-        "{cached:?}"
+        "D1 is neither its retained cache nor its recalculated value: {cached:?}"
     );
     assert_eq!(
         cell("Data", 0, 3).get(TABLE, "formula"),
-        Some("of:=[.B1]*2")
+        Some("of:=[.B1]*2"),
+        "D1 lost its untouched formula"
     );
-    assert_eq!(value("Data", 0, 4), text("Café ☕ _x0041_\nnext line"));
-    assert_eq!(value("Data", 2, 5), text("Inserted"));
-    assert_eq!(value("Notes", 0, 0), text("Keep this sheet"));
+    assert_eq!(
+        value("Data", 0, 4),
+        text("Café ☕ _x0041_\nnext line"),
+        "E1 lost non-ASCII text, a literal escape-like token, or a line break"
+    );
+    assert_eq!(
+        value("Data", 2, 5),
+        text("Inserted"),
+        "F3 lost the text inserted into a new row"
+    );
+    assert_eq!(
+        value("Notes", 0, 0),
+        text("Keep this sheet"),
+        "the untouched Notes sheet lost its text"
+    );
     // An XLSX error literal must reopen as an error (LibreOffice currently
     // imports it as the formula of:=#N/A), not as text that looks like one.
     let error = cell("Data", 0, 5);
-    assert_eq!(value("Data", 0, 5), text("#N/A"));
+    assert_eq!(
+        value("Data", 0, 5),
+        text("#N/A"),
+        "F1 does not display the #N/A error written to it"
+    );
     assert!(
         error.get(CALCEXT, "value-type") == Some("error")
             || error.get(TABLE, "formula") == Some("of:=#N/A"),
         "error value reopened as text"
     );
-    let blank = cells.get(&("Data", 1, 5));
+    let blank = cells.get(&Position {
+        sheet: "Data",
+        row: 1,
+        column: 5,
+    });
     assert!(
         blank.is_none_or(
             |blank| blank.get(OFFICE, "value-type").is_none() && blank.text().is_empty()

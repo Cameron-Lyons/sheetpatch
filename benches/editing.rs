@@ -15,11 +15,10 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::hint::black_box;
-use std::io;
 use std::time::{Duration, Instant};
+use std::{env, hint, io};
 
-use common::{ZipEntry, ZipLayout, payloads, write_zip, zip_entries};
+use common::{ZipEntry, ZipLayout};
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -70,12 +69,12 @@ const OPERATIONS: &[&str] = &[
 ];
 
 fn selected(variable: &str, name: &str) -> bool {
-    std::env::var(variable).is_ok_and(|filter| filter.split(',').any(|item| item.trim() == name))
-        || std::env::var_os(variable).is_none()
+    env::var(variable).is_ok_and(|filter| filter.split(',').any(|item| item.trim() == name))
+        || env::var_os(variable).is_none()
 }
 
 fn validate_filter(variable: &str, names: &[&str]) {
-    if let Ok(filter) = std::env::var(variable) {
+    if let Ok(filter) = env::var(variable) {
         for item in filter.split(',') {
             assert!(
                 names.contains(&item.trim()),
@@ -144,11 +143,11 @@ fn fixture_with_sheet(sheet: &[u8]) -> Vec<u8> {
 }
 
 fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    write_zip(entries, &LAYOUT)
+    common::write_zip(entries, &LAYOUT)
 }
 
 fn entries(bytes: &[u8]) -> BTreeMap<String, ZipEntry<'_>> {
-    zip_entries(bytes)
+    common::zip_entries(bytes)
         .into_iter()
         .map(|entry| (entry.name.clone(), entry))
         .collect()
@@ -161,7 +160,11 @@ fn verify_output(input: &[u8], output: &[u8], expected: &[u8]) {
 fn verify_parts(input: &[u8], output: &[u8], expected: &[(&str, &[u8])]) {
     let originals = entries(input);
     let replacements = entries(output);
-    assert_eq!(originals.len(), replacements.len());
+    assert_eq!(
+        originals.len(),
+        replacements.len(),
+        "a save added or dropped ZIP members"
+    );
     for &(path, xml) in expected {
         assert_eq!(
             replacements[path].payload(),
@@ -172,29 +175,33 @@ fn verify_parts(input: &[u8], output: &[u8], expected: &[(&str, &[u8])]) {
     for (name, original) in originals {
         if !expected.iter().any(|&(path, _)| path == name) {
             let replacement = &replacements[&name];
-            assert_eq!(original.local, replacement.local, "{name}");
-            assert_eq!(original.compressed, replacement.compressed, "{name}");
+            assert_eq!(
+                original.local, replacement.local,
+                "{name}: an untouched member's local record must be copied unchanged"
+            );
+            assert_eq!(
+                original.compressed, replacement.compressed,
+                "{name}: an untouched member's compressed bytes must be copied unchanged"
+            );
             assert_eq!(
                 original.central_before_offset(),
                 replacement.central_before_offset(),
-                "{name}"
+                "{name}: an untouched member's central record may change only its offset"
             );
             assert_eq!(
                 original.central_after_offset(),
                 replacement.central_after_offset(),
-                "{name}"
+                "{name}: an untouched member's central record may change only its offset"
             );
         }
     }
 }
 
 fn expected(cells: usize, count: usize) -> Vec<u8> {
-    worksheet(
-        cells,
-        &(0..count)
-            .map(|index| (1 + index * cells / count, -((index + 1) as i32)))
-            .collect(),
-    )
+    let values: BTreeMap<usize, i32> = (0..count)
+        .map(|index| (1 + index * cells / count, -((index + 1) as i32)))
+        .collect();
+    worksheet(cells, &values)
 }
 
 fn sequential(input: &[u8], edits: &[(String, CellValue)]) -> Workbook {
@@ -212,7 +219,7 @@ fn measure<T>(samples: usize, label: &str, mut operation: impl FnMut() -> T) -> 
     let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        let result = black_box(operation());
+        let result = hint::black_box(operation());
         times.push(started.elapsed());
         drop(result);
     }
@@ -221,7 +228,7 @@ fn measure<T>(samples: usize, label: &str, mut operation: impl FnMut() -> T) -> 
 }
 
 fn samples() -> usize {
-    std::env::var("SHEETPATCH_BENCH_SAMPLES")
+    env::var("SHEETPATCH_BENCH_SAMPLES")
         .map(|value| {
             value
                 .parse::<usize>()
@@ -280,7 +287,7 @@ fn guarded_batches(samples: usize) {
     let cells = 20_000;
     let input = fixture_with_sheet(&guarded_worksheet(cells, &BTreeMap::new()));
     for count in [1, 500] {
-        let rows: Vec<_> = if count == 1 {
+        let rows: Vec<usize> = if count == 1 {
             vec![10_000]
         } else {
             (0..count).map(|index| 1 + index * cells / count).collect()
@@ -295,7 +302,7 @@ fn guarded_batches(samples: usize) {
                 )
             })
             .collect();
-        let values = rows
+        let values: BTreeMap<usize, i32> = rows
             .iter()
             .enumerate()
             .map(|(index, &row)| (row, -((index + 1) as i32)))
@@ -306,9 +313,14 @@ fn guarded_batches(samples: usize) {
         assert!(
             edited
                 .set_cell_at("Data", CellRef::try_new(10_000, 3).unwrap(), 42)
-                .is_err()
+                .is_err(),
+            "C10000 is a follower of the merged range A10000:D10000, so editing it must fail"
         );
-        assert_eq!(edited.to_bytes().unwrap(), output);
+        assert_eq!(
+            edited.to_bytes().unwrap(),
+            output,
+            "a refused edit must leave the workbook unchanged"
+        );
         report(
             "guarded_bulk_at",
             cells,
@@ -326,7 +338,7 @@ fn table_batches(samples: usize) {
     let mut relationships = String::from(
         "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
     );
-    let mut parts = payloads(&fixture_with_sheet(&wide_worksheet(
+    let mut parts = common::payloads(&fixture_with_sheet(&wide_worksheet(
         2,
         columns,
         &BTreeMap::new(),
@@ -375,13 +387,16 @@ fn table_batches(samples: usize) {
             )
         })
         .collect();
-    let values = edits
+    let values: BTreeMap<CellRef, i32> = edits
         .iter()
         .map(|(cell, _)| (*cell, -i32::from(cell.column())))
         .collect();
     let mut book = bulk_at(&input, &edits);
     verify_output(&input, &book.to_bytes().unwrap(), &worksheet(&values));
-    assert!(book.set_cell("Data", "A1", "changed").is_err());
+    assert!(
+        book.set_cell("Data", "A1", "changed").is_err(),
+        "A1 is the header of a table, so changing its text must fail"
+    );
     // Reuse discovered table headers to isolate bulk-edit scaling from the
     // cost of opening thousands of table parts. Reset keeps those caches.
     report(
@@ -401,8 +416,9 @@ fn table_batches(samples: usize) {
 }
 
 fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> Vec<u8> {
-    let base = fixture_with_sheet(sheets[0].1);
-    let mut parts = payloads(&base);
+    let (_, first_sheet) = sheets[0];
+    let base = fixture_with_sheet(first_sheet);
+    let mut parts = common::payloads(&base);
     let office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     let mut workbook = format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{office}'><sheets>");
     let mut relationships = String::from(
@@ -491,7 +507,10 @@ fn edit_case(
         .get_cells_at("Data", edits.iter().map(|(cell, _)| *cell))
         .unwrap();
     for (read, (_, value)) in reads.iter().zip(edits) {
-        assert_eq!(&read.value, value);
+        assert_eq!(
+            &read.value, value,
+            "a read after a bulk edit must return the value written"
+        );
     }
     report(
         label,
@@ -510,7 +529,7 @@ fn repeated_reads(
     edits: &[(CellRef, CellValue)],
     cells: usize,
 ) {
-    let queries: Vec<_> = edits.iter().take(16).map(|(cell, _)| *cell).collect();
+    let queries: Vec<CellRef> = edits.iter().take(16).map(|(cell, _)| *cell).collect();
     let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
     let read_one_at_a_time = || {
         queries
@@ -518,7 +537,11 @@ fn repeated_reads(
             .map(|&cell| book.get_cell_at("Data", cell).unwrap())
             .collect::<Vec<_>>()
     };
-    assert_eq!(read_one_at_a_time(), expected);
+    assert_eq!(
+        read_one_at_a_time(),
+        expected,
+        "single reads must agree with a batched read"
+    );
     report(
         "cold_single_read",
         cells,
@@ -553,7 +576,11 @@ fn prepared_reads(samples: usize, book: &Workbook, queries: &[CellRef], cells: u
                 .map(|&cell| view.get_cell_at(cell).unwrap())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(read(), expected);
+        assert_eq!(
+            read(),
+            expected,
+            "prepared reads must agree with a batched workbook read"
+        );
         report(
             "prepared_single_reads",
             cells,
@@ -599,7 +626,7 @@ fn shared_string_reads(samples: usize) {
     }
     sheet.push_str("</sheetData></worksheet>");
     let input = expanded_fixture(&[("Data", sheet.as_bytes())], Some(strings.as_bytes()));
-    let queries: Vec<_> = (0..count)
+    let queries: Vec<CellRef> = (0..count)
         .map(|index| CellRef::try_new(1 + (index * cells / count) as u32, 1).unwrap())
         .collect();
     let book = Workbook::from_bytes(input.clone()).unwrap();
@@ -607,10 +634,15 @@ fn shared_string_reads(samples: usize) {
     for (content, cell) in expected.iter().zip(&queries) {
         assert_eq!(
             content.value,
-            CellValue::from(format!("Shared {} ☕ _x0041_", (cell.row() - 1) % 128))
+            CellValue::from(format!("Shared {} ☕ _x0041_", (cell.row() - 1) % 128)),
+            "{cell} must read its shared string's runs joined, with escapes decoded"
         );
     }
-    assert_eq!(book.to_bytes().unwrap(), input);
+    assert_eq!(
+        book.to_bytes().unwrap(),
+        input,
+        "an unedited workbook must save its original bytes"
+    );
     report(
         "shared_cold_reads",
         cells,
@@ -636,7 +668,8 @@ fn shared_string_reads(samples: usize) {
         let view = book.prepare_sheet("Data").unwrap();
         assert_eq!(
             view.get_cells_at(queries.iter().copied()).unwrap(),
-            expected
+            expected,
+            "a prepared view must agree with a workbook read"
         );
         report(
             "shared_prepared_reads",
@@ -654,7 +687,7 @@ fn extra_workloads(samples: usize) {
     if selected("SHEETPATCH_BENCH_CASES", "wide") {
         let rows = 200;
         let columns = 100;
-        let values: BTreeMap<_, _> = (0..100)
+        let values: BTreeMap<CellRef, i32> = (0..100)
             .map(|index| {
                 (
                     CellRef::try_new(
@@ -693,11 +726,11 @@ fn extra_workloads(samples: usize) {
                 .replace("</c>", &format!("{extension}</c>"))
                 .into_bytes()
         };
-        let edits: Vec<_> = updates(cells, count)
+        let edits: Vec<(CellRef, CellValue)> = updates(cells, count)
             .into_iter()
             .map(|(cell, value)| (cell.parse().unwrap(), value))
             .collect();
-        let values = (0..count)
+        let values: BTreeMap<usize, i32> = (0..count)
             .map(|index| (1 + index * cells / count, -((index + 1) as i32)))
             .collect();
         let mut book = edit_case(
@@ -718,7 +751,11 @@ fn extra_workloads(samples: usize) {
                 book.set_cells_at("Data", edits.iter().cloned()).unwrap()
             }),
         );
-        assert_eq!(book.to_bytes().unwrap(), before);
+        assert_eq!(
+            book.to_bytes().unwrap(),
+            before,
+            "rewriting the values a workbook already holds must not change it"
+        );
     }
     if selected("SHEETPATCH_BENCH_CASES", "shared_strings") {
         shared_string_reads(samples);
@@ -781,7 +818,7 @@ fn extra_workloads(samples: usize) {
         let names = ["Data", "Other1", "Other2", "Other3"];
         let sheets: Vec<_> = names.iter().map(|&name| (name, sheet.as_slice())).collect();
         let input = expanded_fixture(&sheets, None);
-        let edits: Vec<_> = names
+        let edits: Vec<CellEdit> = names
             .iter()
             .flat_map(|&name| {
                 updates(cells, count)
@@ -807,7 +844,8 @@ fn extra_workloads(samples: usize) {
         for name in names {
             assert_eq!(
                 book.get_cell(name, "A1").unwrap().value,
-                CellValue::Number(-1.0)
+                CellValue::Number(-1.0),
+                "{name}!A1 must hold the first edit applied to that sheet"
             );
         }
         report(
@@ -862,16 +900,20 @@ fn main() {
         }
         let input = fixture(cells);
         let edits = updates(cells, count);
-        let typed_edits: Vec<_> = edits
+        let typed_edits: Vec<(CellRef, CellValue)> = edits
             .iter()
-            .map(|(address, value)| (address.parse::<CellRef>().unwrap(), value.clone()))
+            .map(|(address, value)| (address.parse().unwrap(), value.clone()))
             .collect();
         let expected = expected(cells, count);
         let batched = bulk(&input, &edits);
         let output = batched.to_bytes().unwrap();
         let typed = bulk_at(&input, &typed_edits);
         verify_output(&input, &typed.to_bytes().unwrap(), &expected);
-        assert_eq!(typed.to_bytes().unwrap(), output);
+        assert_eq!(
+            typed.to_bytes().unwrap(),
+            output,
+            "typed and A1-addressed bulk edits must save the same bytes"
+        );
         if selected("SHEETPATCH_BENCH_OPERATIONS", "sequential") {
             verify_output(
                 &input,
@@ -882,7 +924,10 @@ fn main() {
         verify_output(&input, &output, &expected);
         let mut streamed = Vec::new();
         batched.write_to(&mut streamed).unwrap();
-        assert_eq!(streamed, output);
+        assert_eq!(
+            streamed, output,
+            "write_to must stream the bytes that to_bytes returns"
+        );
         let compact = batched.to_bytes_compact().unwrap();
         verify_output(&input, &compact, &expected);
         let addresses: Vec<_> = edits.iter().map(|(address, _)| address.as_str()).collect();
@@ -890,9 +935,15 @@ fn main() {
         let typed_values = typed
             .get_cells_at("Data", typed_edits.iter().map(|(cell, _)| *cell))
             .unwrap();
-        assert_eq!(typed_values, values);
-        for (cell, (_, expected_value)) in values.iter().zip(&edits) {
-            assert_eq!(&cell.value, expected_value);
+        assert_eq!(
+            typed_values, values,
+            "typed and A1-addressed reads must agree"
+        );
+        for (cell, (address, expected_value)) in values.iter().zip(&edits) {
+            assert_eq!(
+                &cell.value, expected_value,
+                "{address} must read back the value just written"
+            );
         }
         repeated_reads(samples, &input, &batched, &typed_edits, cells);
         let mut unchanged = bulk(&input, &edits);
@@ -904,14 +955,18 @@ fn main() {
                     .map(|(address, value)| (address.as_str(), value.clone())),
             )
             .unwrap();
-        assert_eq!(unchanged.to_bytes().unwrap(), output);
+        assert_eq!(
+            unchanged.to_bytes().unwrap(),
+            output,
+            "rewriting the values a workbook already holds must not change it"
+        );
 
         report(
             "sequential",
             cells,
             count,
             samples,
-            measure(samples, "sequential", || self::sequential(&input, &edits)),
+            measure(samples, "sequential", || sequential(&input, &edits)),
         );
         report(
             "bulk",
@@ -963,7 +1018,11 @@ fn main() {
                     .unwrap()
             }),
         );
-        assert_eq!(unchanged.to_bytes().unwrap(), output);
+        assert_eq!(
+            unchanged.to_bytes().unwrap(),
+            output,
+            "the unchanged_bulk samples must leave the workbook unchanged"
+        );
         report(
             "to_bytes",
             cells,
@@ -1018,7 +1077,10 @@ fn main() {
             .to_bytes_compact()
             .unwrap();
         verify_output(&input, &compacted, &worksheet(cells, &values));
-        assert_eq!(compacted, repeated);
+        assert_eq!(
+            compacted, repeated,
+            "repeated saves must leave nothing for compaction to remove"
+        );
         println!(
             "growth,{cells},saves=5,normal={},compact={}",
             repeated.len(),
