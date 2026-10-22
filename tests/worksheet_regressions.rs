@@ -936,6 +936,50 @@ fn edit_refusals_name_the_cell() {
 }
 
 #[test]
+fn values_marked_to_preserve_whitespace_can_be_rewritten_and_replaced() {
+    // SheetJS writes text with surrounding spaces or a line break this way.
+    let mut book = workbook(
+        &row(concat!(
+            "<c r='A1' t='str'><v xml:space='preserve'>  spaced  </v></c>",
+            "<c r='B1' t='str'><v xml:space='preserve'>multi\nline</v></c>",
+            "<c r='C1'><v xml:space='default'>7</v></c>",
+            "<c r='D1'><v xml:space='preserve' unexpected='1'>8</v></c>",
+        )),
+        None,
+    );
+    let original = book.to_bytes().unwrap();
+    let current = [
+        ("A1", CellValue::from("  spaced  ")),
+        ("B1", CellValue::from("multi\nline")),
+        ("C1", CellValue::Number(7.0)),
+    ];
+    for (address, expected) in &current {
+        assert_eq!(&value(&book, address), expected);
+    }
+    book.set_cells("Data", current).unwrap();
+    assert!(!book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), original);
+    assert_eq!(
+        unsupported_message(book.set_cell("Data", "D1", 9)),
+        "D1: unfamiliar attributes inside the cell value payload"
+    );
+    book.set_cells(
+        "Data",
+        [
+            ("A1", CellValue::from(" new ")),
+            ("B1", CellValue::Blank),
+            ("C1", CellValue::Number(9.0)),
+        ],
+    )
+    .unwrap();
+    let saved = reopened(&book);
+    assert_eq!(value(&saved, "A1"), CellValue::from(" new "));
+    assert_eq!(value(&saved, "B1"), CellValue::Blank);
+    assert_eq!(value(&saved, "C1"), CellValue::Number(9.0));
+    assert_eq!(value(&saved, "D1"), CellValue::Number(8.0));
+}
+
+#[test]
 fn namespace_prefix_caches_follow_shadowing_and_empty_element_scopes() {
     let escaped_main = MAIN_NS.replace("/main", "/ma&#105;n");
     let body = format!(

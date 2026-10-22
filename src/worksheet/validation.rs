@@ -38,8 +38,10 @@ fn validate_payload_element(
         return Err(unsupported("unfamiliar XML inside the cell value payload"));
     }
     let allowed_attributes: &[&str] = match element.local_name(source) {
-        "v" | "is" | "r" | "rPr" => &[],
-        "t" => &["xml:space"],
+        "is" | "r" | "rPr" => &[],
+        // SheetJS marks `<v>` text with surrounding spaces or a line break,
+        // as Excel marks `<t>`. Reads already take either text verbatim.
+        "v" | "t" => &["xml:space"],
         "rPh" => &["sb", "eb"],
         "phoneticPr" => &["fontId", "type", "alignment"],
         "color" => &["auto", "indexed", "rgb", "theme", "tint"],
