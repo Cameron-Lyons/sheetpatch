@@ -213,7 +213,7 @@ mod tests {
             Error::SheetNotFound("Data".into()),
             Error::ProtectedCell {
                 sheet: "Data".into(),
-                cell: CellRef::new(2, 3).unwrap(),
+                cell: CellRef::try_new(2, 3).unwrap(),
                 reason: "contains a formula".into(),
             },
             Error::Unsupported("unsupported".into()),
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn context_prefixes_only_messages_that_do_not_identify_their_subject() {
-        let cell = CellRef::new(7, 2).unwrap();
+        let cell = CellRef::try_new(7, 2).unwrap();
         let prefixed = [
             Error::Xml("xml".into()),
             Error::InvalidWorkbook("invalid".into()),
@@ -290,7 +290,7 @@ mod tests {
         );
         let error = Error::ProtectedCell {
             sheet: "Q\"1".into(),
-            cell: CellRef::new(2, 3).unwrap(),
+            cell: CellRef::try_new(2, 3).unwrap(),
             reason: "contains a formula".into(),
         };
         assert_eq!(

@@ -783,16 +783,16 @@ fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
     book.set_cell("Data & Notes", "C1", 101).unwrap();
     let pending = book.to_bytes().unwrap();
     book.apply_edits([
-        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
-        CellEdit::new("Other", "A1", 7).unwrap(),
+        CellEdit::try_new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::try_new("Other", "A1", 7).unwrap(),
     ])
     .unwrap();
     assert!(book.has_changes());
     assert_eq!(book.to_bytes().unwrap(), pending);
 
     book.apply_edits([
-        CellEdit::new("Data & Notes", "C1", 101).unwrap(),
-        CellEdit::new("Other", "A1", 8).unwrap(),
+        CellEdit::try_new("Data & Notes", "C1", 101).unwrap(),
+        CellEdit::try_new("Other", "A1", 8).unwrap(),
     ])
     .unwrap();
     let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
@@ -806,8 +806,8 @@ fn no_op_edits_preserve_pending_transactions_and_exact_original_reversion() {
     );
 
     book.apply_edits([
-        CellEdit::new("Data & Notes", "C1", 99).unwrap(),
-        CellEdit::new("Other", "A1", 7).unwrap(),
+        CellEdit::try_new("Data & Notes", "C1", 99).unwrap(),
+        CellEdit::try_new("Other", "A1", 7).unwrap(),
     ])
     .unwrap();
     assert!(!book.has_changes());
@@ -824,14 +824,14 @@ fn multi_sheet_transaction_rolls_back_every_sheet_on_failure() {
     book.set_cell("Data & Notes", "A2", false).unwrap();
     let before = book.to_bytes().unwrap();
     let edits = vec![
-        CellEdit::new("Data & Notes", "A1", "pending").unwrap(),
-        CellEdit::new("Other", "A1", 8).unwrap(),
+        CellEdit::try_new("Data & Notes", "A1", "pending").unwrap(),
+        CellEdit::try_new("Other", "A1", 8).unwrap(),
     ];
     assert!(book.apply_edits(edits).is_err());
     assert_eq!(book.to_bytes().unwrap(), before);
     book.apply_edits([
-        CellEdit::new("Data & Notes", "A1", "committed").unwrap(),
-        CellEdit::at("Other", CellRef::new(2, 2).unwrap(), 9).unwrap(),
+        CellEdit::try_new("Data & Notes", "A1", "committed").unwrap(),
+        CellEdit::try_new_at("Other", CellRef::try_new(2, 2).unwrap(), 9).unwrap(),
     ])
     .unwrap();
     assert_eq!(

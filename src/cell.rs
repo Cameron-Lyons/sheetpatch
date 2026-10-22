@@ -23,7 +23,7 @@ impl CellRef {
     ///
     /// Returns [`Error::InvalidCellReference`] unless the row is within
     /// `1..=`[`Self::MAX_ROW`] and the column is within `1..=`[`Self::MAX_COLUMN`].
-    pub fn new(row: u32, column: u16) -> Result<Self> {
+    pub fn try_new(row: u32, column: u16) -> Result<Self> {
         if !(1..=Self::MAX_ROW).contains(&row) || !(1..=Self::MAX_COLUMN).contains(&column) {
             return Err(Error::InvalidCellReference(format!(
                 "row {row}, column {column}"
@@ -31,6 +31,17 @@ impl CellRef {
         }
         Ok(Self { row, column })
     }
+
+    /// Construct an address from one-based row and column numbers.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellRef::try_new`")]
+    pub fn new(row: u32, column: u16) -> Result<Self> {
+        Self::try_new(row, column)
+    }
+
     /// Return the one-based row number.
     pub fn row(self) -> u32 {
         self.row
@@ -126,7 +137,7 @@ impl fmt::Display for CellRef {
     /// ```
     /// use sheetpatch::CellRef;
     ///
-    /// let cell = CellRef::new(2, 28)?;
+    /// let cell = CellRef::try_new(2, 28)?;
     /// assert_eq!(cell.to_string(), "AB2");
     /// assert_eq!(format!("[{cell:>5}]"), "[  AB2]");
     /// # Ok::<(), sheetpatch::Error>(())
@@ -151,7 +162,7 @@ impl fmt::Display for CellRef {
 /// let range: CellRange = "c2:A1".parse()?;
 /// assert_eq!(range.to_string(), "A1:C2");
 /// assert_eq!((range.height(), range.width(), range.cell_count()), (2, 3, 6));
-/// assert!(range.contains(CellRef::new(2, 2)?));
+/// assert!(range.contains(CellRef::try_new(2, 2)?));
 ///
 /// let cells: Vec<String> = range.cells().map(|cell| cell.to_string()).collect();
 /// assert_eq!(cells, ["A1", "B1", "C1", "A2", "B2", "C2"]);
@@ -531,12 +542,12 @@ impl CellEdit {
     ///
     /// Returns [`Error::InvalidCellReference`] for an invalid address, and
     /// otherwise [`Error::InvalidValue`] for a value no cell can hold.
-    pub fn new(
+    pub fn try_new(
         sheet: impl Into<String>,
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<Self> {
-        Self::at(sheet, address.parse()?, value)
+        Self::try_new_at(sheet, address.parse()?, value)
     }
 
     /// Construct an edit from a sheet name, a typed address, and a value.
@@ -550,7 +561,7 @@ impl CellEdit {
     /// Returns [`Error::InvalidValue`] for a non-finite number, text longer
     /// than Excel's 32,767 UTF-16 code units, or an error value that is not
     /// one of Excel's error codes.
-    pub fn at(
+    pub fn try_new_at(
         sheet: impl Into<String>,
         cell: CellRef,
         value: impl Into<CellValue>,
@@ -562,6 +573,34 @@ impl CellEdit {
             cell,
             value,
         })
+    }
+
+    /// Construct an edit from a sheet name, an A1 address, and a value.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellEdit::try_new`")]
+    pub fn new(
+        sheet: impl Into<String>,
+        address: &str,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        Self::try_new(sheet, address, value)
+    }
+
+    /// Construct an edit from a sheet name, a typed address, and a value.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new_at`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellEdit::try_new_at`")]
+    pub fn at(
+        sheet: impl Into<String>,
+        cell: CellRef,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        Self::try_new_at(sheet, cell, value)
     }
 
     /// Return the target sheet name.
@@ -900,14 +939,14 @@ mod tests {
     #[test]
     fn typed_addresses_and_edits_validate_before_mutation() {
         assert_eq!(
-            CellRef::new(1_048_576, 16_384).unwrap().to_string(),
+            CellRef::try_new(1_048_576, 16_384).unwrap().to_string(),
             "XFD1048576"
         );
         for (row, column) in [(0, 1), (1, 0), (1_048_577, 1), (1, 16_385)] {
-            assert!(CellRef::new(row, column).is_err());
+            assert!(CellRef::try_new(row, column).is_err());
         }
-        assert!(CellEdit::new("Data", "A1", f64::NAN).is_err());
-        let edit = CellEdit::at("Data", CellRef::new(2, 3).unwrap(), 7).unwrap();
+        assert!(CellEdit::try_new("Data", "A1", f64::NAN).is_err());
+        let edit = CellEdit::try_new_at("Data", CellRef::try_new(2, 3).unwrap(), 7).unwrap();
         assert_eq!(edit.sheet(), "Data");
         assert_eq!(edit.cell().to_string(), "C2");
         assert_eq!(edit.value(), &CellValue::Number(7.0));

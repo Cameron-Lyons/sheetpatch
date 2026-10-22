@@ -60,7 +60,7 @@ fn fixture_cells_are_enumerated_with_their_contents() {
     let notes = book.prepare_sheet("Notes").unwrap();
     assert_eq!(
         notes.used_range(),
-        Some(CellRange::from(CellRef::new(1, 1).unwrap()))
+        Some(CellRange::from(CellRef::try_new(1, 1).unwrap()))
     );
 }
 

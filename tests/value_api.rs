@@ -39,9 +39,9 @@ fn literals_and_new_conversions_work_with_every_editing_api() {
     book.set_cell_at("Data", cell("C3"), 7).unwrap();
     book.set_cells_at("Data", [(cell("C4"), 8)]).unwrap();
     book.apply_edits([
-        CellEdit::new("Data", "A5", 7).unwrap(),
-        CellEdit::at("Data", cell("B5"), 0.25).unwrap(),
-        CellEdit::new("Notes", "A2", Some(&name)).unwrap(),
+        CellEdit::try_new("Data", "A5", 7).unwrap(),
+        CellEdit::try_new_at("Data", cell("B5"), 0.25).unwrap(),
+        CellEdit::try_new("Notes", "A2", Some(&name)).unwrap(),
     ])
     .unwrap();
 
@@ -243,11 +243,11 @@ fn default_display_and_accessors_follow_each_variant() {
 
 #[test]
 fn edits_compare_by_sheet_cell_and_value() {
-    let edit = CellEdit::new("Data", "b2", 7).unwrap();
-    assert_eq!(edit, CellEdit::at("Data", cell("B2"), 7.0).unwrap());
-    assert_ne!(edit, CellEdit::new("Data", "B2", "7").unwrap());
-    assert_ne!(edit, CellEdit::new("Data", "B3", 7).unwrap());
-    assert_ne!(edit, CellEdit::new("Notes", "B2", 7).unwrap());
+    let edit = CellEdit::try_new("Data", "b2", 7).unwrap();
+    assert_eq!(edit, CellEdit::try_new_at("Data", cell("B2"), 7.0).unwrap());
+    assert_ne!(edit, CellEdit::try_new("Data", "B2", "7").unwrap());
+    assert_ne!(edit, CellEdit::try_new("Data", "B3", 7).unwrap());
+    assert_ne!(edit, CellEdit::try_new("Notes", "B2", 7).unwrap());
 }
 
 #[test]
@@ -271,11 +271,11 @@ fn unsupported_errors_do_not_claim_an_edit_was_attempted() {
 fn grid_limits_match_address_validation() {
     assert_eq!(CellRef::MAX_ROW, 1_048_576);
     assert_eq!(CellRef::MAX_COLUMN, 16_384);
-    let corner = CellRef::new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap();
+    let corner = CellRef::try_new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap();
     assert_eq!(corner.to_string(), "XFD1048576");
     assert_eq!(cell("xfd1048576"), corner);
-    assert!(CellRef::new(CellRef::MAX_ROW + 1, 1).is_err());
-    assert!(CellRef::new(1, CellRef::MAX_COLUMN + 1).is_err());
+    assert!(CellRef::try_new(CellRef::MAX_ROW + 1, 1).is_err());
+    assert!(CellRef::try_new(1, CellRef::MAX_COLUMN + 1).is_err());
     assert!("XFE1".parse::<CellRef>().is_err());
     assert!("A1048577".parse::<CellRef>().is_err());
 }
@@ -371,7 +371,7 @@ fn ranges_measure_and_contain_cells_up_to_the_grid_corner() {
     assert_eq!(sheet.first(), cell("A1"));
     assert_eq!(
         sheet.last(),
-        CellRef::new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap()
+        CellRef::try_new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap()
     );
     assert_eq!(sheet.height(), CellRef::MAX_ROW);
     assert_eq!(sheet.width(), CellRef::MAX_COLUMN);

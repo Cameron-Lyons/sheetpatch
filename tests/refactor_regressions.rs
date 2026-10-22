@@ -98,11 +98,12 @@ fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
         assert_eq!(view.get_cells(addresses).unwrap(), original_values);
         assert_eq!(view.get_cell("a1").unwrap(), original_values[1]);
         assert_eq!(
-            view.get_cell_at(CellRef::new(1, 4).unwrap()).unwrap(),
+            view.get_cell_at(CellRef::try_new(1, 4).unwrap()).unwrap(),
             original_values[2]
         );
         assert_eq!(
-            view.get_cells_at([CellRef::new(1, 1).unwrap(); 2]).unwrap(),
+            view.get_cells_at([CellRef::try_new(1, 1).unwrap(); 2])
+                .unwrap(),
             vec![original_values[1].clone(); 2]
         );
     }
@@ -129,8 +130,8 @@ fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
     assert_eq!(book.to_bytes().unwrap(), pending);
     assert!(matches!(
         book.apply_edits([
-            CellEdit::new("Other", "A1", 10).unwrap(),
-            CellEdit::new("Data", "D1", 11).unwrap(),
+            CellEdit::try_new("Other", "A1", 10).unwrap(),
+            CellEdit::try_new("Data", "D1", 11).unwrap(),
         ]),
         Err(Error::ProtectedCell { sheet, cell, .. })
             if sheet == "Data" && cell.to_string() == "D1"

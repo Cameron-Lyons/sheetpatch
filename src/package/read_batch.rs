@@ -59,7 +59,7 @@ mod tests {
         assert_eq!(collect_cells(columns).unwrap().len(), MAX_READ_CELLS);
         let unsized_cells = columns.cells().filter(|_| true);
         assert_eq!(collect_cells(unsized_cells).unwrap().len(), MAX_READ_CELLS);
-        let one_more = || columns.cells().chain([CellRef::new(1, 17).unwrap()]);
+        let one_more = || columns.cells().chain([CellRef::try_new(1, 17).unwrap()]);
         assert!(too_many(collect_cells(one_more())));
         assert!(too_many(collect_cells(one_more().filter(|_| true))));
     }

@@ -97,8 +97,8 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
     let original = book.to_bytes().unwrap();
     let error = book
         .apply_edits([
-            CellEdit::new("Alpha", "B1", 1).unwrap(),
-            CellEdit::new("Beta", "A1", 5).unwrap(),
+            CellEdit::try_new("Alpha", "B1", 1).unwrap(),
+            CellEdit::try_new("Beta", "A1", 5).unwrap(),
         ])
         .unwrap_err();
     assert_eq!(
@@ -114,9 +114,9 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
 
     for result in [
         book.set_cell("Beta", "B2", 3),
-        book.set_cell_at("Beta", CellRef::new(2, 2).unwrap(), 3),
+        book.set_cell_at("Beta", CellRef::try_new(2, 2).unwrap(), 3),
         book.set_cells("Beta", [("B2", 3)]),
-        book.set_cells_at("Beta", [(CellRef::new(2, 2).unwrap(), 3)]),
+        book.set_cells_at("Beta", [(CellRef::try_new(2, 2).unwrap(), 3)]),
     ] {
         let error = result.unwrap_err();
         assert_eq!(
@@ -135,7 +135,10 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
     ));
     // A single-cell edit's caller holds the cell, but a batch's value error
     // names the cell it concerns.
-    let (a1, b7) = (CellRef::new(1, 1).unwrap(), CellRef::new(7, 2).unwrap());
+    let (a1, b7) = (
+        CellRef::try_new(1, 1).unwrap(),
+        CellRef::try_new(7, 2).unwrap(),
+    );
     for result in [
         book.set_cell("Alpha", "B7", f64::NAN),
         book.set_cell_at("Alpha", b7, f64::NAN),
@@ -201,9 +204,9 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
         // leaves every worksheet and the unreadable shared-string part intact.
         let error = book
             .apply_edits([
-                CellEdit::new("Alpha", "A1", "first").unwrap(),
-                CellEdit::new("Beta", "A1", "second").unwrap(),
-                CellEdit::new("Gamma", "B1", 7).unwrap(),
+                CellEdit::try_new("Alpha", "A1", "first").unwrap(),
+                CellEdit::try_new("Beta", "A1", "second").unwrap(),
+                CellEdit::try_new("Gamma", "B1", 7).unwrap(),
             ])
             .unwrap_err();
         assert_eq!(
@@ -217,8 +220,8 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
         );
 
         book.apply_edits([
-            CellEdit::new("Alpha", "A1", "first").unwrap(),
-            CellEdit::new("Beta", "A1", "second").unwrap(),
+            CellEdit::try_new("Alpha", "A1", "first").unwrap(),
+            CellEdit::try_new("Beta", "A1", "second").unwrap(),
         ])
         .unwrap();
         let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
@@ -319,7 +322,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         );
         for error in [
             book.get_cells("Beta", ["A1", "B2"]).unwrap_err(),
-            book.get_cell_at("Beta", CellRef::new(1, 1).unwrap())
+            book.get_cell_at("Beta", CellRef::try_new(1, 1).unwrap())
                 .unwrap_err(),
         ] {
             assert_eq!(error.to_string(), direct.to_string(), "{case}");
@@ -345,7 +348,7 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
 #[test]
 fn single_cell_setters_resolve_the_sheet_before_the_address_and_value() {
     let mut book = book(&[("Data", worksheet(CELL))]);
-    let a1 = CellRef::new(1, 1).unwrap();
+    let a1 = CellRef::try_new(1, 1).unwrap();
     for error in [
         book.set_cell("Missing", "A0", 1).unwrap_err(),
         book.set_cell_at("Missing", a1, f64::NAN).unwrap_err(),
@@ -575,8 +578,8 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
         ),
     ] {
         let cell: CellRef = address.parse().unwrap();
-        let alpha = CellEdit::new("Alpha", "B1", 1).unwrap();
-        let edit = CellEdit::at("Beta", cell, value.clone()).unwrap();
+        let alpha = CellEdit::try_new("Alpha", "B1", 1).unwrap();
+        let edit = CellEdit::try_new_at("Beta", cell, value.clone()).unwrap();
         for (method, result) in [
             ("set_cell", book.set_cell("Beta", address, value.clone())),
             ("set_cell_at", book.set_cell_at("Beta", cell, value.clone())),
@@ -696,7 +699,7 @@ fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
     for (case, xml, expected) in cases {
         let mut book = shared_string_book(Some(&xml));
         let view = book.prepare_sheet("Data").unwrap();
-        let a1 = CellRef::new(1, 1).unwrap();
+        let a1 = CellRef::try_new(1, 1).unwrap();
         let errors = [
             book.get_cell("Data", "A1").unwrap_err(),
             book.get_cell_at("Data", a1).unwrap_err(),
@@ -806,7 +809,7 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     let expected =
         "part \"xl/sharedStrings.xml\": string 1: unpaired UTF-16 surrogate in Excel text escape";
     let view = book.prepare_sheet("Data").unwrap();
-    let a2 = CellRef::new(2, 1).unwrap();
+    let a2 = CellRef::try_new(2, 1).unwrap();
     for error in [
         book.get_cell("Data", "A2").unwrap_err(),
         book.get_cell_at("Data", a2).unwrap_err(),

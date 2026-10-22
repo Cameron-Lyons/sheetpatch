@@ -290,7 +290,7 @@ fn guarded_batches(samples: usize) {
             .enumerate()
             .map(|(index, &row)| {
                 (
-                    CellRef::new(row as u32, 5).unwrap(),
+                    CellRef::try_new(row as u32, 5).unwrap(),
                     CellValue::Number(-((index + 1) as f64)),
                 )
             })
@@ -305,7 +305,7 @@ fn guarded_batches(samples: usize) {
         verify_output(&input, &output, &guarded_worksheet(cells, &values));
         assert!(
             edited
-                .set_cell_at("Data", CellRef::new(10_000, 3).unwrap(), 42)
+                .set_cell_at("Data", CellRef::try_new(10_000, 3).unwrap(), 42)
                 .is_err()
         );
         assert_eq!(edited.to_bytes().unwrap(), output);
@@ -332,8 +332,8 @@ fn table_batches(samples: usize) {
         &BTreeMap::new(),
     )));
     for column in 1..=columns {
-        let first = CellRef::new(1, column).unwrap();
-        let last = CellRef::new(2, column).unwrap();
+        let first = CellRef::try_new(1, column).unwrap();
+        let last = CellRef::try_new(2, column).unwrap();
         write!(table_parts, "<tablePart r:id='t{column}'/>").unwrap();
         write!(
             relationships,
@@ -370,7 +370,7 @@ fn table_batches(samples: usize) {
     let edits: Vec<_> = (1..=columns)
         .map(|column| {
             (
-                CellRef::new(2, column).unwrap(),
+                CellRef::try_new(2, column).unwrap(),
                 CellValue::from(-i32::from(column)),
             )
         })
@@ -457,12 +457,12 @@ fn expanded_fixture(sheets: &[(&str, &[u8])], shared_strings: Option<&[u8]>) -> 
 }
 
 fn wide_worksheet(rows: u32, columns: u16, values: &BTreeMap<CellRef, i32>) -> Vec<u8> {
-    let last = CellRef::new(rows, columns).unwrap();
+    let last = CellRef::try_new(rows, columns).unwrap();
     let mut xml = format!("<worksheet xmlns='{MAIN_NS}'><dimension ref='A1:{last}'/><sheetData>");
     for row in 1..=rows {
         write!(xml, "<row r='{row}'>").unwrap();
         for column in 1..=columns {
-            let cell = CellRef::new(row, column).unwrap();
+            let cell = CellRef::try_new(row, column).unwrap();
             let value = values
                 .get(&cell)
                 .copied()
@@ -599,7 +599,7 @@ fn shared_string_reads(samples: usize) {
     sheet.push_str("</sheetData></worksheet>");
     let input = expanded_fixture(&[("Data", sheet.as_bytes())], Some(strings.as_bytes()));
     let queries: Vec<_> = (0..count)
-        .map(|index| CellRef::new(1 + (index * cells / count) as u32, 1).unwrap())
+        .map(|index| CellRef::try_new(1 + (index * cells / count) as u32, 1).unwrap())
         .collect();
     let book = Workbook::from_bytes(input.clone()).unwrap();
     let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
@@ -656,7 +656,7 @@ fn extra_workloads(samples: usize) {
         let values: BTreeMap<_, _> = (0..100)
             .map(|index| {
                 (
-                    CellRef::new(
+                    CellRef::try_new(
                         1 + index * rows / 100,
                         1 + (index * 37 % u32::from(columns)) as u16,
                     )
@@ -729,7 +729,7 @@ fn extra_workloads(samples: usize) {
         for row in 1..=500 {
             write!(rows, "<row r=\"{row}\">").unwrap();
             for column in 1..=2 {
-                let cell = CellRef::new(row, column).unwrap();
+                let cell = CellRef::try_new(row, column).unwrap();
                 let value = row as i32 * i32::from(column);
                 write!(rows, "<c r=\"{cell}\"><v>{value}</v></c>").unwrap();
                 edits.push((cell, CellValue::from(value)));
@@ -759,7 +759,7 @@ fn extra_workloads(samples: usize) {
         let mut expected = prefix;
         let mut edits = Vec::new();
         for column in 1..=1_024 {
-            let cell = CellRef::new(1, column).unwrap();
+            let cell = CellRef::try_new(1, column).unwrap();
             write!(expected, "<c r=\"{cell}\"><v>{column}</v></c>").unwrap();
             edits.push((cell, CellValue::from(i32::from(column))));
         }
@@ -785,7 +785,7 @@ fn extra_workloads(samples: usize) {
             .flat_map(|&name| {
                 updates(cells, count)
                     .into_iter()
-                    .map(move |(cell, value)| CellEdit::new(name, &cell, value).unwrap())
+                    .map(move |(cell, value)| CellEdit::try_new(name, &cell, value).unwrap())
             })
             .collect();
         let run = || {
@@ -826,7 +826,7 @@ fn extra_workloads(samples: usize) {
         let mut rows = String::from("<sheetData>");
         let mut edits = Vec::new();
         for row in 1..=64 {
-            let cell = CellRef::new(row, 1).unwrap();
+            let cell = CellRef::try_new(row, 1).unwrap();
             write!(
                 rows,
                 "<row r=\"{row}\"><c r=\"{cell}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{escaped}</t></is></c></row>"

@@ -1901,7 +1901,7 @@ fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() 
     ));
     let mut cells: BTreeMap<_, _> = (1..=10)
         .chain([30])
-        .map(|row| (CellRef::new(row, 26).unwrap(), CellValue::Blank))
+        .map(|row| (CellRef::try_new(row, 26).unwrap(), CellValue::Blank))
         .collect();
     cells.insert("C15".parse().unwrap(), CellValue::Blank);
     for merged in [false, true] {

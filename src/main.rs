@@ -580,7 +580,8 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch, Failure> 
         let value = parse_value(kind, fields.next()).map_err(|error| match error {
             ValueError::Arity(message) | ValueError::Invalid(message) => invalid(message),
         })?;
-        let edit = CellEdit::at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
+        let edit =
+            CellEdit::try_new_at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
         patch.row_count += 1;
         let lines = &mut patch.lines;
         if let Some(&index) = lines.targets.get(sheet).and_then(|cells| cells.get(&cell)) {
@@ -999,7 +1000,7 @@ fn cmd_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
         ValueError::Arity(message) => Failure::Usage(message),
         ValueError::Invalid(message) => Failure::invalid("set", message),
     })?;
-    let edit = CellEdit::at(sheet, cell, value)
+    let edit = CellEdit::try_new_at(sheet, cell, value)
         .map_err(|error| Failure::invalid("set", error.to_string()))?;
     let source = Source::new(line.command, &args[0])?;
     let destination = Destination::new(line.command, &args[1], terminal)?;

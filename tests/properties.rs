@@ -179,7 +179,7 @@ fn brief(value: &impl fmt::Debug) -> String {
 }
 
 fn cell(row: u32, column: u16) -> CellRef {
-    CellRef::new(row, column).expect("generated address is within the grid")
+    CellRef::try_new(row, column).expect("generated address is within the grid")
 }
 
 // ---------------------------------------------------------------- values
@@ -1682,8 +1682,8 @@ fn apply_batch(
                 let sheet = sheet_name(position);
                 let value = edit.value.clone();
                 edits.push(match edit.spelling {
-                    Spelling::Typed => CellEdit::at(sheet, edit.cell, value)?,
-                    _ => CellEdit::new(sheet, &edit.address(), value)?,
+                    Spelling::Typed => CellEdit::try_new_at(sheet, edit.cell, value)?,
+                    _ => CellEdit::try_new(sheet, &edit.address(), value)?,
                 });
             }
             book.apply_edits(edits)
@@ -2272,9 +2272,11 @@ fn reads_return_written_values_before_and_after_saving() {
         if rng.chance(1, 2) {
             let edits = written
                 .iter()
-                .map(|(&(sheet, cell), value)| CellEdit::at(names[sheet], cell, value.clone()))
+                .map(|(&(sheet, cell), value)| {
+                    CellEdit::try_new_at(names[sheet], cell, value.clone())
+                })
                 .collect::<sheetpatch::Result<Vec<_>>>()
-                .or_fail(case, "CellEdit::at");
+                .or_fail(case, "CellEdit::try_new_at");
             reopened
                 .apply_edits(edits)
                 .or_fail(case, "rewriting values");
@@ -2629,7 +2631,8 @@ fn cell_references_and_ranges_round_trip() {
                 );
             }
             assert_eq!(
-                CellRef::new(reference.row(), reference.column()).or_fail(case, "CellRef::new"),
+                CellRef::try_new(reference.row(), reference.column())
+                    .or_fail(case, "CellRef::try_new"),
                 reference,
                 "{case}"
             );
@@ -2650,19 +2653,19 @@ fn cell_references_and_ranges_round_trip() {
                 );
             }
             assert!(
-                CellRef::new(0, reference.column()).is_err(),
+                CellRef::try_new(0, reference.column()).is_err(),
                 "{case}: row 0"
             );
             assert!(
-                CellRef::new(reference.row(), 0).is_err(),
+                CellRef::try_new(reference.row(), 0).is_err(),
                 "{case}: column 0"
             );
             assert!(
-                CellRef::new(CellRef::MAX_ROW + 1, reference.column()).is_err(),
+                CellRef::try_new(CellRef::MAX_ROW + 1, reference.column()).is_err(),
                 "{case}: row past the limit"
             );
             assert!(
-                CellRef::new(reference.row(), CellRef::MAX_COLUMN + 1).is_err(),
+                CellRef::try_new(reference.row(), CellRef::MAX_COLUMN + 1).is_err(),
                 "{case}: column past the limit"
             );
         }

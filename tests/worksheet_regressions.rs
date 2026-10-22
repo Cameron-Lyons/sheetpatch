@@ -395,7 +395,7 @@ fn error_values_must_be_excel_error_codes_but_reads_stay_lenient() {
             ),
             "{invalid}"
         );
-        assert!(CellEdit::new("Data", "B1", error).is_err(), "{invalid}");
+        assert!(CellEdit::try_new("Data", "B1", error).is_err(), "{invalid}");
     }
     assert!(!book.has_changes());
     let valid = [
@@ -508,11 +508,11 @@ fn bulk_insertions_keep_each_rows_custom_or_column_style() {
     );
     let mut book = workbook(&body, None);
     let mut edits = (1..=128)
-        .map(|column| (sheetpatch::CellRef::new(1, column).unwrap(), 2))
+        .map(|column| (sheetpatch::CellRef::try_new(1, column).unwrap(), 2))
         .collect::<Vec<_>>();
     for row in 2..=4 {
         for column in [3, 4] {
-            edits.push((sheetpatch::CellRef::new(row, column).unwrap(), 2));
+            edits.push((sheetpatch::CellRef::try_new(row, column).unwrap(), 2));
         }
     }
     book.set_cells_at("Data", edits).unwrap();
@@ -521,7 +521,7 @@ fn bulk_insertions_keep_each_rows_custom_or_column_style() {
     assert_eq!(view.get_cell("A1").unwrap().style_index, Some(3));
     for column in 2..=128 {
         assert_eq!(
-            view.get_cell_at(sheetpatch::CellRef::new(1, column).unwrap())
+            view.get_cell_at(sheetpatch::CellRef::try_new(1, column).unwrap())
                 .unwrap()
                 .style_index,
             Some(7)

@@ -176,8 +176,8 @@ fn edits_that_change_a_header_cell_are_refused_without_changes() {
         assert_refused(book.set_cells("Data", [("B2", "8"), ("B1", "x")]), "B1");
         assert_refused(
             book.apply_edits([
-                CellEdit::new("Notes", "A1", 2).unwrap(),
-                CellEdit::new("Data", "A1", "Label").unwrap(),
+                CellEdit::try_new("Notes", "A1", 2).unwrap(),
+                CellEdit::try_new("Data", "A1", "Label").unwrap(),
             ]),
             "A1",
         );
@@ -222,7 +222,7 @@ fn unchanged_headers_leave_the_rest_of_a_batch_on_a_pending_sheet_as_it_is() {
     let edits = |edits: &[(&str, &str, CellValue)]| {
         edits
             .iter()
-            .map(|(sheet, cell, value)| CellEdit::new(*sheet, cell, value.clone()).unwrap())
+            .map(|(sheet, cell, value)| CellEdit::try_new(*sheet, cell, value.clone()).unwrap())
             .collect::<Vec<_>>()
     };
     let mut expected = Workbook::from_bytes(original.clone()).unwrap();
@@ -591,16 +591,16 @@ fn a_table_part_shared_by_worksheets_protects_each_of_them() {
     assert_refused_in(
         "Notes",
         together.apply_edits([
-            CellEdit::new("Data", "B2", 3).unwrap(),
-            CellEdit::new("Notes", "A1", "Changed").unwrap(),
+            CellEdit::try_new("Data", "B2", 3).unwrap(),
+            CellEdit::try_new("Notes", "A1", "Changed").unwrap(),
         ]),
         "A1",
     );
     assert!(!together.has_changes());
     together
         .apply_edits([
-            CellEdit::new("Data", "B2", 3).unwrap(),
-            CellEdit::new("Notes", "B3", 4).unwrap(),
+            CellEdit::try_new("Data", "B2", 3).unwrap(),
+            CellEdit::try_new("Notes", "B3", 4).unwrap(),
         ])
         .unwrap();
 
@@ -849,7 +849,7 @@ fn rewriting_a_date_header_with_its_serial_is_a_no_op() {
         // Any other number would change the header.
         assert_refused(book.set_cell("Data", "B1", other), "B1");
         assert_refused(
-            book.apply_edits([CellEdit::new("Data", "B1", serial + 1).unwrap()]),
+            book.apply_edits([CellEdit::try_new("Data", "B1", serial + 1).unwrap()]),
             "B1",
         );
         assert_eq!(book.to_bytes().unwrap(), original);

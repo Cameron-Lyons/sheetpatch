@@ -36,7 +36,7 @@ fn main() -> sheetpatch::Result<()> {
     book.set_cell("Summary", "E2", CellValue::Blank)?;
 
     // Typed addresses use one-based row and column numbers.
-    let target = CellRef::new(5, 3)?;
+    let target = CellRef::try_new(5, 3)?;
     book.set_cell_at("Summary", target, 37.5)?;
 
     // A batch parses each affected worksheet once.
@@ -51,8 +51,8 @@ fn main() -> sheetpatch::Result<()> {
 
     // A transaction across worksheets commits only after all edits succeed.
     book.apply_edits([
-        CellEdit::new("Summary", "B3", "Reviewed")?,
-        CellEdit::new("Summary", "B4", "Approved")?,
+        CellEdit::try_new("Summary", "B3", "Reviewed")?,
+        CellEdit::try_new("Summary", "B4", "Approved")?,
     ])?;
 
     let cell = book.get_cell_at("Summary", target)?;
@@ -109,7 +109,7 @@ transaction reports one refused edit, which need not be the first in input
 order; the `set_cells` and `apply_edits` documentation gives the order of the
 checks. `has_changes()` reports pending changes and `reset_changes()` restores
 the original archive.
-`get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`, and `CellEdit::at`
+`get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`, and `CellEdit::try_new_at`
 accept typed `CellRef` addresses directly, avoiding conversion through A1 strings.
 Typed batches preserve input order for reads and use the last value for duplicate
 edits, with the same transaction and value validation rules as A1 batches.
