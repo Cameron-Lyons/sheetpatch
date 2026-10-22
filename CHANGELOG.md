@@ -2,8 +2,34 @@
 
 ## Unreleased
 
+### Rust API
+
+- `CellRef::try_new`, `CellEdit::try_new`, and `CellEdit::try_new_at` replace
+  `CellRef::new`, `CellEdit::new`, and `CellEdit::at`, following the
+  [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)'s
+  convention that a constructor returning `Result` is named `try_new`. The old
+  names remain as deprecated aliases until the next major version.
+- Pure accessors, such as `CellRef::row`, `Workbook::sheets`, and
+  `SheetVisibility::as_str`, and the `Error` type are `#[must_use]`, so code that
+  ignores their results gets a warning.
+
 ### Quality
 
+- The code follows the
+  [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html).
+  `rustfmt.toml` sets the guide's formatting options, CI checks its
+  one-module-per-`use` import grouping with a pinned nightly rustfmt, and Clippy
+  lints configured in `Cargo.toml` and `src/lib.rs` enforce the rules they can
+  detect, such as calling functions through their module, messages on
+  assertions, `#[must_use]`, and no `unwrap` outside tests. Modules with
+  submodules now only declare and re-export them, and abbreviated names,
+  tuple-shaped records, and `bool` parameters whose meaning was unclear at call
+  sites became full words, named structs, and enums.
+- A panic while the table-part cache's lock was held no longer lets later edits
+  use that cache: a poisoned cache is bypassed and the table parts are read
+  again.
+- The property tests name a failing case with a drop guard instead of
+  `catch_unwind`.
 - The optional LibreOfficeKit round-trip check is now an ignored Rust
   integration test, run with `cargo test --test libreoffice -- --ignored`,
   instead of a Python script. The published package no longer includes
