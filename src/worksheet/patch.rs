@@ -1,9 +1,8 @@
-use super::index::{RowEntry, WorksheetIndex, reference_range};
+use super::index::{self, RowEntry, WorksheetIndex};
 use super::parse::Element;
-use super::read::{SharedStrings, StoredValue, decode_payload, value_payload};
-use super::validation::validate_payload;
-use super::{errors, protection};
-use crate::xml::{Attributes, excel_escaped, trim_whitespace as trim_xml_whitespace};
+use super::read::{self, SharedStrings, StoredValue};
+use super::{errors, protection, validation};
+use crate::xml::{self, Attributes};
 use crate::{CellRef, CellValue, Error, Result};
 use std::collections::BTreeMap;
 
@@ -111,7 +110,7 @@ pub(super) fn text_escaped(text: &str) -> String {
     // Excel escapes come first: characters XML cannot carry are stored as
     // `_xHHHH_`, and literal tokens are escaped so Excel shows the exact user
     // string rather than interpreting, for example, _x0041_ as A.
-    let text = excel_escaped(text);
+    let text = xml::excel_escaped(text);
     let mut output = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
@@ -194,7 +193,7 @@ fn unchanged_value<'s>(
     if matches!(value, CellValue::Blank) {
         return false;
     }
-    match decode_payload(xml, index, cell, payload, current.date1904) {
+    match read::decode_payload(xml, index, cell, payload, current.date1904) {
         Ok(StoredValue::Value(old)) => old == *value,
         // The table is loaded only to compare text. An entry that cannot be
         // decoded, like a table that cannot be loaded, leaves a change.
@@ -224,9 +223,9 @@ fn patched_cell<'s>(
         index.namespace,
     );
     let cell = &elements[cell_index];
-    let value_child = value_payload(index, cell).map_err(|error| error.context(address))?;
+    let value_child = read::value_payload(index, cell).map_err(|error| error.context(address))?;
     if let Some(child) = value_child {
-        validate_payload(source, elements, attributes, child, namespace)
+        validation::validate_payload(source, elements, attributes, child, namespace)
             .map_err(|error| error.context(address))?;
     }
     let unchanged = if let Some(child) = value_child {
@@ -248,8 +247,8 @@ fn patched_cell<'s>(
         return Err(errors::protected(address, protection::CELL_METADATA));
     }
     let value_bytes = payload(source, cell, value);
-    if let Some(kind) = attribute_edit(cell, attributes, "t", value_type(value)) {
-        edits.push(kind);
+    if let Some(type_edit) = attribute_edit(cell, attributes, "t", value_type(value)) {
+        edits.push(type_edit);
     }
     if cell.empty {
         if !value_bytes.is_empty() {
@@ -278,6 +277,13 @@ fn patched_cell<'s>(
     Ok(true)
 }
 
+// One `first:last` interval of a row's `spans` hint.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Span {
+    first: u16,
+    last: u16,
+}
+
 fn spans_edit(
     row: &Element,
     row_number: u32,
@@ -289,38 +295,39 @@ fn spans_edit(
     };
     let invalid = || errors::unsupported(format!("row {row_number}: invalid row spans"));
     let mut spans = Vec::new();
-    for span in attribute
+    let span_texts = attribute
         .value
         .split([' ', '\t', '\r', '\n'])
-        .filter(|span| !span.is_empty())
-    {
+        .filter(|span| !span.is_empty());
+    for span in span_texts {
         let Some((first, last)) = span.split_once(':') else {
             return Err(invalid());
         };
-        let first = first.parse::<u16>().map_err(|_| invalid())?;
-        let last = last.parse::<u16>().map_err(|_| invalid())?;
+        let first: u16 = first.parse().map_err(|_| invalid())?;
+        let last: u16 = last.parse().map_err(|_| invalid())?;
         if first == 0 || first > last || last > CellRef::MAX_COLUMN {
             return Err(invalid());
         }
-        spans.push((first, last));
+        spans.push(Span { first, last });
     }
-    if spans.is_empty() {
+    let (Some(mut first), Some(mut last)) = (
+        spans.iter().map(|span| span.first).min(),
+        spans.iter().map(|span| span.last).max(),
+    ) else {
         return Err(errors::unsupported(format!(
             "row {row_number}: empty row spans"
         )));
-    }
+    };
     spans.sort_unstable();
-    let mut first = spans[0].0;
-    let mut last = spans.iter().map(|span| span.1).max().unwrap();
     let mut spans = spans.into_iter().peekable();
     let mut changed = false;
     // Changed columns arrive in order. Sweep the sorted intervals once rather
     // than checking every span for every cell in a large fragmented row.
     for column in columns {
-        while spans.peek().is_some_and(|&(_, end)| end < column) {
+        while spans.peek().is_some_and(|span| span.last < column) {
             spans.next();
         }
-        changed |= spans.peek().is_none_or(|&(start, _)| column < start);
+        changed |= spans.peek().is_none_or(|span| column < span.first);
         first = first.min(column);
         last = last.max(column);
     }
@@ -348,7 +355,7 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
     let attributes = &index.attributes;
     let custom_format = row
         .attribute(attributes, "customFormat")
-        .map(|attribute| trim_xml_whitespace(attribute.value));
+        .map(|attribute| xml::trim_whitespace(attribute.value));
     if matches!(custom_format, None | Some("0" | "false")) {
         return Ok(RowStyle::ColumnDefault);
     }
@@ -360,14 +367,14 @@ fn row_style(index: &WorksheetIndex, row: &Element, cell: CellRef) -> Result<Row
     let Some(style) = row.attribute(attributes, "s") else {
         return Ok(RowStyle::Custom(0));
     };
-    trim_xml_whitespace(style.value)
+    xml::trim_whitespace(style.value)
         .parse::<u32>()
         .map(RowStyle::Custom)
         .map_err(|_| errors::unsupported(format!("{cell}: invalid row style index")))
 }
 
 // One row's edits, in column order.
-type RowChanges<'a> = [(&'a CellRef, &'a CellValue)];
+type RowChanges<'edits> = [(&'edits CellRef, &'edits CellValue)];
 
 // Patches an existing row's cells and inserts its new ones in column order.
 // Only a row with a changed cell gets wider spans or, when it was empty
@@ -390,13 +397,13 @@ fn patch_existing_row<'s>(
     // Resolve only when a new nonblank cell needs a style. Existing cells and
     // blank edits must not start validating row defaults; later insertions can
     // reuse the first result without rescanning attributes or numeric text.
-    let mut cached_row_style = None;
+    let mut cached_row_style: Option<RowStyle> = None;
     // Trailing cells follow the last existing cell. Only an extension list
     // after that cell comes later; one placed before or between cells must not
     // move new cells ahead of existing ones.
     let after_cells = existing_cells
         .last()
-        .map_or(element.open_end(), |&(_, cell)| elements[cell].end());
+        .map_or(element.open_end(), |cell| elements[cell.element].end());
     let fallback = element
         .children(elements)
         .map(|child| &elements[child])
@@ -404,15 +411,15 @@ fn patch_existing_row<'s>(
         .map_or(element.close_start(), Element::start);
     for &(&cell, value) in changes {
         while cell_position < existing_cells.len()
-            && existing_cells[cell_position].0.column < cell.column
+            && existing_cells[cell_position].address.column < cell.column
         {
             cell_position += 1;
         }
         let existing = existing_cells
             .get(cell_position)
-            .filter(|&&(address, _)| address == cell);
-        if let Some(&(_, cell_index)) = existing {
-            if !patched_cell(xml, index, cell, cell_index, value, edits, current)? {
+            .filter(|existing| existing.address == cell);
+        if let Some(existing) = existing {
+            if !patched_cell(xml, index, cell, existing.element, value, edits, current)? {
                 continue;
             }
         } else if matches!(value, CellValue::Blank) {
@@ -436,7 +443,7 @@ fn patch_existing_row<'s>(
             } else {
                 let insertion = existing_cells
                     .get(cell_position)
-                    .map_or(fallback, |&(_, next)| elements[next].start());
+                    .map_or(fallback, |next| elements[next.element].start());
                 edits.push(Edit {
                     start: insertion,
                     end: insertion,
@@ -514,7 +521,7 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
         .ok_or_else(|| errors::unsupported("dimension without a reference"))?;
     // Reads ignore the dimension, so a malformed reference refuses only the
     // edits that may need to widen it, like a malformed `spans` hint.
-    let old = reference_range(reference.value).map_err(|error| match error {
+    let old = index::reference_range(reference.value).map_err(|error| match error {
         Error::InvalidWorkbook(message) => errors::unsupported(message),
         error => error,
     })?;
@@ -568,9 +575,9 @@ pub(super) fn plan_cells<'s>(
         {
             row_position += 1;
         }
-        let mut changes = Vec::new();
-        while pending.peek().is_some_and(|(cell, _)| cell.row == number) {
-            changes.push(pending.next().unwrap());
+        let mut changes: Vec<(&CellRef, &CellValue)> = Vec::new();
+        while let Some(change) = pending.next_if(|(cell, _)| cell.row == number) {
+            changes.push(change);
         }
         let next_row = index.rows.get(row_position);
         if let Some(row) = next_row.filter(|row| row.number == number) {

@@ -1,7 +1,6 @@
 use super::errors;
 use crate::xml::{
-    AttributeChecks, AttributeView, Attributes, DocumentRules, NamespaceId, NamespacePool,
-    arena_push, attribute_spans, compact, markup,
+    self, AttributeChecks, AttributeView, Attributes, DocumentRules, NamespaceId, NamespacePool,
 };
 use crate::{Error, Result};
 use quick_xml::events::Event;
@@ -66,12 +65,16 @@ impl Element {
         &source[self.name_span()]
     }
     pub(super) fn local_name<'s>(&self, source: &'s str) -> &'s str {
-        self.name(source).rsplit(':').next().unwrap()
+        let name = self.name(source);
+        name.rsplit_once(':').map_or(name, |(_, local)| local)
     }
     pub(super) fn is(&self, source: &str, namespace: NamespaceId, name: &str) -> bool {
         // Callers name an unprefixed local name, so it matches the whole
         // qualified name or the bytes after its colon.
-        debug_assert!(!name.contains(':'));
+        debug_assert!(
+            !name.contains(':'),
+            "callers pass an unprefixed local name, not {name:?}"
+        );
         let qualified = &source.as_bytes()[self.name_span()];
         self.namespace == namespace
             && qualified.ends_with(name.as_bytes())
@@ -116,8 +119,8 @@ impl Element {
 
 // Elements are recorded in preorder. A child's subtree ends at the next
 // sibling, so the index needs no separately allocated list for each parent.
-pub(super) struct Children<'a> {
-    pub(super) elements: &'a [Element],
+pub(super) struct Children<'elements> {
+    pub(super) elements: &'elements [Element],
     pub(super) next: usize,
     pub(super) end: usize,
 }
@@ -198,10 +201,14 @@ pub(super) fn parse_with<'xml>(
         match event {
             Event::Start(ref tag) | Event::Empty(ref tag) => {
                 let name_end = start + 1 + tag.name().as_ref().len();
-                let name = markup(source, start + 1..name_end)?;
+                let name = xml::markup(source, start + 1..name_end)?;
                 rules.start_element(stack.len(), name)?;
-                let namespace = document.namespaces.resolve(&reader, tag.name(), false)?;
-                let attributes = attribute_spans(
+                let namespace = document.namespaces.resolve(
+                    &reader,
+                    tag.name(),
+                    /* attribute: */ false,
+                )?;
+                let attributes = xml::attribute_spans(
                     name_end,
                     end,
                     &mut document.attributes,
@@ -211,20 +218,22 @@ pub(super) fn parse_with<'xml>(
                 )?;
                 let empty = matches!(event, Event::Empty(_));
                 let index = document.elements.len();
-                arena_push(
+                xml::arena_push(
                     &mut document.elements,
                     Element {
-                        name_len: compact(name.len()),
+                        name_len: xml::compact(name.len()),
                         namespace,
-                        parent: stack.last().map_or(NO_PARENT, |&parent| compact(parent)),
-                        children_start: compact(index + 1),
-                        children_end: compact(index + 1),
-                        attributes_start: compact(attributes.start),
-                        attributes_end: compact(attributes.end),
-                        start: compact(start),
-                        open_end: compact(end),
-                        close_start: compact(end),
-                        end: compact(end),
+                        parent: stack
+                            .last()
+                            .map_or(NO_PARENT, |&parent| xml::compact(parent)),
+                        children_start: xml::compact(index + 1),
+                        children_end: xml::compact(index + 1),
+                        attributes_start: xml::compact(attributes.start),
+                        attributes_end: xml::compact(attributes.end),
+                        start: xml::compact(start),
+                        open_end: xml::compact(end),
+                        close_start: xml::compact(end),
+                        end: xml::compact(end),
                         empty,
                         opaque_markup: false,
                     },
@@ -239,10 +248,10 @@ pub(super) fn parse_with<'xml>(
                 let index = stack
                     .pop()
                     .ok_or_else(|| errors::xml_error("unmatched closing XML tag"))?;
-                let children_end = compact(document.elements.len());
+                let children_end = xml::compact(document.elements.len());
                 let element = &mut document.elements[index];
-                element.close_start = compact(start);
-                element.end = compact(end);
+                element.close_start = xml::compact(start);
+                element.end = xml::compact(end);
                 element.children_end = children_end;
                 if stack.len() == 1 {
                     document.complete_child(index, &mut release);

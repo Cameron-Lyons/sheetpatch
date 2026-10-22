@@ -5,6 +5,7 @@ use crate::{CellContent, CellRef, CellValue, Result};
 #[cfg(test)]
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::result::Result as StdResult;
 
 /// A validated worksheet index retained only for the lifetime of an explicit
 /// view or of one worksheet's edits. All spans borrow the immutable XML
@@ -24,7 +25,7 @@ impl<'xml> PreparedWorksheet<'xml> {
 
     /// The address of every `<c>` element, in row-major order.
     pub(crate) fn cells(&self) -> impl ExactSizeIterator<Item = CellRef> + '_ {
-        self.index.cells.iter().map(|&(cell, _)| cell)
+        self.index.cells.iter().map(|cell| cell.address)
     }
 
     /// Reads one cell without allocating a batch result. The shared-string
@@ -34,7 +35,7 @@ impl<'xml> PreparedWorksheet<'xml> {
         cell: CellRef,
         mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
-    ) -> std::result::Result<CellContent, ReadError> {
+    ) -> StdResult<CellContent, ReadError> {
         read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
     }
 
@@ -48,7 +49,7 @@ impl<'xml> PreparedWorksheet<'xml> {
         cells: &[CellRef],
         shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
-    ) -> std::result::Result<Vec<CellContent>, ReadError> {
+    ) -> StdResult<Vec<CellContent>, ReadError> {
         read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
     }
 
@@ -70,7 +71,10 @@ impl<'xml> PreparedWorksheet<'xml> {
         shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
         date1904: bool,
     ) -> Result<Option<CellPatch<'xml>>> {
-        debug_assert!(cells.values().all(|value| value.validate().is_ok()));
+        debug_assert!(
+            cells.values().all(|value| value.validate().is_ok()),
+            "every public edit path validates its values before planning them"
+        );
         let plan = patch::plan_cells(self.xml, &self.index, cells, shared_strings, date1904)?;
         Ok((!plan.is_empty()).then_some(CellPatch {
             xml: self.xml,
@@ -112,7 +116,7 @@ pub(crate) fn read_cells<'strings>(
     cells: &[CellRef],
     shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
     date1904: bool,
-) -> std::result::Result<Vec<CellContent>, ReadError> {
+) -> StdResult<Vec<CellContent>, ReadError> {
     if cells.is_empty() {
         return Ok(Vec::new());
     }
