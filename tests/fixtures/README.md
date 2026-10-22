@@ -12,19 +12,21 @@ To create a fresh export and verify both default saves and compact saves through
 an independent reopen and ODS export, run:
 
 ```sh
-python3 scripts/check_interoperability.py
+cargo test --test libreoffice -- --ignored
 ```
 
-The optional script needs an installed LibreOfficeKit. Its
-`--libreoffice-program` option selects the installation directory containing
-`libsofficeapp.so`, `libmergedlo.so`, or the corresponding platform library;
-`--sheetpatch` selects an already-built executable. Otherwise it locates
-LibreOffice and builds sheetpatch with `cargo build --locked`. It uses only
-Python's standard library, an isolated temporary profile, and synthetic data.
+The optional test is ignored by default because it needs an installed
+LibreOfficeKit on a Unix system. `SHEETPATCH_LIBREOFFICE_PROGRAM` selects the
+installation directory containing `libsofficeapp.so`, `libmergedlo.so`, or the
+corresponding macOS library; otherwise the test locates LibreOffice through the
+`libreoffice` or `soffice` launcher on `PATH`. It edits with the `sheetpatch`
+executable Cargo builds for the test, so adding `--release` checks an optimized
+build. It needs no additional Rust dependencies and uses an isolated temporary
+profile and synthetic data.
 It verifies values, formatting, formula fidelity, both sheets, and string handling.
-The Rust test separately checks stored formula cache preservation; LibreOffice
-may retain that cache or recalculate on import. The script does not request
-formula recalculation or test Microsoft Excel or VBA.
+The fixture test separately checks stored formula cache preservation; LibreOffice
+may retain that cache or recalculate on import. The LibreOffice test does not
+request formula recalculation or test Microsoft Excel or VBA.
 
-The C API prefixes used by the script are defined in the upstream
+The C API prefixes used by the test are defined in the upstream
 [LibreOfficeKit header](https://github.com/LibreOffice/core/blob/master/include/LibreOfficeKit/LibreOfficeKit.h).

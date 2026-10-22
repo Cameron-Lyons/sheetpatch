@@ -579,12 +579,12 @@ shared strings, and cached formulas. An optional independent round-trip check
 requires installed LibreOfficeKit:
 
 ```sh
-python3 scripts/check_interoperability.py
+cargo test --test libreoffice -- --ignored
 ```
 
-The script exports a workbook, applies CLI edits, and verifies both normal and
-compacted files through LibreOffice. It does not require an additional Rust or
-Python package dependency.
+The ignored test exports a workbook, applies CLI edits, and verifies both normal
+and compacted files through LibreOffice. It runs on Unix and does not require an
+additional dependency.
 
 ## Performance
 

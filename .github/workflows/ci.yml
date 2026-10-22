@@ -163,10 +163,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libreoffice-calc
-      - name: Release CLI
-        run: cargo build --locked --release
+      # The ignored test edits with the release CLI that --release builds.
       - name: Export, edit, and reopen normal and compacted workbooks
-        run: python3 scripts/check_interoperability.py --sheetpatch target/release/sheetpatch
+        run: cargo test --locked --release --test libreoffice -- --ignored
 
   advisories:
     name: Dependency advisories

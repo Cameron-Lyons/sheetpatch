@@ -68,7 +68,7 @@ The committed LibreOffice fixture runs in the ordinary Rust test suite. With
 LibreOfficeKit installed, also run the independent export/edit/reopen check:
 
 ```sh
-python3 scripts/check_interoperability.py
+cargo test --test libreoffice -- --ignored
 ```
 
 This checks normal and compacted output, including styles, literal text, Unicode,

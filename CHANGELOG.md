@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Quality
+
+- The optional LibreOfficeKit round-trip check is now an ignored Rust
+  integration test, run with `cargo test --test libreoffice -- --ignored`,
+  instead of a Python script. The published package no longer includes
+  `scripts/`.
+
 ## 1.0.0 — 2026-10-22
 
 The first stable release, and the first published on crates.io, covers surgical
