@@ -5,7 +5,7 @@ mod common;
 
 use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
 use std::collections::BTreeMap;
-use std::mem::discriminant;
+use std::mem;
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NAMESPACE: &str =
@@ -20,18 +20,24 @@ fn worksheet(body: &str) -> Vec<u8> {
 
 /// The parts of a workbook whose worksheets have the given names and XML.
 fn parts(sheets: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+    use std::fmt::Write as _;
+
     let mut entries = String::new();
     let mut relationships = String::new();
     let mut parts = BTreeMap::new();
     for (number, (name, xml)) in sheets.iter().enumerate() {
         let number = number + 1;
         let name = name.replace('&', "&amp;").replace('"', "&quot;");
-        entries.push_str(&format!(
+        write!(
+            entries,
             "<sheet name=\"{name}\" sheetId='{number}' r:id='s{number}'/>"
-        ));
-        relationships.push_str(&format!(
+        )
+        .unwrap();
+        write!(
+            relationships,
             "<Relationship Id='s{number}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{number}.xml'/>"
-        ));
+        )
+        .unwrap();
         parts.insert(format!("xl/worksheets/sheet{number}.xml"), xml.clone());
     }
     parts.insert("[Content_Types].xml".into(), CONTENT_TYPES.into());
@@ -73,14 +79,26 @@ fn message(error: &Error) -> &str {
 }
 
 /// The worksheet, cell, and reason of a protected-cell refusal.
-fn protected(error: &Error) -> (&str, String, &str) {
+#[derive(Debug, PartialEq)]
+struct Refusal<'error> {
+    sheet: &'error str,
+    cell: String,
+    reason: &'error str,
+}
+
+/// The refusal that `error`, which must be a protected-cell error, reports.
+fn protected(error: &Error) -> Refusal<'_> {
     match error {
         Error::ProtectedCell {
             sheet,
             cell,
             reason,
             ..
-        } => (sheet, cell.to_string(), reason),
+        } => Refusal {
+            sheet,
+            cell: cell.to_string(),
+            reason,
+        },
         other => panic!("expected a protected-cell refusal, got {other:?}"),
     }
 }
@@ -105,7 +123,11 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         .unwrap_err();
     assert_eq!(
         protected(&error),
-        ("Beta", "A1".into(), "contains a formula")
+        Refusal {
+            sheet: "Beta",
+            cell: "A1".into(),
+            reason: "contains a formula",
+        }
     );
     assert_eq!(
         error.to_string(),
@@ -123,11 +145,11 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         let error = result.unwrap_err();
         assert_eq!(
             protected(&error),
-            (
-                "Beta",
-                "B2".into(),
-                "has value metadata (a linked or rich data type)"
-            )
+            Refusal {
+                sheet: "Beta",
+                cell: "B2".into(),
+                reason: "has value metadata (a linked or rich data type)",
+            }
         );
     }
     // Workbook-level refusals and value errors carry no worksheet.
@@ -155,10 +177,13 @@ fn edit_refusals_name_the_worksheet_in_cross_sheet_transactions() {
         book.set_cells_at("Alpha", [(a1, 1.0), (b7, f64::NAN)]),
     ] {
         let error = result.unwrap_err();
-        let Error::InvalidValue(m) = &error else {
+        let Error::InvalidValue(message) = &error else {
             panic!("expected a value error, got {error:?}");
         };
-        assert!(m.starts_with("B7: ") && !m.contains("worksheet"), "{m}");
+        assert!(
+            message.starts_with("B7: ") && !message.contains("worksheet"),
+            "{message}"
+        );
         assert_eq!(
             error.to_string(),
             "invalid cell value: B7: numbers must be finite"
@@ -182,17 +207,17 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
             ("Beta", sheet.clone()),
             ("Gamma", sheet),
         ]);
-        let relationships = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+        let relationships = str::from_utf8(&parts["xl/_rels/workbook.xml.rels"])
+            .unwrap()
+            .replace(
+                "</Relationships>",
+                &format!(
+                    "<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
+                ),
+            );
         parts.insert(
             "xl/_rels/workbook.xml.rels".into(),
-            relationships
-                .replace(
-                    "</Relationships>",
-                    &format!(
-                        "<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"
-                    ),
-                )
-                .into_bytes(),
+            relationships.into_bytes(),
         );
         if let Some(xml) = shared_strings {
             parts.insert("xl/sharedStrings.xml".into(), xml.as_bytes().to_vec());
@@ -213,7 +238,11 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
             .unwrap_err();
         assert_eq!(
             protected(&error),
-            ("Gamma", "B1".into(), "contains a formula")
+            Refusal {
+                sheet: "Gamma",
+                cell: "B1".into(),
+                reason: "contains a formula",
+            }
         );
         assert_eq!(book.to_bytes().unwrap(), original);
         assert_eq!(
@@ -239,7 +268,7 @@ fn cross_sheet_repairs_keep_unreadable_shared_string_errors_and_atomicity() {
         // into a missing-table or missing-index error, in either workbook.
         for workbook in [&book, &reopened] {
             let actual = workbook.get_cell("Gamma", "A1").unwrap_err();
-            assert_eq!(discriminant(&actual), discriminant(&expected));
+            assert_eq!(mem::discriminant(&actual), mem::discriminant(&expected));
             assert_eq!(actual.to_string(), expected.to_string());
         }
     }
@@ -252,7 +281,7 @@ fn worksheet_names_are_debug_quoted() {
         worksheet("<sheetData><row r='1'><c r='A1'><f>1</f><v>1</v></c></row></sheetData>"),
     )]);
     let error = book.set_cell("Q\"1 & \\", "A1", 2).unwrap_err();
-    assert_eq!(protected(&error).0, "Q\"1 & \\");
+    assert_eq!(protected(&error).sheet, "Q\"1 & \\");
     assert_eq!(
         error.to_string(),
         "protected cell: worksheet \"Q\\\"1 & \\\\\": A1 contains a formula"
@@ -313,8 +342,8 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
             Err(error) => error,
         };
         assert_eq!(
-            discriminant(&direct),
-            discriminant(&expected),
+            mem::discriminant(&direct),
+            mem::discriminant(&expected),
             "{case}: {direct}"
         );
         assert_eq!(prepared.to_string(), direct.to_string(), "{case}");
@@ -334,7 +363,11 @@ fn read_and_parse_errors_name_the_worksheet_and_match_prepared_views() {
         let edit = book.set_cell("Beta", "C3", 1);
         if case != "unreadable value" {
             let edit = edit.unwrap_err();
-            assert_eq!(discriminant(&edit), discriminant(&expected), "{case}");
+            assert_eq!(
+                mem::discriminant(&edit),
+                mem::discriminant(&expected),
+                "{case}"
+            );
             assert!(
                 message(&edit).starts_with("worksheet \"Beta\": "),
                 "{case}: {edit}"
@@ -458,8 +491,8 @@ fn package_parts_and_worksheets_report_malformed_xml_with_the_same_variant() {
         let book = book(&[("Data", damage(&sheet))]);
         let worksheet_error = book.get_cell("Data", "A1").unwrap_err();
         assert_eq!(
-            discriminant(&worksheet_error),
-            discriminant(expected),
+            mem::discriminant(&worksheet_error),
+            mem::discriminant(expected),
             "worksheet, {case}: {worksheet_error}"
         );
 
@@ -470,7 +503,7 @@ fn package_parts_and_worksheets_report_malformed_xml_with_the_same_variant() {
             "xl/workbook.xml",
             "xl/_rels/workbook.xml.rels",
         ] {
-            let xml = String::from_utf8(base[part].clone()).unwrap();
+            let xml = str::from_utf8(&base[part]).unwrap();
             let close = xml.rfind("</").unwrap();
             let root = format!("{}<!--note-->{}", &xml[..close], &xml[close..]).replacen(
                 '>',
@@ -481,8 +514,8 @@ fn package_parts_and_worksheets_report_malformed_xml_with_the_same_variant() {
             damaged.insert(part.into(), damage(&root));
             let error = Workbook::from_bytes(archive(&damaged)).err().unwrap();
             assert_eq!(
-                discriminant(&error),
-                discriminant(expected),
+                mem::discriminant(&error),
+                mem::discriminant(expected),
                 "{part}, {case}: {error}"
             );
         }
@@ -492,11 +525,12 @@ fn package_parts_and_worksheets_report_malformed_xml_with_the_same_variant() {
 #[test]
 fn discovery_names_duplicate_targets_and_misplaced_sheets_as_invalid() {
     let mut parts = parts(&[("Data", worksheet(CELL)), ("Alias", worksheet(CELL))]);
-    let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
+    let relationships = str::from_utf8(&parts["xl/_rels/workbook.xml.rels"])
+        .unwrap()
+        .replace("worksheets/sheet2.xml", "worksheets/sheet1.xml");
     parts.insert(
         "xl/_rels/workbook.xml.rels".into(),
-        rels.replace("worksheets/sheet2.xml", "worksheets/sheet1.xml")
-            .into_bytes(),
+        relationships.into_bytes(),
     );
     let error = Workbook::from_bytes(archive(&parts)).err().unwrap();
     assert!(
@@ -551,8 +585,7 @@ fn guarded_parts() -> BTreeMap<String, Vec<u8>> {
 
 #[test]
 fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
-    let original = archive(&guarded_parts());
-    let mut book = Workbook::from_bytes(original.clone()).unwrap();
+    let mut book = Workbook::from_bytes(archive(&guarded_parts())).unwrap();
     for (address, value, reason) in [
         ("A1", CellValue::from(2), "contains a formula"),
         ("C1", CellValue::Blank, "contains a formula"),
@@ -602,7 +635,11 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
             let error = result.unwrap_err();
             assert_eq!(
                 protected(&error),
-                ("Beta", address.to_owned(), reason),
+                Refusal {
+                    sheet: "Beta",
+                    cell: address.to_owned(),
+                    reason,
+                },
                 "{method} {address}"
             );
             // The worksheet is named once, by the variant's own message.
@@ -620,7 +657,7 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
     let error = book
         .set_cells("Beta", [("J1", "Name"), ("H1", "1")])
         .unwrap_err();
-    assert_eq!(protected(&error).1, "H1");
+    assert_eq!(protected(&error).cell, "H1");
     book.set_cells(
         "Beta",
         [("J1", CellValue::from("Name")), ("H1", CellValue::from(1))],
@@ -628,7 +665,7 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
     .unwrap();
     assert!(!book.has_changes());
     assert_eq!(
-        protected(&book.set_cell("Beta", "A1", 2).unwrap_err()).2,
+        protected(&book.set_cell("Beta", "A1", 2).unwrap_err()).reason,
         "contains a formula"
     );
     // Worksheet-level refusals stay unsupported and name the worksheet.
@@ -649,14 +686,15 @@ fn every_protected_cell_names_its_worksheet_through_every_edit_method() {
 
 /// Adds a shared-string table to the workbook's parts.
 fn add_shared_strings(parts: &mut BTreeMap<String, Vec<u8>>, table: &[u8]) {
-    let rels = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone()).unwrap();
-    parts.insert(
-        "xl/_rels/workbook.xml.rels".into(),
-        rels.replace(
+    let relationships = str::from_utf8(&parts["xl/_rels/workbook.xml.rels"])
+        .unwrap()
+        .replace(
             "</Relationships>",
             &format!("<Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
-        )
-        .into_bytes(),
+        );
+    parts.insert(
+        "xl/_rels/workbook.xml.rels".into(),
+        relationships.into_bytes(),
     );
     parts.insert("xl/sharedStrings.xml".into(), table.to_vec());
 }
@@ -713,8 +751,8 @@ fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
         ];
         for error in &errors {
             assert_eq!(
-                discriminant(error),
-                discriminant(&expected),
+                mem::discriminant(error),
+                mem::discriminant(&expected),
                 "{case}: {error}"
             );
             let message = message(error);
@@ -738,15 +776,13 @@ fn shared_string_table_errors_name_their_part_rather_than_the_worksheet() {
 #[test]
 fn table_headers_read_through_a_damaged_shared_string_table_name_that_part() {
     let mut parts = guarded_parts();
-    let beta = String::from_utf8(parts["xl/worksheets/sheet2.xml"].clone()).unwrap();
-    parts.insert(
-        "xl/worksheets/sheet2.xml".into(),
-        beta.replace(
+    let beta = str::from_utf8(&parts["xl/worksheets/sheet2.xml"])
+        .unwrap()
+        .replace(
             "<c r='J1' t='inlineStr'><is><t>Name</t></is></c>",
             "<c r='J1' t='s'><v>0</v></c>",
-        )
-        .into_bytes(),
-    );
+        );
+    parts.insert("xl/worksheets/sheet2.xml".into(), beta.into_bytes());
     add_shared_strings(
         &mut parts,
         format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Name</t></si>").as_bytes(),
@@ -827,14 +863,13 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
         );
     }
     // Every other cell reads normally, including the other shared string.
-    assert_eq!(
-        view.get_cells(["A1", "B2"])
-            .unwrap()
-            .into_iter()
-            .map(|content| content.value)
-            .collect::<Vec<_>>(),
-        [CellValue::from("Name"), CellValue::Number(2.0)]
-    );
+    let values: Vec<CellValue> = view
+        .get_cells(["A1", "B2"])
+        .unwrap()
+        .into_iter()
+        .map(|content| content.value)
+        .collect();
+    assert_eq!(values, [CellValue::from("Name"), CellValue::Number(2.0)]);
     drop(view);
 
     // Rewriting the header that is string 0 with its value is a no-op, and
@@ -843,7 +878,7 @@ fn an_undecodable_shared_string_refuses_only_the_cells_that_use_it() {
     book.set_cells("Data", [("A1", "Name")]).unwrap();
     assert!(!book.has_changes());
     let error = book.set_cell("Data", "A1", "Renamed").unwrap_err();
-    assert_eq!(protected(&error).1, "A1");
+    assert_eq!(protected(&error).cell, "A1");
     // The header that is string 1 cannot be compared with any value, so every
     // edit of it is refused, even one that would match its empty placeholder.
     for value in ["", "Other"] {
@@ -1104,14 +1139,14 @@ fn each_kind_of_defect_has_one_variant_in_every_part() {
     ] {
         for (defect, part, from, to) in cases {
             let mut parts = every_part();
-            let xml = String::from_utf8(parts[*part].clone()).unwrap();
+            let xml = str::from_utf8(&parts[*part]).unwrap();
             let damaged = xml.replace(from, to);
             assert_ne!(damaged, xml, "{defect} in {part}");
             parts.insert(part.to_string(), damaged.into_bytes());
             let error = first_error(&parts).unwrap_err();
             assert_eq!(
-                discriminant(&error),
-                discriminant(&expected),
+                mem::discriminant(&error),
+                mem::discriminant(&expected),
                 "{defect} in {part}: {error}"
             );
         }

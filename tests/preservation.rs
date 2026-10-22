@@ -1,13 +1,11 @@
 mod common;
 
-use std::fs;
-use std::io::Write;
 use std::process::Command;
+use std::{fs, iter};
 
-use common::{
-    TempDir, ZipLayout, archive_comment, central_directory_offset, payload, write_zip, zip_entries,
-    zip_entry,
-};
+use common::{TempDir, ZipLayout};
+use quick_xml::Reader;
+use quick_xml::events::Event;
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -26,22 +24,22 @@ fn fixture_at(
     let content_types = format!(
         r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Override PartName="/{workbook_path}" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/{sheet_path}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#
     );
-    let root_rels = format!(
+    let root_relationships = format!(
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="office" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{workbook_path}"/></Relationships>"#
     );
     let workbook = format!(
         r#"<workbook xmlns="{MAIN_NAMESPACE}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data &amp; Notes" sheetId="1" r:id="rId1"/></sheets><calcPr calcId="191029"/></workbook>"#
     );
-    let workbook_rels = format!(
+    let workbook_relationships = format!(
         r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{sheet_target}"/><Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="/xl/sharedStrings.xml"/></Relationships>"#
     );
     let (parent, file) = workbook_path.rsplit_once('/').unwrap();
-    let workbook_rels_path = format!("{parent}/_rels/{file}.rels");
+    let workbook_relationships_path = format!("{parent}/_rels/{file}.rels");
     let entries: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", content_types.as_bytes()),
-        ("_rels/.rels", root_rels.as_bytes()),
+        ("_rels/.rels", root_relationships.as_bytes()),
         (workbook_path, workbook.as_bytes()),
-        (&workbook_rels_path, workbook_rels.as_bytes()),
+        (&workbook_relationships_path, workbook_relationships.as_bytes()),
         (sheet_path, worksheet.as_bytes()),
         ("xl/charts/chart1.xml", b"<chartSpace xmlns='urn:chart'><opaque preserve='true'>chart cache</opaque></chartSpace>"),
         ("xl/pivotTables/pivotTable1.xml", b"<pivotTableDefinition name='ExistingPivot' cacheId='7'/><!--retain-->"),
@@ -70,7 +68,7 @@ const LAYOUT: ZipLayout<'static> = ZipLayout {
 };
 
 fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    write_zip(entries, &LAYOUT)
+    common::write_zip(entries, &LAYOUT)
 }
 
 fn fixture(worksheet: &str) -> Vec<u8> {
@@ -83,21 +81,25 @@ fn fixture(worksheet: &str) -> Vec<u8> {
 }
 
 fn compressed_payload<'a>(bytes: &'a [u8], name: &str) -> &'a [u8] {
-    zip_entry(bytes, name).compressed
+    common::zip_entry(bytes, name).compressed
 }
 
 fn worksheet_xml(bytes: &[u8]) -> String {
-    String::from_utf8(payload(bytes, "xl/worksheets/sheet1.xml")).unwrap()
+    String::from_utf8(common::payload(bytes, "xl/worksheets/sheet1.xml")).unwrap()
 }
 
 fn assert_untouched_parts(original: &[u8], updated: &[u8]) {
-    let originals = zip_entries(original);
-    let updates = zip_entries(updated);
-    assert_eq!(updates.len(), originals.len());
-    for entry in originals
+    let originals = common::zip_entries(original);
+    let updates = common::zip_entries(updated);
+    assert_eq!(
+        updates.len(),
+        originals.len(),
+        "the update added or removed parts"
+    );
+    let untouched = originals
         .iter()
-        .filter(|entry| entry.name != "xl/worksheets/sheet1.xml")
-    {
+        .filter(|entry| entry.name != "xl/worksheets/sheet1.xml");
+    for entry in untouched {
         let updated_entry = updates
             .iter()
             .find(|updated| updated.name == entry.name)
@@ -133,11 +135,15 @@ fn assert_untouched_parts(original: &[u8], updated: &[u8]) {
             entry.name
         );
     }
-    assert_eq!(archive_comment(updated), archive_comment(original));
+    assert_eq!(
+        common::archive_comment(updated),
+        common::archive_comment(original),
+        "changed archive comment"
+    );
 }
 
 fn assert_contiguous_local_records(bytes: &[u8]) {
-    let mut ranges: Vec<_> = zip_entries(bytes)
+    let mut ranges: Vec<(usize, usize)> = common::zip_entries(bytes)
         .iter()
         .map(|entry| (entry.local_offset, entry.local_offset + entry.local.len()))
         .collect();
@@ -147,7 +153,11 @@ fn assert_contiguous_local_records(bytes: &[u8]) {
         assert_eq!(start, cursor, "unexpected unused bytes between ZIP records");
         cursor = end;
     }
-    assert_eq!(cursor, central_directory_offset(bytes));
+    assert_eq!(
+        cursor,
+        common::central_directory_offset(bytes),
+        "unexpected unused bytes before the central directory"
+    );
 }
 
 #[test]
@@ -210,12 +220,12 @@ fn resolves_workbook_and_sheet_paths_from_relationships() {
     workbook.set_cell("Data & Notes", "C1", 42).unwrap();
     let updated = workbook.to_bytes().unwrap();
     assert_ne!(
-        payload(&updated, "sheets/data.xml"),
-        payload(&original, "sheets/data.xml")
+        common::payload(&updated, "sheets/data.xml"),
+        common::payload(&original, "sheets/data.xml")
     );
     assert_eq!(
-        payload(&updated, "custom/books/report.xml"),
-        payload(&original, "custom/books/report.xml")
+        common::payload(&updated, "custom/books/report.xml"),
+        common::payload(&original, "custom/books/report.xml")
     );
 }
 
@@ -240,12 +250,12 @@ fn writes_text_numbers_booleans_and_blanks_without_shared_string_mutation() {
     assert!(xml.contains("<v>0</v>"), "{xml}");
     assert!(!xml.contains("<v>22</v>"), "{xml}");
     assert_eq!(
-        payload(&updated, "xl/sharedStrings.xml"),
-        payload(&original, "xl/sharedStrings.xml")
+        common::payload(&updated, "xl/sharedStrings.xml"),
+        common::payload(&original, "xl/sharedStrings.xml")
     );
-    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut reader = Reader::from_str(&xml);
     loop {
-        if reader.read_event().unwrap() == quick_xml::events::Event::Eof {
+        if reader.read_event().unwrap() == Event::Eof {
             break;
         }
     }
@@ -279,18 +289,21 @@ fn edits_prefixed_transitional_and_strict_worksheets_without_changing_namespaces
         );
         let original = fixture(&xml);
         let original = if namespace != MAIN_NAMESPACE {
-            let entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
-                .into_iter()
-                .map(|entry| {
-                    let bytes = payload(&original, &entry.name);
-                    let bytes = if entry.name.ends_with(".xml") || entry.name.ends_with(".rels") {
-                        String::from_utf8(bytes).unwrap()
-                            .replace(MAIN_NAMESPACE, namespace)
-                            .replace("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "http://purl.oclc.org/ooxml/officeDocument/relationships")
-                            .into_bytes()
-                    } else { bytes };
-                    (entry.name, bytes)
-                }).collect();
+            let transitional_relationships =
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+            let strict_relationships = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+            for entry in common::zip_entries(&original) {
+                let mut bytes = common::payload(&original, &entry.name);
+                if entry.name.ends_with(".xml") || entry.name.ends_with(".rels") {
+                    bytes = String::from_utf8(bytes)
+                        .unwrap()
+                        .replace(MAIN_NAMESPACE, namespace)
+                        .replace(transitional_relationships, strict_relationships)
+                        .into_bytes();
+                }
+                entries.push((entry.name, bytes));
+            }
             let borrowed: Vec<(&str, &[u8])> = entries
                 .iter()
                 .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
@@ -379,10 +392,10 @@ fn rejects_non_ooxml_input() {
 #[test]
 fn signed_packages_can_be_read_but_cannot_be_edited() {
     let original = fixture(WORKSHEET);
-    let mut entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
+    let mut entries: Vec<(String, Vec<u8>)> = common::zip_entries(&original)
         .into_iter()
         .map(|entry| {
-            let bytes = payload(&original, &entry.name);
+            let bytes = common::payload(&original, &entry.name);
             (entry.name, bytes)
         })
         .collect();
@@ -397,11 +410,9 @@ fn signed_packages_can_be_read_but_cannot_be_edited() {
     let signed = archive(&borrowed);
     let mut workbook = Workbook::from_bytes(signed.clone()).unwrap();
     workbook
-        .set_cells("Data & Notes", std::iter::empty::<(&str, i32)>())
+        .set_cells("Data & Notes", iter::empty::<(&str, i32)>())
         .unwrap();
-    workbook
-        .apply_edits(std::iter::empty::<CellEdit>())
-        .unwrap();
+    workbook.apply_edits(iter::empty::<CellEdit>()).unwrap();
     assert!(!workbook.has_changes());
     assert!(workbook.set_cell("Data & Notes", "A1", 3).is_err());
     assert_eq!(workbook.to_bytes().unwrap(), signed);
@@ -410,20 +421,18 @@ fn signed_packages_can_be_read_but_cannot_be_edited() {
 #[test]
 fn signature_relationships_protect_unconventional_signature_paths() {
     let original = fixture(WORKSHEET);
-    let mut entries: Vec<(String, Vec<u8>)> = zip_entries(&original)
-        .into_iter()
-        .map(|entry| {
-            let mut bytes = payload(&original, &entry.name);
-            if entry.name == "_rels/.rels" {
-                let xml = String::from_utf8(bytes).unwrap().replace(
-                    "</Relationships>",
-                    "<Relationship Id=\"signature\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin\" Target=\"vendor/origin.sigs\"/></Relationships>",
-                );
-                bytes = xml.into_bytes();
-            }
-            (entry.name, bytes)
-        })
-        .collect();
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in common::zip_entries(&original) {
+        let mut bytes = common::payload(&original, &entry.name);
+        if entry.name == "_rels/.rels" {
+            let xml = String::from_utf8(bytes).unwrap().replace(
+                "</Relationships>",
+                "<Relationship Id=\"signature\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin\" Target=\"vendor/origin.sigs\"/></Relationships>",
+            );
+            bytes = xml.into_bytes();
+        }
+        entries.push((entry.name, bytes));
+    }
     entries.push(("vendor/origin.sigs".into(), Vec::new()));
     let borrowed: Vec<(&str, &[u8])> = entries
         .iter()
@@ -592,6 +601,7 @@ fn failed_cli_edits_leave_existing_output_unchanged() {
 
 #[test]
 fn cli_rejects_non_utf8_patch_rows_with_the_line_number_and_usage_exit_code() {
+    use std::io::Write as _;
     use std::process::Stdio;
 
     let directory = TempDir::new();
@@ -667,14 +677,14 @@ fn failed_atomic_rename_keeps_existing_destination_and_removes_temporary_files()
 }
 
 fn replace_parts(original: &[u8], replacements: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut owned: Vec<(String, Vec<u8>)> = zip_entries(original)
+    let mut owned: Vec<(String, Vec<u8>)> = common::zip_entries(original)
         .into_iter()
         .map(|entry| {
             let bytes = replacements
                 .iter()
                 .find(|(name, _)| *name == entry.name)
                 .map_or_else(
-                    || payload(original, &entry.name),
+                    || common::payload(original, &entry.name),
                     |(_, bytes)| bytes.to_vec(),
                 );
             (entry.name, bytes)
@@ -685,12 +695,11 @@ fn replace_parts(original: &[u8], replacements: &[(&str, &[u8])]) -> Vec<u8> {
             owned.push((name.to_owned(), bytes.to_vec()));
         }
     }
-    archive(
-        &owned
-            .iter()
-            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-            .collect::<Vec<_>>(),
-    )
+    let borrowed: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    archive(&borrowed)
 }
 
 #[test]
@@ -714,8 +723,9 @@ fn batch_edits_are_ordered_transactional_and_preserve_opaque_parts() {
     let contents = workbook
         .get_cells("Data & Notes", ["E3", "A1", "B2", "D3", "D1", "Z99", "A1"])
         .unwrap();
+    let values: Vec<&CellValue> = contents.iter().map(|cell| &cell.value).collect();
     assert_eq!(
-        contents.iter().map(|cell| &cell.value).collect::<Vec<_>>(),
+        values,
         vec![
             &CellValue::from("third row"),
             &CellValue::from("last wins"),
@@ -747,18 +757,24 @@ fn batch_edits_are_ordered_transactional_and_preserve_opaque_parts() {
 }
 
 fn add_other_sheet(original: &[u8], other: &str) -> Vec<u8> {
-    let workbook_xml = String::from_utf8(payload(original, "xl/workbook.xml"))
+    let workbook_xml = String::from_utf8(common::payload(original, "xl/workbook.xml"))
         .unwrap()
         .replace(
             "</sheets>",
             "<sheet name=\"Other\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
         );
-    let rels = String::from_utf8(payload(original, "xl/_rels/workbook.xml.rels")).unwrap().replace("</Relationships>", "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/other.xml\"/></Relationships>");
+    let relationships =
+        String::from_utf8(common::payload(original, "xl/_rels/workbook.xml.rels"))
+            .unwrap()
+            .replace(
+                "</Relationships>",
+                "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/other.xml\"/></Relationships>",
+            );
     replace_parts(
         original,
         &[
             ("xl/workbook.xml", workbook_xml.as_bytes()),
-            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", relationships.as_bytes()),
             ("xl/worksheets/other.xml", other.as_bytes()),
         ],
     )
@@ -904,11 +920,11 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
         reopened.get_cell("Data & Notes", "A1").unwrap().value,
         CellValue::from("iteration 3")
     );
-    for entry in zip_entries(&original) {
+    for entry in common::zip_entries(&original) {
         if entry.name != "xl/worksheets/sheet1.xml" {
             assert_eq!(
-                payload(&compact, &entry.name),
-                payload(&original, &entry.name)
+                common::payload(&compact, &entry.name),
+                common::payload(&original, &entry.name)
             );
             assert_eq!(
                 compressed_payload(&compact, &entry.name),
@@ -916,7 +932,10 @@ fn streaming_output_and_compaction_preserve_active_payloads() {
             );
         }
     }
-    assert_eq!(archive_comment(&original), archive_comment(&compact));
+    assert_eq!(
+        common::archive_comment(&original),
+        common::archive_comment(&compact)
+    );
     assert_eq!(reopened.to_bytes_compact().unwrap(), compact);
 }
 
@@ -930,7 +949,7 @@ fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
     let ending = b"</x:padding></worksheet>";
     worksheet.resize(XML_LIMIT - 1000 - ending.len(), b'x');
     worksheet.extend_from_slice(ending);
-    let original = fixture(std::str::from_utf8(&worksheet).unwrap());
+    let original = fixture(str::from_utf8(&worksheet).unwrap());
     drop(worksheet);
     assert_eq!(
         Workbook::from_bytes(original.clone())

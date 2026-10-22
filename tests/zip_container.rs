@@ -1,13 +1,15 @@
 mod common;
 
 use sheetpatch::{CellValue, Error, Workbook};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Write};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
-const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const OFFICE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
 #[test]
 fn ambiguous_legacy_zip_names_cannot_select_a_different_worksheet() {
@@ -19,15 +21,14 @@ fn ambiguous_legacy_zip_names_cannot_select_a_different_worksheet() {
     let mut parts = common::payloads(FIXTURE);
     parts.remove("xl/worksheets/sheet1.xml");
     for name in ["xl/_rels/workbook.xml.rels", "[Content_Types].xml"] {
-        let xml = String::from_utf8(parts[name].clone()).unwrap();
-        parts.insert(
-            name.to_owned(),
-            xml.replace("worksheets/sheet1.xml", ENCODED).into_bytes(),
-        );
+        let xml = str::from_utf8(&parts[name])
+            .unwrap()
+            .replace("worksheets/sheet1.xml", ENCODED);
+        parts.insert(name.to_owned(), xml.into_bytes());
     }
     let sheet = |value| {
         format!(
-            "<worksheet xmlns='{MAIN}'><sheetData><row r='1'><c r='A1'><v>{value}</v></c></row></sheetData></worksheet>"
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>{value}</v></c></row></sheetData></worksheet>"
         )
     };
     let target = sheet(2);
@@ -163,30 +164,39 @@ fn ole_compound_files_are_unsupported_rather_than_invalid() {
 /// to the other letter so that the CRC-32 of `bytes` becomes `target`, as a
 /// bit set. CRC-32 is affine over GF(2), so the flips' effects combine by XOR.
 fn flips_for_crc(bytes: &[u8], start: usize, count: usize, target: u32) -> u128 {
+    /// A CRC change and the flips causing it, as a bit set.
+    struct Row {
+        change: u32,
+        flips: u128,
+    }
+
     let crc = common::crc32(bytes);
-    // Each row is a CRC change and the flips causing it. Rows have distinct
-    // highest bits and stay sorted by them, so XOR with a row only lowers a
-    // value whose highest bit it shares.
-    let mut rows: Vec<(u32, u128)> = Vec::new();
+    // Rows have distinct highest bits and stay sorted by them, so XOR with a
+    // row only lowers a value whose highest bit it shares.
+    let mut rows: Vec<Row> = Vec::new();
     for position in 0..count {
         let mut flipped = bytes.to_vec();
         flipped[start + position] ^= b'a' ^ b'c';
-        let mut row = (common::crc32(&flipped) ^ crc, 1 << position);
-        for &(change, flips) in &rows {
-            if row.0 ^ change < row.0 {
-                row = (row.0 ^ change, row.1 ^ flips);
+        let mut row = Row {
+            change: common::crc32(&flipped) ^ crc,
+            flips: 1 << position,
+        };
+        for other in &rows {
+            if row.change ^ other.change < row.change {
+                row.change ^= other.change;
+                row.flips ^= other.flips;
             }
         }
-        if row.0 != 0 {
+        if row.change != 0 {
             rows.push(row);
-            rows.sort_unstable_by_key(|&(change, _)| std::cmp::Reverse(change));
+            rows.sort_unstable_by_key(|row| Reverse(row.change));
         }
     }
     let (mut remaining, mut solution) = (crc ^ target, 0);
-    for &(change, flips) in &rows {
-        if remaining ^ change < remaining {
-            remaining ^= change;
-            solution ^= flips;
+    for row in &rows {
+        if remaining ^ row.change < remaining {
+            remaining ^= row.change;
+            solution ^= row.flips;
         }
     }
     assert_eq!(remaining, 0, "no flips give the target checksum");
@@ -203,25 +213,25 @@ fn saves_refuse_checksums_that_would_form_another_end_record() {
         (
             "_rels/.rels",
             format!(
-                "<Relationships xmlns='{PACKAGE}'><Relationship Id='office' Type='{OFFICE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+                "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
             ),
         ),
         (
             "xl/workbook.xml",
             format!(
-                "<workbook xmlns='{MAIN}' xmlns:r='{OFFICE}'><sheets><sheet name='S1' sheetId='1' r:id='s1'/></sheets></workbook>"
+                "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='S1' sheetId='1' r:id='s1'/></sheets></workbook>"
             ),
         ),
         (
             "xl/_rels/workbook.xml.rels",
             format!(
-                "<Relationships xmlns='{PACKAGE}'><Relationship Id='s1' Type='{OFFICE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
+                "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='s1' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
             ),
         ),
         (
             SHEET,
             format!(
-                "<worksheet xmlns='{MAIN}'><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData></worksheet>"
+                "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData></worksheet>"
             ),
         ),
     ]);
@@ -264,7 +274,8 @@ fn saves_refuse_checksums_that_would_form_another_end_record() {
         .unwrap();
     let flips = flips_for_crc(&xml, start, 128, END_SIGNATURE);
     let mut text = base.into_bytes();
-    for (position, letter) in text.iter_mut().take(128).enumerate() {
+    let flippable = text.iter_mut().take(128).enumerate();
+    for (position, letter) in flippable {
         if flips >> position & 1 == 1 {
             *letter = b'c';
         }
@@ -272,7 +283,7 @@ fn saves_refuse_checksums_that_would_form_another_end_record() {
     xml[start..start + length].copy_from_slice(&text);
     assert_eq!(common::crc32(&xml), END_SIGNATURE);
 
-    let book = edited(std::str::from_utf8(&text).unwrap());
+    let book = edited(str::from_utf8(&text).unwrap());
     let refused = |result: sheetpatch::Result<()>| {
         matches!(
             result,

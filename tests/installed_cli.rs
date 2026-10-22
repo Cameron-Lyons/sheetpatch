@@ -6,7 +6,6 @@
 //! SHEETPATCH_INSTALLED_BINARY=/path/to/sheetpatch cargo test --test installed_cli -- --ignored
 //! ```
 use std::env;
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 const FIXTURE: &str = concat!(
@@ -17,6 +16,8 @@ const FIXTURE: &str = concat!(
 /// Standard output of the installed executable, which must succeed without
 /// writing to standard error.
 fn installed(args: &[&str], input: &str) -> String {
+    use std::io::Write as _;
+
     let binary = env::var_os("SHEETPATCH_INSTALLED_BINARY")
         .expect("set SHEETPATCH_INSTALLED_BINARY to the executable to check");
     let mut child = Command::new(binary)

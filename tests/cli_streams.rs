@@ -4,7 +4,6 @@ mod common;
 use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -21,6 +20,8 @@ fn command(args: &[&str]) -> Command {
 
 /// Run with `input` on standard input and capture standard output.
 fn piped(args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write as _;
+
     let mut child = command(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -44,7 +45,11 @@ fn success(output: Output) -> Vec<u8> {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "a successful command wrote to standard error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
@@ -144,12 +149,12 @@ fn workbooks_written_to_standard_output_match_saved_files() {
         vec!["patch", FIXTURE, "{}", text(&patch)],
         vec!["compact", FIXTURE, "{}"],
     ] {
-        let to_file: Vec<_> = args
+        let to_file: Vec<&str> = args
             .iter()
             .map(|arg| if *arg == "{}" { text(&saved) } else { arg })
             .collect();
         assert!(success(cli(&to_file)).is_empty());
-        let to_stdout: Vec<_> = args
+        let to_stdout: Vec<&str> = args
             .iter()
             .map(|arg| if *arg == "{}" { "-" } else { arg })
             .collect();
@@ -159,11 +164,15 @@ fn workbooks_written_to_standard_output_match_saved_files() {
 
     // The patch comes from standard input while the workbook goes to standard output.
     let streamed = success(piped(&["patch", FIXTURE, "-", "-"], rows.as_bytes()));
+    let streamed = Workbook::from_bytes(streamed).unwrap();
     assert_eq!(
-        cell(streamed.clone(), "Data", "A1"),
+        streamed.get_cell("Data", "A1").unwrap().value,
         CellValue::Text("Patched".into())
     );
-    assert_eq!(cell(streamed, "Notes", "B2"), CellValue::Bool(true));
+    assert_eq!(
+        streamed.get_cell("Notes", "B2").unwrap().value,
+        CellValue::Bool(true)
+    );
 
     // Both ends of a pipeline can be workbooks.
     let workbook = fs::read(FIXTURE).unwrap();
@@ -307,6 +316,8 @@ fn io_errors_display_non_unicode_paths_lossily() {
 #[cfg(target_os = "linux")]
 #[test]
 fn full_standard_output_reports_a_write_error() {
+    use std::fs::OpenOptions;
+
     let text_error = "sheetpatch: cannot write output: ";
     let workbook_error = "sheetpatch: cannot write workbook to standard output: ";
     for (args, prefix) in [
@@ -320,12 +331,7 @@ fn full_standard_output_reports_a_write_error() {
         ),
     ] {
         let output = command(&args)
-            .stdout(
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open("/dev/full")
-                    .unwrap(),
-            )
+            .stdout(OpenOptions::new().write(true).open("/dev/full").unwrap())
             .stderr(Stdio::piped())
             .output()
             .unwrap();
@@ -349,7 +355,7 @@ fn large_workbook() -> Vec<u8> {
     let workbook = format!(
         "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>"
     );
-    let rels = format!(
+    let relationships = format!(
         "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
     );
     let worksheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
@@ -361,7 +367,7 @@ fn large_workbook() -> Vec<u8> {
         ),
         ("_rels/.rels", root.as_bytes()),
         ("xl/workbook.xml", workbook.as_bytes()),
-        ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", relationships.as_bytes()),
         ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
         ("xl/media/padding.bin", &padding),
     ])
@@ -415,11 +421,13 @@ fn a_reader_that_closes_the_pipe_early_fails_a_workbook_write() {
 #[cfg(unix)]
 #[test]
 fn saving_to_a_symlink_replaces_the_link_and_keeps_its_target() {
+    use std::os::unix::fs as unix_fs;
+
     let directory = TempDir::new();
     let target = directory.join("target.xlsx");
     let link = directory.join("link.xlsx");
     fs::write(&target, b"target bytes stay unchanged").unwrap();
-    std::os::unix::fs::symlink(&target, &link).unwrap();
+    unix_fs::symlink(&target, &link).unwrap();
     for args in [
         vec![
             "set",
@@ -437,7 +445,7 @@ fn saving_to_a_symlink_replaces_the_link_and_keeps_its_target() {
         assert_eq!(fs::read(&target).unwrap(), b"target bytes stay unchanged");
         assert!(Workbook::open(&link).is_ok());
         fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        unix_fs::symlink(&target, &link).unwrap();
     }
     assert_eq!(count(&directory), 2);
 }

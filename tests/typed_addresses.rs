@@ -1,5 +1,6 @@
 //! Typed access uses the same preservation and transaction rules as A1 access.
 use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
+use std::iter;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 
@@ -88,11 +89,11 @@ fn typed_batches_validate_overwritten_values_and_roll_back_on_formula_protection
 #[test]
 fn empty_typed_batches_validate_sheet_names_without_staging_changes() {
     let mut book = Workbook::from_bytes(FIXTURE.to_vec()).unwrap();
-    book.set_cells_at("Data", std::iter::empty::<(CellRef, i32)>())
+    book.set_cells_at("Data", iter::empty::<(CellRef, i32)>())
         .unwrap();
     assert!(book.get_cells_at("Data", []).unwrap().is_empty());
     assert!(matches!(
-        book.set_cells_at("data", std::iter::empty::<(CellRef, i32)>()),
+        book.set_cells_at("data", iter::empty::<(CellRef, i32)>()),
         Err(Error::SheetNotFound(_))
     ));
     assert!(matches!(
@@ -104,7 +105,10 @@ fn empty_typed_batches_validate_sheet_names_without_staging_changes() {
 }
 
 #[test]
-#[allow(deprecated)]
+#[allow(
+    deprecated,
+    reason = "the test checks the deprecated constructors themselves"
+)]
 fn deprecated_constructors_behave_like_their_replacements() {
     assert_eq!(
         CellRef::new(3, 6).unwrap(),

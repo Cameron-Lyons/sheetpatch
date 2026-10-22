@@ -55,7 +55,7 @@ fn archive(properties: &str, data: &str, other: &str) -> Vec<u8> {
 
 #[test]
 fn workbook_relationships_resolve_independently_of_legacy_zip_name_spelling() {
-    for (workbook_path, rels_path) in [
+    for (workbook_path, relationships_path) in [
         ("xl/book%20one.xml", "xl/_rels/book one.xml.rels"),
         ("xl/book one.xml", "xl/_rels/book%20one.xml.rels"),
     ] {
@@ -63,10 +63,10 @@ fn workbook_relationships_resolve_independently_of_legacy_zip_name_spelling() {
         let workbook = parts.remove("xl/workbook.xml").unwrap();
         parts.insert(workbook_path.into(), workbook);
         let relationships = parts.remove("xl/_rels/workbook.xml.rels").unwrap();
-        parts.insert(rels_path.into(), relationships);
+        parts.insert(relationships_path.into(), relationships);
         let roots = parts.get_mut("_rels/.rels").unwrap();
         *roots = roots.replace("xl/workbook.xml", "XL/BOOK%20ONE.XML");
-        if rels_path.contains("%20") {
+        if relationships_path.contains("%20") {
             // The encoded relationship part wins even when the workbook's
             // ZIP name is decoded and a decoded relationship decoy exists.
             parts.insert("xl/_rels/book one.xml.rels".into(), "not XML".into());
@@ -502,7 +502,10 @@ fn sheets_in_compatibility_branches_are_unsupported_and_misplaced_ones_invalid()
     let open = |replacement: &str| {
         let mut parts = parts("", "", "");
         let workbook = parts.get_mut("xl/workbook.xml").unwrap();
-        assert!(workbook.contains(&sheets));
+        assert!(
+            workbook.contains(&sheets),
+            "the template workbook lists both sheets in one sheets element"
+        );
         *workbook = workbook.replace(&sheets, replacement);
         Workbook::from_bytes(stored(&parts)).err()
     };

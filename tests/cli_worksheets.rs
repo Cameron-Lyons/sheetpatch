@@ -4,7 +4,6 @@ mod common;
 
 use common::TempDir;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -28,21 +27,51 @@ const SPARSE: &str = "<sheetData>\
 
 const SPARSE_CELLS: &str = "C2\tnumber\t1.5\nE2\ttext\ttwo words\nA5\tbool\ttrue\nB5\terror\t#N/A\nC5\tblank\t\nD5\ttext\tx\nE5\ttext\t\nAA9\tnumber\t-0.25\nAB9\ttext\ttab\tand\nline\n";
 
-/// A workbook with one worksheet for each `(name, sheet attributes,
-/// worksheet children)`, where the name is XML-escaped and the attributes,
-/// if any, start with a space.
-fn workbook(sheets: &[(&str, &str, &str)]) -> Vec<u8> {
-    let mut list = String::new();
+/// One worksheet of a constructed workbook.
+struct SheetXml<'xml> {
+    /// The sheet's XML-escaped name.
+    name: &'xml str,
+    /// Extra `<sheet>` attributes, each starting with a space, or nothing.
+    attributes: &'xml str,
+    /// The children of the `<worksheet>` element.
+    children: &'xml str,
+}
+
+impl<'xml> SheetXml<'xml> {
+    /// A worksheet without extra `<sheet>` attributes.
+    fn new(name: &'xml str, children: &'xml str) -> Self {
+        Self {
+            name,
+            attributes: "",
+            children,
+        }
+    }
+}
+
+/// A workbook with one worksheet for each of `sheets`, in order.
+fn workbook(sheets: &[SheetXml<'_>]) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut sheet_list = String::new();
     let mut relationships = String::new();
-    let mut parts = Vec::new();
-    for (index, (name, attributes, children)) in sheets.iter().enumerate() {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    for (index, sheet) in sheets.iter().enumerate() {
         let id = index + 1;
-        list.push_str(&format!(
+        let SheetXml {
+            name,
+            attributes,
+            children,
+        } = sheet;
+        write!(
+            sheet_list,
             "<sheet name='{name}' sheetId='{id}' r:id='s{id}'{attributes}/>"
-        ));
-        relationships.push_str(&format!(
+        )
+        .unwrap();
+        write!(
+            relationships,
             "<Relationship Id='s{id}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{id}.xml'/>"
-        ));
+        )
+        .unwrap();
         parts.push((
             format!("xl/worksheets/sheet{id}.xml"),
             format!("<worksheet xmlns='{MAIN_NAMESPACE}'>{children}</worksheet>"),
@@ -52,9 +81,9 @@ fn workbook(sheets: &[(&str, &str, &str)]) -> Vec<u8> {
         "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let workbook = format!(
-        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{list}</sheets></workbook>"
+        "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{sheet_list}</sheets></workbook>"
     );
-    let rels =
+    let workbook_relationships =
         format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>");
     let mut entries: Vec<(&str, &[u8])> = vec![
         (
@@ -63,7 +92,10 @@ fn workbook(sheets: &[(&str, &str, &str)]) -> Vec<u8> {
         ),
         ("_rels/.rels", root.as_bytes()),
         ("xl/workbook.xml", workbook.as_bytes()),
-        ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            workbook_relationships.as_bytes(),
+        ),
     ];
     entries.extend(
         parts
@@ -74,7 +106,7 @@ fn workbook(sheets: &[(&str, &str, &str)]) -> Vec<u8> {
 }
 
 /// Write `workbook(sheets)` to `name` in `directory`.
-fn saved(directory: &TempDir, name: &str, sheets: &[(&str, &str, &str)]) -> PathBuf {
+fn saved(directory: &TempDir, name: &str, sheets: &[SheetXml<'_>]) -> PathBuf {
     let path = directory.join(name);
     fs::write(&path, workbook(sheets)).unwrap();
     path
@@ -85,6 +117,8 @@ fn text(path: &Path) -> &str {
 }
 
 fn cli(args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write as _;
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_sheetpatch"))
         .args(args)
         .stdin(Stdio::piped())
@@ -104,7 +138,11 @@ fn success(args: &[&str]) -> String {
         "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "{args:?} succeeded but wrote to standard error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
@@ -119,7 +157,7 @@ fn failure(args: &[&str], input: &[u8]) -> String {
 #[test]
 fn cells_list_values_and_formulas_but_skip_formatting_only_cells() {
     let directory = TempDir::new();
-    let path = saved(&directory, "sparse.xlsx", &[("Data", "", SPARSE)]);
+    let path = saved(&directory, "sparse.xlsx", &[SheetXml::new("Data", SPARSE)]);
     let path = text(&path);
     assert_eq!(success(&["cells", path, "Data"]), SPARSE_CELLS);
     // JSON objects match get --json for the listed cells, in the same order.
@@ -148,7 +186,7 @@ fn cells_ranges_filter_the_worksheet_cells() {
     let path = saved(
         &directory,
         "ranges.xlsx",
-        &[("Data", "", SPARSE), ("Far", "", far)],
+        &[SheetXml::new("Data", SPARSE), SheetXml::new("Far", far)],
     );
     let path = text(&path);
     for (range, expected) in [
@@ -193,10 +231,9 @@ fn cells_of_sheets_without_values_are_empty() {
         &directory,
         "empty.xlsx",
         &[
-            ("Empty", "", "<sheetData/>"),
-            (
+            SheetXml::new("Empty", "<sheetData/>"),
+            SheetXml::new(
                 "Styled",
-                "",
                 "<dimension ref='A1:C3'/><sheetData><row r='1' s='4' customFormat='1'><c r='A1' s='1'/><c r='C1' s='2'/></row><row r='3'/></sheetData>",
             ),
         ],
@@ -231,7 +268,11 @@ fn large_cell_listings_skip_empty_batches_and_keep_json_separators_correct() {
         })
         .collect();
     let data = format!("<sheetData>{rows}</sheetData>");
-    let path = saved(&directory, "large-sparse.xlsx", &[("Data", "", &data)]);
+    let path = saved(
+        &directory,
+        "large-sparse.xlsx",
+        &[SheetXml::new("Data", &data)],
+    );
     let path = text(&path);
     assert_eq!(
         success(&["cells", path, "Data"]),
@@ -260,7 +301,10 @@ fn cells_lines_prefixed_with_a_sheet_name_are_patch_rows() {
     let input = saved(
         &directory,
         "in.xlsx",
-        &[("Values", "", values), ("Copy", "", "<sheetData/>")],
+        &[
+            SheetXml::new("Values", values),
+            SheetXml::new("Copy", "<sheetData/>"),
+        ],
     );
     let output = directory.join("out.xlsx");
     let listed = success(&["cells", text(&input), "Values"]);
@@ -322,11 +366,11 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
         &directory,
         "in.xlsx",
         &[
-            ("Values", "", &values),
-            ("Copy", "", "<sheetData/>"),
-            ("Ranges", "", ranges),
-            ("Payloads", "", payloads),
-            ("Group", "", group),
+            SheetXml::new("Values", &values),
+            SheetXml::new("Copy", "<sheetData/>"),
+            SheetXml::new("Ranges", ranges),
+            SheetXml::new("Payloads", payloads),
+            SheetXml::new("Group", group),
         ],
     );
     let path = text(&path);
@@ -452,7 +496,11 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
 #[test]
 fn patch_fields_are_raw_so_quotes_are_stored_as_written() {
     let directory = TempDir::new();
-    let input = saved(&directory, "in.xlsx", &[("Data", "", "<sheetData/>")]);
+    let input = saved(
+        &directory,
+        "in.xlsx",
+        &[SheetXml::new("Data", "<sheetData/>")],
+    );
     let output = directory.join("out.xlsx");
     // Rows quoted like CSV fields or shell words keep their quotes.
     let patch = "Data\tA1\ttext\t\"x \"\"y\"\"\"\nData\tA2\ttext\t'z'\n";
@@ -485,7 +533,7 @@ fn patch_fields_are_raw_so_quotes_are_stored_as_written() {
 #[test]
 fn get_ranges_read_sparse_sheets_row_by_row() {
     let directory = TempDir::new();
-    let path = saved(&directory, "sparse.xlsx", &[("Data", "", SPARSE)]);
+    let path = saved(&directory, "sparse.xlsx", &[SheetXml::new("Data", SPARSE)]);
     let path = text(&path);
     assert_eq!(
         success(&["get", path, "Data", "B4:C5", "aa9", "E2:E2"]),
@@ -505,10 +553,22 @@ fn list_reports_each_sheet_visibility() {
         &directory,
         "visibility.xlsx",
         &[
-            ("Shown", "", empty),
-            ("Hidden", " state='hidden'", empty),
-            ("Very &amp; hidden", " state='veryHidden'", empty),
-            ("Explicit", " state='visible'", empty),
+            SheetXml::new("Shown", empty),
+            SheetXml {
+                name: "Hidden",
+                attributes: " state='hidden'",
+                children: empty,
+            },
+            SheetXml {
+                name: "Very &amp; hidden",
+                attributes: " state='veryHidden'",
+                children: empty,
+            },
+            SheetXml {
+                name: "Explicit",
+                attributes: " state='visible'",
+                children: empty,
+            },
         ],
     );
     let path = text(&path);
@@ -537,8 +597,8 @@ fn piped_lists_keep_control_characters_in_names() {
         &directory,
         "names.xlsx",
         &[
-            ("Two&#10;Lines", "", "<sheetData/>"),
-            ("Tab&#9;Name", "", "<sheetData/>"),
+            SheetXml::new("Two&#10;Lines", "<sheetData/>"),
+            SheetXml::new("Tab&#9;Name", "<sheetData/>"),
         ],
     );
     // Only a terminal shows escapes; pipes receive the exact names.
@@ -565,9 +625,9 @@ fn refused_patch_edits_name_only_lines_for_the_refused_cell() {
         &directory,
         "guards.xlsx",
         &[
-            ("Data", "", data),
-            ("Other", "", "<sheetData/>"),
-            ("Grouped", "", grouped),
+            SheetXml::new("Data", data),
+            SheetXml::new("Other", "<sheetData/>"),
+            SheetXml::new("Grouped", grouped),
         ],
     );
     let output = directory.join("out.xlsx");

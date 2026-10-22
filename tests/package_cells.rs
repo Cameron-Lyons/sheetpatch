@@ -15,7 +15,7 @@ fn book(worksheet: &str) -> Workbook {
     let root = format!(
         "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
-    let rels = format!(
+    let relationships = format!(
         "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"
     );
     let bytes = common::stored_archive(&[
@@ -25,7 +25,7 @@ fn book(worksheet: &str) -> Workbook {
         ),
         ("_rels/.rels", root.as_bytes()),
         ("xl/workbook.xml", workbook.as_bytes()),
-        ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", relationships.as_bytes()),
         ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
     ]);
     Workbook::from_bytes(bytes).unwrap()

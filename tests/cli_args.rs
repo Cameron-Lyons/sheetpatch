@@ -34,7 +34,7 @@ fn workspace() -> TempDir {
 
 /// The sorted names of the files in `directory`.
 fn names(directory: &TempDir) -> Vec<String> {
-    let mut names: Vec<_> = fs::read_dir(directory.path())
+    let mut names: Vec<String> = fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();

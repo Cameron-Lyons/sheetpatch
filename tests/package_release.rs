@@ -2,6 +2,7 @@ mod common;
 
 use sheetpatch::{CellValue, Error, Workbook};
 use std::collections::BTreeMap;
+use std::iter;
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NAMESPACE: &str =
@@ -97,10 +98,10 @@ fn duplicate_decoded_names_are_rejected_for_all_sheet_types() {
     for kind in ["worksheet", "chartsheet", "macrosheet"] {
         let sheets =
             format!("<sheets>{SHEET}<sheet name='_x0044_ata' sheetId='2' r:id='two'/></sheets>");
-        let rels = format!(
+        let relationships = format!(
             "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/{kind}' Target='worksheets/sheet2.xml'/>"
         );
-        assert!(Workbook::from_bytes(fixture(&sheets, &rels, &[])).is_err());
+        assert!(Workbook::from_bytes(fixture(&sheets, &relationships, &[])).is_err());
     }
 }
 
@@ -109,7 +110,7 @@ fn sheet_names_with_unpaired_surrogate_escapes_are_unsupported_by_position() {
     // Such a name is valid, but no Rust string can hold it, so the workbook
     // cannot be opened. The error names the sheet's position in tab order,
     // counting sheets of every type.
-    let rels = format!(
+    let relationships = format!(
         "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/chartsheet' Target='worksheets/sheet2.xml'/><Relationship Id='three' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet3.xml'/>"
     );
     let third = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
@@ -121,15 +122,23 @@ fn sheet_names_with_unpaired_surrogate_escapes_are_unsupported_by_position() {
     };
     // With each escape paired, the same workbook opens.
     let paired = "_xD83D__xDE00_";
-    let workbook = Workbook::from_bytes(fixture(&sheets(paired, "Data"), &rels, &replacements));
+    let workbook = Workbook::from_bytes(fixture(
+        &sheets(paired, "Data"),
+        &relationships,
+        &replacements,
+    ));
     assert_eq!(workbook.unwrap().sheets()[0].name(), "😀");
     for (first, third, position) in [
         ("_xD800_", "Data", 1),
         ("_xD83D__xD83D__xDE00_", "Data", 1),
         (paired, "Data _xDE00_", 3),
     ] {
-        let error =
-            Workbook::from_bytes(fixture(&sheets(first, third), &rels, &replacements)).unwrap_err();
+        let error = Workbook::from_bytes(fixture(
+            &sheets(first, third),
+            &relationships,
+            &replacements,
+        ))
+        .unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -147,10 +156,10 @@ fn unrelated_sheet_types_and_foreign_elements_remain_opaque() {
     let sheets = format!(
         "<sheets xmlns:x='urn:vendor'>{SHEET}<x:sheet name='Opaque'/><sheet name='Chart' sheetId='2' r:id='two'/></sheets>"
     );
-    let rels = format!(
+    let relationships = format!(
         "{RELATIONSHIP}<Relationship Id='two' Type='{OFFICE_NAMESPACE}/chartsheet' Target='worksheets/sheet2.xml'/>"
     );
-    let original = fixture(&sheets, &rels, &[]);
+    let original = fixture(&sheets, &relationships, &[]);
     let workbook = Workbook::from_bytes(original.clone()).unwrap();
     assert_eq!(workbook.sheets().len(), 1);
     assert_eq!(workbook.sheets()[0].name(), "Data");
@@ -190,7 +199,7 @@ fn binary_workbooks_are_classified_independently_of_zip_name_case() {
         );
         assert!(matches!(
             Workbook::from_bytes(original),
-            Err(sheetpatch::Error::Unsupported(message)) if message.contains(".xlsb")
+            Err(Error::Unsupported(message)) if message.contains(".xlsb")
         ));
     }
 }
@@ -203,7 +212,7 @@ fn namespace_character_references_are_normalized_before_discovery_and_editing() 
     let workbook_xml = format!(
         "<workbook xmlns='{encoded_main}' xmlns:r='{encoded_office}'><sheets>{SHEET}</sheets></workbook>"
     );
-    let root_rels = format!(
+    let root_relationships = format!(
         "<Relationships xmlns='{encoded_package}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
     );
     let worksheet_xml = format!(
@@ -214,7 +223,7 @@ fn namespace_character_references_are_normalized_before_discovery_and_editing() 
         RELATIONSHIP,
         &[
             ("xl/workbook.xml", &workbook_xml),
-            ("_rels/.rels", &root_rels),
+            ("_rels/.rels", &root_relationships),
             ("xl/worksheets/sheet1.xml", &worksheet_xml),
         ],
     );
@@ -251,16 +260,16 @@ fn empty_batches_require_an_existing_worksheet_without_creating_changes() {
     let original = fixture(&format!("<sheets>{SHEET}</sheets>"), RELATIONSHIP, &[]);
     let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
     workbook
-        .set_cells("Data", std::iter::empty::<(&str, i32)>())
+        .set_cells("Data", iter::empty::<(&str, i32)>())
         .unwrap();
     assert!(
         workbook
-            .set_cells("missing", std::iter::empty::<(&str, i32)>())
+            .set_cells("missing", iter::empty::<(&str, i32)>())
             .is_err()
     );
     assert!(
         workbook
-            .get_cells("missing", std::iter::empty::<&str>())
+            .get_cells("missing", iter::empty::<&str>())
             .is_err()
     );
     assert!(!workbook.has_changes());
@@ -305,7 +314,7 @@ fn escaped_part_fixture(decoded_names: bool, include_decoys: bool) -> Vec<u8> {
     } else {
         "books/Workbook%20Main.xml"
     };
-    let rels_name = if decoded_names {
+    let relationships_name = if decoded_names {
         "books/_rels/Workbook Main.xml.rels"
     } else {
         "books/_rels/Workbook%20Main.xml.rels"
@@ -327,7 +336,7 @@ fn escaped_part_fixture(decoded_names: bool, include_decoys: bool) -> Vec<u8> {
         ("[Content_Types].xml", "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/><Override PartName='/books/Workbook%20Main.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/><Override PartName='/tabs/Sheet%20%3F.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/><Override PartName='/strings/Shared%20Text.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'/></Types>".into()),
         ("_rels/.rels", format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='BOOKS/workbook%20main.xml'/></Relationships>")),
         (workbook_name, format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/></sheets></workbook>")),
-        (rels_name, format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='../tabs/sheet%20%3f.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='/strings/shared%20text.xml'/></Relationships>")),
+        (relationships_name, format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='../tabs/sheet%20%3f.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='/strings/shared%20text.xml'/></Relationships>")),
         (sheet_name, worksheet),
         (strings_name, format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Canonical</t></si></sst>")),
     ]);
@@ -344,7 +353,7 @@ fn escaped_part_fixture(decoded_names: bool, include_decoys: bool) -> Vec<u8> {
 #[test]
 fn escaped_opc_part_names_discover_read_edit_and_compact_without_decoding_zip_names() {
     for include_decoys in [false, true] {
-        let original = escaped_part_fixture(false, include_decoys);
+        let original = escaped_part_fixture(/* decoded_names: */ false, include_decoys);
         let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
         assert_eq!(workbook.sheets()[0].path(), "tabs/Sheet%20%3F.xml");
         assert_eq!(workbook.to_bytes().unwrap(), original);
@@ -373,7 +382,9 @@ fn escaped_opc_part_names_discover_read_edit_and_compact_without_decoding_zip_na
 
 #[test]
 fn legacy_decoded_zip_part_names_remain_readable_when_encoded_parts_are_absent() {
-    let original = escaped_part_fixture(true, false);
+    let original = escaped_part_fixture(
+        /* decoded_names: */ true, /* include_decoys: */ false,
+    );
     let mut workbook = Workbook::from_bytes(original.clone()).unwrap();
     assert_eq!(workbook.sheets()[0].path(), "tabs/Sheet ?.xml");
     assert_eq!(workbook.to_bytes().unwrap(), original);
@@ -393,22 +404,24 @@ fn legacy_decoded_zip_part_names_remain_readable_when_encoded_parts_are_absent()
 fn workbook_relationship_parts_resolve_encoded_and_legacy_names_independently() {
     for decoded_workbook in [false, true] {
         for decoded_relationships in [false, true] {
-            let mut parts = common::payloads(&escaped_part_fixture(false, false));
+            let mut parts = common::payloads(&escaped_part_fixture(
+                /* decoded_names: */ false, /* include_decoys: */ false,
+            ));
             if decoded_workbook {
                 let workbook = parts.remove("books/Workbook%20Main.xml").unwrap();
                 parts.insert("books/Workbook Main.xml".into(), workbook);
             }
-            let encoded_rels = "books/_rels/Workbook%20Main.xml.rels";
-            let decoded_rels = "books/_rels/Workbook Main.xml.rels";
+            let encoded_relationships_name = "books/_rels/Workbook%20Main.xml.rels";
+            let decoded_relationships_name = "books/_rels/Workbook Main.xml.rels";
             if decoded_relationships {
-                let relationships = parts.remove(encoded_rels).unwrap();
-                parts.insert(decoded_rels.into(), relationships);
+                let relationships = parts.remove(encoded_relationships_name).unwrap();
+                parts.insert(decoded_relationships_name.into(), relationships);
             } else {
                 // The canonical encoded relationships part takes precedence
                 // even when the workbook itself has a legacy decoded name.
-                parts.insert(decoded_rels.into(), b"<unrelated/>".to_vec());
+                parts.insert(decoded_relationships_name.into(), b"<unrelated/>".to_vec());
             }
-            let entries: Vec<_> = parts
+            let entries: Vec<(&str, &[u8])> = parts
                 .iter()
                 .map(|(name, xml)| (name.as_str(), xml.as_slice()))
                 .collect();
@@ -449,11 +462,11 @@ fn sheets_sharing_one_worksheet_part_are_rejected() {
         "/xl/worksheets/sheet1.xml",
         "../xl/worksheets/sheet1.xml",
     ] {
-        let rels = format!(
+        let relationships = format!(
             "{RELATIONSHIP}{}",
             worksheet_relationship("two", target, "")
         );
-        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        let error = Workbook::from_bytes(fixture(&sheets, &relationships, &[])).err();
         assert!(
             matches!(&error, Some(Error::InvalidWorkbook(message)) if message.contains("duplicate")),
             "{target}: {error:?}"
@@ -472,7 +485,7 @@ fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
             "<Relationship Id='{id}' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/>"
         )
     };
-    for (rels, expected) in [
+    for (relationships, expected) in [
         (
             format!("{RELATIONSHIP}{duplicate}"),
             "duplicate relationship id",
@@ -494,10 +507,10 @@ fn duplicate_relationship_ids_and_dangling_sheet_relationships_are_rejected() {
             "expected at most one internal shared-string relationship",
         ),
     ] {
-        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        let error = Workbook::from_bytes(fixture(&sheets, &relationships, &[])).err();
         assert!(
             matches!(&error, Some(Error::InvalidWorkbook(message)) if message == expected),
-            "{rels}: {error:?}"
+            "{relationships}: {error:?}"
         );
     }
     // The namespace prefix is declared, so the root is what is rejected.
@@ -527,8 +540,8 @@ fn external_sheet_relationships_are_rejected() {
         "file:///C:/Books/Linked.xlsx",
         "https://example.com/linked.xlsx",
     ] {
-        let rels = worksheet_relationship("one", target, " TargetMode='External'");
-        let error = Workbook::from_bytes(fixture(&sheets, &rels, &[])).err();
+        let relationships = worksheet_relationship("one", target, " TargetMode='External'");
+        let error = Workbook::from_bytes(fixture(&sheets, &relationships, &[])).err();
         assert!(
             matches!(&error, Some(Error::Unsupported(message)) if message.contains("external")),
             "{target}: {error:?}"
@@ -578,6 +591,6 @@ fn equivalent_worksheet_zip_names_are_rejected_before_editing() {
     );
     assert!(matches!(
         Workbook::from_bytes(original),
-        Err(sheetpatch::Error::InvalidWorkbook(message)) if message.contains("ambiguous equivalent OPC part names")
+        Err(Error::InvalidWorkbook(message)) if message.contains("ambiguous equivalent OPC part names")
     ));
 }

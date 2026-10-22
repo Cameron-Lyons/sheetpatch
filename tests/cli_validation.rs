@@ -2,6 +2,7 @@
 mod common;
 
 use common::TempDir;
+use sheetpatch::{CellValue, Workbook};
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -90,14 +91,14 @@ fn duplicate_patch_targets_keep_the_last_value_and_count_every_row() {
     assert!(applied.status.success(), "{:?}", applied.stderr);
     assert!(applied.stdout.is_empty());
     assert!(applied.stderr.is_empty());
-    let workbook = sheetpatch::Workbook::open(&output).unwrap();
+    let workbook = Workbook::open(&output).unwrap();
     assert_eq!(
         workbook.get_cell("Data", "A1").unwrap().value,
-        sheetpatch::CellValue::from("last")
+        CellValue::from("last")
     );
     assert_eq!(
         workbook.get_cell("Notes", "A1").unwrap().value,
-        sheetpatch::CellValue::Bool(false)
+        CellValue::Bool(false)
     );
 }
 
@@ -305,7 +306,7 @@ fn command_help_is_available_without_opening_an_input() {
         let named = cli(&["help", command]);
         assert!(named.status.success());
         assert!(named.stderr.is_empty());
-        let help = String::from_utf8(named.stdout.clone()).unwrap();
+        let help = str::from_utf8(&named.stdout).unwrap();
         assert!(help.contains(&format!("sheetpatch {command} ")));
         for flag in ["--help", "-h"] {
             let output = cli(&[command, flag]);

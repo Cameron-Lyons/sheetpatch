@@ -1,8 +1,7 @@
 //! Regressions for worksheet text decoding, value validation, and new cells.
 mod common;
 
-use common::{payloads, stored_archive};
-use sheetpatch::{CellEdit, CellValue, Error, Workbook};
+use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const OFFICE_NAMESPACE: &str =
@@ -42,7 +41,7 @@ fn workbook_in_namespace(body: &str, shared_strings: Option<&str>, namespace: &s
     if shared_strings.is_some() {
         parts.push(("xl/sharedStrings.xml", strings.as_bytes()));
     }
-    Workbook::from_bytes(stored_archive(&parts)).unwrap()
+    Workbook::from_bytes(common::stored_archive(&parts)).unwrap()
 }
 
 fn row(cells: &str) -> String {
@@ -55,7 +54,7 @@ fn value(book: &Workbook, address: &str) -> CellValue {
 
 fn sheet_xml(book: &Workbook) -> String {
     String::from_utf8(
-        payloads(&book.to_bytes().unwrap())
+        common::payloads(&book.to_bytes().unwrap())
             .remove(SHEET_PATH)
             .unwrap(),
     )
@@ -153,8 +152,8 @@ fn uppercase_x_in_stored_text_is_literal_for_reads_edits_and_no_ops() {
         assert_eq!(value(&reopened(&book), "A1"), CellValue::from("A"));
         if strings.is_some() {
             assert_eq!(
-                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
-                payloads(&original)["xl/sharedStrings.xml"]
+                common::payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+                common::payloads(&original)["xl/sharedStrings.xml"]
             );
         }
 
@@ -174,16 +173,16 @@ fn uppercase_x_in_sheet_names_is_literal() {
         ("_x0041_", "A"),
         ("_x005F_X0041_", "_X0041_"),
     ] {
-        let mut parts = payloads(&original);
-        let metadata = String::from_utf8(parts["xl/workbook.xml"].clone())
+        let mut parts = common::payloads(&original);
+        let metadata = str::from_utf8(&parts["xl/workbook.xml"])
             .unwrap()
             .replace("name='Data'", &format!("name='{stored_name}'"));
         parts.insert("xl/workbook.xml".into(), metadata.as_bytes().to_vec());
-        let entries: Vec<_> = parts
+        let entries: Vec<(&str, &[u8])> = parts
             .iter()
             .map(|(name, xml)| (name.as_str(), xml.as_slice()))
             .collect();
-        let original = stored_archive(&entries);
+        let original = common::stored_archive(&entries);
         let mut book = Workbook::from_bytes(original.clone()).unwrap();
         assert_eq!(book.sheets()[0].name(), decoded_name);
         assert_eq!(
@@ -196,7 +195,10 @@ fn uppercase_x_in_sheet_names_is_literal() {
 
         book.set_cell(decoded_name, "A1", 2).unwrap();
         let saved = book.to_bytes().unwrap();
-        assert_eq!(payloads(&saved)["xl/workbook.xml"], metadata.as_bytes());
+        assert_eq!(
+            common::payloads(&saved)["xl/workbook.xml"],
+            metadata.as_bytes()
+        );
         let book = Workbook::from_bytes(saved).unwrap();
         assert_eq!(book.sheets()[0].name(), decoded_name);
         assert_eq!(
@@ -493,9 +495,9 @@ fn new_cells_inherit_row_then_column_default_styles() {
 
 #[test]
 fn bulk_insertions_keep_each_rows_custom_or_column_style() {
-    let padding = (0..512)
+    let padding: String = (0..512)
         .map(|index| format!(" v:a{index}='keep'"))
-        .collect::<String>();
+        .collect();
     let row_attributes = format!(
         "r='1' xmlns:v='urn:vendor'{padding} customFormat=' 1 ' s='{}7'",
         "0".repeat(32_768)
@@ -508,12 +510,12 @@ fn bulk_insertions_keep_each_rows_custom_or_column_style() {
          <row r='4' customFormat='false' s='ignored'/></sheetData>"
     );
     let mut book = workbook(&body, None);
-    let mut edits = (1..=128)
-        .map(|column| (sheetpatch::CellRef::try_new(1, column).unwrap(), 2))
-        .collect::<Vec<_>>();
+    let mut edits: Vec<(CellRef, i32)> = (1..=128)
+        .map(|column| (CellRef::try_new(1, column).unwrap(), 2))
+        .collect();
     for row in 2..=4 {
         for column in [3, 4] {
-            edits.push((sheetpatch::CellRef::try_new(row, column).unwrap(), 2));
+            edits.push((CellRef::try_new(row, column).unwrap(), 2));
         }
     }
     book.set_cells_at("Data", edits).unwrap();
@@ -522,7 +524,7 @@ fn bulk_insertions_keep_each_rows_custom_or_column_style() {
     assert_eq!(view.get_cell("A1").unwrap().style_index, Some(3));
     for column in 2..=128 {
         assert_eq!(
-            view.get_cell_at(sheetpatch::CellRef::try_new(1, column).unwrap())
+            view.get_cell_at(CellRef::try_new(1, column).unwrap())
                 .unwrap()
                 .style_index,
             Some(7)
@@ -634,7 +636,7 @@ fn rewriting_a_shared_string_cell_with_its_own_text_is_a_no_op() {
     // A missing or unreadable table, or an invalid index, still allows the edit.
     for (body, strings) in [
         (body.clone(), None),
-        (body.clone(), Some("<si><t>first</si>")),
+        (body, Some("<si><t>first</si>")),
         (
             row("<c r='A1' t='s'><v>9</v></c>"),
             Some("<si><t>first</t></si>"),
@@ -782,8 +784,8 @@ fn duplicate_text_in_one_rich_text_run_cannot_produce_false_no_ops() {
         CellValue::from("firstsecond")
     );
     assert_eq!(
-        payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
-        payloads(&original)["xl/sharedStrings.xml"]
+        common::payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+        common::payloads(&original)["xl/sharedStrings.xml"]
     );
 
     for content in [
@@ -827,8 +829,8 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
         )
         .to_bytes()
         .unwrap();
-        let mut parts = payloads(&original);
-        let relationships = String::from_utf8(parts["xl/_rels/workbook.xml.rels"].clone())
+        let mut parts = common::payloads(&original);
+        let relationships = str::from_utf8(&parts["xl/_rels/workbook.xml.rels"])
             .unwrap()
             .replace(
                 "</Relationships>",
@@ -838,7 +840,7 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
             "xl/_rels/workbook.xml.rels".into(),
             relationships.into_bytes(),
         );
-        let types = String::from_utf8(parts["[Content_Types].xml"].clone())
+        let types = str::from_utf8(&parts["[Content_Types].xml"])
             .unwrap()
             .replace(
                 "</Types>",
@@ -846,18 +848,18 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
             );
         parts.insert("[Content_Types].xml".into(), types.into_bytes());
         parts.insert("xl/metadata.xml".into(), metadata.as_bytes().to_vec());
-        let entries: Vec<_> = parts
+        let entries: Vec<(&str, &[u8])> = parts
             .iter()
             .map(|(name, xml)| (name.as_str(), xml.as_slice()))
             .collect();
-        let original = stored_archive(&entries);
+        let original = common::stored_archive(&entries);
         let mut book = Workbook::from_bytes(original.clone()).unwrap();
         assert_eq!(value(&book, "A1"), CellValue::Number(1.0));
         book.set_cell("Data", "A1", 1).unwrap();
         assert!(!book.has_changes());
         assert_eq!(book.to_bytes().unwrap(), original);
 
-        for value in [
+        for replacement in [
             CellValue::Number(2.0),
             CellValue::from("replacement"),
             CellValue::Bool(true),
@@ -865,7 +867,10 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
             CellValue::Blank,
         ] {
             let error = book
-                .set_cells("Data", [("B1", CellValue::Number(8.0)), ("A1", value)])
+                .set_cells(
+                    "Data",
+                    [("B1", CellValue::Number(8.0)), ("A1", replacement)],
+                )
                 .unwrap_err();
             assert_eq!(
                 error.to_string(),
@@ -876,7 +881,7 @@ fn cell_metadata_with_edit_sensitive_semantics_cannot_survive_value_changes() {
         }
         book.set_cell("Data", "B1", 8).unwrap();
         let saved = book.to_bytes().unwrap();
-        let after = payloads(&saved);
+        let after = common::payloads(&saved);
         for (name, bytes) in &parts {
             if name != SHEET_PATH {
                 assert_eq!(&after[name], bytes);
@@ -1202,12 +1207,13 @@ fn mixed_spreadsheet_namespaces_cannot_shift_or_truncate_shared_strings() {
             );
             // Like any unreadable table, this still permits an explicit
             // replacement of an ordinary cell without changing that table.
-            let original_table =
-                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"].clone();
+            let original_table = common::payloads(&book.to_bytes().unwrap())
+                .remove("xl/sharedStrings.xml")
+                .unwrap();
             book.set_cell("Data", "A1", "replacement").unwrap();
             assert_eq!(value(&book, "A1"), CellValue::from("replacement"));
             assert_eq!(
-                payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
+                common::payloads(&book.to_bytes().unwrap())["xl/sharedStrings.xml"],
                 original_table
             );
         }
