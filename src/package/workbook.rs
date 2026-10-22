@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 
 /// An existing OOXML workbook with pending surgical cell edits.
 ///
@@ -723,14 +723,14 @@ impl Workbook {
         if let Some(headers) = cache.get() {
             return Ok(headers);
         }
-        // Poisoning is harmless: entries are inserted whole, never partially.
-        let mut parts = self
-            .table_parts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let headers =
-            discovery::table_headers(&self.archive, &self.sheet_xml[index].uri, &mut parts)?;
-        drop(parts);
+        let uri = &self.sheet_xml[index].uri;
+        // A panic while the lock was held leaves the shared cache poisoned,
+        // and a poisoned cache is not trusted: this worksheet's table parts
+        // are then read again, into a cache of their own.
+        let headers = match self.table_parts.lock() {
+            Ok(mut parts) => discovery::table_headers(&self.archive, uri, &mut parts)?,
+            Err(_) => discovery::table_headers(&self.archive, uri, &mut HashMap::new())?,
+        };
         Ok(cache.get_or_init(|| headers))
     }
 
