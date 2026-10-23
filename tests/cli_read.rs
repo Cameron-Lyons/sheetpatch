@@ -3,10 +3,8 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
-use std::{
-    fs,
-    process::{Command, Output, Stdio},
-};
+use std::process::{Command, Output, Stdio};
+use std::{fs, iter};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,7 +21,11 @@ fn cli(args: &[&str]) -> Output {
 fn success(args: &[&str]) -> String {
     let output = cli(args);
     assert!(output.status.success(), "{:?}", output.stderr);
-    assert!(output.stderr.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "a successful command wrote to standard error: {:?}",
+        output.stderr
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
@@ -44,7 +46,7 @@ fn shared_text_workbook(value: &str, cells: usize, tail: &str) -> Vec<u8> {
         format!("<worksheet xmlns='{namespace}'><sheetData>{rows}{tail}</sheetData></worksheet>")
             .into_bytes(),
     );
-    let entries: Vec<_> = parts
+    let entries: Vec<(&str, &[u8])> = parts
         .iter()
         .map(|(name, data)| (name.as_str(), data.as_slice()))
         .collect();
@@ -211,7 +213,7 @@ fn an_undecodable_shared_string_refuses_only_reads_of_cells_that_use_it() {
         )
         .into_bytes(),
     );
-    let entries: Vec<_> = parts
+    let entries: Vec<(&str, &[u8])> = parts
         .iter()
         .map(|(name, data)| (name.as_str(), data.as_slice()))
         .collect();
@@ -261,7 +263,7 @@ fn malformed_late_values_emit_nothing_after_many_shared_strings() {
             )
             .into_bytes(),
         );
-        let entries: Vec<_> = parts
+        let entries: Vec<(&str, &[u8])> = parts
             .iter()
             .map(|(name, data)| (name.as_str(), data.as_slice()))
             .collect();
@@ -395,12 +397,8 @@ fn large_reads_are_complete_and_in_order() {
     assert_eq!(success(&args), expected);
     let group = success(&["get", "--json", FIXTURE, "Data", "A1", "D1", "F3"]);
     let objects = &group[1..group.len() - 2];
-    let expected = format!(
-        "[{}]\n",
-        std::iter::repeat_n(objects, 3000)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let repeated: Vec<&str> = iter::repeat_n(objects, 3000).collect();
+    let expected = format!("[{}]\n", repeated.join(","));
     args.insert(1, "--json");
     assert_eq!(success(&args), expected);
 }

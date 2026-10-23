@@ -3,18 +3,17 @@
 //! The ZIP writer here is deliberately independent of the crate's own writer:
 //! package discovery and preservation are checked against archives the crate
 //! did not produce. Each test crate uses a subset of these helpers.
-#![allow(dead_code)]
+#![allow(dead_code, reason = "each test crate uses a subset of these helpers")]
 
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{env, fs, process};
 
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 
 const LOCAL_HEADER: u32 = 0x0403_4b50;
 const CENTRAL_HEADER: u32 = 0x0201_4b50;
@@ -27,16 +26,16 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 /// How [`write_zip`] records each entry.
 #[derive(Clone, Copy, Debug)]
-pub struct ZipLayout<'a> {
+pub struct ZipLayout<'comment> {
     /// Deflate level (method 8); `None` stores every entry (method 0).
     pub deflate_level: Option<u32>,
     /// Entries larger than this many bytes are stored even when deflating.
     pub store_larger_than: usize,
     /// When set, every entry records DOS timestamps, a Unix producer and file
     /// mode, and this central-directory comment. Otherwise those fields are zero.
-    pub entry_comment: Option<&'a [u8]>,
+    pub entry_comment: Option<&'comment [u8]>,
     /// End-of-central-directory comment.
-    pub archive_comment: &'a [u8],
+    pub archive_comment: &'comment [u8],
 }
 
 impl ZipLayout<'static> {
@@ -59,6 +58,8 @@ impl ZipLayout<'static> {
 
 /// Writes a minimal single-disk ZIP archive of `entries`, in order.
 pub fn write_zip(entries: &[(&str, &[u8])], layout: &ZipLayout<'_>) -> Vec<u8> {
+    use std::io::Write as _;
+
     let (made_by, time, date, mode, entry_comment) = match layout.entry_comment {
         Some(comment) => (0x0314, 0x4220, 0x5d47, 0o100640 << 16, comment),
         None => (20, 0, 0, 0, &[][..]),
@@ -87,7 +88,7 @@ pub fn write_zip(entries: &[(&str, &[u8])], layout: &ZipLayout<'_>) -> Vec<u8> {
             put_u32(&mut output, value);
         }
         put_u16(&mut output, zip16(name.len()));
-        put_u16(&mut output, 0); // extra field length
+        put_u16(&mut output, 0); // Extra field length.
         output.extend_from_slice(name.as_bytes());
         output.extend_from_slice(&compressed);
 
@@ -175,7 +176,7 @@ pub fn archive_comment(bytes: &[u8]) -> &[u8] {
 }
 
 /// One central-directory record and the local record it points to.
-pub struct ZipEntry<'a> {
+pub struct ZipEntry<'archive> {
     pub name: String,
     pub method: u16,
     pub crc: u32,
@@ -183,16 +184,18 @@ pub struct ZipEntry<'a> {
     /// Offset of the local record.
     pub local_offset: usize,
     /// Complete local record: header, name, extra field, and compressed bytes.
-    pub local: &'a [u8],
+    pub local: &'archive [u8],
     /// Compressed bytes only.
-    pub compressed: &'a [u8],
+    pub compressed: &'archive [u8],
     /// Complete central-directory record, including name, extra field, and comment.
-    pub central: &'a [u8],
+    pub central: &'archive [u8],
 }
 
 impl ZipEntry<'_> {
     /// Decompressed bytes, after checking their size and CRC-32.
     pub fn payload(&self) -> Vec<u8> {
+        use std::io::Read as _;
+
         let output = match self.method {
             0 => self.compressed.to_vec(),
             8 => {
@@ -207,10 +210,15 @@ impl ZipEntry<'_> {
         assert_eq!(
             output.len(),
             self.uncompressed_size,
-            "uncompressed size: {}",
+            "{}: decompressed size differs from the recorded size",
             self.name
         );
-        assert_eq!(crc32(&output), self.crc, "CRC: {}", self.name);
+        assert_eq!(
+            crc32(&output),
+            self.crc,
+            "{}: CRC-32 of the decompressed bytes differs from the recorded one",
+            self.name
+        );
         output
     }
 
@@ -231,12 +239,20 @@ pub fn zip_entries(bytes: &[u8]) -> Vec<ZipEntry<'_>> {
     let mut at = u32_at(bytes, end + 16) as usize;
     let mut entries = Vec::new();
     for _ in 0..u16_at(bytes, end + 10) {
-        assert_eq!(u32_at(bytes, at), CENTRAL_HEADER);
+        assert_eq!(
+            u32_at(bytes, at),
+            CENTRAL_HEADER,
+            "no central-directory record at offset {at}, where the directory says one starts"
+        );
         let name_len = u16_at(bytes, at + 28);
         let central_len = 46 + name_len + u16_at(bytes, at + 30) + u16_at(bytes, at + 32);
         let compressed_size = u32_at(bytes, at + 20) as usize;
         let local = u32_at(bytes, at + 42) as usize;
-        assert_eq!(u32_at(bytes, local), LOCAL_HEADER);
+        assert_eq!(
+            u32_at(bytes, local),
+            LOCAL_HEADER,
+            "no local header at offset {local}, where a central-directory record points"
+        );
         let start = local + 30 + u16_at(bytes, local + 26) + u16_at(bytes, local + 28);
         entries.push(ZipEntry {
             name: String::from_utf8(bytes[at + 46..at + 46 + name_len].to_vec()).unwrap(),
@@ -285,9 +301,9 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = env::temp_dir().join(format!(
             "sheetpatch-test-{}-{}",
-            std::process::id(),
+            process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&path).unwrap();

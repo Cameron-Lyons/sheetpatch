@@ -3,11 +3,9 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{CellValue, Workbook};
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Output},
-};
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -36,7 +34,7 @@ fn workspace() -> TempDir {
 
 /// The sorted names of the files in `directory`.
 fn names(directory: &TempDir) -> Vec<String> {
-    let mut names: Vec<_> = fs::read_dir(directory.path())
+    let mut names: Vec<String> = fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();

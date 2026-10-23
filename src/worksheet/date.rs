@@ -1,5 +1,7 @@
 //! ISO 8601 cell values (`t="d"`) as Excel serial date numbers.
 
+use std::ops::Range;
+
 // Days since 1970-01-01 in the proleptic Gregorian calendar.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
@@ -11,7 +13,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 // A fixed-width run of ASCII digits; `get` keeps slicing on character bounds.
-fn digits(text: &str, range: std::ops::Range<usize>) -> Option<i64> {
+fn digits(text: &str, range: Range<usize>) -> Option<i64> {
     let text = text.get(range)?;
     text.bytes()
         .all(|byte| byte.is_ascii_digit())
@@ -48,7 +50,7 @@ fn time(text: &str) -> Option<f64> {
     }
     let hours = digits(text, 0..2)?;
     let minutes = digits(text, 3..5)?;
-    let seconds = match text.get(5..)? {
+    let seconds: f64 = match text.get(5..)? {
         "" => 0.0,
         rest => {
             // `:SS`, optionally followed by `.` and at least one digit.
@@ -64,7 +66,7 @@ fn time(text: &str) -> Option<f64> {
             {
                 return None;
             }
-            rest.parse::<f64>().ok()?
+            rest.parse().ok()?
         }
     };
     if hours > 23 || minutes > 59 {
@@ -165,14 +167,17 @@ mod tests {
                 let last = month_days(year, month);
                 for day in [0, last + 1] {
                     assert_eq!(
-                        excel_serial(&format!("{year:04}-{month:02}-{day:02}"), false),
+                        excel_serial(
+                            &format!("{year:04}-{month:02}-{day:02}"),
+                            /* date1904: */ false
+                        ),
                         Err(DateError::Invalid),
                         "{year}-{month}-{day}"
                     );
                 }
                 for day in 1..=last {
-                    let serial =
-                        excel_serial(&format!("{year:04}-{month:02}-{day:02}"), false).unwrap();
+                    let text = format!("{year:04}-{month:02}-{day:02}");
+                    let serial = excel_serial(&text, /* date1904: */ false).unwrap();
                     // Excel counts a nonexistent 1900-02-29 as serial 60.
                     let step = if (year, month, day) == (1900, 3, 1) {
                         2.0

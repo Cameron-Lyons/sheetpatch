@@ -3,14 +3,18 @@ mod common;
 
 use common::TempDir;
 use sheetpatch::{Error, Workbook};
-use std::{fs, io, process::Command};
+use std::fmt::Debug;
+use std::fs::File;
+use std::io::Cursor;
+use std::process::Command;
+use std::{fs, io};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/libreoffice.xlsx"
 );
 
-fn assert_invalid_input<T: std::fmt::Debug>(result: Result<T, Error>, message: &str) {
+fn assert_invalid_input<T: Debug>(result: Result<T, Error>, message: &str) {
     match result {
         Err(Error::Io(error)) => {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
@@ -64,11 +68,12 @@ fn directory_destinations_are_rejected_without_writing() {
 #[cfg(unix)]
 #[test]
 fn symlinked_device_destinations_are_rejected_without_writing() {
+    use std::os::unix::fs as unix_fs;
     use std::os::unix::fs::FileTypeExt;
 
     let directory = TempDir::new();
     let destination = directory.join("output.xlsx");
-    std::os::unix::fs::symlink("/dev/null", &destination).unwrap();
+    unix_fs::symlink("/dev/null", &destination).unwrap();
     let workbook = Workbook::open(FIXTURE).unwrap();
     assert_invalid_input(
         workbook.save(&destination),
@@ -92,7 +97,7 @@ fn oversized_inputs_are_rejected_before_reading() {
     // A sparse file one byte larger than any ZIP32 archive can be: rejected
     // from its metadata, without allocating or reading eight gibibytes.
     let limit = 2 * u64::from(u32::MAX) + 22 + u64::from(u16::MAX);
-    fs::File::create(&path).unwrap().set_len(limit + 1).unwrap();
+    File::create(&path).unwrap().set_len(limit + 1).unwrap();
     match Workbook::open(&path) {
         Err(Error::Unsupported(message)) => assert!(message.contains("ZIP32"), "{message}"),
         other => panic!("expected an unsupported-input error, got {:?}", other.err()),
@@ -101,13 +106,15 @@ fn oversized_inputs_are_rejected_before_reading() {
 
 #[test]
 fn workbooks_read_from_streams_match_opened_files() {
+    use std::io::Read;
+
     let opened = Workbook::open(FIXTURE).unwrap();
-    let streamed = Workbook::from_reader(fs::File::open(FIXTURE).unwrap()).unwrap();
+    let streamed = Workbook::from_reader(File::open(FIXTURE).unwrap()).unwrap();
     assert_eq!(streamed.sheets(), opened.sheets());
     assert_eq!(streamed.to_bytes().unwrap(), fs::read(FIXTURE).unwrap());
     // Any reader works, including a byte slice or a mutable reference.
     let bytes = fs::read(FIXTURE).unwrap();
-    let mut reader = io::Cursor::new(&bytes);
+    let mut reader = Cursor::new(&bytes);
     let mut workbook = Workbook::from_reader(&mut reader).unwrap();
     workbook.set_cell("Data", "A1", "streamed").unwrap();
     let saved = Workbook::from_reader(&workbook.to_bytes().unwrap()[..]).unwrap();
@@ -117,7 +124,7 @@ fn workbooks_read_from_streams_match_opened_files() {
     );
 
     struct Failing;
-    impl io::Read for Failing {
+    impl Read for Failing {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::other("stream failed"))
         }
@@ -135,10 +142,10 @@ fn workbooks_read_from_streams_match_opened_files() {
 #[cfg(unix)]
 mod permissions {
     use super::*;
-    use std::{
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        path::{Path, PathBuf},
-    };
+    use std::fs::{OpenOptions, Permissions};
+    use std::os::unix::fs as unix_fs;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o7777
@@ -146,7 +153,7 @@ mod permissions {
 
     fn umask(directory: &TempDir) -> u32 {
         let probe = directory.join("umask-probe");
-        fs::OpenOptions::new()
+        OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o777)
@@ -160,7 +167,7 @@ mod permissions {
     fn source(directory: &TempDir, permissions: u32) -> PathBuf {
         let path = directory.join(format!("source-{permissions:o}.xlsx"));
         fs::copy(FIXTURE, &path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(permissions)).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(permissions)).unwrap();
         path
     }
 
@@ -213,7 +220,7 @@ mod permissions {
         assert_eq!(mode(&saved), 0o666 & !umask);
         // A stream carries no permissions, even when it reads a private file.
         let private = source(&directory, 0o600);
-        let workbook = Workbook::from_reader(fs::File::open(private).unwrap()).unwrap();
+        let workbook = Workbook::from_reader(File::open(private).unwrap()).unwrap();
         let streamed = directory.join("streamed.xlsx");
         workbook.save(&streamed).unwrap();
         assert_eq!(mode(&streamed), 0o666 & !umask);
@@ -251,7 +258,7 @@ mod permissions {
         let Some(&other) = other_groups(default).first() else {
             return;
         };
-        std::os::unix::fs::chown(&input, None, Some(other)).unwrap();
+        unix_fs::chown(&input, None, Some(other)).unwrap();
         let mut workbook = Workbook::open(&input).unwrap();
         workbook.set_cell("Data", "A1", "edited").unwrap();
         let saved = directory.join("saved.xlsx");
@@ -265,8 +272,8 @@ mod permissions {
         assert_eq!(gid(&input), default);
         let shared = directory.join("shared");
         fs::create_dir(&shared).unwrap();
-        std::os::unix::fs::chown(&shared, None, Some(other)).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2775)).unwrap();
+        unix_fs::chown(&shared, None, Some(other)).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o2775)).unwrap();
         let workbook = Workbook::open(&input).unwrap();
         let saved = shared.join("saved.xlsx");
         workbook.save_compact(&saved).unwrap();
@@ -287,7 +294,7 @@ mod permissions {
         let saved = directory.join("saved.xlsx");
         workbook.save(&saved).unwrap();
         assert_eq!(mode(&saved), 0o750 & !umask);
-        fs::set_permissions(&saved, fs::Permissions::from_mode(0o4755)).unwrap();
+        fs::set_permissions(&saved, Permissions::from_mode(0o4755)).unwrap();
         workbook.save(&saved).unwrap();
         assert_eq!(mode(&saved), 0o755);
         workbook.save(&input).unwrap();
@@ -333,7 +340,7 @@ mod permissions {
         let workbook = Workbook::open(source(&directory, 0o600)).unwrap();
         let destination = directory.join("existing.xlsx");
         fs::copy(FIXTURE, &destination).unwrap();
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&destination, Permissions::from_mode(0o644)).unwrap();
         workbook.save(&destination).unwrap();
         assert_eq!(mode(&destination), 0o644);
 

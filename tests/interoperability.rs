@@ -6,14 +6,8 @@ const LIBREOFFICE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 #[test]
 fn reads_and_edits_a_libreoffice_workbook_with_styles_and_formulas() {
     let mut workbook = Workbook::from_bytes(LIBREOFFICE.to_vec()).unwrap();
-    assert_eq!(
-        workbook
-            .sheets()
-            .iter()
-            .map(|sheet| sheet.name())
-            .collect::<Vec<_>>(),
-        ["Data", "Notes"]
-    );
+    let names: Vec<&str> = workbook.sheets().iter().map(|sheet| sheet.name()).collect();
+    assert_eq!(names, ["Data", "Notes"]);
     let original = workbook.get_cell("Data", "A1").unwrap();
     assert_eq!(original.value, CellValue::from("Original text"));
     assert_eq!(original.style_index, Some(1));

@@ -1,5 +1,8 @@
 use crate::{Error, Result};
-use std::{borrow::Cow, fmt, iter::FusedIterator, str::FromStr};
+use std::borrow::Cow;
+use std::fmt::{self, Alignment, Display, Formatter};
+use std::iter::FusedIterator;
+use std::str::FromStr;
 
 /// An A1 address within Excel's 16,384 columns and 1,048,576 rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -20,7 +23,7 @@ impl CellRef {
     ///
     /// Returns [`Error::InvalidCellReference`] unless the row is within
     /// `1..=`[`Self::MAX_ROW`] and the column is within `1..=`[`Self::MAX_COLUMN`].
-    pub fn new(row: u32, column: u16) -> Result<Self> {
+    pub fn try_new(row: u32, column: u16) -> Result<Self> {
         if !(1..=Self::MAX_ROW).contains(&row) || !(1..=Self::MAX_COLUMN).contains(&column) {
             return Err(Error::InvalidCellReference(format!(
                 "row {row}, column {column}"
@@ -28,11 +31,24 @@ impl CellRef {
         }
         Ok(Self { row, column })
     }
+
+    /// Construct an address from one-based row and column numbers.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellRef::try_new`")]
+    pub fn new(row: u32, column: u16) -> Result<Self> {
+        Self::try_new(row, column)
+    }
+
     /// Return the one-based row number.
+    #[must_use]
     pub fn row(self) -> u32 {
         self.row
     }
     /// Return the one-based column number.
+    #[must_use]
     pub fn column(self) -> u16 {
         self.column
     }
@@ -112,23 +128,23 @@ impl CellRef {
 
 // Formats an ASCII address built on the stack, honoring width, fill, and
 // alignment like a string.
-fn pad_ascii(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    f.pad(std::str::from_utf8(bytes).map_err(|_| fmt::Error)?)
+fn pad_ascii(f: &mut Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    f.pad(str::from_utf8(bytes).map_err(|_| fmt::Error)?)
 }
 
-impl fmt::Display for CellRef {
+impl Display for CellRef {
     /// Format as an A1 address, such as `"XFD1048576"`. Width, fill, and
     /// alignment are honored as for a string.
     ///
     /// ```
     /// use sheetpatch::CellRef;
     ///
-    /// let cell = CellRef::new(2, 28)?;
+    /// let cell = CellRef::try_new(2, 28)?;
     /// assert_eq!(cell.to_string(), "AB2");
     /// assert_eq!(format!("[{cell:>5}]"), "[  AB2]");
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut buffer = [0u8; Self::MAX_LEN];
         let len = self.encode(&mut buffer);
         pad_ascii(f, &buffer[..len])
@@ -148,7 +164,7 @@ impl fmt::Display for CellRef {
 /// let range: CellRange = "c2:A1".parse()?;
 /// assert_eq!(range.to_string(), "A1:C2");
 /// assert_eq!((range.height(), range.width(), range.cell_count()), (2, 3, 6));
-/// assert!(range.contains(CellRef::new(2, 2)?));
+/// assert!(range.contains(CellRef::try_new(2, 2)?));
 ///
 /// let cells: Vec<String> = range.cells().map(|cell| cell.to_string()).collect();
 /// assert_eq!(cells, ["A1", "B1", "C1", "A2", "B2", "C2"]);
@@ -185,6 +201,7 @@ impl CellRange {
     ///
     /// The corners can be given in any order; they are normalized so that
     /// [`Self::first`] is the top-left and [`Self::last`] the bottom-right cell.
+    #[must_use]
     pub fn new(a: CellRef, b: CellRef) -> Self {
         Self {
             first: CellRef {
@@ -198,28 +215,34 @@ impl CellRange {
         }
     }
     /// Return the top-left cell.
+    #[must_use]
     pub fn first(self) -> CellRef {
         self.first
     }
     /// Return the bottom-right cell.
+    #[must_use]
     pub fn last(self) -> CellRef {
         self.last
     }
     /// Return the number of rows, at least 1.
+    #[must_use]
     pub fn height(self) -> u32 {
         self.last.row - self.first.row + 1
     }
     /// Return the number of columns, at least 1.
+    #[must_use]
     pub fn width(self) -> u16 {
         self.last.column - self.first.column + 1
     }
     /// Return the number of cells, `height × width`.
     ///
     /// This is a `u64` because a whole worksheet holds more than 2³² cells.
+    #[must_use]
     pub fn cell_count(self) -> u64 {
         u64::from(self.height()) * u64::from(self.width())
     }
     /// Return whether the cell lies within this range.
+    #[must_use]
     pub fn contains(self, cell: CellRef) -> bool {
         (self.first.row..=self.last.row).contains(&cell.row)
             && (self.first.column..=self.last.column).contains(&cell.column)
@@ -275,7 +298,7 @@ impl FromStr for CellRange {
     }
 }
 
-impl fmt::Display for CellRange {
+impl Display for CellRange {
     /// Format as `"A1:C3"`, or as a single address such as `"B2"` when the
     /// range holds one cell. Width, fill, and alignment are honored as for a
     /// string.
@@ -287,7 +310,7 @@ impl fmt::Display for CellRange {
     /// assert_eq!(format!("[{range:-^9}]"), "[--A1:C3--]");
     /// # Ok::<(), sheetpatch::Error>(())
     /// ```
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut buffer = [0u8; 2 * CellRef::MAX_LEN + 1];
         let mut len = self.first.encode(&mut buffer);
         if self.first != self.last {
@@ -428,6 +451,10 @@ impl FusedIterator for CellRangeIter {}
 /// # Ok::<(), sheetpatch::Error>(())
 /// ```
 #[derive(Clone, Debug, Default, PartialEq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "a closed set of SpreadsheetML value types; see above"
+)]
 pub enum CellValue {
     /// Text, written as an inline string without creating a formula.
     Text(String),
@@ -469,19 +496,23 @@ impl CellValue {
             "#EXTERNAL!",
         ];
         match self {
-            Self::Number(n) if !n.is_finite() => {
+            Self::Number(number) if !number.is_finite() => {
                 Err(Error::InvalidValue("numbers must be finite".into()))
             }
             // Characters XML 1.0 forbids are written as Excel `_xHHHH_` escapes,
             // so any text a cell can hold, including text read back, is valid.
-            Self::Text(s) if s.len() > 32_767 && s.encode_utf16().take(32_768).count() > 32_767 => {
+            Self::Text(text)
+                if text.len() > 32_767 && text.encode_utf16().take(32_768).count() > 32_767 =>
+            {
                 Err(Error::InvalidValue(
                     "text exceeds Excel's 32,767 UTF-16 code unit limit".into(),
                 ))
             }
-            Self::Error(s) if !ERROR_VALUES.contains(&s.as_str()) => Err(Error::InvalidValue(
-                "error values must be an Excel error code such as #N/A or #DIV/0!".into(),
-            )),
+            Self::Error(code) if !ERROR_VALUES.contains(&code.as_str()) => {
+                Err(Error::InvalidValue(
+                    "error values must be an Excel error code such as #N/A or #DIV/0!".into(),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -528,12 +559,12 @@ impl CellEdit {
     ///
     /// Returns [`Error::InvalidCellReference`] for an invalid address, and
     /// otherwise [`Error::InvalidValue`] for a value no cell can hold.
-    pub fn new(
+    pub fn try_new(
         sheet: impl Into<String>,
         address: &str,
         value: impl Into<CellValue>,
     ) -> Result<Self> {
-        Self::at(sheet, address.parse()?, value)
+        Self::try_new_at(sheet, address.parse()?, value)
     }
 
     /// Construct an edit from a sheet name, a typed address, and a value.
@@ -547,7 +578,7 @@ impl CellEdit {
     /// Returns [`Error::InvalidValue`] for a non-finite number, text longer
     /// than Excel's 32,767 UTF-16 code units, or an error value that is not
     /// one of Excel's error codes.
-    pub fn at(
+    pub fn try_new_at(
         sheet: impl Into<String>,
         cell: CellRef,
         value: impl Into<CellValue>,
@@ -561,15 +592,46 @@ impl CellEdit {
         })
     }
 
+    /// Construct an edit from a sheet name, an A1 address, and a value.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellEdit::try_new`")]
+    pub fn new(
+        sheet: impl Into<String>,
+        address: &str,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        Self::try_new(sheet, address, value)
+    }
+
+    /// Construct an edit from a sheet name, a typed address, and a value.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Self::try_new_at`].
+    #[deprecated(since = "1.1.0", note = "renamed to `CellEdit::try_new_at`")]
+    pub fn at(
+        sheet: impl Into<String>,
+        cell: CellRef,
+        value: impl Into<CellValue>,
+    ) -> Result<Self> {
+        Self::try_new_at(sheet, cell, value)
+    }
+
     /// Return the target sheet name.
+    #[must_use]
     pub fn sheet(&self) -> &str {
         &self.sheet
     }
     /// Return the target cell address.
+    #[must_use]
     pub fn cell(&self) -> CellRef {
         self.cell
     }
     /// Return the validated value to write.
+    #[must_use]
     pub fn value(&self) -> &CellValue {
         &self.value
     }
@@ -593,6 +655,7 @@ impl CellEdit {
 /// ```
 impl CellValue {
     /// Return the text of a [`CellValue::Text`] value.
+    #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
@@ -600,6 +663,7 @@ impl CellValue {
         }
     }
     /// Return the number of a [`CellValue::Number`] value.
+    #[must_use]
     pub fn as_number(&self) -> Option<f64> {
         match self {
             Self::Number(number) => Some(*number),
@@ -607,6 +671,7 @@ impl CellValue {
         }
     }
     /// Return the boolean of a [`CellValue::Bool`] value.
+    #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
@@ -614,6 +679,7 @@ impl CellValue {
         }
     }
     /// Return the error token, such as `#N/A`, of a [`CellValue::Error`] value.
+    #[must_use]
     pub fn as_error(&self) -> Option<&str> {
         match self {
             Self::Error(token) => Some(token),
@@ -621,12 +687,13 @@ impl CellValue {
         }
     }
     /// Return whether this is [`CellValue::Blank`].
+    #[must_use]
     pub fn is_blank(&self) -> bool {
         matches!(self, Self::Blank)
     }
 }
 
-impl fmt::Display for CellValue {
+impl Display for CellValue {
     /// Format the value as plain text, matching the CLI's `get` output.
     ///
     /// Text and error tokens are written verbatim, numbers use `f64`'s
@@ -650,10 +717,10 @@ impl fmt::Display for CellValue {
     /// assert_eq!(CellValue::Error("#N/A".into()).to_string(), "#N/A");
     /// assert_eq!(CellValue::Blank.to_string(), "");
     /// ```
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Text(text) | Self::Error(text) => pad_whole(f, text),
-            Self::Number(number) => fmt::Display::fmt(number, f),
+            Self::Number(number) => Display::fmt(number, f),
             Self::Bool(true) => pad_whole(f, "true"),
             Self::Bool(false) => pad_whole(f, "false"),
             Self::Blank => pad_whole(f, ""),
@@ -664,7 +731,9 @@ impl fmt::Display for CellValue {
 // Pads `text` to the formatter's width with its fill and alignment (left by
 // default, as for strings), but ignores precision, which `Formatter::pad`
 // would apply by truncating the text.
-fn pad_whole(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+fn pad_whole(f: &mut Formatter<'_>, text: &str) -> fmt::Result {
+    use std::fmt::Write as _;
+
     if f.precision().is_none() {
         return f.pad(text);
     }
@@ -675,81 +744,81 @@ fn pad_whole(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
         return f.write_str(text);
     }
     let (before, after) = match f.align() {
-        Some(fmt::Alignment::Right) => (padding, 0),
-        Some(fmt::Alignment::Center) => (padding / 2, padding.div_ceil(2)),
-        Some(fmt::Alignment::Left) | None => (0, padding),
+        Some(Alignment::Right) => (padding, 0),
+        Some(Alignment::Center) => (padding / 2, padding.div_ceil(2)),
+        Some(Alignment::Left) | None => (0, padding),
     };
     let fill = f.fill();
     for _ in 0..before {
-        fmt::Write::write_char(f, fill)?;
+        f.write_char(fill)?;
     }
     f.write_str(text)?;
     for _ in 0..after {
-        fmt::Write::write_char(f, fill)?;
+        f.write_char(fill)?;
     }
     Ok(())
 }
 
 impl From<&str> for CellValue {
-    fn from(v: &str) -> Self {
-        Self::Text(v.to_owned())
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
     }
 }
 impl From<String> for CellValue {
-    fn from(v: String) -> Self {
-        Self::Text(v)
+    fn from(text: String) -> Self {
+        Self::Text(text)
     }
 }
 impl From<&String> for CellValue {
-    fn from(v: &String) -> Self {
-        Self::Text(v.clone())
+    fn from(text: &String) -> Self {
+        Self::Text(text.clone())
     }
 }
 impl From<Cow<'_, str>> for CellValue {
-    fn from(v: Cow<'_, str>) -> Self {
-        Self::Text(v.into_owned())
+    fn from(text: Cow<'_, str>) -> Self {
+        Self::Text(text.into_owned())
     }
 }
 impl From<char> for CellValue {
-    fn from(v: char) -> Self {
-        Self::Text(v.to_string())
+    fn from(character: char) -> Self {
+        Self::Text(character.to_string())
     }
 }
 impl From<f64> for CellValue {
-    fn from(v: f64) -> Self {
-        Self::Number(v)
+    fn from(number: f64) -> Self {
+        Self::Number(number)
     }
 }
 macro_rules! exact_number_from {
     ($($int:ty),*) => {$(
         /// Converts the integer to an exactly equal [`CellValue::Number`].
         impl From<$int> for CellValue {
-            fn from(v: $int) -> Self {
-                Self::Number(f64::from(v))
+            fn from(integer: $int) -> Self {
+                Self::Number(f64::from(integer))
             }
         }
     )*};
 }
 exact_number_from!(i8, i16, i32, u8, u16, u32);
 impl From<bool> for CellValue {
-    fn from(v: bool) -> Self {
-        Self::Bool(v)
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
     }
 }
 /// Converts `Some(value)` like `value` itself, and `None` to
 /// [`CellValue::Blank`], which clears the cell's value.
 impl<T: Into<CellValue>> From<Option<T>> for CellValue {
-    fn from(v: Option<T>) -> Self {
-        v.map_or(Self::Blank, Into::into)
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Blank, Into::into)
     }
 }
 
 /// 2^53: every integer up to this magnitude has an exact `f64` representation.
 const MAX_EXACT_INTEGER: u64 = 1 << 53;
 
-fn inexact_integer(v: impl fmt::Display) -> Error {
+fn inexact_integer(integer: impl Display) -> Error {
     Error::InvalidValue(format!(
-        "integer {v} exceeds 2^53 in magnitude, so it cannot be stored exactly as a number; \
+        "integer {integer} exceeds 2^53 in magnitude, so it cannot be stored exactly as a number; \
          write it as text"
     ))
 }
@@ -761,11 +830,11 @@ fn inexact_integer(v: impl fmt::Display) -> Error {
 impl TryFrom<i64> for CellValue {
     type Error = Error;
 
-    fn try_from(v: i64) -> Result<Self> {
-        if v.unsigned_abs() > MAX_EXACT_INTEGER {
-            return Err(inexact_integer(v));
+    fn try_from(integer: i64) -> Result<Self> {
+        if integer.unsigned_abs() > MAX_EXACT_INTEGER {
+            return Err(inexact_integer(integer));
         }
-        Ok(Self::Number(v as f64))
+        Ok(Self::Number(integer as f64))
     }
 }
 /// Converts the integer to an exactly equal [`CellValue::Number`], or returns
@@ -775,29 +844,29 @@ impl TryFrom<i64> for CellValue {
 impl TryFrom<u64> for CellValue {
     type Error = Error;
 
-    fn try_from(v: u64) -> Result<Self> {
-        if v > MAX_EXACT_INTEGER {
-            return Err(inexact_integer(v));
+    fn try_from(integer: u64) -> Result<Self> {
+        if integer > MAX_EXACT_INTEGER {
+            return Err(inexact_integer(integer));
         }
-        Ok(Self::Number(v as f64))
+        Ok(Self::Number(integer as f64))
     }
 }
 /// Converts like the [`i64`] conversion, rejecting magnitudes above 2^53.
 impl TryFrom<isize> for CellValue {
     type Error = Error;
 
-    fn try_from(v: isize) -> Result<Self> {
-        let v = i64::try_from(v).map_err(|_| inexact_integer(v))?;
-        Self::try_from(v)
+    fn try_from(integer: isize) -> Result<Self> {
+        let integer = i64::try_from(integer).map_err(|_| inexact_integer(integer))?;
+        Self::try_from(integer)
     }
 }
 /// Converts like the [`u64`] conversion, rejecting values above 2^53.
 impl TryFrom<usize> for CellValue {
     type Error = Error;
 
-    fn try_from(v: usize) -> Result<Self> {
-        let v = u64::try_from(v).map_err(|_| inexact_integer(v))?;
-        Self::try_from(v)
+    fn try_from(integer: usize) -> Result<Self> {
+        let integer = u64::try_from(integer).map_err(|_| inexact_integer(integer))?;
+        Self::try_from(integer)
     }
 }
 
@@ -897,14 +966,14 @@ mod tests {
     #[test]
     fn typed_addresses_and_edits_validate_before_mutation() {
         assert_eq!(
-            CellRef::new(1_048_576, 16_384).unwrap().to_string(),
+            CellRef::try_new(1_048_576, 16_384).unwrap().to_string(),
             "XFD1048576"
         );
         for (row, column) in [(0, 1), (1, 0), (1_048_577, 1), (1, 16_385)] {
-            assert!(CellRef::new(row, column).is_err());
+            assert!(CellRef::try_new(row, column).is_err());
         }
-        assert!(CellEdit::new("Data", "A1", f64::NAN).is_err());
-        let edit = CellEdit::at("Data", CellRef::new(2, 3).unwrap(), 7).unwrap();
+        assert!(CellEdit::try_new("Data", "A1", f64::NAN).is_err());
+        let edit = CellEdit::try_new_at("Data", CellRef::try_new(2, 3).unwrap(), 7).unwrap();
         assert_eq!(edit.sheet(), "Data");
         assert_eq!(edit.cell().to_string(), "C2");
         assert_eq!(edit.value(), &CellValue::Number(7.0));

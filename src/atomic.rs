@@ -1,11 +1,14 @@
 //! Write a complete replacement beside the destination before renaming it.
 use crate::Result;
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, BufWriter, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+#[cfg(target_os = "linux")]
+use rustix::fs as rustix_fs;
+#[cfg(target_os = "linux")]
+use rustix::io as rustix_io;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Temporary {
     path: PathBuf,
@@ -49,7 +52,9 @@ impl Drop for Temporary {
 
 impl Temporary {
     fn file(&self) -> &File {
-        self.file.as_ref().expect("temporary file is open")
+        self.file
+            .as_ref()
+            .expect("the temporary file stays open until `write` closes it to rename it")
     }
 }
 
@@ -65,14 +70,14 @@ pub(crate) struct SourcePermissions {
 
 impl SourcePermissions {
     /// The permissions of `file`, an open regular file with `metadata`.
-    pub(crate) fn new(file: &File, metadata: &fs::Metadata) -> Self {
+    pub(crate) fn new(file: &File, metadata: &Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
 
             #[cfg(target_os = "linux")]
             let mode = file_mode(metadata, |value| {
-                rustix::fs::fgetxattr(file, ACCESS_ACL, value)
+                rustix_fs::fgetxattr(file, ACCESS_ACL, value)
             });
             #[cfg(not(target_os = "linux"))]
             let mode = {
@@ -137,7 +142,7 @@ impl Mode {
         // An empty buffer asks only whether the file has an access ACL.
         #[cfg(target_os = "linux")]
         let has_acl = self.masked != self.plain
-            && rustix::fs::fgetxattr(file, ACCESS_ACL, &mut [0; 0]).is_ok();
+            && rustix_fs::fgetxattr(file, ACCESS_ACL, &mut [0; 0]).is_ok();
         // Elsewhere both modes are the file's mode bits as they are.
         #[cfg(not(target_os = "linux"))]
         let has_acl = {
@@ -160,14 +165,14 @@ const ACCESS_ACL: &str = "system.posix_acl_access";
 /// and other bits are cleared.
 #[cfg(target_os = "linux")]
 fn file_mode(
-    metadata: &fs::Metadata,
-    read_acl: impl FnOnce(&mut [u8]) -> rustix::io::Result<usize>,
+    metadata: &Metadata,
+    read_acl: impl FnOnce(&mut [u8]) -> rustix_io::Result<usize>,
 ) -> Mode {
     use rustix::io::Errno;
     use std::os::unix::fs::MetadataExt;
 
     // No extended attribute value is larger than XATTR_SIZE_MAX (64 KiB).
-    let mut value = vec![0; 1 << 16];
+    let mut value: Vec<u8> = vec![0; 1 << 16];
     match read_acl(&mut value) {
         Ok(len) => effective_mode(metadata.mode(), Some(&value[..len])),
         Err(Errno::NODATA | Errno::NOTSUP) => effective_mode(metadata.mode(), None),
@@ -246,7 +251,7 @@ fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> 
     loop {
         let candidate = destination.with_file_name(format!(
             ".{prefix}.sheetpatch-{}-{}.tmp",
-            std::process::id(),
+            process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = OpenOptions::new();
@@ -269,8 +274,8 @@ fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> 
                     renamed: false,
                 });
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -281,7 +286,7 @@ fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> 
 /// replaced by the new file. Anything else that already exists (a directory,
 /// FIFO, device, or socket) cannot be replaced by renaming a workbook over
 /// it, so it is rejected before any output is generated.
-fn existing_destination(path: &Path) -> io::Result<Option<fs::Metadata>> {
+fn existing_destination(path: &Path) -> io::Result<Option<Metadata>> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
         Ok(_) => Err(io::Error::new(
@@ -332,23 +337,24 @@ fn replacement_bits(mode: Mode, same_group: bool, inherited_acl: bool) -> u32 {
 /// group change without applying it.
 #[cfg(unix)]
 fn assign_group(file: &File, gid: u32) -> io::Result<bool> {
-    use std::os::unix::fs::{MetadataExt, fchown};
+    use std::os::unix::fs::{self as unix_fs, MetadataExt};
 
     Ok(file.metadata()?.gid() == gid
-        || (fchown(file, None, Some(gid)).is_ok() && file.metadata()?.gid() == gid))
+        || (unix_fs::fchown(file, None, Some(gid)).is_ok() && file.metadata()?.gid() == gid))
 }
 
 /// Create the replacement of `path`, an existing destination with resolved
 /// metadata `destination`, with the destination's group and mode bits before
 /// any contents are written.
 #[cfg(unix)]
-fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Temporary> {
+fn create_replacement(path: &Path, destination: &Metadata) -> Result<Temporary> {
+    use std::fs::Permissions;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Like the metadata, the ACL is read through symlinks.
     #[cfg(target_os = "linux")]
     let mode = file_mode(destination, |value| {
-        rustix::fs::getxattr(path, ACCESS_ACL, value)
+        rustix_fs::getxattr(path, ACCESS_ACL, value)
     });
     #[cfg(not(target_os = "linux"))]
     let mode = Mode::from(destination.mode());
@@ -358,7 +364,7 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
     let same_group = assign_group(temp.file(), destination.gid())?;
     let inherited_acl = same_group && mode.inherited_acl(temp.file());
     temp.file()
-        .set_permissions(fs::Permissions::from_mode(replacement_bits(
+        .set_permissions(Permissions::from_mode(replacement_bits(
             mode,
             same_group,
             inherited_acl,
@@ -367,7 +373,7 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
 }
 
 #[cfg(not(unix))]
-fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Temporary> {
+fn create_replacement(path: &Path, destination: &Metadata) -> Result<Temporary> {
     let temp = create_temporary(path, None)?;
     temp.file().set_permissions(destination.permissions())?;
     Ok(temp)
@@ -381,6 +387,7 @@ fn create_replacement(path: &Path, destination: &fs::Metadata) -> Result<Tempora
 /// assigning that group when the process may.
 #[cfg(unix)]
 fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporary> {
+    use std::fs::Permissions;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let Some(source) = source else {
@@ -420,9 +427,7 @@ fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporar
         mode & source.mode.plain
     };
     temp.file()
-        .set_permissions(fs::Permissions::from_mode(replacement_mode(
-            mode, same_group,
-        )))?;
+        .set_permissions(Permissions::from_mode(replacement_mode(mode, same_group)))?;
     Ok(temp)
 }
 
@@ -466,6 +471,8 @@ pub(crate) fn write(
     source: Option<SourcePermissions>,
     serialize: impl FnOnce(&mut BufWriter<&File>) -> Result<()>,
 ) -> Result<()> {
+    use std::io::Write as _;
+
     if path.file_name().is_none() {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "destination must name a file").into(),
@@ -482,7 +489,7 @@ pub(crate) fn write(
         Some(existing) => create_replacement(path, &existing)?,
         None => create_new(path, source)?,
     };
-    let file = temp.file.as_ref().expect("temporary file is open");
+    let file = temp.file();
     {
         let mut writer = BufWriter::new(file);
         serialize(&mut writer)?;
@@ -500,6 +507,14 @@ pub(crate) fn write(
 mod tests {
     use super::*;
     use crate::Error;
+    use std::env;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+    #[cfg(unix)]
+    use std::process::Command;
 
     /// A uniquely named directory that is removed even when a test fails.
     struct TempDir(PathBuf);
@@ -507,9 +522,9 @@ mod tests {
     impl TempDir {
         fn new(label: &str) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let path = env::temp_dir().join(format!(
                 "sheetpatch-atomic-{label}-{}-{}",
-                std::process::id(),
+                process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
@@ -588,17 +603,16 @@ mod tests {
     /// The process's groups other than `default`, which it may assign.
     #[cfg(unix)]
     fn other_groups(default: u32) -> Vec<u32> {
-        let output = std::process::Command::new("id").arg("-G").output();
-        output
+        let output = Command::new("id").arg("-G").output();
+        let Some(groups) = output
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
-            .into_iter()
-            .flat_map(|groups| {
-                groups
-                    .split_whitespace()
-                    .filter_map(|gid| gid.parse::<u32>().ok())
-                    .collect::<Vec<_>>()
-            })
+        else {
+            return Vec::new();
+        };
+        groups
+            .split_whitespace()
+            .filter_map(|gid| gid.parse().ok())
             .filter(|&gid| gid != default)
             .collect()
     }
@@ -613,7 +627,7 @@ mod tests {
         let foreign = [0, 65534, 54321].into_iter().find(|&gid| {
             gid != default
                 && !groups.contains(&gid)
-                && std::os::unix::fs::chown(&probe, None, Some(gid)).is_err()
+                && unix_fs::chown(&probe, None, Some(gid)).is_err()
         });
         fs::remove_file(probe).unwrap();
         foreign
@@ -720,10 +734,11 @@ mod tests {
     #[test]
     fn fifo_and_socket_destinations_are_rejected_without_being_replaced() {
         use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
 
         let directory = TempDir::new("special");
         let fifo = directory.join("fifo.xlsx");
-        let status = std::process::Command::new("mkfifo")
+        let status = Command::new("mkfifo")
             .arg(&fifo)
             .status()
             .expect("mkfifo is available");
@@ -734,7 +749,7 @@ mod tests {
         assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
 
         let socket = directory.join("socket.xlsx");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
         let result = write(&socket, None, |_| panic!("rejected before serializing"));
         assert_invalid_input(result, "destination is not a regular file");
         assert!(
@@ -749,11 +764,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinks_to_devices_are_rejected_and_symlinks_to_files_are_replaced() {
-        use std::os::unix::fs::{FileTypeExt, symlink};
+        use std::os::unix::fs::FileTypeExt;
 
         let directory = TempDir::new("symlink");
         let device = directory.join("null.xlsx");
-        symlink("/dev/null", &device).unwrap();
+        unix_fs::symlink("/dev/null", &device).unwrap();
         let result = write(&device, None, |_| panic!("rejected before serializing"));
         assert_invalid_input(result, "destination is not a regular file");
         assert!(fs::symlink_metadata(&device).unwrap().is_symlink());
@@ -764,7 +779,7 @@ mod tests {
         let target = directory.join("target.xlsx");
         fs::write(&target, b"original").unwrap();
         let link = directory.join("link.xlsx");
-        symlink(&target, &link).unwrap();
+        unix_fs::symlink(&target, &link).unwrap();
         replace(&link, b"replacement").unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_file());
         assert_eq!(fs::read(&link).unwrap(), b"replacement");
@@ -805,7 +820,7 @@ mod tests {
         let directory = TempDir::new("private");
         let destination = directory.join("book.xlsx");
         fs::write(&destination, b"private original").unwrap();
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&destination, Permissions::from_mode(0o600)).unwrap();
         let gid = fs::metadata(&destination).unwrap().gid();
         write(&destination, None, |writer| {
             let temporary = fs::read_dir(&directory.0)?
@@ -837,7 +852,7 @@ mod tests {
         // Like `sed -i`, a rename-based save also replaces a read-only (0o400)
         // destination on Unix; Windows refuses (see the Windows-only test).
         for permissions in [0o640, 0o604, 0o644, 0o400] {
-            fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(permissions)).unwrap();
             // A private source must not override an existing file's mode.
             let source = SourcePermissions {
                 mode: Mode::from(0o600),
@@ -850,17 +865,17 @@ mod tests {
             .unwrap();
             assert_eq!(mode(&destination), permissions);
             assert_eq!(fs::metadata(&destination).unwrap().gid(), default_gid);
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(0o600)).unwrap();
         }
 
         // When the user belongs to another group, a destination in that group
         // keeps it, along with its group permission bits.
         let other_group = other_groups(default_gid)
             .into_iter()
-            .find(|&gid| std::os::unix::fs::chown(&destination, None, Some(gid)).is_ok());
+            .find(|&gid| unix_fs::chown(&destination, None, Some(gid)).is_ok());
         if let Some(gid) = other_group {
             assert_eq!(fs::metadata(&destination).unwrap().gid(), gid);
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(0o640)).unwrap();
             replace(&destination, b"group replacement").unwrap();
             assert_eq!(fs::read(&destination).unwrap(), b"group replacement");
             assert_eq!(fs::metadata(&destination).unwrap().gid(), gid);
@@ -872,14 +887,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn group_permissions_are_withheld_from_a_different_group() {
-        assert_eq!(replacement_mode(0o640, true), 0o640);
-        assert_eq!(replacement_mode(0o640, false), 0o600);
-        assert_eq!(replacement_mode(0o664, false), 0o604);
-        assert_eq!(replacement_mode(0o2775, true), 0o775);
-        assert_eq!(replacement_mode(0o2775, false), 0o705);
-        assert_eq!(replacement_mode(0o4755, false), 0o705);
-        assert_eq!(replacement_mode(0o7777, true), 0o777);
-        assert_eq!(replacement_mode(0o100_644, true), 0o644);
+        assert_eq!(replacement_mode(0o640, /* same_group: */ true), 0o640);
+        assert_eq!(replacement_mode(0o640, /* same_group: */ false), 0o600);
+        assert_eq!(replacement_mode(0o664, /* same_group: */ false), 0o604);
+        assert_eq!(replacement_mode(0o2775, /* same_group: */ true), 0o775);
+        assert_eq!(replacement_mode(0o2775, /* same_group: */ false), 0o705);
+        assert_eq!(replacement_mode(0o4755, /* same_group: */ false), 0o705);
+        assert_eq!(replacement_mode(0o7777, /* same_group: */ true), 0o777);
+        assert_eq!(replacement_mode(0o100_644, /* same_group: */ true), 0o644);
     }
 
     #[cfg(unix)]
@@ -889,8 +904,11 @@ mod tests {
         // the old group denied read access by 0604 must not gain it when they
         // become "other" after the replacement gets a different group.
         for (original, expected) in [(0o604, 0o600), (0o646, 0o604), (0o624, 0o600)] {
-            assert_eq!(replacement_mode(original, false), expected);
-            assert_eq!(replacement_mode(original, true), original);
+            assert_eq!(
+                replacement_mode(original, /* same_group: */ false),
+                expected
+            );
+            assert_eq!(replacement_mode(original, /* same_group: */ true), original);
         }
 
         let directory = TempDir::new("other-access");
@@ -921,7 +939,7 @@ mod tests {
         // replacement deliberately has none of these bits.
         for permissions in [0o4755, 0o2755, 0o1755, 0o6750, 0o7777] {
             // Some systems refuse a sticky bit on a regular file.
-            if fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).is_err()
+            if fs::set_permissions(&destination, Permissions::from_mode(permissions)).is_err()
                 || mode(&destination) != permissions
             {
                 continue;
@@ -1015,8 +1033,8 @@ mod tests {
         // group access.
         let shared = directory.join("shared");
         fs::create_dir(&shared).unwrap();
-        std::os::unix::fs::chown(&shared, None, Some(other)).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2775)).unwrap();
+        unix_fs::chown(&shared, None, Some(other)).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o2775)).unwrap();
         assert_eq!(default_gid(&shared), other);
         let destination = shared.join("inherited.xlsx");
         let source = SourcePermissions {
@@ -1046,7 +1064,7 @@ mod tests {
     /// `setfacl` is missing or the filesystem refuses ACLs.
     #[cfg(target_os = "linux")]
     fn share_with_one_user(path: &Path) -> bool {
-        std::process::Command::new("setfacl")
+        Command::new("setfacl")
             .args(["-m", "u:65534:rw"])
             .arg(path)
             .output()
@@ -1064,7 +1082,7 @@ mod tests {
         for permissions in [0o600, 0o604] {
             let destination = directory.join(&format!("book-{permissions:o}.xlsx"));
             fs::write(&destination, b"original").unwrap();
-            fs::set_permissions(&destination, fs::Permissions::from_mode(permissions)).unwrap();
+            fs::set_permissions(&destination, Permissions::from_mode(permissions)).unwrap();
             if !share_with_one_user(&destination) {
                 return;
             }
@@ -1106,7 +1124,7 @@ mod tests {
     /// refuses ACLs.
     #[cfg(target_os = "linux")]
     fn share_new_files_with_one_user(directory: &Path) -> bool {
-        std::process::Command::new("setfacl")
+        Command::new("setfacl")
             .args(["-d", "-m", "u:65534:rw,g::-,o::r"])
             .arg(directory)
             .output()
@@ -1159,19 +1177,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn symlinked_destinations_use_the_access_acl_of_their_target() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new("acl-symlink");
         let target = directory.join("target.xlsx");
         fs::write(&target, b"original").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
         if !share_with_one_user(&target) {
             return;
         }
         // The link has no ACL of its own. Like the mode bits, the owning
         // group's entry comes from the target, so the group gets no access.
         let link = directory.join("link.xlsx");
-        symlink(&target, &link).unwrap();
+        unix_fs::symlink(&target, &link).unwrap();
         replace(&link, b"replacement").unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_file());
         assert_eq!(mode(&link), 0o600);
@@ -1188,13 +1206,25 @@ mod tests {
             plain: 0o604,
             masked: 0o664,
         };
-        // In another group, others keep only what the owning group had.
-        assert_eq!(replacement_bits(mode, false, false), 0o600);
-        assert_eq!(replacement_bits(mode, false, true), 0o600);
-        // In the destination's group, an inherited ACL keeps the mask.
-        assert_eq!(replacement_bits(mode, true, false), 0o604);
-        assert_eq!(replacement_bits(mode, true, true), 0o664);
-        assert_eq!(replacement_bits(Mode::from(0o4775), false, false), 0o705);
+        // Each case is a destination's mode, whether its replacement has the
+        // destination's group, whether the replacement inherited an access
+        // ACL, and the replacement's permission bits.
+        let cases = [
+            // In another group, others keep only what the owning group had.
+            (mode, false, false, 0o600),
+            (mode, false, true, 0o600),
+            // In the destination's group, an inherited ACL keeps the mask.
+            (mode, true, false, 0o604),
+            (mode, true, true, 0o664),
+            (Mode::from(0o4775), false, false, 0o705),
+        ];
+        for (mode, same_group, inherited_acl, expected) in cases {
+            assert_eq!(
+                replacement_bits(mode, same_group, inherited_acl),
+                expected,
+                "{mode:?}, same group: {same_group}, inherited ACL: {inherited_acl}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1298,7 +1328,7 @@ mod tests {
         let directory = TempDir::new("acl-errors");
         let path = directory.join("book.xlsx");
         fs::write(&path, b"").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o664)).unwrap();
         let metadata = fs::metadata(&path).unwrap();
         // No ACL, or no ACL support: the mode bits are the permissions.
         for error in [Errno::NODATA, Errno::NOTSUP, Errno::OPNOTSUPP] {
@@ -1356,7 +1386,7 @@ mod tests {
             let temporary = temporary.expect("temporary file exists while serializing");
             let temporary = temporary.to_str().unwrap();
             let counter = temporary
-                .strip_prefix(&format!(".{prefix}.sheetpatch-{}-", std::process::id()))
+                .strip_prefix(&format!(".{prefix}.sheetpatch-{}-", process::id()))
                 .and_then(|rest| rest.strip_suffix(".tmp"));
             assert!(
                 counter.is_some_and(|counter| counter.parse::<u64>().is_ok()),

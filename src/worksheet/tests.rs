@@ -1,8 +1,50 @@
-use super::parse::{XmlDocument, parse};
-use super::patch::text_escaped;
-use super::validation::validate_ranges;
-use super::*;
-use crate::CellRange;
+use super::parse::{self, STRICT, TRANSITIONAL, XmlDocument};
+use super::prepared_worksheet::{self, PreparedWorksheet};
+use super::read::{self, ArenaPeaks, ReadError, SharedStrings};
+use super::validation::{self, RangeKind};
+use super::{date, patch, protection};
+use crate::{CellContent, CellRange, CellRef, CellValue, Error, Result};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::iter;
+
+fn patch_cells<'xml, 'strings>(
+    xml: &'xml [u8],
+    cells: &BTreeMap<CellRef, CellValue>,
+    shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
+    date1904: bool,
+) -> Result<Cow<'xml, [u8]>> {
+    PreparedWorksheet::parse(xml)?.patch_cells(cells, shared_strings, date1904)
+}
+
+fn patch_cell(xml: &[u8], cell: CellRef, value: &CellValue) -> Result<Vec<u8>> {
+    patch_cells(
+        xml,
+        &BTreeMap::from([(cell, value.clone())]),
+        || None,
+        /* date1904: */ false,
+    )
+    .map(Cow::into_owned)
+}
+
+fn read_cell(
+    xml: &[u8],
+    cell: CellRef,
+    shared_strings: Option<&SharedStrings>,
+) -> Result<CellContent> {
+    prepared_worksheet::read_cells(
+        xml,
+        &[cell],
+        || Ok(shared_strings),
+        /* date1904: */ false,
+    )
+    .map(|mut cells| cells.remove(0))
+    .map_err(|error| match error {
+        ReadError::Worksheet(error)
+        | ReadError::SharedStrings(error)
+        | ReadError::UndecodableString { error, .. } => error,
+    })
+}
 
 fn sheet(body: &str) -> String {
     format!(
@@ -79,16 +121,16 @@ fn indexes_direct_children_across_nested_extensions_and_empty_elements() {
     let input = sheet(&format!(
         "{foreign}<sheetData>{foreign}<row r='1'>{foreign}<c r='A1' t='inlineStr'>{rich}{foreign}</c>{foreign}<c r='C1'/>{foreign}</row>{foreign}<row r='3'/>{foreign}</sheetData>{foreign}"
     ));
-    let addresses: Vec<_> = ["A1", "C1", "A2", "B3"]
+    let addresses: Vec<CellRef> = ["A1", "C1", "A2", "B3"]
         .iter()
         .map(|address| address.parse().unwrap())
         .collect();
     assert_eq!(
-        read_cells(
+        prepared_worksheet::read_cells(
             input.as_bytes(),
             &addresses,
             || panic!("inline strings should not load shared strings"),
-            false
+            /* date1904: */ false
         )
         .unwrap()
         .into_iter()
@@ -124,11 +166,11 @@ fn indexes_direct_children_across_nested_extensions_and_empty_elements() {
         );
     assert_eq!(changed, expected);
     assert_eq!(
-        read_cells(
+        prepared_worksheet::read_cells(
             changed.as_bytes(),
             &addresses,
             || panic!("inline strings should not load shared strings"),
-            false
+            /* date1904: */ false
         )
         .unwrap()
         .into_iter()
@@ -190,13 +232,13 @@ fn normalizes_literal_attribute_whitespace_before_character_references() {
         elements,
         attributes,
         ..
-    } = parse(input.as_bytes()).unwrap();
+    } = parse::parse(input.as_bytes()).unwrap();
     let cell = elements
         .iter()
         .find(|element| element.is(source, elements[0].namespace, "c"))
         .unwrap();
     assert_eq!(
-        cell.attr(&attributes, "x:flag").unwrap().value,
+        cell.attribute(&attributes, "x:flag").unwrap().value,
         "a b c d e\rf\ng\th"
     );
     let changed = edit(&input, "A1", 2.0.into()).unwrap();
@@ -246,11 +288,17 @@ fn formula_cells_are_those_with_a_main_namespace_formula_child() {
         "<sheetData><row r='1'><c r='A1'><v>1</v></c><c r='B1'><x:f>foreign</x:f><v>2</v></c><c r='C1'><v>3</v><f>C2</f></c></row><row r='3'><c r='A3' xmlns:s='{TRANSITIONAL}'><s:f>1</s:f></c><c r='B3'/></row></sheetData>"
     ));
     let edits = |addresses: &[&str]| {
-        let cells = addresses
+        let cells: BTreeMap<CellRef, CellValue> = addresses
             .iter()
             .map(|address| (address.parse().unwrap(), CellValue::Number(9.0)))
             .collect();
-        patch_cells(input.as_bytes(), &cells, || None, false).map(Cow::into_owned)
+        patch_cells(
+            input.as_bytes(),
+            &cells,
+            || None,
+            /* date1904: */ false,
+        )
+        .map(Cow::into_owned)
     };
     for address in ["A1", "B1", "B3", "A2", "D1", "C3"] {
         assert!(edits(&[address]).is_ok(), "{address}");
@@ -479,7 +527,7 @@ fn generated_elements_use_the_context_prefix_after_default_namespace_rebinding()
         ],
     )
     .unwrap();
-    let contents = read_cells(
+    let contents = prepared_worksheet::read_cells(
         output.as_bytes(),
         &[
             "A1".parse().unwrap(),
@@ -487,7 +535,7 @@ fn generated_elements_use_the_context_prefix_after_default_namespace_rebinding()
             "C2".parse().unwrap(),
         ],
         || Ok(None),
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert_eq!(
@@ -546,11 +594,11 @@ fn clearing_empty_typed_cells_removes_type_and_retains_unknown_content() {
 #[test]
 fn escapes_excel_tokens_and_carriage_returns() {
     assert_eq!(
-        text_escaped("_x0041_\r&_Xabcd_"),
+        patch::text_escaped("_x0041_\r&_Xabcd_"),
         "_x005F_x0041_&#13;&amp;_Xabcd_"
     );
     assert_eq!(
-        text_escaped("<\0\u{b}_x000B\u{b}\u{ffff}>"),
+        patch::text_escaped("<\0\u{b}_x000B\u{b}\u{ffff}>"),
         "&lt;_x0000__x000B__x005F_x000B_x000B__xFFFF_&gt;"
     );
 }
@@ -901,7 +949,7 @@ fn shared_strings_are_loaded_only_for_text_over_shared_cells() {
             loads += 1;
             Some(&strings)
         },
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert!(matches!(unchanged, Cow::Borrowed(_)));
@@ -915,7 +963,7 @@ fn shared_strings_are_loaded_only_for_text_over_shared_cells() {
             ("C1", "x".into()),
         ]),
         || panic!("shared strings are not needed"),
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert!(matches!(changed, Cow::Owned(_)));
@@ -924,7 +972,7 @@ fn shared_strings_are_loaded_only_for_text_over_shared_cells() {
         input.as_bytes(),
         &cells(&[("A1", "first".into()), ("B1", "second".into())]),
         || None,
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert_eq!(
@@ -974,7 +1022,6 @@ fn new_cells_use_row_or_column_default_styles_with_the_context_prefix() {
 #[test]
 fn iso_dates_convert_in_both_date_systems() {
     use super::date::DateError::{BeforeEpoch, Invalid, TimeZoneOffset};
-    use super::date::excel_serial;
     for (text, serial_1900, serial_1904) in [
         ("1900-01-01", Ok(1.0), Err(BeforeEpoch)),
         ("1900-02-28", Ok(59.0), Err(BeforeEpoch)),
@@ -1030,8 +1077,16 @@ fn iso_dates_convert_in_both_date_systems() {
         ("12:00:00.+1", Err(Invalid), Err(Invalid)),
         ("", Err(Invalid), Err(Invalid)),
     ] {
-        assert_eq!(excel_serial(text, false), serial_1900, "{text}");
-        assert_eq!(excel_serial(text, true), serial_1904, "{text}");
+        assert_eq!(
+            date::excel_serial(text, /* date1904: */ false),
+            serial_1900,
+            "{text}"
+        );
+        assert_eq!(
+            date::excel_serial(text, /* date1904: */ true),
+            serial_1904,
+            "{text}"
+        );
     }
     // A time before midnight never rounds into the next day, even where the
     // fraction of a second rounds up to 60 seconds or the day's serial leaves
@@ -1044,7 +1099,7 @@ fn iso_dates_convert_in_both_date_systems() {
         ("2024-01-15T23:59:59.9999999999999999Z", 45_306.0),
         ("9999-12-31T23:59:59.999999999", 2_958_465.0),
     ] {
-        let serial = excel_serial(text, false).unwrap();
+        let serial = date::excel_serial(text, /* date1904: */ false).unwrap();
         assert!(serial >= day && serial < day + 1.0, "{text}: {serial}");
         assert!(serial > day + 0.9999, "{text}: {serial}");
     }
@@ -1052,7 +1107,7 @@ fn iso_dates_convert_in_both_date_systems() {
         "<sheetData><row r='1'><c r='A1' t='d' s='3'><v>2024-01-15</v></c><c r='B1' t='d'><v>1899-12-31T12:00:00</v></c></row></sheetData>",
     );
     for (date1904, serial) in [(false, 45_306.0), (true, 43_844.0)] {
-        let content = read_cells(
+        let content = prepared_worksheet::read_cells(
             input.as_bytes(),
             &["A1".parse().unwrap()],
             || panic!("no strings"),
@@ -1080,11 +1135,17 @@ fn iso_dates_convert_in_both_date_systems() {
     };
     // Rewriting a date cell's own serial, in the workbook's date system,
     // leaves its exact XML.
-    assert!(matches!(date_cell(false, 45_306.0), Cow::Borrowed(_)));
-    assert!(matches!(date_cell(true, 43_844.0), Cow::Borrowed(_)));
+    assert!(matches!(
+        date_cell(/* date1904: */ false, 45_306.0),
+        Cow::Borrowed(_)
+    ));
+    assert!(matches!(
+        date_cell(/* date1904: */ true, 43_844.0),
+        Cow::Borrowed(_)
+    ));
     // Any other number replaces the date with a plain number.
     assert_eq!(
-        date_cell(true, 45_306.0).as_ref(),
+        date_cell(/* date1904: */ true, 45_306.0).as_ref(),
         input
             .replace(" t='d' s='3'><v>2024-01-15", " s='3'><v>45306")
             .as_bytes()
@@ -1216,7 +1277,7 @@ fn rejects_illegal_namespace_declarations_even_when_unused_or_escaped() {
 // makes its default resolver accept HTML entities. XML 1.0 predefines five.
 #[test]
 fn only_xml_10_entities_are_resolved_whatever_quick_xml_features_are_enabled() {
-    let a1 = "A1".parse().unwrap();
+    let a1: CellRef = "A1".parse().unwrap();
     let cell = |attributes: &str, text: &str| {
         sheet(&format!(
             "<sheetData><row r='1'><c r='A1' t='inlineStr'{attributes}><is><t>{text}</t></is></c></row></sheetData>"
@@ -1253,7 +1314,9 @@ fn only_xml_10_entities_are_resolved_whatever_quick_xml_features_are_enabled() {
         read_cell(cell("", "&nbsp;").as_bytes(), a1, None).map(|_| ())
     ));
     let table = format!("<sst xmlns='{TRANSITIONAL}'><si><t>a&nbsp;b</t></si></sst>");
-    assert!(undefined(read_shared_strings(table.as_bytes()).map(|_| ())));
+    assert!(undefined(
+        read::read_shared_strings(table.as_bytes()).map(|_| ())
+    ));
 }
 
 #[test]
@@ -1287,14 +1350,14 @@ fn validates_xml_declarations_and_retains_valid_unicode_names() {
 }
 
 fn batch(xml: &str, changes: &[(&str, CellValue)]) -> Result<String> {
-    let cells = changes
+    let cells: BTreeMap<CellRef, CellValue> = changes
         .iter()
         .map(|(address, value)| (address.parse().unwrap(), value.clone()))
         .collect();
-    Ok(
-        String::from_utf8(patch_cells(xml.as_bytes(), &cells, || None, false)?.into_owned())
-            .unwrap(),
+    Ok(String::from_utf8(
+        patch_cells(xml.as_bytes(), &cells, || None, /* date1904: */ false)?.into_owned(),
     )
+    .unwrap())
 }
 
 #[test]
@@ -1417,12 +1480,18 @@ fn reads_values_formulas_styles_and_preserves_requested_order() {
     let input = sheet(
         r#"<sheetData><row r="1"><c r="A1" s="7"><f>SUM(B1,C1)&amp;2</f><v>42.5</v></c><c r="B1" t="b"><v>1</v></c><c r="C1" t="inlineStr"><is><r><rPr><b/></rPr><t>rich &amp; </t></r><r><t>text</t></r><rPh sb="0" eb="1"><t>phonetic</t></rPh></is></c><c r="D1" t="s"><v>1</v></c><c r="E1" t="e"><v>#DIV/0!</v></c><c r="F1" t="str"><f>"cached"</f><v>cached</v></c><c r="G1" s="9"/></row></sheetData>"#,
     );
-    let addresses: Vec<_> = ["C1", "A1", "D1", "B1", "E1", "F1", "G1", "A2", "C1"]
+    let addresses: Vec<CellRef> = ["C1", "A1", "D1", "B1", "E1", "F1", "G1", "A2", "C1"]
         .iter()
         .map(|address| address.parse().unwrap())
         .collect();
     let strings = SharedStrings::from_iter(["first", "second"]);
-    let cells = read_cells(input.as_bytes(), &addresses, || Ok(Some(&strings)), false).unwrap();
+    let cells = prepared_worksheet::read_cells(
+        input.as_bytes(),
+        &addresses,
+        || Ok(Some(&strings)),
+        /* date1904: */ false,
+    )
+    .unwrap();
     assert_eq!(
         cells
             .iter()
@@ -1451,11 +1520,11 @@ fn shared_strings_are_loaded_only_for_requested_shared_cells() {
     let input = sheet(
         r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row></sheetData>"#,
     );
-    let numeric = read_cells(
+    let numeric = prepared_worksheet::read_cells(
         input.as_bytes(),
         &["A1".parse().unwrap()],
         || panic!("reading a number should not access shared strings"),
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert_eq!(numeric[0].value, CellValue::Number(7.0));
@@ -1463,7 +1532,7 @@ fn shared_strings_are_loaded_only_for_requested_shared_cells() {
     // The loader is asked for each shared cell; the workbook keeps the table.
     let strings = SharedStrings::from_iter(["first", "second"]);
     let mut loads = 0;
-    let contents = read_cells(
+    let contents = prepared_worksheet::read_cells(
         input.as_bytes(),
         &[
             "B1".parse().unwrap(),
@@ -1475,7 +1544,7 @@ fn shared_strings_are_loaded_only_for_requested_shared_cells() {
             loads += 1;
             Ok(Some(&strings))
         },
-        false,
+        /* date1904: */ false,
     )
     .unwrap();
     assert_eq!(loads, 3);
@@ -1490,6 +1559,8 @@ fn shared_strings_are_loaded_only_for_requested_shared_cells() {
 
 #[test]
 fn shared_string_tables_return_each_decoded_string_exactly() {
+    use std::fmt::Write as _;
+
     // Empty, multi-byte and escaped text, split into runs at varying points,
     // so that strings of every length meet at every kind of boundary.
     let pieces = [
@@ -1517,21 +1588,23 @@ fn shared_string_tables_return_each_decoded_string_exactly() {
         let runs: Vec<String> = (0..next(4))
             .map(|_| (0..next(4)).map(|_| pieces[next(pieces.len())]).collect())
             .collect();
-        let t = |text: &str| format!("<t xml:space='preserve'>{}</t>", text_escaped(text));
-        body.push_str(&match runs.as_slice() {
-            [] => "<si/>".to_owned(),
-            [text] if next(2) == 0 => format!("<si>{}</si>", t(text)),
-            runs => format!(
-                "<si>{}</si>",
-                runs.iter()
+        let t = |text: &str| format!("<t xml:space='preserve'>{}</t>", patch::text_escaped(text));
+        match runs.as_slice() {
+            [] => body.push_str("<si/>"),
+            [text] if next(2) == 0 => write!(body, "<si>{}</si>", t(text)).unwrap(),
+            runs => {
+                let markup: String = runs
+                    .iter()
                     .map(|text| format!("<r>{}</r>", t(text)))
-                    .collect::<String>()
-            ),
-        });
+                    .collect();
+                write!(body, "<si>{markup}</si>").unwrap();
+            }
+        }
         expected.push(runs.concat());
     }
-    let table = read_shared_strings(format!("<sst xmlns='{TRANSITIONAL}'>{body}</sst>").as_bytes())
-        .unwrap();
+    let table =
+        read::read_shared_strings(format!("<sst xmlns='{TRANSITIONAL}'>{body}</sst>").as_bytes())
+            .unwrap();
     for (index, text) in expected.iter().enumerate() {
         assert!(
             matches!(table.get(index), Some(Ok(entry)) if entry == text),
@@ -1546,7 +1619,7 @@ fn shared_string_tables_return_each_decoded_string_exactly() {
 fn reads_shared_rich_strings_excel_escapes_and_xml_newlines() {
     let table = format!(r#"<sst xmlns="{STRICT}"><si><t>first</t></si><si><r><t>_x005F_x0041_</t></r><r><t>_xD83D__xDE00_&#13;<![CDATA[\r\nline\r]]></t></r><rPh sb="0" eb="1"><t>ignore</t></rPh></si><si><r><t>_</t></r><r><t>x0041_</t></r></si></sst>"#).replace("\\r", "\r").replace("\\n", "\n");
     assert_eq!(
-        read_shared_strings(table.as_bytes()).unwrap(),
+        read::read_shared_strings(table.as_bytes()).unwrap(),
         vec!["first", "_x0041_😀\r\nline\n", "_x0041_"]
     );
     let input = sheet(
@@ -1576,14 +1649,14 @@ fn hidden_shared_strings_cannot_shift_visible_string_indices() {
             "<sst xmlns='{namespace}' xmlns:mc='{mc}' xmlns:x='urn:custom'><mc:AlternateContent><mc:Choice Requires='x'><si><t>first</t></si></mc:Choice><mc:Fallback><si><t>first fallback</t></si></mc:Fallback></mc:AlternateContent><si><t>second</t></si></sst>"
         );
         assert!(matches!(
-            read_shared_strings(table.as_bytes()),
+            read::read_shared_strings(table.as_bytes()),
             Err(Error::Unsupported(_))
         ));
         let foreign = format!(
             "<sst xmlns='{namespace}' xmlns:x='urn:custom'><x:si><x:t>extension</x:t></x:si><si><t>first</t></si><si><t>second</t></si></sst>"
         );
         assert_eq!(
-            read_shared_strings(foreign.as_bytes()).unwrap(),
+            read::read_shared_strings(foreign.as_bytes()).unwrap(),
             vec!["first", "second"]
         );
     }
@@ -1608,7 +1681,7 @@ fn hidden_rich_text_cannot_produce_a_partial_scalar_read() {
         let table = format!(
             "<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:custom'><si>{payload}</si><si><t>next</t></si></sst>"
         );
-        let table = read_shared_strings(table.as_bytes()).unwrap();
+        let table = read::read_shared_strings(table.as_bytes()).unwrap();
         assert!(matches!(table.get(0), Some(Err(Error::Unsupported(_)))));
         assert!(matches!(table.get(1), Some(Ok("next"))));
     }
@@ -1701,7 +1774,13 @@ fn no_op_patches_borrow_the_original_xml() {
         BTreeMap::from([("C1".parse().unwrap(), CellValue::Blank)]),
     ] {
         assert!(matches!(
-            patch_cells(input.as_bytes(), &changes, || None, false).unwrap(),
+            patch_cells(
+                input.as_bytes(),
+                &changes,
+                || None,
+                /* date1904: */ false
+            )
+            .unwrap(),
             Cow::Borrowed(_)
         ));
     }
@@ -1711,7 +1790,7 @@ fn no_op_patches_borrow_the_original_xml() {
 fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
     // Clearing an existing payload is a change even when it reads as blank;
     // every other edit is a no-op only if a read returns the same value.
-    let strings = read_shared_strings(
+    let strings = read::read_shared_strings(
         format!(
             "<sst xmlns='{TRANSITIONAL}'><si><t>first</t></si><si><t xml:space='preserve'> 2</t></si><si><t>_xD800_</t></si></sst>"
         )
@@ -1758,7 +1837,7 @@ fn edits_are_no_ops_exactly_when_the_cell_already_reads_as_the_value() {
     ] {
         let input = sheet(&format!("<sheetData><row r='1'>{cell}</row></sheetData>"));
         for date1904 in [false, true] {
-            let read = read_cells(
+            let read = prepared_worksheet::read_cells(
                 input.as_bytes(),
                 &[address],
                 || Ok(Some(&strings)),
@@ -1807,25 +1886,32 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
             },
         ));
     }
-    for merged in [false, true] {
+    for kind in [RangeKind::Formula, RangeKind::Merged] {
         for row in 1..=35 {
             for column in 1..=14 {
                 let cell = CellRef { row, column };
-                let blocked = ranges
-                    .iter()
-                    .any(|range| range.contains(cell) && (!merged || cell != range.first()));
+                let blocked = ranges.iter().any(|range| {
+                    range.contains(cell) && (kind == RangeKind::Formula || cell != range.first())
+                });
                 assert_eq!(
-                    validate_ranges(&BTreeMap::from([(cell, CellValue::Blank)]), &ranges, merged)
-                        .is_err(),
+                    validation::validate_ranges(
+                        &BTreeMap::from([(cell, CellValue::Blank)]),
+                        &ranges,
+                        kind
+                    )
+                    .is_err(),
                     blocked
                 );
                 // The same target in a large batch exercises the event
                 // sweep. Other cells lie past every generated rectangle.
-                let mut batch: BTreeMap<_, _> = (40..=70)
+                let mut batch: BTreeMap<CellRef, CellValue> = (40..=70)
                     .map(|row| (CellRef { row, column: 1 }, CellValue::Blank))
                     .collect();
                 batch.insert(cell, CellValue::Blank);
-                assert_eq!(validate_ranges(&batch, &ranges, merged).is_err(), blocked);
+                assert_eq!(
+                    validation::validate_ranges(&batch, &ranges, kind).is_err(),
+                    blocked
+                );
             }
         }
     }
@@ -1840,18 +1926,18 @@ fn range_guards_match_rectangle_membership_with_overlapping_ranges() {
         },
     );
     assert!(
-        validate_ranges(
+        validation::validate_ranges(
             &BTreeMap::from([("XFD1".parse().unwrap(), CellValue::Blank)]),
             &[boundary],
-            true
+            RangeKind::Merged
         )
         .is_ok()
     );
     assert!(
-        validate_ranges(
+        validation::validate_ranges(
             &BTreeMap::from([("XFD1048576".parse().unwrap(), CellValue::Blank)]),
             &[boundary],
-            true
+            RangeKind::Merged
         )
         .is_err()
     );
@@ -1864,24 +1950,24 @@ fn range_envelope_includes_interior_edits_and_keeps_overlapping_anchor_guards() 
         "B15".parse().unwrap(),
         "F15".parse().unwrap(),
     ));
-    let mut cells: BTreeMap<_, _> = (1..=10)
+    let mut cells: BTreeMap<CellRef, CellValue> = (1..=10)
         .chain([30])
-        .map(|row| (CellRef::new(row, 26).unwrap(), CellValue::Blank))
+        .map(|row| (CellRef::try_new(row, 26).unwrap(), CellValue::Blank))
         .collect();
     cells.insert("C15".parse().unwrap(), CellValue::Blank);
-    for merged in [false, true] {
-        let error = validate_ranges(&cells, &ranges, merged).unwrap_err();
+    for kind in [RangeKind::Formula, RangeKind::Merged] {
+        let error = validation::validate_ranges(&cells, &ranges, kind).unwrap_err();
         assert!(error.to_string().contains("C15"));
     }
     cells.remove(&"C15".parse().unwrap());
     cells.insert("B15".parse().unwrap(), CellValue::Blank);
-    assert!(validate_ranges(&cells, &ranges, true).is_ok());
-    assert!(validate_ranges(&cells, &ranges, false).is_err());
+    assert!(validation::validate_ranges(&cells, &ranges, RangeKind::Merged).is_ok());
+    assert!(validation::validate_ranges(&cells, &ranges, RangeKind::Formula).is_err());
     ranges.push(CellRange::new(
         "A15".parse().unwrap(),
         "D15".parse().unwrap(),
     ));
-    let error = validate_ranges(&cells, &ranges, true).unwrap_err();
+    let error = validation::validate_ranges(&cells, &ranges, RangeKind::Merged).unwrap_err();
     assert!(error.to_string().contains("B15"));
 }
 
@@ -1965,7 +2051,7 @@ fn attribute_lists_end_only_at_the_tag_terminator() {
     ] {
         let input = sheet(&format!("<sheetData/>{tag}"));
         assert!(
-            matches!(parse(input.as_bytes()), Err(Error::Xml(_))),
+            matches!(parse::parse(input.as_bytes()), Err(Error::Xml(_))),
             "{tag}"
         );
     }
@@ -1980,7 +2066,7 @@ fn attribute_lists_end_only_at_the_tag_terminator() {
             elements,
             attributes,
             ..
-        } = parse(input.as_bytes()).unwrap();
+        } = parse::parse(input.as_bytes()).unwrap();
         let element = elements.last().unwrap();
         assert!(element.attributes(&attributes).all(|attribute| {
             input.as_bytes()[attribute.end() - 1] == input.as_bytes()[attribute.value_start() - 1]
@@ -2008,7 +2094,7 @@ fn duplicate_attributes_are_found_in_tags_of_any_length() {
     };
     for count in [1, 7, 8, 9, 20, 40] {
         let input = tag(count, "");
-        assert!(parse(input.as_bytes()).is_ok(), "{count}");
+        assert!(parse::parse(input.as_bytes()).is_ok(), "{count}");
         for duplicate in [
             " n0='again'".to_owned(),
             format!(" n{}='again'", count - 1),
@@ -2018,7 +2104,7 @@ fn duplicate_attributes_are_found_in_tags_of_any_length() {
         ] {
             let input = tag(count, &duplicate);
             assert!(
-                matches!(parse(input.as_bytes()), Err(Error::Xml(_))),
+                matches!(parse::parse(input.as_bytes()), Err(Error::Xml(_))),
                 "{count}{duplicate}"
             );
         }
@@ -2041,7 +2127,7 @@ fn element_names_match_whole_local_names() {
     ));
     let XmlDocument {
         source, elements, ..
-    } = parse(input.as_bytes()).unwrap();
+    } = parse::parse(input.as_bytes()).unwrap();
     let main = elements[0].namespace;
     let mut matches = Vec::new();
     for element in &elements {
@@ -2079,7 +2165,7 @@ fn released_subtrees_take_their_normalized_attribute_values() {
             .collect::<String>()
     );
     let values = |document: &XmlDocument, index: usize| {
-        std::iter::once(index)
+        iter::once(index)
             .chain(document.elements[index].descendants())
             .flat_map(|element| document.elements[element].attributes(&document.attributes))
             .map(|attribute| attribute.value.to_owned())
@@ -2093,23 +2179,23 @@ fn released_subtrees_take_their_normalized_attribute_values() {
             format!("one\n{n}"),
         ]
     };
-    let mut n = 0;
-    let document = super::parse::parse_with(input.as_bytes(), |document, index| {
-        assert_eq!(values(document, index), expected(n));
+    let mut entry = 0;
+    let document = parse::parse_with(input.as_bytes(), |document, index| {
+        assert_eq!(values(document, index), expected(entry));
         // Keep every other string and release the rest.
-        let release = n % 2 == 1;
-        n += 1;
+        let release = entry % 2 == 1;
+        entry += 1;
         release
     })
     .unwrap();
-    let kept: Vec<_> = document.elements[0]
+    let kept: Vec<Vec<String>> = document.elements[0]
         .children(&document.elements)
         .map(|index| values(&document, index))
         .collect();
     assert_eq!(kept, [expected(0), expected(2), expected(4)]);
     assert_eq!(
         document.elements[0]
-            .attr(&document.attributes, "a")
+            .attribute(&document.attributes, "a")
             .unwrap()
             .value,
         "root\tvalue"
@@ -2130,13 +2216,13 @@ fn xml_variants_follow_the_shared_policy() {
     // The root and 255 nested elements are accepted; one more is refused.
     let accepted = nested(255, "sst");
     assert_eq!(
-        read_shared_strings(accepted.as_bytes()).unwrap(),
+        read::read_shared_strings(accepted.as_bytes()).unwrap(),
         Vec::<String>::new()
     );
     for root in ["worksheet", "sst"] {
         let input = nested(256, root);
         let error = if root == "sst" {
-            read_shared_strings(input.as_bytes()).unwrap_err()
+            read::read_shared_strings(input.as_bytes()).unwrap_err()
         } else {
             read_cell(input.as_bytes(), "A1".parse().unwrap(), None).unwrap_err()
         };
@@ -2259,11 +2345,11 @@ fn read_errors_name_the_cell() {
         Err(Error::InvalidWorkbook(error)) if error == "B2: shared-string index 5 is out of bounds"
     ));
     // A failure to load the table concerns that part, not the cell.
-    let loaded = read_cells(
+    let loaded = prepared_worksheet::read_cells(
         input.as_bytes(),
         &["B2".parse().unwrap()],
         || Err(Error::Xml("shared strings".into())),
-        false,
+        /* date1904: */ false,
     );
     assert!(matches!(
         loaded,
@@ -2271,7 +2357,7 @@ fn read_errors_name_the_cell() {
     ));
     // So does a string the table cannot decode, which only cells that use it
     // fail to read. The table's loader names its part.
-    let strings = read_shared_strings(
+    let strings = read::read_shared_strings(
         format!("<sst xmlns='{TRANSITIONAL}'><si><t>Name</t></si><si><t>_xD83D_</t></si></sst>")
             .as_bytes(),
     )
@@ -2280,11 +2366,11 @@ fn read_errors_name_the_cell() {
         "<sheetData><row r='2'><c r='A2' t='s'><v>0</v></c><c r='B2' t='s'><v>1</v></c></row></sheetData>",
     );
     let read = |address: &str| {
-        read_cells(
+        prepared_worksheet::read_cells(
             input.as_bytes(),
             &[address.parse().unwrap()],
             || Ok(Some(&strings)),
-            false,
+            /* date1904: */ false,
         )
         .map(|mut cells| cells.remove(0).value)
     };
@@ -2298,11 +2384,11 @@ fn read_errors_name_the_cell() {
     ));
     // A cell's own problems are the worksheet's, even when they concern the
     // table: here, its absence.
-    let loaded = read_cells(
+    let loaded = prepared_worksheet::read_cells(
         input.as_bytes(),
         &["B2".parse().unwrap()],
         || Ok(None),
-        false,
+        /* date1904: */ false,
     );
     assert!(matches!(
         loaded,
@@ -2314,7 +2400,7 @@ fn read_errors_name_the_cell() {
 #[test]
 fn shared_strings_stream_without_changing_error_precedence() {
     let table = |body: &str| format!("<sst xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{body}</sst>");
-    let strings: Vec<_> = (0..500).map(|index| format!("s{index}_x0041_")).collect();
+    let strings: Vec<String> = (0..500).map(|index| format!("s{index}_x0041_")).collect();
     let body: String = strings
         .iter()
         .enumerate()
@@ -2326,12 +2412,12 @@ fn shared_strings_stream_without_changing_error_precedence() {
             }
         })
         .collect();
-    let expected: Vec<_> = strings
+    let expected: Vec<String> = strings
         .iter()
         .map(|text| text.replace("_x0041_", "A"))
         .collect();
     assert_eq!(
-        read_shared_strings(table(&body).as_bytes()).unwrap(),
+        read::read_shared_strings(table(&body).as_bytes()).unwrap(),
         expected
     );
     let undecodable = "<si><t>_xD800_</t></si>";
@@ -2348,7 +2434,7 @@ fn shared_strings_stream_without_changing_error_precedence() {
             "document type",
         ),
     ] {
-        let error = read_shared_strings(table(&body).as_bytes()).unwrap_err();
+        let error = read::read_shared_strings(table(&body).as_bytes()).unwrap_err();
         assert!(error.to_string().contains(expected), "{body}: {error:?}");
     }
     // Otherwise strings that cannot be decoded fail only their own reads,
@@ -2365,7 +2451,7 @@ fn shared_strings_stream_without_changing_error_precedence() {
             [elements, surrogate],
         ),
     ] {
-        let strings = read_shared_strings(table(&body).as_bytes()).unwrap();
+        let strings = read::read_shared_strings(table(&body).as_bytes()).unwrap();
         for (index, expected) in errors.into_iter().enumerate() {
             assert!(
                 matches!(
@@ -2380,7 +2466,7 @@ fn shared_strings_stream_without_changing_error_precedence() {
     }
     // Each distinct error is kept once, however many entries share it.
     let many = format!("{undecodable}{unsupported}").repeat(1_000);
-    let strings = read_shared_strings(table(&many).as_bytes()).unwrap();
+    let strings = read::read_shared_strings(table(&many).as_bytes()).unwrap();
     assert_eq!(strings.error_count(), 2);
     assert!(matches!(
         strings.get(1_999),
@@ -2389,7 +2475,7 @@ fn shared_strings_stream_without_changing_error_precedence() {
     let wrong_root =
         format!("<worksheet xmlns='{TRANSITIONAL}' xmlns:x='urn:x'>{unsupported}</worksheet>");
     assert!(matches!(
-        read_shared_strings(wrong_root.as_bytes()),
+        read::read_shared_strings(wrong_root.as_bytes()),
         Err(Error::InvalidWorkbook(error)) if error == "expected an OOXML shared-string table"
     ));
 }
@@ -2429,14 +2515,20 @@ fn fragmented_row_spans_support_large_batches() {
         "<sheetData><row r='1' spans='{spans}'/></sheetData>"
     ));
     for parity in [0, 1] {
-        let changes = (1..=2048)
+        let changes: BTreeMap<CellRef, CellValue> = (1..=2048)
             .filter(|column| column % 2 == parity)
             .map(|column| (CellRef { row: 1, column }, CellValue::Number(1.0)))
             .collect();
-        let output = patch_cells(input.as_bytes(), &changes, || None, false).unwrap();
+        let output = patch_cells(
+            input.as_bytes(),
+            &changes,
+            || None,
+            /* date1904: */ false,
+        )
+        .unwrap();
         let expected = if parity == 0 { "1:2048" } else { &spans };
         assert!(
-            std::str::from_utf8(&output)
+            str::from_utf8(&output)
                 .unwrap()
                 .contains(&format!("spans='{expected}'"))
         );
@@ -2467,9 +2559,13 @@ fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
     );
     let strings = SharedStrings::from_iter(["Name"]);
     let cells = |worksheet: &PreparedWorksheet<'_>| {
-        let addresses = ["A1", "A2", "B2"].map(|address| address.parse().unwrap());
+        let addresses: [CellRef; 3] = ["A1", "A2", "B2"].map(|address| address.parse().unwrap());
         worksheet
-            .read_cells(&addresses, || Ok(Some(&strings)), false)
+            .read_cells(
+                &addresses,
+                || Ok(Some(&strings)),
+                /* date1904: */ false,
+            )
             .unwrap()
             .into_iter()
             .map(|content| content.value)
@@ -2484,7 +2580,7 @@ fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
                 ("B2".parse().unwrap(), 8.0.into()),
             ]),
             || Some(&strings),
-            false,
+            /* date1904: */ false,
         )
         .unwrap();
     assert_eq!(
@@ -2502,9 +2598,15 @@ fn shared_string_tables_are_parsed_one_entry_at_a_time() {
     // Each entry holds a normalized attribute value, and so does the root.
     let entries = "<si><r><t a='&#49;'>a</t></r></si>".repeat(1000);
     let input = format!("<sst xmlns='{TRANSITIONAL}' a='&#9;'>{entries}</sst>");
-    super::read::SHARED_STRING_PEAKS.set((0, 0));
-    let strings = read_shared_strings(input.as_bytes()).unwrap();
+    read::SHARED_STRING_PEAKS.set(ArenaPeaks::default());
+    let strings = read::read_shared_strings(input.as_bytes()).unwrap();
     assert_eq!(strings.get(999).unwrap().unwrap(), "a");
     // The root, then one entry's si, r and t elements and t's value.
-    assert_eq!(super::read::SHARED_STRING_PEAKS.get(), (4, 2));
+    assert_eq!(
+        read::SHARED_STRING_PEAKS.get(),
+        ArenaPeaks {
+            elements: 4,
+            values: 2
+        }
+    );
 }

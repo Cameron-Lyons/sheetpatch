@@ -1,9 +1,9 @@
 use super::parse::Element;
-use super::read::validate_rich_text_structure;
-use super::{protected, protection, unsupported};
+use super::{errors, protection, read};
 use crate::xml::{Attributes, NamespaceId};
 use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::BTreeMap;
+use std::mem;
 
 // Known rich text is the old value and may be replaced. Unfamiliar markup
 // within that value could carry other meaning: refuse to discard it.
@@ -16,12 +16,14 @@ pub(super) fn validate_payload(
 ) -> Result<()> {
     let element = &elements[index];
     if element.namespace != namespace || element.opaque_markup {
-        return Err(unsupported("unfamiliar XML inside the cell value payload"));
+        return Err(errors::unsupported(
+            "unfamiliar XML inside the cell value payload",
+        ));
     }
     if element.local_name(source) == "is" {
         // The same hidden text that makes a scalar read ambiguous must not be
         // discarded by an edit, even when each individual tag is familiar.
-        validate_rich_text_structure(source, elements, index, namespace)?;
+        read::validate_rich_text_structure(source, elements, index, namespace)?;
     }
     validate_payload_element(source, elements, attributes, index, namespace)
 }
@@ -35,7 +37,9 @@ fn validate_payload_element(
 ) -> Result<()> {
     let element = &elements[index];
     if element.namespace != namespace || element.opaque_markup {
-        return Err(unsupported("unfamiliar XML inside the cell value payload"));
+        return Err(errors::unsupported(
+            "unfamiliar XML inside the cell value payload",
+        ));
     }
     let allowed_attributes: &[&str] = match element.local_name(source) {
         "is" | "r" | "rPr" => &[],
@@ -47,19 +51,25 @@ fn validate_payload_element(
         "color" => &["auto", "indexed", "rgb", "theme", "tint"],
         "rFont" | "charset" | "family" | "b" | "i" | "strike" | "outline" | "shadow"
         | "condense" | "extend" | "sz" | "u" | "vertAlign" | "scheme" => &["val"],
-        _ => return Err(unsupported("unfamiliar XML inside the cell value payload")),
+        _ => {
+            return Err(errors::unsupported(
+                "unfamiliar XML inside the cell value payload",
+            ));
+        }
     };
     if element.attributes(attributes).any(|attribute| {
         attribute.name != "xmlns"
             && !attribute.name.starts_with("xmlns:")
             && !allowed_attributes.contains(&attribute.name)
     }) {
-        return Err(unsupported(
+        return Err(errors::unsupported(
             "unfamiliar attributes inside the cell value payload",
         ));
     }
     if matches!(element.local_name(source), "v" | "t") && element.has_children() {
-        return Err(unsupported("elements inside a simple cell value payload"));
+        return Err(errors::unsupported(
+            "elements inside a simple cell value payload",
+        ));
     }
     for child in element.children(elements) {
         validate_payload_element(source, elements, attributes, child, namespace)?;
@@ -83,7 +93,10 @@ pub(super) fn sort_guard_events(events: &mut Vec<GuardEvent>) {
         return;
     }
     // Three byte-wide passes cover every event row, up to one past the last.
-    const _: () = assert!(CellRef::MAX_ROW < 1 << 24);
+    const _: () = assert!(
+        CellRef::MAX_ROW < 1 << 24,
+        "an event row, at most one past the last row, must fit in the three radix bytes"
+    );
     let mut scratch = events.clone();
     for shift in [0, 8, 16] {
         let mut counts = [0usize; 256];
@@ -101,25 +114,34 @@ pub(super) fn sort_guard_events(events: &mut Vec<GuardEvent>) {
             scratch[counts[bucket]] = event;
             counts[bucket] += 1;
         }
-        std::mem::swap(events, &mut scratch);
+        mem::swap(events, &mut scratch);
     }
+}
+
+// What a worksheet range protects from edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RangeKind {
+    // Every cell of a formula group's reference range.
+    Formula,
+    // Every cell of a merged range except its anchor, the first cell.
+    Merged,
 }
 
 pub(super) fn validate_ranges(
     cells: &BTreeMap<CellRef, CellValue>,
     ranges: &[CellRange],
-    merged: bool,
+    kind: RangeKind,
 ) -> Result<()> {
     if cells.is_empty() || ranges.is_empty() {
         return Ok(());
     }
+    let merged = kind == RangeKind::Merged;
     let violation = |cell: CellRef| {
-        let reason = if merged {
-            protection::MERGED
-        } else {
-            protection::FORMULA_RANGE
+        let reason = match kind {
+            RangeKind::Formula => protection::FORMULA_RANGE,
+            RangeKind::Merged => protection::MERGED,
         };
-        protected(cell, reason)
+        errors::protected(cell, reason)
     };
     // With either dimension small, direct membership checks cost less than
     // sorting events and allocating a column index. Large batches still use
@@ -135,8 +157,13 @@ pub(super) fn validate_ranges(
         }
         return Ok(());
     }
-    let first_row = cells.first_key_value().unwrap().0.row;
-    let last_row = cells.last_key_value().unwrap().0.row;
+    // The batch is not empty, as checked above.
+    let (Some((first_cell, _)), Some((last_cell, _))) =
+        (cells.first_key_value(), cells.last_key_value())
+    else {
+        return Ok(());
+    };
+    let (first_row, last_row) = (first_cell.row, last_cell.row);
     let (first_column, last_column) = cells.keys().fold((u16::MAX, 0), |(first, last), cell| {
         (first.min(cell.column), last.max(cell.column))
     });

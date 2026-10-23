@@ -36,7 +36,7 @@ fn main() -> sheetpatch::Result<()> {
     book.set_cell("Summary", "E2", CellValue::Blank)?;
 
     // Typed addresses use one-based row and column numbers.
-    let target = CellRef::new(5, 3)?;
+    let target = CellRef::try_new(5, 3)?;
     book.set_cell_at("Summary", target, 37.5)?;
 
     // A batch parses each affected worksheet once.
@@ -51,8 +51,8 @@ fn main() -> sheetpatch::Result<()> {
 
     // A transaction across worksheets commits only after all edits succeed.
     book.apply_edits([
-        CellEdit::new("Summary", "B3", "Reviewed")?,
-        CellEdit::new("Summary", "B4", "Approved")?,
+        CellEdit::try_new("Summary", "B3", "Reviewed")?,
+        CellEdit::try_new("Summary", "B4", "Approved")?,
     ])?;
 
     let cell = book.get_cell_at("Summary", target)?;
@@ -109,8 +109,9 @@ transaction reports one refused edit, which need not be the first in input
 order; the `set_cells` and `apply_edits` documentation gives the order of the
 checks. `has_changes()` reports pending changes and `reset_changes()` restores
 the original archive.
-`get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`, and `CellEdit::at`
-accept typed `CellRef` addresses directly, avoiding conversion through A1 strings.
+`get_cell_at`, `get_cells_at`, `set_cell_at`, `set_cells_at`, and
+`CellEdit::try_new_at` accept typed `CellRef` addresses directly, avoiding
+conversion through A1 strings.
 Typed batches preserve input order for reads and use the last value for duplicate
 edits, with the same transaction and value validation rules as A1 batches.
 Saving does not clear pending changes or replace the in-memory original archive.
@@ -536,8 +537,15 @@ Three direct dependencies, and a fourth on Linux; XML parsing, compression, and
 There are no additional Rust CLI or test dependencies. ZIP records are handled
 in the crate so untouched records can remain unchanged.
 
+The code follows the
+[Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html).
+`rustfmt.toml` and the Clippy lints configured in `Cargo.toml` and `src/lib.rs`
+check the rules those tools can detect; the guide's import grouping needs a
+nightly rustfmt.
+
 ```sh
 cargo fmt --check
+cargo +nightly fmt --all -- --check --config imports_granularity=Module,format_macro_matchers=true
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 cargo test --locked --lib --features quick-xml/escape-html
@@ -549,9 +557,9 @@ cargo package --locked
 
 GitHub CI runs for pull requests, pushes to `main` and `v*` tags, manual
 dispatch, and a weekly schedule; a newer push to a pull request cancels its
-superseded run, while other runs always complete. It checks formatting, Clippy
-for the host and the Windows MSVC target, and documentation, with warnings
-treated as errors. Tests run on Linux, macOS, and Windows with stable Rust, and
+superseded run, while other runs always complete. It checks formatting,
+including import grouping with a pinned nightly rustfmt, Clippy for the host and
+the Windows MSVC target, and documentation, with warnings treated as errors. Tests run on Linux, macOS, and Windows with stable Rust, and
 on Linux with the minimum supported Rust 1.88.0; each run repeats the library
 tests with `quick-xml`'s `escape-html` feature, which another dependency could
 enable. The package job builds release

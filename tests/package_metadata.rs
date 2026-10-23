@@ -5,10 +5,11 @@ mod common;
 use sheetpatch::{CellValue, Error, Sheet, SheetVisibility, Workbook};
 use std::collections::{BTreeMap, HashSet};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const STRICT_MAIN_NAMESPACE: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const SIGNATURE_ORIGIN: &str =
     "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin";
 
@@ -16,7 +17,7 @@ const SIGNATURE_ORIGIN: &str =
 /// given extra sheet attributes for its worksheets `Data` and `Other`.
 fn parts(properties: &str, data: &str, other: &str) -> BTreeMap<String, String> {
     let worksheet = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1' t='d' s='1'><v>2024-01-15</v></c><c r='B1'><v>45306</v></c><c r='C1' s='2'/></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1' t='d' s='1'><v>2024-01-15</v></c><c r='B1'><v>45306</v></c><c r='C1' s='2'/></row></sheetData></worksheet>"
     );
     BTreeMap::from([
         (
@@ -25,15 +26,15 @@ fn parts(properties: &str, data: &str, other: &str) -> BTreeMap<String, String> 
         ),
         (
             "_rels/.rels".into(),
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
         ),
         (
             "xl/workbook.xml".into(),
-            format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'>{properties}<sheets><sheet name='Data' sheetId='1' r:id='one'{data}/><sheet name='Other' sheetId='2' r:id='two'{other}/></sheets></workbook>"),
+            format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'>{properties}<sheets><sheet name='Data' sheetId='1' r:id='one'{data}/><sheet name='Other' sheetId='2' r:id='two'{other}/></sheets></workbook>"),
         ),
         (
             "xl/_rels/workbook.xml.rels".into(),
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='two' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/></Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='two' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet2.xml'/></Relationships>"),
         ),
         ("xl/worksheets/sheet1.xml".into(), worksheet.clone()),
         ("xl/worksheets/sheet2.xml".into(), worksheet),
@@ -54,7 +55,7 @@ fn archive(properties: &str, data: &str, other: &str) -> Vec<u8> {
 
 #[test]
 fn workbook_relationships_resolve_independently_of_legacy_zip_name_spelling() {
-    for (workbook_path, rels_path) in [
+    for (workbook_path, relationships_path) in [
         ("xl/book%20one.xml", "xl/_rels/book one.xml.rels"),
         ("xl/book one.xml", "xl/_rels/book%20one.xml.rels"),
     ] {
@@ -62,10 +63,10 @@ fn workbook_relationships_resolve_independently_of_legacy_zip_name_spelling() {
         let workbook = parts.remove("xl/workbook.xml").unwrap();
         parts.insert(workbook_path.into(), workbook);
         let relationships = parts.remove("xl/_rels/workbook.xml.rels").unwrap();
-        parts.insert(rels_path.into(), relationships);
+        parts.insert(relationships_path.into(), relationships);
         let roots = parts.get_mut("_rels/.rels").unwrap();
         *roots = roots.replace("xl/workbook.xml", "XL/BOOK%20ONE.XML");
-        if rels_path.contains("%20") {
+        if relationships_path.contains("%20") {
             // The encoded relationship part wins even when the workbook's
             // ZIP name is decoded and a decoded relationship decoy exists.
             parts.insert("xl/_rels/book one.xml.rels".into(), "not XML".into());
@@ -125,7 +126,7 @@ fn iso_date_cells_read_as_serials_in_the_workbook_date_system() {
 fn strict_workbooks_report_their_date_system() {
     let mut parts = parts("<workbookPr date1904='1'/>", "", "");
     for xml in parts.values_mut() {
-        *xml = xml.replace(MAIN_NS, STRICT_MAIN_NS);
+        *xml = xml.replace(MAIN_NAMESPACE, STRICT_MAIN_NAMESPACE);
     }
     let book = Workbook::from_bytes(stored(&parts)).unwrap();
     assert!(book.uses_1904_dates());
@@ -137,10 +138,13 @@ fn strict_workbooks_report_their_date_system() {
 
 #[test]
 fn mixed_spreadsheetml_metadata_is_not_silently_ignored() {
-    for (root, other) in [(MAIN_NS, STRICT_MAIN_NS), (STRICT_MAIN_NS, MAIN_NS)] {
+    for (root, other) in [
+        (MAIN_NAMESPACE, STRICT_MAIN_NAMESPACE),
+        (STRICT_MAIN_NAMESPACE, MAIN_NAMESPACE),
+    ] {
         let mut parts = parts("", "", "");
         let workbook = parts["xl/workbook.xml"].replacen(
-            &format!("xmlns='{MAIN_NS}'"),
+            &format!("xmlns='{MAIN_NAMESPACE}'"),
             &format!("xmlns='{root}'"),
             1,
         );
@@ -292,10 +296,10 @@ fn process_content_cannot_promote_hidden_workbook_date_properties() {
             "<x:wrapper><workbookPr date1904='1'/></x:wrapper>",
         ),
     ] {
-        for main in [MAIN_NS, STRICT_MAIN_NS] {
+        for main in [MAIN_NAMESPACE, STRICT_MAIN_NAMESPACE] {
             let mut parts = parts(properties, "", "");
             let workbook = parts.get_mut("xl/workbook.xml").unwrap();
-            *workbook = workbook.replace(MAIN_NS, main).replacen(
+            *workbook = workbook.replace(MAIN_NAMESPACE, main).replacen(
                 "<workbook ",
                 &format!(
                     "<workbook xmlns:mc='{compatibility}' xmlns:x='urn:vend&#111;r' xmlns:alias='urn:vendor' {directives} "
@@ -404,22 +408,26 @@ fn namespace_binding_caches_follow_shadowing_and_empty_element_scopes() {
     let mut parts = parts(properties, " state='hidden'", " state='veryHidden'");
     let workbook = parts.get_mut("xl/workbook.xml").unwrap();
     *workbook = workbook
-        .replacen("<workbook ", &format!("<workbook xmlns:p='{MAIN_NS}' "), 1)
+        .replacen(
+            "<workbook ",
+            &format!("<workbook xmlns:p='{MAIN_NAMESPACE}' "),
+            1,
+        )
         .replace("<sheets>", "<p:sheets>")
         .replace("</sheets>", "</p:sheets>")
         .replace("<sheet ", "<p:sheet ");
     parts.insert(
         "xl/_rels/workbook.xml.rels".into(),
         format!(
-            "<Relationships xmlns='{PACKAGE_NS}' xmlns:p='{PACKAGE_NS}'>\
-              <p:Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/>\
+            "<Relationships xmlns='{PACKAGE_NAMESPACE}' xmlns:p='{PACKAGE_NAMESPACE}'>\
+              <p:Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/>\
               <p:Relationship xmlns:p='urn:vendor' Id='one' Type='ignored' Target='ignored'/>\
               <extension xmlns:p='urn:vendor'>\
                 <p:Relationship Id='one' Type='ignored' Target='ignored'/>\
                 <Relationship xmlns='' Id='one' Type='ignored' Target='ignored'/>\
               </extension>\
               <Relationship xmlns='' Id='one' Type='ignored' Target='ignored'/>\
-              <p:Relationship Id='two' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/>\
+              <p:Relationship Id='two' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet2.xml'/>\
             </Relationships>"
         ),
     );
@@ -494,7 +502,10 @@ fn sheets_in_compatibility_branches_are_unsupported_and_misplaced_ones_invalid()
     let open = |replacement: &str| {
         let mut parts = parts("", "", "");
         let workbook = parts.get_mut("xl/workbook.xml").unwrap();
-        assert!(workbook.contains(&sheets));
+        assert!(
+            workbook.contains(&sheets),
+            "the template workbook lists both sheets in one sheets element"
+        );
         *workbook = workbook.replace(&sheets, replacement);
         Workbook::from_bytes(stored(&parts)).err()
     };
@@ -562,7 +573,7 @@ fn signed_packages_are_reported_before_any_edit() {
     let mut origin = parts("", "", "");
     origin.insert(
         "_rels/.rels".into(),
-        format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/><Relationship Id='signature' Type='{SIGNATURE_ORIGIN}' Target='signatures/origin.sigs'/></Relationships>"),
+        format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/><Relationship Id='signature' Type='{SIGNATURE_ORIGIN}' Target='signatures/origin.sigs'/></Relationships>"),
     );
     let mut folder = parts("", "", "");
     folder.insert("_XmlSignatures/sig1.xml".into(), "<Signature/>".into());

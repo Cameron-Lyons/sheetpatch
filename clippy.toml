@@ -1,0 +1,2 @@
+# Tests may panic for assertions, so `unwrap` stays allowed in them.
+allow-unwrap-in-tests = true

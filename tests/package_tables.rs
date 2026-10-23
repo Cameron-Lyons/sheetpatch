@@ -4,14 +4,16 @@ mod common;
 
 use sheetpatch::{CellEdit, CellValue, Error, Workbook};
 use std::collections::BTreeMap;
+use std::{mem, slice};
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const STRICT_MAIN_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const STRICT_MAIN_NAMESPACE: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const STRICT_OFFICE_NAMESPACE: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const TABLE_PATH: &str = "xl/tables/table1.xml";
-const SHEET_RELS: &str = "xl/worksheets/_rels/sheet1.xml.rels";
+const SHEET_RELATIONSHIPS: &str = "xl/worksheets/_rels/sheet1.xml.rels";
 
 const REFUSAL: &str =
     "is an Excel table header cell; editing it would desynchronize the table's column names";
@@ -20,14 +22,14 @@ const REFUSAL: &str =
 /// (an inline string). Notes has no relationships.
 fn parts(table_attributes: &str) -> BTreeMap<String, String> {
     let data = format!(
-        "<worksheet xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheetData>\
+        "<worksheet xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheetData>\
          <row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='inlineStr'><is><t>Amount</t></is></c><c r='C1'><v>9</v></c></row>\
          <row r='2'><c r='A2' t='inlineStr'><is><t>x</t></is></c><c r='B2'><v>5</v></c></row>\
          <row r='3'><c r='A3' t='inlineStr'><is><t>y</t></is></c><c r='B3'><v>6</v></c></row>\
          </sheetData><tableParts count='1'><tablePart r:id='table'/></tableParts></worksheet>"
     );
     let notes = format!(
-        "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData></worksheet>"
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>1</v></c></row></sheetData></worksheet>"
     );
     BTreeMap::from([
         (
@@ -36,29 +38,29 @@ fn parts(table_attributes: &str) -> BTreeMap<String, String> {
         ),
         (
             "_rels/.rels".into(),
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
         ),
         (
             "xl/workbook.xml".into(),
-            format!("<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets><sheet name='Data' sheetId='1' r:id='one'/><sheet name='Notes' sheetId='2' r:id='two'/></sheets></workbook>"),
+            format!("<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets><sheet name='Data' sheetId='1' r:id='one'/><sheet name='Notes' sheetId='2' r:id='two'/></sheets></workbook>"),
         ),
         (
             "xl/_rels/workbook.xml.rels".into(),
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='one' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='two' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet2.xml'/><Relationship Id='strings' Type='{OFFICE_NS}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='one' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet1.xml'/><Relationship Id='two' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet2.xml'/><Relationship Id='strings' Type='{OFFICE_NAMESPACE}/sharedStrings' Target='sharedStrings.xml'/></Relationships>"),
         ),
         (
             "xl/sharedStrings.xml".into(),
-            format!("<sst xmlns='{MAIN_NS}'><si><t>Name</t></si></sst>"),
+            format!("<sst xmlns='{MAIN_NAMESPACE}'><si><t>Name</t></si></sst>"),
         ),
         ("xl/worksheets/sheet1.xml".into(), data),
         ("xl/worksheets/sheet2.xml".into(), notes),
         (
-            SHEET_RELS.into(),
-            format!("<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='link' Type='{OFFICE_NS}/hyperlink' Target='https://example.com/' TargetMode='External'/><Relationship Id='table' Type='{OFFICE_NS}/table' Target='../tables/table1.xml'/></Relationships>"),
+            SHEET_RELATIONSHIPS.into(),
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='link' Type='{OFFICE_NAMESPACE}/hyperlink' Target='https://example.com/' TargetMode='External'/><Relationship Id='table' Type='{OFFICE_NAMESPACE}/table' Target='../tables/table1.xml'/></Relationships>"),
         ),
         (
             TABLE_PATH.into(),
-            format!("<table xmlns='{MAIN_NS}' id='1' name='Table1' displayName='Table1' {table_attributes}><autoFilter ref='A1:B3'/><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Amount'/></tableColumns></table>"),
+            format!("<table xmlns='{MAIN_NAMESPACE}' id='1' name='Table1' displayName='Table1' {table_attributes}><autoFilter ref='A1:B3'/><tableColumns count='2'><tableColumn id='1' name='Name'/><tableColumn id='2' name='Amount'/></tableColumns></table>"),
         ),
     ])
 }
@@ -87,12 +89,14 @@ fn assert_refused_in(sheet_name: &str, result: sheetpatch::Result<()>, address: 
         ) => {
             assert_eq!(
                 (sheet.as_str(), cell.to_string().as_str()),
-                (sheet_name, address)
+                (sheet_name, address),
+                "the refusal names a different cell"
             );
-            assert_eq!(reason, REFUSAL);
+            assert_eq!(reason, REFUSAL, "{address} is refused for another reason");
             assert_eq!(
                 error.to_string(),
-                format!("protected cell: worksheet \"{sheet_name}\": {address} {REFUSAL}")
+                format!("protected cell: worksheet \"{sheet_name}\": {address} {REFUSAL}"),
+                "the refusal's message does not name the worksheet and cell once"
             );
         }
         other => panic!("expected {address} to be refused, got {other:?}"),
@@ -124,7 +128,7 @@ fn table_body_and_cells_outside_tables_remain_editable() {
 
 #[test]
 fn table_relationships_resolve_independently_of_legacy_zip_name_spelling() {
-    for (target, sheet_path, rels_path) in [
+    for (target, sheet_path, relationships_path) in [
         (
             "worksheets/sheet%20one.xml",
             "xl/worksheets/sheet%20one.xml",
@@ -144,16 +148,16 @@ fn table_relationships_resolve_independently_of_legacy_zip_name_spelling() {
         let mut parts = parts("ref='A1:B3'");
         let sheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
         parts.insert(sheet_path.into(), sheet);
-        let rels = parts.remove(SHEET_RELS).unwrap();
-        parts.insert(rels_path.into(), rels);
-        if rels_path.contains("%20") {
+        let relationships = parts.remove(SHEET_RELATIONSHIPS).unwrap();
+        parts.insert(relationships_path.into(), relationships);
+        if relationships_path.contains("%20") {
             parts.insert(
                 "xl/worksheets/_rels/sheet one.xml.rels".into(),
-                format!("<Relationships xmlns='{PACKAGE_NS}'/>"),
+                format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'/>"),
             );
         }
-        let workbook_rels = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
-        *workbook_rels = workbook_rels.replace("worksheets/sheet1.xml", target);
+        let workbook_relationships = parts.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *workbook_relationships = workbook_relationships.replace("worksheets/sheet1.xml", target);
 
         let mut book = book(&parts);
         assert_refused(book.set_cell("Data", "B1", "Changed"), "B1");
@@ -176,8 +180,8 @@ fn edits_that_change_a_header_cell_are_refused_without_changes() {
         assert_refused(book.set_cells("Data", [("B2", "8"), ("B1", "x")]), "B1");
         assert_refused(
             book.apply_edits([
-                CellEdit::new("Notes", "A1", 2).unwrap(),
-                CellEdit::new("Data", "A1", "Label").unwrap(),
+                CellEdit::try_new("Notes", "A1", 2).unwrap(),
+                CellEdit::try_new("Data", "A1", "Label").unwrap(),
             ]),
             "A1",
         );
@@ -211,39 +215,36 @@ fn unchanged_headers_leave_the_rest_of_a_batch_on_a_pending_sheet_as_it_is() {
     *sheet = sheet.replace("<sheetData>", "<dimension ref='A1:C3'/><sheetData>");
     let original = archive(&parts);
     let body = [
-        ("Data", "B2", CellValue::from(8)),
-        ("Data", "A4", CellValue::from("below")),
-        ("Notes", "A1", CellValue::from(true)),
+        CellEdit::try_new("Data", "B2", 8).unwrap(),
+        CellEdit::try_new("Data", "A4", "below").unwrap(),
+        CellEdit::try_new("Notes", "A1", true).unwrap(),
     ];
     let headers = [
-        ("Data", "A1", CellValue::from("Name")),
-        ("Data", "B1", CellValue::from("Amount")),
+        CellEdit::try_new("Data", "A1", "Name").unwrap(),
+        CellEdit::try_new("Data", "B1", "Amount").unwrap(),
     ];
-    let edits = |edits: &[(&str, &str, CellValue)]| {
-        edits
-            .iter()
-            .map(|(sheet, cell, value)| CellEdit::new(*sheet, cell, value.clone()).unwrap())
-            .collect::<Vec<_>>()
-    };
     let mut expected = Workbook::from_bytes(original.clone()).unwrap();
     let mut book = Workbook::from_bytes(original).unwrap();
     for book in [&mut expected, &mut book] {
         // Widening the dimension moves the header cells in the pending XML.
         book.set_cell("Data", "D9", "pending").unwrap();
     }
-    expected.apply_edits(edits(&body)).unwrap();
+    expected.apply_edits(body.clone()).unwrap();
     let pending = expected.to_bytes().unwrap();
-    book.apply_edits(edits(&[&headers[..], &body[..]].concat()))
+    book.apply_edits([&headers[..], &body[..]].concat())
         .unwrap();
     assert_eq!(book.to_bytes().unwrap(), pending);
     // A changed header still refuses the whole transaction.
-    let changed = ("Data", "B1", CellValue::from("Total"));
+    let changed = CellEdit::try_new("Data", "B1", "Total").unwrap();
     assert_refused(
-        book.apply_edits(edits(&[&body[..], std::slice::from_ref(&changed)].concat())),
+        book.apply_edits([&body[..], slice::from_ref(&changed)].concat()),
         "B1",
     );
     assert_refused(
-        book.set_cells("Data", [("B2", CellValue::from(9)), ("B1", changed.2)]),
+        book.set_cells(
+            "Data",
+            [("B2", CellValue::from(9)), ("B1", changed.value().clone())],
+        ),
         "B1",
     );
     assert_eq!(book.to_bytes().unwrap(), pending);
@@ -270,22 +271,27 @@ fn header_checks_agree_before_and_after_the_tables_are_resolved() {
         &[("A1", "Name".into()), ("B1", "Amount".into())],
         &[("B1", "Amount".into()), ("A3", "z".into())],
     ];
-    let outcomes = |parts: &BTreeMap<String, String>, resolved: bool| {
+    /// A batch's error message, if any, and the workbook's bytes after it.
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        result: Result<(), String>,
+        bytes: Vec<u8>,
+    }
+    let outcomes = |parts: &BTreeMap<String, String>, resolved: bool| -> Vec<Outcome> {
         let mut book = book(parts);
         if resolved {
             book.set_cell("Data", "B2", 7).unwrap();
             book.reset_changes();
         }
-        batches
-            .iter()
-            .map(|&batch| {
-                let result = book.set_cells("Data", batch.iter().cloned());
-                (
-                    result.map_err(|error| error.to_string()),
-                    book.to_bytes().unwrap(),
-                )
-            })
-            .collect::<Vec<_>>()
+        let mut recorded = Vec::new();
+        for &batch in &batches {
+            let result = book.set_cells("Data", batch.iter().cloned());
+            recorded.push(Outcome {
+                result: result.map_err(|error| error.to_string()),
+                bytes: book.to_bytes().unwrap(),
+            });
+        }
+        recorded
     };
     let refusal = format!("protected cell: worksheet \"Data\": A1 {REFUSAL}");
     let unreadable_header = "invalid workbook: worksheet \"Data\": B1: invalid cell style index";
@@ -301,13 +307,13 @@ fn header_checks_agree_before_and_after_the_tables_are_resolved() {
             ],
         ),
     ] {
-        let first = outcomes(parts, false);
-        let results: Vec<_> = first
+        let first = outcomes(parts, /* resolved: */ false);
+        let results: Vec<Result<(), &str>> = first
             .iter()
-            .map(|(result, _)| result.as_ref().map_err(String::as_str).copied())
+            .map(|outcome| outcome.result.as_ref().map_err(String::as_str).copied())
             .collect();
         assert_eq!(results, expected);
-        assert_eq!(outcomes(parts, true), first);
+        assert_eq!(outcomes(parts, /* resolved: */ true), first);
     }
 }
 
@@ -337,7 +343,8 @@ fn tables_are_resolved_after_the_edits_are_checked_and_before_headers_are_read()
     // A batch that changes nothing does not need them.
     book.set_cell("Data", "A1", "Name").unwrap();
     // A change does, and their error precedes reading the edited header.
-    let missing = format!("invalid workbook: part {SHEET_RELS:?}: missing table part {TABLE_PATH}");
+    let missing =
+        format!("invalid workbook: part {SHEET_RELATIONSHIPS:?}: missing table part {TABLE_PATH}");
     for batch in [&[("B3", "8")][..], &[("B1", "Total"), ("B3", "8")]] {
         let error = book.set_cells("Data", batch.iter().copied()).unwrap_err();
         assert_eq!(error.to_string(), missing, "{batch:?}");
@@ -368,17 +375,17 @@ fn tables_without_a_header_row_leave_the_first_row_editable() {
 #[test]
 fn multiple_tables_keep_header_columns_and_cell_error_order() {
     let mut parts = parts("ref='B1:C3' headerRowCount='3'");
-    let relationships = parts.get_mut(SHEET_RELS).unwrap();
+    let relationships = parts.get_mut(SHEET_RELATIONSHIPS).unwrap();
     *relationships = relationships.replace(
         "</Relationships>",
         &format!(
-            "<Relationship Id='other' Type='{OFFICE_NS}/table' Target='../tables/table2.xml'/></Relationships>"
+            "<Relationship Id='other' Type='{OFFICE_NAMESPACE}/table' Target='../tables/table2.xml'/></Relationships>"
         ),
     );
     parts.insert(
         "xl/tables/table2.xml".into(),
         format!(
-            "<table xmlns='{MAIN_NS}' id='2' name='Other' displayName='Other' ref='A1:A3'><tableColumns count='1'><tableColumn id='1' name='Name'/></tableColumns></table>"
+            "<table xmlns='{MAIN_NAMESPACE}' id='2' name='Other' displayName='Other' ref='A1:A3'><tableColumns count='1'><tableColumn id='1' name='Name'/></tableColumns></table>"
         ),
     );
     let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
@@ -449,7 +456,7 @@ fn later_header_read_errors_take_precedence_over_changed_headers() {
         );
     parts.insert(
         "xl/sharedStrings.xml".into(),
-        format!("<sst xmlns='{MAIN_NS}'>"),
+        format!("<sst xmlns='{MAIN_NAMESPACE}'>"),
     );
     let original = archive(&parts);
     let mut book = Workbook::from_bytes(original.clone()).unwrap();
@@ -466,15 +473,15 @@ fn later_header_read_errors_take_precedence_over_changed_headers() {
 #[test]
 fn strict_table_relationships_and_namespaces_are_recognized() {
     let mut parts = parts("ref='A1:B3'");
-    let rels = parts[SHEET_RELS].replace(
-        &format!("{OFFICE_NS}/table"),
-        &format!("{STRICT_OFFICE_NS}/table"),
+    let relationships = parts[SHEET_RELATIONSHIPS].replace(
+        &format!("{OFFICE_NAMESPACE}/table"),
+        &format!("{STRICT_OFFICE_NAMESPACE}/table"),
     );
-    parts.insert(SHEET_RELS.into(), rels);
+    parts.insert(SHEET_RELATIONSHIPS.into(), relationships);
     let mut book = self::book(&parts);
     assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
 
-    let table = parts[TABLE_PATH].replace(MAIN_NS, STRICT_MAIN_NS);
+    let table = parts[TABLE_PATH].replace(MAIN_NAMESPACE, STRICT_MAIN_NAMESPACE);
     parts.insert(TABLE_PATH.into(), table);
     let mut book = self::book(&parts);
     assert_refused(book.set_cell("Data", "B1", "Total"), "B1");
@@ -484,7 +491,7 @@ fn strict_table_relationships_and_namespaces_are_recognized() {
 #[test]
 fn repeated_table_targets_keep_protection_and_relationship_error_order() {
     let mut parts = parts("ref='A1:B3'");
-    let aliases = [
+    let aliases: String = [
         "../tables/table1.xml",
         "../tables/table1.xml",
         "../tables/./table1.xml",
@@ -495,11 +502,14 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
     .iter()
     .enumerate()
     .map(|(index, target)| {
-        format!("<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{target}'/>")
+        format!(
+            "<Relationship Id='alias{index}' Type='{OFFICE_NAMESPACE}/table' Target='{target}'/>"
+        )
     })
-    .collect::<String>();
-    let rels = parts.get_mut(SHEET_RELS).unwrap();
-    *rels = rels.replace("</Relationships>", &format!("{aliases}</Relationships>"));
+    .collect();
+    let relationships = parts.get_mut(SHEET_RELATIONSHIPS).unwrap();
+    *relationships =
+        relationships.replace("</Relationships>", &format!("{aliases}</Relationships>"));
 
     let original = archive(&parts);
     let mut book = self::book(&parts);
@@ -516,25 +526,25 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
         (
             "Target='../tables/table1.xml' TargetMode='External'",
             false,
-            SHEET_RELS,
+            SHEET_RELATIONSHIPS,
             "table relationship late is external",
         ),
         (
             "Target='../../../outside.xml'",
             false,
-            SHEET_RELS,
+            SHEET_RELATIONSHIPS,
             "relationship target escapes package root",
         ),
         (
             "Target='../tables/missing.xml'",
             false,
-            SHEET_RELS,
+            SHEET_RELATIONSHIPS,
             "missing table part",
         ),
         (
             "Target='../tables/table1%xx.xml'",
             false,
-            SHEET_RELS,
+            SHEET_RELATIONSHIPS,
             "invalid percent-encoded target",
         ),
         (
@@ -546,15 +556,17 @@ fn repeated_table_targets_keep_protection_and_relationship_error_order() {
         (
             "Target='../tables/table1.xml' TargetMode='invalid'",
             true,
-            SHEET_RELS,
+            SHEET_RELATIONSHIPS,
             "invalid relationship TargetMode",
         ),
     ] {
         let mut damaged = parts.clone();
-        let rels = damaged.get_mut(SHEET_RELS).unwrap();
-        *rels = rels.replace(
+        let relationships = damaged.get_mut(SHEET_RELATIONSHIPS).unwrap();
+        *relationships = relationships.replace(
             "</Relationships>",
-            &format!("<Relationship Id='late' Type='{OFFICE_NS}/table' {late}/></Relationships>"),
+            &format!(
+                "<Relationship Id='late' Type='{OFFICE_NAMESPACE}/table' {late}/></Relationships>"
+            ),
         );
         if broken_table {
             let table = damaged.get_mut(TABLE_PATH).unwrap();
@@ -577,8 +589,8 @@ fn a_table_part_shared_by_worksheets_protects_each_of_them() {
     let mut shared = parts("ref='A1:B3'");
     let data = shared["xl/worksheets/sheet1.xml"].clone();
     shared.insert("xl/worksheets/sheet2.xml".into(), data);
-    let rels = shared[SHEET_RELS].clone();
-    shared.insert("xl/worksheets/_rels/sheet2.xml.rels".into(), rels);
+    let relationships = shared[SHEET_RELATIONSHIPS].clone();
+    shared.insert("xl/worksheets/_rels/sheet2.xml.rels".into(), relationships);
 
     // In separate calls, the second worksheet reuses the first one's table.
     let mut separate = book(&shared);
@@ -591,23 +603,26 @@ fn a_table_part_shared_by_worksheets_protects_each_of_them() {
     assert_refused_in(
         "Notes",
         together.apply_edits([
-            CellEdit::new("Data", "B2", 3).unwrap(),
-            CellEdit::new("Notes", "A1", "Changed").unwrap(),
+            CellEdit::try_new("Data", "B2", 3).unwrap(),
+            CellEdit::try_new("Notes", "A1", "Changed").unwrap(),
         ]),
         "A1",
     );
     assert!(!together.has_changes());
     together
         .apply_edits([
-            CellEdit::new("Data", "B2", 3).unwrap(),
-            CellEdit::new("Notes", "B3", 4).unwrap(),
+            CellEdit::try_new("Data", "B2", 3).unwrap(),
+            CellEdit::try_new("Notes", "B3", 4).unwrap(),
         ])
         .unwrap();
 
     // A table part that cannot be read is reported again for each worksheet,
     // naming the part rather than the worksheet.
-    let mut broken = shared.clone();
-    broken.insert(TABLE_PATH.into(), format!("<table xmlns='{MAIN_NS}'/>"));
+    let mut broken = shared;
+    broken.insert(
+        TABLE_PATH.into(),
+        format!("<table xmlns='{MAIN_NAMESPACE}'/>"),
+    );
     let mut broken = book(&broken);
     for sheet in ["Data", "Notes", "Data"] {
         let error = broken.set_cell(sheet, "B2", 1).unwrap_err();
@@ -631,14 +646,14 @@ fn many_repeated_table_targets_share_long_source_uris() {
     parts.insert(worksheet_path, worksheet);
     let table = parts.remove(TABLE_PATH).unwrap();
     parts.insert(table_path, table);
-    let relationships = parts.remove(SHEET_RELS).unwrap();
-    let aliases = (0..1024)
+    let relationships = parts.remove(SHEET_RELATIONSHIPS).unwrap();
+    let aliases: String = (0..1024)
         .map(|index| {
             format!(
-                "<Relationship Id='repeat{index}' Type='{OFFICE_NS}/table' Target='table1.xml'/>"
+                "<Relationship Id='repeat{index}' Type='{OFFICE_NAMESPACE}/table' Target='table1.xml'/>"
             )
         })
-        .collect::<String>();
+        .collect();
     parts.insert(
         relationships_path,
         relationships
@@ -668,35 +683,35 @@ fn alternate_table_target_spellings_share_long_source_uris() {
     parts.insert(format!("{directory}/sheet1.xml"), worksheet);
     let table = parts.remove(TABLE_PATH).unwrap();
     parts.insert(format!("{directory}/table1.xml"), table);
-    let relationships = parts.remove(SHEET_RELS).unwrap();
+    let relationships = parts.remove(SHEET_RELATIONSHIPS).unwrap();
     // Every alias spells table1.xml differently, by letter case, escapes of
     // unreserved letters, and dot segments, so none repeats a spelling.
-    let spell = |c: char, choice: usize| match choice {
-        0 => c.to_string(),
-        1 => c.to_ascii_uppercase().to_string(),
-        2 => format!("%{:02x}", c as u32),
-        _ => format!("%{:02X}", c as u32),
+    let spell = |character: char, choice: usize| match choice {
+        0 => character.to_string(),
+        1 => character.to_ascii_uppercase().to_string(),
+        2 => format!("%{:02x}", character as u32),
+        _ => format!("%{:02X}", character as u32),
     };
-    let aliases = (0..16_384usize)
+    let aliases: String = (0..16_384usize)
         .map(|index| {
             let mut rest = index;
             let name: String = "table1.xml"
                 .chars()
-                .map(|c| {
-                    if !c.is_ascii_alphabetic() {
-                        return c.to_string();
+                .map(|character| {
+                    if !character.is_ascii_alphabetic() {
+                        return character.to_string();
                     }
                     let choice = rest % 4;
                     rest /= 4;
-                    spell(c, choice)
+                    spell(character, choice)
                 })
                 .collect();
             let prefix = ["", "./", "d/../", "./d/./../"][index % 4];
             format!(
-                "<Relationship Id='alias{index}' Type='{OFFICE_NS}/table' Target='{prefix}{name}'/>"
+                "<Relationship Id='alias{index}' Type='{OFFICE_NAMESPACE}/table' Target='{prefix}{name}'/>"
             )
         })
-        .collect::<String>();
+        .collect();
     parts.insert(
         format!("{directory}/_rels/sheet1.xml.rels"),
         relationships
@@ -723,21 +738,21 @@ fn table_targets_appending_one_path_to_different_directories_stay_distinct() {
     // Both targets append tables/table1.xml, one to the worksheet's xl/
     // directory and one to the package root, so they name different parts.
     let mut parts = parts("ref='A1:B3'");
-    let rels = parts.get_mut(SHEET_RELS).unwrap();
-    *rels = rels.replace(
+    let relationships = parts.get_mut(SHEET_RELATIONSHIPS).unwrap();
+    *relationships = relationships.replace(
         "</Relationships>",
-        &format!("<Relationship Id='root' Type='{OFFICE_NS}/table' Target='/tables/table1.xml'/></Relationships>"),
+        &format!("<Relationship Id='root' Type='{OFFICE_NAMESPACE}/table' Target='/tables/table1.xml'/></Relationships>"),
     );
     let error = book(&parts).set_cell("Data", "B2", 7).unwrap_err();
     assert!(
         matches!(&error, Error::InvalidWorkbook(message)
-            if message == &format!("part {SHEET_RELS:?}: missing table part tables/table1.xml")),
+            if message == &format!("part {SHEET_RELATIONSHIPS:?}: missing table part tables/table1.xml")),
         "{error}"
     );
 
     parts.insert(
         "tables/table1.xml".into(),
-        format!("<table xmlns='{MAIN_NS}' ref='C1:C3'/>"),
+        format!("<table xmlns='{MAIN_NAMESPACE}' ref='C1:C3'/>"),
     );
     let mut both = book(&parts);
     assert_refused(both.set_cell("Data", "C1", "beside"), "C1");
@@ -753,7 +768,7 @@ fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
         let worksheet_path = format!("{directory}/sheet1.xml");
         let worksheet = parts.remove("xl/worksheets/sheet1.xml").unwrap();
         parts.insert(worksheet_path.clone(), worksheet);
-        let relationships = parts.remove(SHEET_RELS).unwrap();
+        let relationships = parts.remove(SHEET_RELATIONSHIPS).unwrap();
         parts.insert(
             format!("{directory}/_rels/sheet1.xml.rels"),
             relationships.replace("../tables/table1.xml", "table1.xml"),
@@ -769,7 +784,7 @@ fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
         // would read this unrelated table and leave the real headers editable.
         parts.insert(
             "xl/worksheetsA/table1.xml".into(),
-            format!("<table xmlns='{MAIN_NS}' ref='Z1:Z3'/>"),
+            format!("<table xmlns='{MAIN_NAMESPACE}' ref='Z1:Z3'/>"),
         );
 
         let original = archive(&parts);
@@ -789,24 +804,24 @@ fn table_targets_resolve_against_the_worksheet_uri_not_its_decoded_zip_name() {
 #[test]
 fn sheets_without_tables_are_unaffected() {
     let mut parts = parts("ref='A1:B3'");
-    parts.remove(SHEET_RELS);
+    parts.remove(SHEET_RELATIONSHIPS);
     let mut book = self::book(&parts);
     book.set_cell("Data", "B1", "Total").unwrap();
 
     // Relationships to other parts, and table relationships of other sheets,
     // do not protect anything.
     let mut parts = self::parts("ref='A1:B3'");
-    let rels = parts.remove(SHEET_RELS).unwrap();
+    let relationships = parts.remove(SHEET_RELATIONSHIPS).unwrap();
     parts.insert(
-        SHEET_RELS.into(),
-        rels.replace(
-            &format!("{OFFICE_NS}/table"),
-            &format!("{OFFICE_NS}/drawing"),
+        SHEET_RELATIONSHIPS.into(),
+        relationships.replace(
+            &format!("{OFFICE_NAMESPACE}/table"),
+            &format!("{OFFICE_NAMESPACE}/drawing"),
         ),
     );
     parts.insert(
         "xl/worksheets/_rels/sheet2.xml.rels".into(),
-        rels.replace("../tables/table1.xml", "/xl/tables/table1.xml"),
+        relationships.replace("../tables/table1.xml", "/xl/tables/table1.xml"),
     );
     let mut book = self::book(&parts);
     book.set_cell("Data", "B1", "Total").unwrap();
@@ -849,7 +864,7 @@ fn rewriting_a_date_header_with_its_serial_is_a_no_op() {
         // Any other number would change the header.
         assert_refused(book.set_cell("Data", "B1", other), "B1");
         assert_refused(
-            book.apply_edits([CellEdit::new("Data", "B1", serial + 1).unwrap()]),
+            book.apply_edits([CellEdit::try_new("Data", "B1", serial + 1).unwrap()]),
             "B1",
         );
         assert_eq!(book.to_bytes().unwrap(), original);
@@ -919,7 +934,7 @@ fn malformed_tables_of_an_edited_sheet_are_invalid() {
         &|parts| {
             parts.remove(TABLE_PATH);
         },
-        SHEET_RELS,
+        SHEET_RELATIONSHIPS,
     );
     assert!(
         message.ends_with(&format!("missing table part {TABLE_PATH}")),
@@ -927,29 +942,29 @@ fn malformed_tables_of_an_edited_sheet_are_invalid() {
     );
     invalid(
         &|parts| {
-            let rels = parts[SHEET_RELS].replace(
+            let relationships = parts[SHEET_RELATIONSHIPS].replace(
                 "Target='../tables/table1.xml'",
                 "Target='../tables/table1.xml' TargetMode='External'",
             );
-            parts.insert(SHEET_RELS.into(), rels);
+            parts.insert(SHEET_RELATIONSHIPS.into(), relationships);
         },
-        SHEET_RELS,
+        SHEET_RELATIONSHIPS,
     );
     invalid(
         &|parts| {
-            let rels = parts[SHEET_RELS]
+            let relationships = parts[SHEET_RELATIONSHIPS]
                 .replace("Target='../tables/table1.xml'", "Target='../../../x.xml'");
-            parts.insert(SHEET_RELS.into(), rels);
+            parts.insert(SHEET_RELATIONSHIPS.into(), relationships);
         },
-        SHEET_RELS,
+        SHEET_RELATIONSHIPS,
     );
     invalid(
         &|parts| {
-            let rels = parts[SHEET_RELS].replace("<Relationships ", "<Other ");
-            let rels = rels.replace("</Relationships>", "</Other>");
-            parts.insert(SHEET_RELS.into(), rels);
+            let relationships = parts[SHEET_RELATIONSHIPS].replace("<Relationships ", "<Other ");
+            let relationships = relationships.replace("</Relationships>", "</Other>");
+            parts.insert(SHEET_RELATIONSHIPS.into(), relationships);
         },
-        SHEET_RELS,
+        SHEET_RELATIONSHIPS,
     );
 }
 
@@ -957,9 +972,13 @@ fn malformed_tables_of_an_edited_sheet_are_invalid() {
 fn unreadable_table_parts_name_the_part_with_their_own_variant() {
     for (part, damage, expected) in [
         (TABLE_PATH, "truncated", Error::Xml(String::new())),
-        (SHEET_RELS, "truncated", Error::Xml(String::new())),
+        (SHEET_RELATIONSHIPS, "truncated", Error::Xml(String::new())),
         (TABLE_PATH, "doctype", Error::Unsupported(String::new())),
-        (SHEET_RELS, "doctype", Error::Unsupported(String::new())),
+        (
+            SHEET_RELATIONSHIPS,
+            "doctype",
+            Error::Unsupported(String::new()),
+        ),
     ] {
         let mut parts = parts("ref='A1:B3'");
         let xml = &parts[part];
@@ -971,8 +990,8 @@ fn unreadable_table_parts_name_the_part_with_their_own_variant() {
         let mut book = book(&parts);
         let error = book.set_cell("Data", "B2", 7).unwrap_err();
         assert_eq!(
-            std::mem::discriminant(&error),
-            std::mem::discriminant(&expected),
+            mem::discriminant(&error),
+            mem::discriminant(&expected),
             "{part} {damage}: {error:?}"
         );
         let message = match &error {

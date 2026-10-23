@@ -1,7 +1,7 @@
 //! Deterministic randomized properties for edits, reads, and preservation.
 //!
 //! Every test runs a fixed number of cases from a fixed seed, using a small
-//! xorshift64* generator, so a failure reproduces exactly. Failure messages name
+//! xorshift64* generator, so a failure reproduces exactly. Failure output names
 //! the test, seed, and case. Set `SHEETPATCH_PROPERTY_SEED` (decimal or `0x`
 //! hexadecimal) to explore other inputs, and `SHEETPATCH_PROPERTY_CASES` to
 //! change the number of cases each test runs.
@@ -12,27 +12,24 @@
 //! oracle rather than against the crate's own parser.
 mod common;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    panic::{self, AssertUnwindSafe},
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::{env, iter, thread};
 
-use common::{
-    ZipLayout, central_directory_offset, data_descriptor_len, payload, with_data_descriptors,
-    write_zip, zip_entries,
-};
+use common::{ZipEntry, ZipLayout};
 use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Workbook};
 
-const DEFAULT_SEED: u64 = 0x5EE7_5EED_2026_1011;
+const DEFAULT_SEED: u64 = 0x5ee7_5eed_2026_1011;
 
-const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
-const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const STRICT_OFFICE_NS: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
-const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
-const CONTENT_TYPES_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
-const VENDOR_NS: &str = "urn:sheetpatch:vendor";
+const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const STRICT_NAMESPACE: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+const OFFICE_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const STRICT_OFFICE_NAMESPACE: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const CONTENT_TYPES_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/package/2006/content-types";
+const VENDOR_NAMESPACE: &str = "urn:sheetpatch:vendor";
 
 const MAX_TEXT_UNITS: usize = 32_767;
 
@@ -63,17 +60,17 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        Self((z ^ (z >> 31)) | 1)
+        let mut mixed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Self((mixed ^ (mixed >> 31)) | 1)
     }
 
     fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
     fn below(&mut self, bound: usize) -> usize {
@@ -108,8 +105,8 @@ struct Case {
     index: usize,
 }
 
-impl fmt::Display for Case {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Case {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "[{} SHEETPATCH_PROPERTY_SEED={:#x} case {}]",
@@ -119,7 +116,7 @@ impl fmt::Display for Case {
 }
 
 fn env_number(name: &str) -> Option<u64> {
-    let text = std::env::var(name).ok()?;
+    let text = env::var(name).ok()?;
     let text = text.trim();
     let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(hex) => u64::from_str_radix(&hex.replace('_', ""), 16),
@@ -129,37 +126,41 @@ fn env_number(name: &str) -> Option<u64> {
 }
 
 /// Runs `body` for each case with an independent generator. A panic anywhere,
-/// including inside the crate, is reported with the seed and case number.
+/// including inside the crate, is followed by a line that names the test, seed,
+/// and case number.
 fn run_cases(test: &'static str, default_cases: usize, mut body: impl FnMut(Case, &mut Rng)) {
     let seed = env_number("SHEETPATCH_PROPERTY_SEED").unwrap_or(DEFAULT_SEED);
     let cases = env_number("SHEETPATCH_PROPERTY_CASES").map_or(default_cases, |n| n as usize);
-    let stream = test.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    let stream = test.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     for index in 0..cases {
         let case = Case { test, seed, index };
-        let mut rng = Rng::new(seed ^ stream ^ (index as u64).wrapping_mul(0xD605_BBB5_8C8A_BBFD));
-        if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| body(case, &mut rng))) {
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("non-text panic payload");
-            if message.contains(&case.to_string()) {
-                panic::resume_unwind(panic);
-            }
-            panic!("{case} failed: {message}");
+        let mut rng = Rng::new(seed ^ stream ^ (index as u64).wrapping_mul(0xd605_bbb5_8c8a_bbfd));
+        let _guard = CaseGuard(case);
+        body(case, &mut rng);
+    }
+}
+
+/// Names its case on standard error when it is dropped by a panic, so that
+/// a failure anywhere, even one whose message lacks the case, can be rerun.
+struct CaseGuard(Case);
+
+impl Drop for CaseGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!("{} failed", self.0);
         }
     }
 }
 
-trait OrFail<T> {
-    fn or_fail(self, case: Case, what: impl fmt::Display) -> T;
+trait ResultExt<T> {
+    fn or_fail(self, case: Case, what: impl Display) -> T;
 }
 
-impl<T, E: fmt::Debug> OrFail<T> for Result<T, E> {
+impl<T, E: Debug> ResultExt<T> for Result<T, E> {
     #[track_caller]
-    fn or_fail(self, case: Case, what: impl fmt::Display) -> T {
+    fn or_fail(self, case: Case, what: impl Display) -> T {
         match self {
             Ok(value) => value,
             Err(error) => panic!("{case} {what}: {error:?}"),
@@ -168,7 +169,7 @@ impl<T, E: fmt::Debug> OrFail<T> for Result<T, E> {
 }
 
 /// Debug output, truncated so 32,767-unit strings keep messages readable.
-fn brief(value: &impl fmt::Debug) -> String {
+fn brief(value: &impl Debug) -> String {
     let text = format!("{value:?}");
     if text.len() <= 240 {
         return text;
@@ -181,7 +182,7 @@ fn brief(value: &impl fmt::Debug) -> String {
 }
 
 fn cell(row: u32, column: u16) -> CellRef {
-    CellRef::new(row, column).expect("generated address is within the grid")
+    CellRef::try_new(row, column).expect("generated address is within the grid")
 }
 
 // ---------------------------------------------------------------- values
@@ -269,11 +270,12 @@ fn longest_text(rng: &mut Rng) -> String {
         1
     };
     let mut text = unit.repeat(repeats);
-    text.extend(std::iter::repeat_n(
-        'z',
-        MAX_TEXT_UNITS - repeats * unit_len,
-    ));
-    assert_eq!(text.encode_utf16().count(), MAX_TEXT_UNITS);
+    text.extend(iter::repeat_n('z', MAX_TEXT_UNITS - repeats * unit_len));
+    assert_eq!(
+        text.encode_utf16().count(),
+        MAX_TEXT_UNITS,
+        "the padding must fill exactly the units that whole repeats leave"
+    );
     text
 }
 
@@ -327,7 +329,7 @@ fn number_value(rng: &mut Rng) -> f64 {
             f64::EPSILON,
             // The smallest and largest subnormal numbers.
             f64::from_bits(1),
-            f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+            f64::from_bits(0x000f_ffff_ffff_ffff),
             -f64::from_bits(1),
             45_306.75,
             1e300,
@@ -396,7 +398,7 @@ struct Expected {
 }
 
 impl Expected {
-    fn value(value: CellValue) -> Self {
+    fn new(value: CellValue) -> Self {
         Self {
             value,
             formula: None,
@@ -404,7 +406,7 @@ impl Expected {
         }
     }
 
-    fn formula(value: CellValue, formula: &str) -> Self {
+    fn new_with_formula(value: CellValue, formula: &str) -> Self {
         Self {
             value,
             formula: Some(formula.to_owned()),
@@ -425,6 +427,21 @@ struct RowFormat {
     custom: bool,
 }
 
+/// The default style of the columns `min..=max`; style 0 is no style.
+#[derive(Clone, Copy)]
+struct ColumnStyle {
+    min: u16,
+    max: u16,
+    style: u32,
+}
+
+/// The size of a generated grid.
+#[derive(Clone, Copy)]
+struct Extent {
+    rows: u32,
+    columns: u16,
+}
+
 /// A generated worksheet and the oracle for reading and editing it.
 #[derive(Clone)]
 struct SheetModel {
@@ -433,8 +450,8 @@ struct SheetModel {
     /// Every cell element in the worksheet, by address.
     cells: BTreeMap<CellRef, Expected>,
     rows: BTreeMap<u32, RowFormat>,
-    /// Column default styles as `(min, max, style)`; style 0 is no style.
-    columns: Vec<(u16, u16, u32)>,
+    /// Column default styles, sorted and nonoverlapping.
+    columns: Vec<ColumnStyle>,
     formula_cells: BTreeSet<CellRef>,
     formula_ranges: Vec<CellRange>,
     merges: Vec<CellRange>,
@@ -443,7 +460,7 @@ struct SheetModel {
     /// Cells whose value payload holds a comment, which no edit may discard.
     opaque_cells: BTreeSet<CellRef>,
     /// The generated grid's last row and column, before far-away cells.
-    extent: (u32, u16),
+    extent: Extent,
     xml: String,
     /// Exact source of each cell element and row start tag.
     cell_sources: BTreeMap<CellRef, String>,
@@ -460,7 +477,7 @@ impl SheetModel {
         self.cells
             .get(&cell)
             .cloned()
-            .unwrap_or_else(|| Expected::value(CellValue::Blank))
+            .unwrap_or_else(|| Expected::new(CellValue::Blank))
     }
 
     fn protected(&self, cell: CellRef) -> bool {
@@ -501,8 +518,8 @@ impl SheetModel {
         }
         self.columns
             .iter()
-            .find(|&&(min, max, _)| (min..=max).contains(&cell.column()))
-            .map(|&(_, _, style)| style)
+            .find(|column| (column.min..=column.max).contains(&cell.column()))
+            .map(|column| column.style)
             .filter(|&style| style != 0)
     }
 
@@ -580,7 +597,7 @@ struct Names {
 }
 
 impl Names {
-    fn el(self, local: &str) -> String {
+    fn element(self, local: &str) -> String {
         format!("{}{local}", self.prefix)
     }
 
@@ -602,7 +619,7 @@ fn escape_attribute(text: &str) -> String {
 }
 
 fn t_element(rng: &mut Rng, names: Names, source: &str) -> String {
-    let t = names.el("t");
+    let t = names.element("t");
     if source.is_empty() && rng.chance(1, 2) {
         return format!("<{t}/>");
     }
@@ -618,6 +635,8 @@ fn t_element(rng: &mut Rng, names: Names, source: &str) -> String {
 /// Rich text for an `<is>` or `<si>` element: a plain `<t>` or formatted runs,
 /// optionally followed by phonetic runs that are not part of the cell text.
 fn rich_text(rng: &mut Rng, names: Names) -> (String, String) {
+    use std::fmt::Write as _;
+
     let mut xml = String::new();
     let mut text = String::new();
     if rng.chance(1, 2) {
@@ -630,31 +649,33 @@ fn rich_text(rng: &mut Rng, names: Names) -> (String, String) {
             let properties = if rng.chance(1, 2) {
                 format!(
                     "<{rpr}><{b}/><{sz} val=\"11\"/><{color} rgb=\"FFFF0000\"/><{font} val=\"Calibri\"/></{rpr}>",
-                    rpr = names.el("rPr"),
-                    b = names.el("b"),
-                    sz = names.el("sz"),
-                    color = names.el("color"),
-                    font = names.el("rFont"),
+                    rpr = names.element("rPr"),
+                    b = names.element("b"),
+                    sz = names.element("sz"),
+                    color = names.element("color"),
+                    font = names.element("rFont"),
                 )
             } else {
                 String::new()
             };
-            let r = names.el("r");
+            let r = names.element("r");
             let t = t_element(rng, names, source);
-            xml.push_str(&format!("<{r}>{properties}{t}</{r}>"));
+            write!(xml, "<{r}>{properties}{t}</{r}>").unwrap();
             text.push_str(decoded);
         }
     }
     if rng.chance(1, 3) {
-        let rph = names.el("rPh");
+        let rph = names.element("rPh");
         for _ in 0..1 + rng.below(2) {
             let t = t_element(rng, names, "ふりがな");
-            xml.push_str(&format!("<{rph} sb=\"0\" eb=\"1\">{t}</{rph}>"));
+            write!(xml, "<{rph} sb=\"0\" eb=\"1\">{t}</{rph}>").unwrap();
         }
-        xml.push_str(&format!(
+        write!(
+            xml,
             "<{} fontId=\"1\" type=\"noConversion\"/>",
-            names.el("phoneticPr")
-        ));
+            names.element("phoneticPr")
+        )
+        .unwrap();
     }
     (xml, text)
 }
@@ -665,19 +686,21 @@ struct SharedStrings {
 }
 
 fn shared_strings(rng: &mut Rng, namespace: &str) -> SharedStrings {
+    use std::fmt::Write as _;
+
     let names = Names {
         prefix: if rng.chance(1, 4) { "ss:" } else { "" },
     };
-    let si = names.el("si");
+    let si = names.element("si");
     let count = 1 + rng.below(8);
     let mut items = String::new();
     let mut texts = Vec::new();
     for _ in 0..count {
         let (xml, text) = rich_text(rng, names);
-        items.push_str(&format!("<{si}>{xml}</{si}>"));
+        write!(items, "<{si}>{xml}</{si}>").unwrap();
         texts.push(text);
     }
-    let sst = names.el("sst");
+    let sst = names.element("sst");
     SharedStrings {
         xml: format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<{sst} {} count=\"{count}\" uniqueCount=\"{count}\">{items}</{sst}>",
@@ -688,7 +711,7 @@ fn shared_strings(rng: &mut Rng, namespace: &str) -> SharedStrings {
 }
 
 /// One generated cell element before its address and style are assigned.
-struct CellSpec {
+struct CellDraft {
     kind: Option<&'static str>,
     children: Vec<String>,
     expected: Expected,
@@ -697,7 +720,7 @@ struct CellSpec {
     formula_range: Option<CellRange>,
 }
 
-impl CellSpec {
+impl CellDraft {
     fn new(kind: Option<&'static str>, children: Vec<String>, expected: Expected) -> Self {
         Self {
             kind,
@@ -711,12 +734,12 @@ impl CellSpec {
 }
 
 fn value_element(names: Names, text: &str) -> String {
-    let v = names.el("v");
+    let v = names.element("v");
     format!("<{v}>{text}</{v}>")
 }
 
 fn formula_element(names: Names, attributes: &str, text: &str) -> String {
-    let f = names.el("f");
+    let f = names.element("f");
     if text.is_empty() {
         format!("<{f}{attributes}/>")
     } else {
@@ -724,13 +747,13 @@ fn formula_element(names: Names, attributes: &str, text: &str) -> String {
     }
 }
 
-fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellSpec {
+fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellDraft {
     let v = |text: &str| vec![value_element(names, text)];
     match rng.below(13) {
         0 | 1 => {
             let (source, number) = *rng.pick(NUMBER_SOURCES);
             let kind = rng.chance(1, 6).then_some("n");
-            CellSpec::new(kind, v(source), Expected::value(CellValue::Number(number)))
+            CellDraft::new(kind, v(source), Expected::new(CellValue::Number(number)))
         }
         2 | 3 if !strings.is_empty() => {
             let index = rng.below(strings.len());
@@ -740,24 +763,24 @@ fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellSpec {
                 index.to_string()
             };
             let text = CellValue::Text(strings[index].clone());
-            CellSpec::new(Some("s"), v(&source), Expected::value(text))
+            CellDraft::new(Some("s"), v(&source), Expected::new(text))
         }
         2..=5 => {
-            let is = names.el("is");
+            let is = names.element("is");
             let (payload, text) = if rng.chance(1, 12) {
                 (format!("<{is}/>"), String::new())
             } else {
                 let (xml, text) = rich_text(rng, names);
                 (format!("<{is}>{xml}</{is}>"), text)
             };
-            let mut spec = CellSpec::new(
+            let mut draft = CellDraft::new(
                 Some("inlineStr"),
                 vec![payload],
-                Expected::value(CellValue::Text(text)),
+                Expected::new(CellValue::Text(text)),
             );
             // A comment in the old value is markup an edit would discard.
-            spec.opaque = spec.children[0].contains("<!--");
-            spec
+            draft.opaque = draft.children[0].contains("<!--");
+            draft
         }
         6 => {
             let (source, value) = *rng.pick(&[
@@ -767,11 +790,7 @@ fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellSpec {
                 ("false", false),
                 (" 1 ", true),
             ]);
-            CellSpec::new(
-                Some("b"),
-                v(source),
-                Expected::value(CellValue::Bool(value)),
-            )
+            CellDraft::new(Some("b"), v(source), Expected::new(CellValue::Bool(value)))
         }
         7 => {
             let code = if rng.chance(1, 6) {
@@ -780,24 +799,24 @@ fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellSpec {
                 rng.pick(&ERROR_CODES)
             };
             let error = CellValue::Error(code.to_owned());
-            CellSpec::new(Some("e"), v(code), Expected::value(error))
+            CellDraft::new(Some("e"), v(code), Expected::new(error))
         }
         8 => {
             let (source, serial) = *rng.pick(DATE_SOURCES);
-            CellSpec::new(
+            CellDraft::new(
                 Some("d"),
                 v(source),
-                Expected::value(CellValue::Number(serial)),
+                Expected::new(CellValue::Number(serial)),
             )
         }
-        9 => CellSpec::new(None, Vec::new(), Expected::value(CellValue::Blank)),
+        9 => CellDraft::new(None, Vec::new(), Expected::new(CellValue::Blank)),
         10 => {
             let empty = if rng.chance(1, 2) {
-                format!("<{}/>", names.el("v"))
+                format!("<{}/>", names.element("v"))
             } else {
                 value_element(names, "")
             };
-            CellSpec::new(None, vec![empty], Expected::value(CellValue::Blank))
+            CellDraft::new(None, vec![empty], Expected::new(CellValue::Blank))
         }
         _ => {
             let number = number_value(rng);
@@ -806,51 +825,51 @@ fn plain_cell(rng: &mut Rng, names: Names, strings: &[String]) -> CellSpec {
             } else {
                 number.to_string()
             };
-            CellSpec::new(None, v(&source), Expected::value(CellValue::Number(number)))
+            CellDraft::new(None, v(&source), Expected::new(CellValue::Number(number)))
         }
     }
 }
 
-fn formula_cell(rng: &mut Rng, names: Names) -> CellSpec {
+fn formula_cell(rng: &mut Rng, names: Names) -> CellDraft {
     let f = |text| formula_element(names, "", text);
     let v = |text| value_element(names, text);
     match rng.below(5) {
-        0 => CellSpec::new(
+        0 => CellDraft::new(
             None,
             vec![f("SUM(A1:B1)"), v("3")],
-            Expected::formula(CellValue::Number(3.0), "SUM(A1:B1)"),
+            Expected::new_with_formula(CellValue::Number(3.0), "SUM(A1:B1)"),
         ),
-        1 => CellSpec::new(
+        1 => CellDraft::new(
             Some("str"),
             vec![f("\"x\"&amp;CHAR(65)"), v("x_x0041_")],
-            Expected::formula(CellValue::Text("xA".into()), "\"x\"&CHAR(65)"),
+            Expected::new_with_formula(CellValue::Text("xA".into()), "\"x\"&CHAR(65)"),
         ),
-        2 => CellSpec::new(
+        2 => CellDraft::new(
             Some("b"),
             vec![f("ISNUMBER(A1)"), v("1")],
-            Expected::formula(CellValue::Bool(true), "ISNUMBER(A1)"),
+            Expected::new_with_formula(CellValue::Bool(true), "ISNUMBER(A1)"),
         ),
-        3 => CellSpec::new(
+        3 => CellDraft::new(
             Some("e"),
             vec![f("1/0"), v("#DIV/0!")],
-            Expected::formula(CellValue::Error("#DIV/0!".into()), "1/0"),
+            Expected::new_with_formula(CellValue::Error("#DIV/0!".into()), "1/0"),
         ),
-        _ => CellSpec::new(
+        _ => CellDraft::new(
             None,
             vec![f("NOW()")],
-            Expected::formula(CellValue::Blank, "NOW()"),
+            Expected::new_with_formula(CellValue::Blank, "NOW()"),
         ),
     }
 }
 
-fn metadata_cell(names: Names) -> CellSpec {
-    let mut spec = CellSpec::new(
+fn metadata_cell(names: Names) -> CellDraft {
+    let mut draft = CellDraft::new(
         Some("e"),
         vec![value_element(names, "#VALUE!")],
-        Expected::value(CellValue::Error("#VALUE!".into())),
+        Expected::new(CellValue::Error("#VALUE!".into())),
     );
-    spec.metadata = true;
-    spec
+    draft.metadata = true;
+    draft
 }
 
 /// A rectangle anchored in the grid, at most three cells on each side.
@@ -872,7 +891,7 @@ fn place_ranges(
     rng: &mut Rng,
     crowded: bool,
     names: Names,
-    grid: &mut BTreeMap<CellRef, CellSpec>,
+    grid: &mut BTreeMap<CellRef, CellDraft>,
     rows: u32,
     columns: u16,
 ) -> Vec<CellRange> {
@@ -888,16 +907,16 @@ fn place_ranges(
         let reference = range.to_string();
         let (anchor, members) = (range.first(), range.cells().skip(1));
         let mut formula = |attributes: String, text: &str, cached: f64| {
-            let mut spec = CellSpec::new(
+            let mut draft = CellDraft::new(
                 None,
                 vec![
                     formula_element(names, &attributes, text),
                     value_element(names, &cached.to_string()),
                 ],
-                Expected::formula(CellValue::Number(cached), text),
+                Expected::new_with_formula(CellValue::Number(cached), text),
             );
-            spec.formula_range = Some(range);
-            grid.insert(anchor, spec);
+            draft.formula_range = Some(range);
+            grid.insert(anchor, draft);
         };
         match rng.below(8) {
             0 | 1 => {
@@ -910,15 +929,15 @@ fn place_ranges(
                 for member in members {
                     if rng.chance(2, 3) {
                         let attributes = format!(" t=\"shared\" si=\"{group}\"");
-                        let spec = CellSpec::new(
+                        let draft = CellDraft::new(
                             None,
                             vec![
                                 formula_element(names, &attributes, ""),
                                 value_element(names, "4"),
                             ],
-                            Expected::formula(CellValue::Number(4.0), ""),
+                            Expected::new_with_formula(CellValue::Number(4.0), ""),
                         );
-                        grid.insert(member, spec);
+                        grid.insert(member, draft);
                     } else {
                         grid.remove(&member);
                     }
@@ -933,12 +952,12 @@ fn place_ranges(
                 // Other array members hold plain cached values.
                 for member in members {
                     if rng.chance(1, 2) {
-                        let spec = CellSpec::new(
+                        let draft = CellDraft::new(
                             None,
                             vec![value_element(names, "7")],
-                            Expected::value(CellValue::Number(7.0)),
+                            Expected::new(CellValue::Number(7.0)),
                         );
-                        grid.insert(member, spec);
+                        grid.insert(member, draft);
                     } else {
                         grid.remove(&member);
                     }
@@ -957,8 +976,8 @@ fn place_ranges(
                             grid.remove(&member);
                         }
                         1 => {
-                            let blank = Expected::value(CellValue::Blank);
-                            grid.insert(member, CellSpec::new(None, Vec::new(), blank));
+                            let blank = Expected::new(CellValue::Blank);
+                            grid.insert(member, CellDraft::new(None, Vec::new(), blank));
                         }
                         _ => {}
                     }
@@ -993,7 +1012,13 @@ fn generate_sheet(
     strict: bool,
     strings: &[String],
 ) -> SheetModel {
-    let namespace = if strict { STRICT_NS } else { MAIN_NS };
+    use std::fmt::Write as _;
+
+    let namespace = if strict {
+        STRICT_NAMESPACE
+    } else {
+        MAIN_NAMESPACE
+    };
     let prefixes: [&'static str; 4] = ["", "x:", "s:", "main:"];
     let names = Names {
         prefix: prefixes[if rng.chance(1, 3) {
@@ -1016,37 +1041,45 @@ fn generate_sheet(
     while next <= columns + 2 && rng.chance(2, 3) {
         let last = next + rng.inclusive(0, 2) as u16;
         let style = *rng.pick(&[0, 0, 1, 4, 9]);
-        column_styles.push((next, last, style));
+        column_styles.push(ColumnStyle {
+            min: next,
+            max: last,
+            style,
+        });
         next = last + 1 + rng.inclusive(0, 2) as u16;
     }
     if rng.chance(1, 6) {
-        column_styles.push((CellRef::MAX_COLUMN, CellRef::MAX_COLUMN, 7));
+        column_styles.push(ColumnStyle {
+            min: CellRef::MAX_COLUMN,
+            max: CellRef::MAX_COLUMN,
+            style: 7,
+        });
     }
 
     // Cells, then protected ranges that overwrite part of the grid.
-    let mut grid: BTreeMap<CellRef, CellSpec> = BTreeMap::new();
+    let mut grid: BTreeMap<CellRef, CellDraft> = BTreeMap::new();
     let density = rng.inclusive(1, 4);
     for row in 1..=rows {
         for column in 1..=columns {
             if rng.inclusive(1, 5) > density {
                 continue;
             }
-            let spec = match rng.below(14) {
+            let draft = match rng.below(14) {
                 0 => formula_cell(rng, names),
                 1 if rng.chance(1, 3) => metadata_cell(names),
                 _ => plain_cell(rng, names, strings),
             };
-            grid.insert(cell(row, column), spec);
+            grid.insert(cell(row, column), draft);
         }
     }
     let merges = place_ranges(rng, crowded, names, &mut grid, rows, columns);
     if rng.chance(1, 6) {
-        let far = *rng.pick(&[
+        let (far_row, far_column) = *rng.pick(&[
             (CellRef::MAX_ROW, CellRef::MAX_COLUMN),
             (CellRef::MAX_ROW, 1),
             (1_000, 27),
         ]);
-        grid.insert(cell(far.0, far.1), plain_cell(rng, names, strings));
+        grid.insert(cell(far_row, far_column), plain_cell(rng, names, strings));
     }
     let mut row_numbers: BTreeSet<u32> = grid.keys().map(|cell| cell.row()).collect();
     for _ in 0..rng.below(3) {
@@ -1058,13 +1091,13 @@ fn generate_sheet(
         path: path.to_owned(),
         cells: BTreeMap::new(),
         rows: BTreeMap::new(),
-        columns: column_styles.clone(),
+        columns: column_styles,
         formula_cells: BTreeSet::new(),
         formula_ranges: Vec::new(),
-        merges: merges.clone(),
+        merges,
         metadata_cells: BTreeSet::new(),
         opaque_cells: BTreeSet::new(),
-        extent: (rows, columns),
+        extent: Extent { rows, columns },
         xml: String::new(),
         cell_sources: BTreeMap::new(),
         row_sources: BTreeMap::new(),
@@ -1086,11 +1119,11 @@ fn generate_sheet(
     } else {
         cell_space
     };
-    let el = |local: &str| names.el(local);
+    let element = |local: &str| names.element(local);
     let mut sheet_data = String::new();
     for &row in &row_numbers {
         let mut format = RowFormat::default();
-        let mut open = format!("<{} r=\"{row}\"", el("row"));
+        let mut open = format!("<{} r=\"{row}\"", element("row"));
         let row_cells: Vec<CellRef> = grid
             .range(cell(row, 1)..=cell(row, CellRef::MAX_COLUMN))
             .map(|(&address, _)| address)
@@ -1129,8 +1162,8 @@ fn generate_sheet(
         let extension = rng.chance(1, 8).then(|| {
             format!(
                 "<{ext_list}><{ext} uri=\"urn:row\"><v:rowFeature on=\"1\"/></{ext}></{ext_list}>",
-                ext_list = el("extLst"),
-                ext = el("ext"),
+                ext_list = element("extLst"),
+                ext = element("ext"),
             )
         });
         sheet_data.push_str(row_space);
@@ -1144,21 +1177,21 @@ fn generate_sheet(
         sheet_data.push_str(&open);
         model.row_sources.insert(row, open);
         for address in row_cells {
-            let spec = grid.remove(&address).unwrap();
-            let mut expected = spec.expected;
+            let draft = grid.remove(&address).unwrap();
+            let mut expected = draft.expected;
             let mut attributes = vec![(String::from("r"), address.to_string())];
             if rng.chance(1, 3) {
                 let style = *rng.pick(&[0, 1, 2, 3, 10, 200]);
                 expected.style = Some(style);
                 attributes.push(("s".into(), style.to_string()));
             }
-            if let Some(kind) = spec.kind {
+            if let Some(kind) = draft.kind {
                 attributes.push(("t".into(), kind.into()));
             }
-            if spec.opaque {
+            if draft.opaque {
                 model.opaque_cells.insert(address);
             }
-            if spec.metadata {
+            if draft.metadata {
                 attributes.push(("vm".into(), "1".into()));
                 model.metadata_cells.insert(address);
             }
@@ -1172,19 +1205,19 @@ fn generate_sheet(
             if rng.chance(1, 4) {
                 rng.shuffle(&mut attributes);
             }
-            let mut children = spec.children;
+            let mut children = draft.children;
             if rng.chance(1, 10) {
                 let extension = format!(
                     "<{ext_list}><{ext} uri=\"urn:cell\"><v:cellFeature flag=\"1\"/></{ext}></{ext_list}>",
-                    ext_list = el("extLst"),
-                    ext = el("ext"),
+                    ext_list = element("extLst"),
+                    ext = element("ext"),
                 );
                 model
                     .tail_sources
-                    .push(format!("{extension}</{}>", el("c")));
+                    .push(format!("{extension}</{}>", element("c")));
                 children.push(extension);
             }
-            let mut source = format!("<{}", el("c"));
+            let mut source = format!("<{}", element("c"));
             for (name, value) in &attributes {
                 source.push_str(&quoted(rng, name, value));
             }
@@ -1196,12 +1229,12 @@ fn generate_sheet(
                     source.push_str(child_space);
                     source.push_str(child);
                 }
-                source.push_str(&format!("</{}>", el("c")));
+                write!(source, "</{}>", element("c")).unwrap();
             }
             if expected.formula.is_some() {
                 model.formula_cells.insert(address);
             }
-            if let Some(range) = spec.formula_range {
+            if let Some(range) = draft.formula_range {
                 model.formula_ranges.push(range);
             }
             sheet_data.push_str(cell_space);
@@ -1213,9 +1246,9 @@ fn generate_sheet(
             sheet_data.push_str(&extension);
             model
                 .tail_sources
-                .push(format!("{extension}</{}>", el("row")));
+                .push(format!("{extension}</{}>", element("row")));
         }
-        sheet_data.push_str(&format!("</{}>", el("row")));
+        write!(sheet_data, "</{}>", element("row")).unwrap();
     }
     assert!(grid.is_empty(), "every generated cell belongs to a row");
 
@@ -1225,18 +1258,22 @@ fn generate_sheet(
     } else {
         ""
     };
-    let office = if strict { STRICT_OFFICE_NS } else { OFFICE_NS };
+    let office = if strict {
+        STRICT_OFFICE_NAMESPACE
+    } else {
+        OFFICE_NAMESPACE
+    };
     let root = format!(
-        "{declaration}<{} {} xmlns:r=\"{office}\" xmlns:v=\"{VENDOR_NS}\" v:mode=\"keep\">",
-        el("worksheet"),
+        "{declaration}<{} {} xmlns:r=\"{office}\" xmlns:v=\"{VENDOR_NAMESPACE}\" v:mode=\"keep\">",
+        element("worksheet"),
         names.declaration(namespace),
     );
-    let mut before = vec![root.clone()];
+    let mut before = vec![root];
     if rng.chance(1, 3) {
         before.push(format!(
-            "<{pr} filterMode=\"0\"><{setup} fitToPage=\"1\"/></{pr}>",
-            pr = el("sheetPr"),
-            setup = el("pageSetUpPr"),
+            "<{properties} filterMode=\"0\"><{setup} fitToPage=\"1\"/></{properties}>",
+            properties = element("sheetPr"),
+            setup = element("pageSetUpPr"),
         ));
     }
     let dimension = rng.chance(3, 4).then(|| {
@@ -1248,46 +1285,53 @@ fn generate_sheet(
             }
             _ => rng.pick(&["A1", "A1:C3", "B2:Z99"]).to_string(),
         };
-        format!("<{} ref=\"{reference}\"/>", el("dimension"))
+        format!("<{} ref=\"{reference}\"/>", element("dimension"))
     });
     let mut middle = Vec::new();
     if rng.chance(1, 3) {
         middle.push(format!(
             "<{views}><{view} workbookViewId=\"0\"><{selection} activeCell=\"B2\" sqref=\"B2\"/></{view}></{views}>",
-            views = el("sheetViews"),
-            view = el("sheetView"),
-            selection = el("selection"),
+            views = element("sheetViews"),
+            view = element("sheetView"),
+            selection = element("selection"),
         ));
     }
     if rng.chance(1, 3) {
         middle.push(format!(
             "<{} defaultRowHeight=\"15\"/>",
-            el("sheetFormatPr")
+            element("sheetFormatPr")
         ));
     }
-    if !column_styles.is_empty() {
-        let mut cols = format!("<{}>", el("cols"));
-        for &(min, max, style) in &column_styles {
+    if !model.columns.is_empty() {
+        let mut column_definitions = format!("<{}>", element("cols"));
+        for column in &model.columns {
+            let ColumnStyle { min, max, style } = *column;
             let style = if style == 0 && rng.chance(1, 2) {
                 String::new()
             } else {
                 format!(" style=\"{style}\"")
             };
-            cols.push_str(&format!(
+            write!(
+                column_definitions,
                 "<{} min=\"{min}\" max=\"{max}\" width=\"9.5\"{style}/>",
-                el("col")
-            ));
+                element("col")
+            )
+            .unwrap();
         }
-        cols.push_str(&format!("</{}>", el("cols")));
-        middle.push(cols);
+        write!(column_definitions, "</{}>", element("cols")).unwrap();
+        middle.push(column_definitions);
     }
     let mut after = Vec::new();
-    if !merges.is_empty() {
-        let mut merge_cells = format!("<{} count=\"{}\">", el("mergeCells"), merges.len());
-        for range in &merges {
-            merge_cells.push_str(&format!("<{} ref=\"{range}\"/>", el("mergeCell")));
+    if !model.merges.is_empty() {
+        let mut merge_cells = format!(
+            "<{} count=\"{}\">",
+            element("mergeCells"),
+            model.merges.len()
+        );
+        for range in &model.merges {
+            write!(merge_cells, "<{} ref=\"{range}\"/>", element("mergeCell")).unwrap();
         }
-        merge_cells.push_str(&format!("</{}>", el("mergeCells")));
+        write!(merge_cells, "</{}>", element("mergeCells")).unwrap();
         after.push(merge_cells);
     }
     if rng.chance(1, 3) {
@@ -1296,25 +1340,25 @@ fn generate_sheet(
     if rng.chance(1, 2) {
         after.push(format!(
             "<{} left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/>",
-            el("pageMargins")
+            element("pageMargins")
         ));
     }
     if rng.chance(1, 3) {
         after.push(format!(
             "<{ext_list}><{ext} uri=\"{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}\"><v:conditionalFormattings/></{ext}></{ext_list}>",
-            ext_list = el("extLst"),
-            ext = el("ext"),
+            ext_list = element("extLst"),
+            ext = element("ext"),
         ));
     }
     let sheet_data = if sheet_data.is_empty() && rng.chance(1, 2) {
-        format!("<{}{}", el("sheetData"), empty_end(rng))
+        format!("<{}{}", element("sheetData"), empty_end(rng))
     } else {
         format!(
             "<{data}>{sheet_data}{row_space}</{data}>",
-            data = el("sheetData")
+            data = element("sheetData")
         )
     };
-    let close = format!("</{}>", el("worksheet"));
+    let close = format!("</{}>", element("worksheet"));
     let mut xml = before.concat();
     xml.push_str(dimension.as_deref().unwrap_or_default());
     xml.push_str(&middle.concat());
@@ -1334,10 +1378,18 @@ fn generate_sheet(
 /// How the archive records its members.
 struct Layout {
     zip: ZipLayout<'static>,
-    /// `None` for no data descriptors, or the chance (in 4) that an entry has
-    /// one and whether they all carry the optional signature (`None`: each
-    /// descriptor decides).
-    descriptors: Option<(u64, Option<bool>)>,
+    /// `None` for no data descriptors.
+    descriptors: Option<DataDescriptors>,
+}
+
+/// Which members record their sizes in a data descriptor.
+#[derive(Clone, Copy)]
+struct DataDescriptors {
+    /// The chance, in 4, that a member has a data descriptor.
+    frequency: u64,
+    /// Whether every descriptor carries the optional signature, or `None` when
+    /// each descriptor decides.
+    signed: Option<bool>,
 }
 
 fn random_layout(rng: &mut Rng) -> Layout {
@@ -1355,11 +1407,9 @@ fn random_layout(rng: &mut Rng) -> Layout {
             b"".as_slice()
         },
     };
-    let descriptors = rng.chance(1, 2).then(|| {
-        (
-            rng.inclusive(1, 4) as u64,
-            *rng.pick(&[Some(true), Some(false), None]),
-        )
+    let descriptors = rng.chance(1, 2).then(|| DataDescriptors {
+        frequency: u64::from(rng.inclusive(1, 4)),
+        signed: *rng.pick(&[Some(true), Some(false), None]),
     });
     Layout { zip, descriptors }
 }
@@ -1372,9 +1422,19 @@ struct Package {
 /// A workbook with one to three worksheets; `crowded` forces every worksheet
 /// to hold many protected ranges, which otherwise happens for one in six.
 fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
+    use std::fmt::Write as _;
+
     let strict = rng.chance(1, 4);
-    let namespace = if strict { STRICT_NS } else { MAIN_NS };
-    let office = if strict { STRICT_OFFICE_NS } else { OFFICE_NS };
+    let namespace = if strict {
+        STRICT_NAMESPACE
+    } else {
+        MAIN_NAMESPACE
+    };
+    let office = if strict {
+        STRICT_OFFICE_NAMESPACE
+    } else {
+        OFFICE_NAMESPACE
+    };
     let strings = rng.chance(3, 4).then(|| shared_strings(rng, namespace));
     let texts = strings.as_ref().map_or(&[][..], |strings| &strings.texts);
 
@@ -1394,44 +1454,52 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
     let mut workbook = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"{namespace}\" xmlns:r=\"{office}\"><bookViews><workbookView/></bookViews><sheets>"
     );
-    let mut relationships = format!("<Relationships xmlns=\"{PACKAGE_NS}\">");
+    let mut relationships = format!("<Relationships xmlns=\"{PACKAGE_NAMESPACE}\">");
     for (index, sheet) in sheets.iter().enumerate() {
         let id = index + 1;
-        workbook.push_str(&format!(
+        write!(
+            workbook,
             "<sheet name=\"{}\" sheetId=\"{id}\" r:id=\"rId{id}\"/>",
             escape_attribute(&sheet.name)
-        ));
+        )
+        .unwrap();
         let target = if rng.chance(1, 4) {
             format!("/{}", sheet.path)
         } else {
             format!("worksheets/sheet{id}.xml")
         };
-        relationships.push_str(&format!(
+        write!(
+            relationships,
             "<Relationship Id=\"rId{id}\" Type=\"{office}/worksheet\" Target=\"{target}\"/>"
-        ));
+        )
+        .unwrap();
     }
     workbook.push_str("</sheets><calcPr calcId=\"191029\"/></workbook>");
     if strings.is_some() {
-        relationships.push_str(&format!(
+        write!(
+            relationships,
             "<Relationship Id=\"rIdStrings\" Type=\"{office}/sharedStrings\" Target=\"sharedStrings.xml\"/>"
-        ));
+        )
+        .unwrap();
     }
-    relationships.push_str(&format!(
+    write!(
+        relationships,
         "<Relationship Id=\"rIdStyles\" Type=\"{office}/styles\" Target=\"styles.xml\"/></Relationships>"
-    ));
+    )
+    .unwrap();
 
     let mut entries: Vec<(String, Vec<u8>)> = vec![
         (
             "[Content_Types].xml".into(),
             format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"{CONTENT_TYPES_NS}\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"bin\" ContentType=\"application/vnd.ms-office.vbaProject\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.ms-excel.sheet.macroEnabled.main+xml\"/></Types>"
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"{CONTENT_TYPES_NAMESPACE}\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"bin\" ContentType=\"application/vnd.ms-office.vbaProject\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.ms-excel.sheet.macroEnabled.main+xml\"/></Types>"
             )
             .into_bytes(),
         ),
         (
             "_rels/.rels".into(),
             format!(
-                "<Relationships xmlns=\"{PACKAGE_NS}\"><Relationship Id=\"rId1\" Type=\"{office}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
+                "<Relationships xmlns=\"{PACKAGE_NAMESPACE}\"><Relationship Id=\"rId1\" Type=\"{office}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
             )
             .into_bytes(),
         ),
@@ -1443,11 +1511,8 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
                 .into_bytes(),
         ),
     ];
-    if let Some(strings) = &strings {
-        entries.push((
-            "xl/sharedStrings.xml".into(),
-            strings.xml.clone().into_bytes(),
-        ));
+    if let Some(strings) = strings {
+        entries.push(("xl/sharedStrings.xml".into(), strings.xml.into_bytes()));
     }
     for sheet in &sheets {
         entries.push((sheet.path.clone(), sheet.xml.clone().into_bytes()));
@@ -1479,8 +1544,8 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
         .iter()
         .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
         .collect();
-    let mut bytes = write_zip(&borrowed, &layout.zip);
-    if let Some((frequency, signed)) = layout.descriptors {
+    let mut bytes = common::write_zip(&borrowed, &layout.zip);
+    if let Some(DataDescriptors { frequency, signed }) = layout.descriptors {
         let choices: BTreeMap<&str, Option<bool>> = entries
             .iter()
             .map(|(name, _)| {
@@ -1490,7 +1555,7 @@ fn generate_package(rng: &mut Rng, crowded: bool) -> Package {
                 (name.as_str(), choice)
             })
             .collect();
-        bytes = with_data_descriptors(&bytes, |name| choices[name]);
+        bytes = common::with_data_descriptors(&bytes, |name| choices[name]);
     }
     Package { bytes, sheets }
 }
@@ -1538,7 +1603,15 @@ struct Batch {
     edits: Vec<Edit>,
     /// Replaces the target sheet name (or the sheet of one `apply_edits`
     /// edit) with a name no worksheet has.
-    missing_sheet: Option<(usize, String)>,
+    missing_sheet: Option<MissingSheet>,
+}
+
+/// A sheet name that no worksheet has, in place of an edit's sheet.
+#[derive(Clone, Debug)]
+struct MissingSheet {
+    /// The position of the edit in its batch.
+    position: usize,
+    name: String,
 }
 
 impl Batch {
@@ -1628,7 +1701,10 @@ fn refusal(sheets: &[SheetModel], batch: &Batch) -> Option<(Outcome, (usize, Cel
                 })
             });
         if let Some(cell) = guarded {
-            debug_assert!(sheet.guarded(cell));
+            debug_assert!(
+                sheet.guarded(cell),
+                "the guards above must be exactly those of `SheetModel::guarded`"
+            );
             return Some((Outcome::Protected, (index, cell)));
         }
         if let Some((cell, _)) = edits().find(|&(cell, value)| !sheet.accepts(cell, value)) {
@@ -1650,7 +1726,7 @@ fn apply_batch(
 ) -> sheetpatch::Result<()> {
     let sheet_name = |position: usize| -> &str {
         match &batch.missing_sheet {
-            Some((index, name)) if *index == position => name,
+            Some(missing) if missing.position == position => &missing.name,
             _ => &sheets[batch.edits[position].sheet].name,
         }
     };
@@ -1684,8 +1760,8 @@ fn apply_batch(
                 let sheet = sheet_name(position);
                 let value = edit.value.clone();
                 edits.push(match edit.spelling {
-                    Spelling::Typed => CellEdit::at(sheet, edit.cell, value)?,
-                    _ => CellEdit::new(sheet, &edit.address(), value)?,
+                    Spelling::Typed => CellEdit::try_new_at(sheet, edit.cell, value)?,
+                    _ => CellEdit::try_new(sheet, &edit.address(), value)?,
                 });
             }
             book.apply_edits(edits)
@@ -1696,7 +1772,7 @@ fn apply_batch(
 /// A target cell biased toward existing cells, their neighbors, the grid's
 /// edge, and Excel's extreme addresses.
 fn pick_cell(rng: &mut Rng, sheet: &SheetModel) -> CellRef {
-    let (rows, columns) = sheet.extent;
+    let Extent { rows, columns } = sheet.extent;
     let count = sheet.cells.len();
     let existing = |rng: &mut Rng| *sheet.cells.keys().nth(rng.below(count)).unwrap();
     match rng.below(10) {
@@ -1745,7 +1821,7 @@ fn accepted_edit(rng: &mut Rng, sheets: &[SheetModel], sheet: usize, allow_long:
     }
     if !available(target) {
         // Ranges never extend more than two rows past the generated grid.
-        target = cell(model.extent.0 + 3, 1);
+        target = cell(model.extent.rows + 3, 1);
     }
     // Rewriting the current value exercises no-op detection, as do the
     // metadata cells, which accept nothing else. Reads accept error codes
@@ -1814,14 +1890,14 @@ fn accepted_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
                     .all(|cell| !model.protected(cell) && !model.metadata_cells.contains(&cell))
             };
             let mut ranges =
-                (0..4).map(|_| small_range(rng, model.extent.0 + 2, model.extent.1 + 2));
+                (0..4).map(|_| small_range(rng, model.extent.rows + 2, model.extent.columns + 2));
             if let Some(range) = ranges.find(editable) {
-                let edits = range
+                let edits: Vec<Edit> = range
                     .cells()
                     .map(|cell| Edit {
                         sheet,
                         cell,
-                        value: random_value(rng, false),
+                        value: random_value(rng, /* allow_long: */ false),
                         spelling: Spelling::Typed,
                     })
                     .collect();
@@ -1835,7 +1911,7 @@ fn accepted_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
         }
         _ => {
             let count = batch_size(rng, &sheets[sheet]);
-            let edits = (0..count)
+            let edits: Vec<Edit> = (0..count)
                 .map(|_| {
                     let sheet = rng.below(sheets.len());
                     edit(rng, sheet)
@@ -1853,7 +1929,7 @@ fn accepted_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
                 continue;
             }
             edits.push(Edit {
-                value: random_value(rng, false),
+                value: random_value(rng, /* allow_long: */ false),
                 spelling: spelling(rng),
                 ..earlier
             });
@@ -1898,10 +1974,10 @@ fn rejected_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
     match rng.below(4) {
         0 | 1 if !protected.is_empty() => {
             let (sheet, target) = *rng.pick(&protected);
-            let mut value = random_value(rng, false);
+            let mut value = random_value(rng, /* allow_long: */ false);
             if sheets[sheet].metadata_cells.contains(&target) {
                 while value == sheets[sheet].expected(target).value {
-                    value = random_value(rng, false);
+                    value = random_value(rng, /* allow_long: */ false);
                 }
             }
             let edit = Edit {
@@ -1938,7 +2014,10 @@ fn rejected_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
             } else {
                 0
             };
-            batch.missing_sheet = Some((index, name));
+            batch.missing_sheet = Some(MissingSheet {
+                position: index,
+                name,
+            });
         }
         _ => {
             let index = rng.below(batch.edits.len());
@@ -2048,12 +2127,12 @@ fn check_reads(case: Case, stage: &str, book: &Workbook, sheets: &[SheetModel], 
 }
 
 /// End offset of each entry's local record, including any data descriptor.
-fn record_end(bytes: &[u8], entry: &common::ZipEntry<'_>) -> usize {
-    entry.local_offset + entry.local.len() + data_descriptor_len(bytes, entry)
+fn record_end(bytes: &[u8], entry: &ZipEntry<'_>) -> usize {
+    entry.local_offset + entry.local.len() + common::data_descriptor_len(bytes, entry)
 }
 
 fn assert_contiguous(case: Case, stage: &str, bytes: &[u8]) {
-    let mut records: Vec<(usize, usize)> = zip_entries(bytes)
+    let mut records: Vec<(usize, usize)> = common::zip_entries(bytes)
         .iter()
         .map(|entry| (entry.local_offset, record_end(bytes, entry)))
         .collect();
@@ -2068,7 +2147,7 @@ fn assert_contiguous(case: Case, stage: &str, bytes: &[u8]) {
     }
     assert_eq!(
         cursor,
-        central_directory_offset(bytes),
+        common::central_directory_offset(bytes),
         "{case} {stage}: gap before the central directory"
     );
 }
@@ -2083,16 +2162,11 @@ fn assert_untouched_records(
     output: &[u8],
     changed: &BTreeSet<&str>,
 ) {
-    let before = zip_entries(input);
-    let after = zip_entries(output);
-    let names = |entries: &[common::ZipEntry<'_>]| -> Vec<String> {
-        entries.iter().map(|entry| entry.name.clone()).collect()
-    };
-    assert_eq!(
-        names(&before),
-        names(&after),
-        "{case} {stage}: member order"
-    );
+    let before = common::zip_entries(input);
+    let after = common::zip_entries(output);
+    let names_before: Vec<&str> = before.iter().map(|entry| entry.name.as_str()).collect();
+    let names_after: Vec<&str> = after.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names_before, names_after, "{case} {stage}: member order");
     for (old, new) in before.iter().zip(&after) {
         // Every member, changed or not, decompresses to its recorded size and CRC.
         new.payload();
@@ -2135,7 +2209,7 @@ fn row_spans(xml: &str, row: u32) -> Option<Vec<(u16, u16)>> {
     let value = tag[name + "spans".len()..].trim_start_matches([' ', '\t', '\n', '=']);
     let quote = value.chars().next()?;
     let value = &value[1..1 + value[1..].find(quote)?];
-    let spans = value
+    let spans: Vec<(u16, u16)> = value
         .split_whitespace()
         .map(|span| {
             let (first, last) = span.split_once(':').expect("span interval");
@@ -2203,9 +2277,9 @@ fn assert_refused(case: Case, book: &mut Workbook, sheets: &[SheetModel], batch:
 #[test]
 fn reads_return_written_values_before_and_after_saving() {
     run_cases("read_after_write", 40, |case, rng| {
-        let package = generate_package(rng, false);
+        let package = generate_package(rng, /* crowded: */ false);
         let mut sheets = package.sheets;
-        let mut book = Workbook::from_bytes(package.bytes.clone()).or_fail(case, "open package");
+        let mut book = Workbook::from_bytes(package.bytes).or_fail(case, "open package");
         check_reads(case, "original", &book, &sheets, rng);
         let mut written: BTreeMap<(usize, CellRef), CellValue> = BTreeMap::new();
         let mut last_batch = None;
@@ -2274,9 +2348,11 @@ fn reads_return_written_values_before_and_after_saving() {
         if rng.chance(1, 2) {
             let edits = written
                 .iter()
-                .map(|(&(sheet, cell), value)| CellEdit::at(names[sheet], cell, value.clone()))
+                .map(|(&(sheet, cell), value)| {
+                    CellEdit::try_new_at(names[sheet], cell, value.clone())
+                })
                 .collect::<sheetpatch::Result<Vec<_>>>()
-                .or_fail(case, "CellEdit::at");
+                .or_fail(case, "CellEdit::try_new_at");
             reopened
                 .apply_edits(edits)
                 .or_fail(case, "rewriting values");
@@ -2310,7 +2386,7 @@ fn reads_return_written_values_before_and_after_saving() {
 #[test]
 fn saves_preserve_untouched_records_and_worksheet_markup() {
     run_cases("preservation", 40, |case, rng| {
-        let package = generate_package(rng, false);
+        let package = generate_package(rng, /* crowded: */ false);
         let input = package.bytes;
         let original = package.sheets;
         let mut sheets = original.clone();
@@ -2361,7 +2437,7 @@ fn saves_preserve_untouched_records_and_worksheet_markup() {
         assert_same_bytes(case, "compact output", &compact, &output);
 
         for (index, sheet) in original.iter().enumerate() {
-            let xml = String::from_utf8(payload(&output, &sheet.path))
+            let xml = String::from_utf8(common::payload(&output, &sheet.path))
                 .or_fail(case, "worksheet is UTF-8");
             let edited_cells: BTreeSet<CellRef> = touched
                 .iter()
@@ -2412,9 +2488,10 @@ fn saves_preserve_untouched_records_and_worksheet_markup() {
             }
             // Existing dimension and row-span hints cover every new cell.
             let had_dimension = dimension(&sheet.xml).is_some();
-            for &created in edited_cells.iter().filter(|cell| {
+            let created_cells = edited_cells.iter().filter(|cell| {
                 !sheet.cells.contains_key(cell) && sheets[index].cells.contains_key(cell)
-            }) {
+            });
+            for &created in created_cells {
                 if had_dimension {
                     let reference = dimension(&xml).unwrap_or_default();
                     let range: CellRange = reference
@@ -2473,7 +2550,7 @@ fn saves_preserve_untouched_records_and_worksheet_markup() {
 #[test]
 fn protection_guards_match_an_independent_oracle() {
     run_cases("guards", 30, |case, rng| {
-        let package = generate_package(rng, true);
+        let package = generate_package(rng, /* crowded: */ true);
         let sheets = package.sheets;
         let mut book = Workbook::from_bytes(package.bytes).or_fail(case, "open package");
         for round in 0..4 {
@@ -2486,7 +2563,7 @@ fn protection_guards_match_an_independent_oracle() {
                     } else {
                         target
                     };
-                    accepted_edit(rng, &sheets, sheet, false)
+                    accepted_edit(rng, &sheets, sheet, /* allow_long: */ false)
                 })
                 .collect();
             // Half of the batches add one protected cell, usually a range
@@ -2607,19 +2684,19 @@ fn exact_hint(remaining: u64) -> (usize, Option<usize>) {
 #[test]
 fn cell_references_and_ranges_round_trip() {
     run_cases("ranges", 400, |case, rng| {
-        let a = cell(random_row(rng), random_column(rng));
-        let b = if rng.chance(2, 3) {
+        let corner = cell(random_row(rng), random_column(rng));
+        let opposite = if rng.chance(2, 3) {
             // A nearby corner keeps most ranges small enough to iterate.
-            let row = (i64::from(a.row()) + rng.inclusive(0, 40) as i64 - 20)
+            let row = (i64::from(corner.row()) + rng.inclusive(0, 40) as i64 - 20)
                 .clamp(1, i64::from(CellRef::MAX_ROW)) as u32;
-            let column = (i64::from(a.column()) + rng.inclusive(0, 40) as i64 - 20)
+            let column = (i64::from(corner.column()) + rng.inclusive(0, 40) as i64 - 20)
                 .clamp(1, i64::from(CellRef::MAX_COLUMN)) as u16;
             cell(row, column)
         } else {
             cell(random_row(rng), random_column(rng))
         };
 
-        for reference in [a, b] {
+        for reference in [corner, opposite] {
             let text = reference.to_string();
             let expected = format!("{}{}", column_letters(reference.column()), reference.row());
             assert_eq!(text, expected, "{case}: Display of {reference:?}");
@@ -2631,7 +2708,8 @@ fn cell_references_and_ranges_round_trip() {
                 );
             }
             assert_eq!(
-                CellRef::new(reference.row(), reference.column()).or_fail(case, "CellRef::new"),
+                CellRef::try_new(reference.row(), reference.column())
+                    .or_fail(case, "CellRef::try_new"),
                 reference,
                 "{case}"
             );
@@ -2643,7 +2721,7 @@ fn cell_references_and_ranges_round_trip() {
                 format!("{letters}${}", reference.row()),
                 format!(" {text}"),
                 format!("{text} "),
-                letters.clone(),
+                letters,
                 reference.row().to_string(),
             ] {
                 assert!(
@@ -2652,27 +2730,37 @@ fn cell_references_and_ranges_round_trip() {
                 );
             }
             assert!(
-                CellRef::new(0, reference.column()).is_err(),
+                CellRef::try_new(0, reference.column()).is_err(),
                 "{case}: row 0"
             );
             assert!(
-                CellRef::new(reference.row(), 0).is_err(),
+                CellRef::try_new(reference.row(), 0).is_err(),
                 "{case}: column 0"
             );
             assert!(
-                CellRef::new(CellRef::MAX_ROW + 1, reference.column()).is_err(),
+                CellRef::try_new(CellRef::MAX_ROW + 1, reference.column()).is_err(),
                 "{case}: row past the limit"
             );
             assert!(
-                CellRef::new(reference.row(), CellRef::MAX_COLUMN + 1).is_err(),
+                CellRef::try_new(reference.row(), CellRef::MAX_COLUMN + 1).is_err(),
                 "{case}: column past the limit"
             );
         }
 
-        let range = CellRange::new(a, b);
-        assert_eq!(range, CellRange::new(b, a), "{case}: corner order");
-        let first = cell(a.row().min(b.row()), a.column().min(b.column()));
-        let last = cell(a.row().max(b.row()), a.column().max(b.column()));
+        let range = CellRange::new(corner, opposite);
+        assert_eq!(
+            range,
+            CellRange::new(opposite, corner),
+            "{case}: corner order"
+        );
+        let first = cell(
+            corner.row().min(opposite.row()),
+            corner.column().min(opposite.column()),
+        );
+        let last = cell(
+            corner.row().max(opposite.row()),
+            corner.column().max(opposite.column()),
+        );
         assert_eq!(
             (range.first(), range.last()),
             (first, last),
@@ -2703,8 +2791,8 @@ fn cell_references_and_ranges_round_trip() {
         for spelling in [
             text.clone(),
             text.to_ascii_lowercase(),
-            format!("{a}:{b}"),
-            format!("{b}:{a}"),
+            format!("{corner}:{opposite}"),
+            format!("{opposite}:{corner}"),
             format!(
                 "{}:{}",
                 cell(first.row(), last.column()),
@@ -2720,7 +2808,7 @@ fn cell_references_and_ranges_round_trip() {
         for invalid in [
             format!("{text}:"),
             format!(":{text}"),
-            format!("{a}:{b}:{a}"),
+            format!("{corner}:{opposite}:{corner}"),
             format!(
                 "{}:{}",
                 column_letters(first.column()),
@@ -2749,7 +2837,8 @@ fn cell_references_and_ranges_round_trip() {
             let width = usize::from(range.width());
             let head: Vec<CellRef> = cells.by_ref().take(width + 1).collect();
             assert_eq!(head[0], first, "{case}: first cell");
-            for (offset, item) in head.iter().take(width).enumerate() {
+            let first_row = &head[..width];
+            for (offset, item) in first_row.iter().enumerate() {
                 assert_eq!(
                     *item,
                     cell(first.row(), first.column() + offset as u16),

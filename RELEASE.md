@@ -15,6 +15,7 @@ Run these checks on the exact candidate commit:
 
 ```sh
 cargo fmt --all -- --check
+cargo +nightly-2026-10-22 fmt --all -- --check --config imports_granularity=Module,format_macro_matchers=true
 cargo clippy --locked --all-targets --all-features -- -D warnings
 rustup target add x86_64-pc-windows-msvc
 cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
@@ -39,15 +40,19 @@ performance claims change. `cargo audit` (from the `cargo-audit` crate) fails on
 vulnerable, unsound, or yanked locked dependencies and reports unmaintained
 crates as warnings; review those warnings, including transitive dependencies in
 Cargo.lock. The `cargo +1.88.0` run requires that toolchain to be installed.
+The nightly rustfmt run checks the Google Rust Style Guide's import grouping and
+macro-matcher formatting, whose rustfmt options are unstable; it requires
+`rustup toolchain install nightly-2026-10-22 --profile minimal --component rustfmt`.
 
 GitHub CI repeats these checks. It runs for pull requests, pushes to `main` and
 `v*` tags, manual dispatch, and a weekly schedule. A newer push to a pull request
 cancels the superseded run; runs for `main`, tags, schedules, and manual dispatch
-always complete. The aggregate `CI` job requires formatting, both Clippy passes,
-and documentation; tests with stable Rust on Linux, macOS, and Windows and with
-Rust 1.88.0 on Linux; the release build, benchmark correctness checks, packaging,
-publishing dry run, and tests, installation, and JSON inspection of the extracted
-package; the LibreOffice interoperability check; and the dependency audit.
+always complete. The aggregate `CI` job requires formatting, including the
+nightly rustfmt import check, both Clippy passes, and documentation; tests with
+stable Rust on Linux, macOS, and Windows and with Rust 1.88.0 on Linux; the
+release build, benchmark correctness checks, packaging, publishing dry run, and
+tests, installation, and JSON inspection of the extracted package; the
+LibreOffice interoperability check; and the dependency audit.
 Scheduled runs only repeat the audit against the unchanged lockfile, so new
 advisories surface between releases.
 

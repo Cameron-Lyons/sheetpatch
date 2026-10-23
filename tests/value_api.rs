@@ -2,7 +2,9 @@
 use sheetpatch::{
     CellContent, CellEdit, CellRange, CellRangeIter, CellRef, CellValue, Error, Workbook,
 };
-use std::{borrow::Cow, collections::HashSet};
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashSet};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 const EXACT: u64 = 1 << 53;
@@ -38,9 +40,9 @@ fn literals_and_new_conversions_work_with_every_editing_api() {
     book.set_cell_at("Data", cell("C3"), 7).unwrap();
     book.set_cells_at("Data", [(cell("C4"), 8)]).unwrap();
     book.apply_edits([
-        CellEdit::new("Data", "A5", 7).unwrap(),
-        CellEdit::at("Data", cell("B5"), 0.25).unwrap(),
-        CellEdit::new("Notes", "A2", Some(&name)).unwrap(),
+        CellEdit::try_new("Data", "A5", 7).unwrap(),
+        CellEdit::try_new_at("Data", cell("B5"), 0.25).unwrap(),
+        CellEdit::try_new("Notes", "A2", Some(&name)).unwrap(),
     ])
     .unwrap();
 
@@ -124,21 +126,27 @@ fn text_and_small_integer_conversions_are_exact() {
 #[test]
 fn wide_integers_convert_only_when_f64_holds_them_exactly() {
     let exact = i64::try_from(EXACT).unwrap();
-    for v in [0, 1, -1, exact - 1, exact, -exact] {
-        assert_eq!(CellValue::try_from(v).unwrap(), CellValue::Number(v as f64));
-        if let Ok(size) = isize::try_from(v) {
+    for integer in [0, 1, -1, exact - 1, exact, -exact] {
+        assert_eq!(
+            CellValue::try_from(integer).unwrap(),
+            CellValue::Number(integer as f64)
+        );
+        if let Ok(size) = isize::try_from(integer) {
             assert_eq!(
                 CellValue::try_from(size).unwrap(),
-                CellValue::Number(v as f64)
+                CellValue::Number(integer as f64)
             );
         }
     }
-    for v in [0, 1, EXACT - 1, EXACT] {
-        assert_eq!(CellValue::try_from(v).unwrap(), CellValue::Number(v as f64));
-        if let Ok(size) = usize::try_from(v) {
+    for integer in [0, 1, EXACT - 1, EXACT] {
+        assert_eq!(
+            CellValue::try_from(integer).unwrap(),
+            CellValue::Number(integer as f64)
+        );
+        if let Ok(size) = usize::try_from(integer) {
             assert_eq!(
                 CellValue::try_from(size).unwrap(),
-                CellValue::Number(v as f64)
+                CellValue::Number(integer as f64)
             );
         }
     }
@@ -151,25 +159,25 @@ fn wide_integers_convert_only_when_f64_holds_them_exactly() {
         Err(Error::InvalidValue(message)) => message,
         other => panic!("expected InvalidValue, got {other:?}"),
     };
-    for v in [exact + 1, -exact - 1, i64::MIN, i64::MAX] {
-        let message = inexact(CellValue::try_from(v));
-        assert!(message.contains(&v.to_string()), "{message}");
+    for integer in [exact + 1, -exact - 1, i64::MIN, i64::MAX] {
+        let message = inexact(CellValue::try_from(integer));
+        assert!(message.contains(&integer.to_string()), "{message}");
         assert!(message.contains("text"), "{message}");
     }
-    for v in [EXACT + 1, u64::MAX] {
-        assert!(inexact(CellValue::try_from(v)).contains(&v.to_string()));
+    for integer in [EXACT + 1, u64::MAX] {
+        assert!(inexact(CellValue::try_from(integer)).contains(&integer.to_string()));
     }
     // 9_007_199_254_740_993 as f64 silently rounds to ...992; TryFrom refuses.
     assert_eq!(9_007_199_254_740_993i64 as f64, 9_007_199_254_740_992.0);
     inexact(CellValue::try_from(9_007_199_254_740_993i64));
 
-    if let Ok(v) = isize::try_from(exact + 1) {
-        inexact(CellValue::try_from(v));
-        inexact(CellValue::try_from(-v));
+    if let Ok(first_inexact) = isize::try_from(exact + 1) {
+        inexact(CellValue::try_from(first_inexact));
+        inexact(CellValue::try_from(-first_inexact));
         inexact(CellValue::try_from(isize::MIN));
     }
-    if let Ok(v) = usize::try_from(EXACT + 1) {
-        inexact(CellValue::try_from(v));
+    if let Ok(first_inexact) = usize::try_from(EXACT + 1) {
+        inexact(CellValue::try_from(first_inexact));
         inexact(CellValue::try_from(usize::MAX));
     }
 }
@@ -189,14 +197,14 @@ fn default_display_and_accessors_follow_each_variant() {
     assert_eq!(boolean.to_string(), "false");
     assert_eq!(error.to_string(), "#DIV/0!");
     assert_eq!(blank.to_string(), "");
-    for (n, shown) in [
+    for (float, shown) in [
         (42.0, "42"),
         (-0.0, "-0"),
         (1e21, "1000000000000000000000"),
         (1e-7, "0.0000001"),
         (0.1 + 0.2, "0.30000000000000004"),
     ] {
-        assert_eq!(CellValue::Number(n).to_string(), shown);
+        assert_eq!(CellValue::Number(float).to_string(), shown);
     }
     assert_eq!(format!("{:>5}|", CellValue::from("ab")), "   ab|");
     assert_eq!(format!("{:<3}|", CellValue::Blank), "   |");
@@ -242,11 +250,11 @@ fn default_display_and_accessors_follow_each_variant() {
 
 #[test]
 fn edits_compare_by_sheet_cell_and_value() {
-    let edit = CellEdit::new("Data", "b2", 7).unwrap();
-    assert_eq!(edit, CellEdit::at("Data", cell("B2"), 7.0).unwrap());
-    assert_ne!(edit, CellEdit::new("Data", "B2", "7").unwrap());
-    assert_ne!(edit, CellEdit::new("Data", "B3", 7).unwrap());
-    assert_ne!(edit, CellEdit::new("Notes", "B2", 7).unwrap());
+    let edit = CellEdit::try_new("Data", "b2", 7).unwrap();
+    assert_eq!(edit, CellEdit::try_new_at("Data", cell("B2"), 7.0).unwrap());
+    assert_ne!(edit, CellEdit::try_new("Data", "B2", "7").unwrap());
+    assert_ne!(edit, CellEdit::try_new("Data", "B3", 7).unwrap());
+    assert_ne!(edit, CellEdit::try_new("Notes", "B2", 7).unwrap());
 }
 
 #[test]
@@ -270,11 +278,11 @@ fn unsupported_errors_do_not_claim_an_edit_was_attempted() {
 fn grid_limits_match_address_validation() {
     assert_eq!(CellRef::MAX_ROW, 1_048_576);
     assert_eq!(CellRef::MAX_COLUMN, 16_384);
-    let corner = CellRef::new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap();
+    let corner = CellRef::try_new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap();
     assert_eq!(corner.to_string(), "XFD1048576");
     assert_eq!(cell("xfd1048576"), corner);
-    assert!(CellRef::new(CellRef::MAX_ROW + 1, 1).is_err());
-    assert!(CellRef::new(1, CellRef::MAX_COLUMN + 1).is_err());
+    assert!(CellRef::try_new(CellRef::MAX_ROW + 1, 1).is_err());
+    assert!(CellRef::try_new(1, CellRef::MAX_COLUMN + 1).is_err());
     assert!("XFE1".parse::<CellRef>().is_err());
     assert!("A1048577".parse::<CellRef>().is_err());
 }
@@ -370,7 +378,7 @@ fn ranges_measure_and_contain_cells_up_to_the_grid_corner() {
     assert_eq!(sheet.first(), cell("A1"));
     assert_eq!(
         sheet.last(),
-        CellRef::new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap()
+        CellRef::try_new(CellRef::MAX_ROW, CellRef::MAX_COLUMN).unwrap()
     );
     assert_eq!(sheet.height(), CellRef::MAX_ROW);
     assert_eq!(sheet.width(), CellRef::MAX_COLUMN);
@@ -425,7 +433,8 @@ fn range_cells_iterate_in_row_major_order_with_an_exact_length() {
 
     let mut sorted: Vec<CellRef> = block.cells().collect();
     sorted.sort();
-    assert_eq!(sorted, block.cells().collect::<Vec<_>>());
+    let in_order: Vec<CellRef> = block.cells().collect();
+    assert_eq!(sorted, in_order);
     assert!(block.cells().all(|cell| block.contains(cell)));
 }
 
@@ -433,7 +442,7 @@ fn range_cells_iterate_in_row_major_order_with_an_exact_length() {
 fn range_skips_match_sequential_iteration_and_remain_exhausted() {
     for text in ["B2:D5", "XFC1048575:XFD1048576", "C3", "A1:A5", "A1:E1"] {
         let block = range(text);
-        let expected: Vec<_> = block.cells().collect();
+        let expected: Vec<CellRef> = block.cells().collect();
         for consumed in 0..=expected.len() {
             for skipped in 0..=expected.len() + 1 {
                 let mut actual = block.cells();
@@ -445,7 +454,9 @@ fn range_skips_match_sequential_iteration_and_remain_exhausted() {
                 assert_eq!(actual.size_hint(), sequential.size_hint());
                 assert_eq!(actual.clone().last(), sequential.clone().last());
                 assert_eq!(actual.clone().count(), sequential.clone().count());
-                assert_eq!(actual.collect::<Vec<_>>(), sequential.collect::<Vec<_>>());
+                let actual_rest: Vec<CellRef> = actual.collect();
+                let sequential_rest: Vec<CellRef> = sequential.collect();
+                assert_eq!(actual_rest, sequential_rest);
             }
         }
         let mut exhausted = block.cells();
@@ -543,7 +554,8 @@ fn addresses_and_ranges_format_like_strings() {
 fn ranges_iterate_directly_and_order_by_their_corners() {
     let block = range("B2:C3");
     let cells: Vec<CellRef> = block.into_iter().collect();
-    assert_eq!(cells, block.cells().collect::<Vec<_>>());
+    let expected: Vec<CellRef> = block.cells().collect();
+    assert_eq!(cells, expected);
     let mut visited = Vec::new();
     for cell in range("A1:B1") {
         visited.push(cell.to_string());
@@ -573,10 +585,7 @@ fn ranges_iterate_directly_and_order_by_their_corners() {
         ["A1", "A1:A2", "A1:C3", "B1:B9", "C1", "A2"]
     );
     assert!(range("A1:A2") > range("A1:C1"));
-    assert_eq!(
-        range("C3:A1").cmp(&range("A1:C3")),
-        std::cmp::Ordering::Equal
-    );
-    let keys: std::collections::BTreeSet<CellRange> = ["B2", "A1:B2", "b2"].map(range).into();
+    assert_eq!(range("C3:A1").cmp(&range("A1:C3")), Ordering::Equal);
+    let keys: BTreeSet<CellRange> = ["B2", "A1:B2", "b2"].map(range).into();
     assert_eq!(keys.len(), 2);
 }

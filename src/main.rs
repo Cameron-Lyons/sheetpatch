@@ -1,15 +1,14 @@
 #![forbid(unsafe_code)]
+#![warn(clippy::unwrap_used)]
 
-use std::{
-    collections::HashMap,
-    env,
-    ffi::{OsStr, OsString},
-    fmt,
-    fs::File,
-    io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write},
-    path::Path,
-    process::ExitCode,
-};
+use std::collections::HashMap;
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fmt::{self, Display, Formatter};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+use std::process::ExitCode;
 
 use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Workbook, WorksheetView};
 
@@ -83,8 +82,8 @@ impl Failure {
     }
 }
 
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Failure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => write!(f, "{message}\n\n{USAGE}"),
             Self::Invalid { command, message } => {
@@ -198,20 +197,20 @@ fn is_option(arg: &OsStr) -> bool {
 }
 
 /// A command's leading options and its positional arguments.
-struct CommandLine<'a> {
+struct CommandLine<'args> {
     command: Command,
     /// Whether the command's option (`--json` or `--check`) was given.
     flag: bool,
     help: bool,
-    args: &'a [OsString],
+    args: &'args [OsString],
     /// The index of the first positional argument in `args`.
     start: usize,
 }
 
-impl<'a> CommandLine<'a> {
+impl<'args> CommandLine<'args> {
     /// Read options from right after the command name up to the first
     /// positional argument.
-    fn parse(command: Command, args: &'a [OsString]) -> Result<Self, Failure> {
+    fn parse(command: Command, args: &'args [OsString]) -> Result<Self, Failure> {
         let mut line = Self {
             command,
             flag: false,
@@ -257,7 +256,7 @@ impl<'a> CommandLine<'a> {
         slots: &[Slot],
         required: usize,
         synopsis: &str,
-    ) -> Result<&'a [OsString], Failure> {
+    ) -> Result<&'args [OsString], Failure> {
         let positionals = &self.args[self.start..];
         let repeated = match slots.last() {
             Some(Slot::Cell) => slots.last(),
@@ -287,6 +286,8 @@ impl<'a> CommandLine<'a> {
     }
 
     fn misplaced_option(&self, arg: &OsStr, slot: Option<&str>) -> Failure {
+        use std::fmt::Write as _;
+
         let mut message = match slot {
             Some(slot) => format!(
                 "{arg:?} is in the {slot} position, but options must come right after the command"
@@ -300,16 +301,18 @@ impl<'a> CommandLine<'a> {
             message.push_str(&synopsis);
         }
         if slot.is_some() {
-            message.push_str(&format!(
+            write!(
+                message,
                 "\nTo name a file that starts with '-', write \"./{}\".",
                 Path::new(arg).display()
-            ));
+            )
+            .expect("writing to a String cannot fail");
         }
         Failure::Usage(message)
     }
 
     /// Return positional argument `index` as text.
-    fn text(&self, index: usize) -> Result<&'a str, Failure> {
+    fn text(&self, index: usize) -> Result<&'args str, Failure> {
         text_arg(self.command.name(), self.args, self.start + index)
     }
 }
@@ -332,13 +335,15 @@ fn quoted_path(path: &OsStr) -> String {
 }
 
 /// Where a command reads its workbook from.
-enum Source<'a> {
+enum Source<'args> {
     Stdin,
-    File(&'a OsStr),
+    File(&'args OsStr),
 }
 
-impl<'a> Source<'a> {
-    fn new(command: Command, arg: &'a OsStr) -> Result<Self, Failure> {
+impl<'args> Source<'args> {
+    fn try_new(command: Command, arg: &'args OsStr) -> Result<Self, Failure> {
+        use std::io::IsTerminal as _;
+
         if arg != "-" {
             return Ok(Self::File(arg));
         }
@@ -364,14 +369,23 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Where a command writes its workbook.
-enum Destination<'a> {
-    Stdout,
-    File(&'a OsStr),
+/// What saving a workbook does with obsolete ZIP records already in its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObsoleteRecords {
+    /// Retain them, as `set` and `patch` do.
+    Keep,
+    /// Remove them, as `compact` does.
+    Remove,
 }
 
-impl<'a> Destination<'a> {
-    fn new(command: Command, arg: &'a OsStr, terminal: bool) -> Result<Self, Failure> {
+/// Where a command writes its workbook.
+enum Destination<'args> {
+    Stdout,
+    File(&'args OsStr),
+}
+
+impl<'args> Destination<'args> {
+    fn try_new(command: Command, arg: &'args OsStr, terminal: bool) -> Result<Self, Failure> {
         if arg != "-" {
             return Ok(Self::File(arg));
         }
@@ -387,15 +401,14 @@ impl<'a> Destination<'a> {
     fn save(
         self,
         workbook: &Workbook,
-        compact: bool,
+        obsolete_records: ObsoleteRecords,
         output: &mut impl Write,
     ) -> Result<(), Failure> {
         match self {
             Self::File(path) => {
-                let saved = if compact {
-                    workbook.save_compact(path)
-                } else {
-                    workbook.save(path)
+                let saved = match obsolete_records {
+                    ObsoleteRecords::Keep => workbook.save(path),
+                    ObsoleteRecords::Remove => workbook.save_compact(path),
                 };
                 // Generation errors, such as ZIP limits, match `patch --check`
                 // output; only file system failures name the destination.
@@ -407,10 +420,9 @@ impl<'a> Destination<'a> {
                 })
             }
             Self::Stdout => {
-                let written = if compact {
-                    workbook.write_compact_to(&mut *output)
-                } else {
-                    workbook.write_to(&mut *output)
+                let written = match obsolete_records {
+                    ObsoleteRecords::Keep => workbook.write_to(&mut *output),
+                    ObsoleteRecords::Remove => workbook.write_compact_to(&mut *output),
                 };
                 // Archive generation reports I/O errors only from its writer.
                 // Unlike text, a truncated archive is unusable, so even a pipe
@@ -480,12 +492,19 @@ fn parse_range(command: &'static str, range: &str) -> Result<CellRange, Failure>
     })
 }
 
+/// The first and last patch lines that target one edit's cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditLines {
+    first: usize,
+    last: usize,
+}
+
 /// The patch lines of each unique edit, kept for diagnostics after the
 /// edits move into the transaction.
 #[derive(Debug, Default)]
 struct PatchLines {
-    /// The first and last line of each edit, by edit index.
-    lines: Vec<(usize, usize)>,
+    /// The lines of each edit, by edit index.
+    lines: Vec<EditLines>,
     /// The index of each edit by worksheet name and cell.
     targets: HashMap<String, HashMap<CellRef, usize>>,
 }
@@ -498,12 +517,12 @@ impl PatchLines {
             // Edits are indexed in first-occurrence order, so a worksheet's
             // lowest edit index began on the first line naming it.
             sheetpatch::Error::SheetNotFound(sheet) => {
-                let first = self.targets.get(sheet)?.values().min()?;
-                Some(self.lines[*first].0)
+                let first_edit = self.targets.get(sheet)?.values().min()?;
+                Some(self.lines[*first_edit].first)
             }
             sheetpatch::Error::ProtectedCell { sheet, cell, .. } => {
                 let index = self.targets.get(sheet)?.get(cell)?;
-                Some(self.lines[*index].1)
+                Some(self.lines[*index].last)
             }
             _ => None,
         }
@@ -583,11 +602,12 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch, Failure> 
         let value = parse_value(kind, fields.next()).map_err(|error| match error {
             ValueError::Arity(message) | ValueError::Invalid(message) => invalid(message),
         })?;
-        let edit = CellEdit::at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
+        let edit =
+            CellEdit::try_new_at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
         patch.row_count += 1;
         let lines = &mut patch.lines;
         if let Some(&index) = lines.targets.get(sheet).and_then(|cells| cells.get(&cell)) {
-            lines.lines[index].1 = line_number;
+            lines.lines[index].last = line_number;
             patch.edits[index] = edit;
         } else {
             lines
@@ -595,7 +615,10 @@ fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch, Failure> 
                 .entry(sheet.to_owned())
                 .or_default()
                 .insert(cell, patch.edits.len());
-            lines.lines.push((line_number, line_number));
+            lines.lines.push(EditLines {
+                first: line_number,
+                last: line_number,
+            });
             patch.edits.push(edit);
         }
     }
@@ -615,8 +638,8 @@ fn read_patch_arg(path: &OsStr) -> Result<Patch, Failure> {
 fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")?;
     let mut start = 0;
-    for (index, ch) in value.char_indices() {
-        let escape = match ch {
+    for (index, character) in value.char_indices() {
+        let escape = match character {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
@@ -631,11 +654,11 @@ fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
         };
         output.write_all(&value.as_bytes()[start..index])?;
         if escape.is_empty() {
-            write!(output, "\\u{:04x}", ch as u32)?;
+            write!(output, "\\u{:04x}", character as u32)?;
         } else {
             output.write_all(escape.as_bytes())?;
         }
-        start = index + ch.len_utf8();
+        start = index + character.len_utf8();
     }
     output.write_all(&value.as_bytes()[start..])?;
     output.write_all(b"\"")
@@ -688,40 +711,52 @@ impl Escape {
         }
     }
 
-    fn applies(self, ch: char) -> bool {
+    fn applies(self, character: char) -> bool {
         match self {
             Self::Exact => false,
-            Self::Controls => ch.is_control() && !matches!(ch, '\t' | '\n'),
-            Self::AllControls => ch.is_control(),
+            Self::Controls => character.is_control() && !matches!(character, '\t' | '\n'),
+            Self::AllControls => character.is_control(),
         }
     }
 }
 
-/// Displays a value for plain output with the characters its `Escape` selects
+/// Displays a value for plain output with the characters its `escape` selects
 /// shown as `\u{..}` escapes.
-struct Escaped<T>(T, Escape);
+struct Escaped<T> {
+    value: T,
+    escape: Escape,
+}
 
-impl<T: fmt::Display> fmt::Display for Escaped<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Escaping<'a, 'b>(&'a mut fmt::Formatter<'b>, Escape);
+impl<T: Display> Display for Escaped<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        struct Escaping<'formatter, 'output> {
+            formatter: &'formatter mut Formatter<'output>,
+            escape: Escape,
+        }
 
         impl fmt::Write for Escaping<'_, '_> {
             fn write_str(&mut self, text: &str) -> fmt::Result {
                 let mut start = 0;
-                for (index, ch) in text.char_indices() {
-                    if self.1.applies(ch) {
-                        self.0.write_str(&text[start..index])?;
-                        write!(self.0, "\\u{{{:x}}}", u32::from(ch))?;
-                        start = index + ch.len_utf8();
+                for (index, character) in text.char_indices() {
+                    if self.escape.applies(character) {
+                        self.formatter.write_str(&text[start..index])?;
+                        write!(self.formatter, "\\u{{{:x}}}", u32::from(character))?;
+                        start = index + character.len_utf8();
                     }
                 }
-                self.0.write_str(&text[start..])
+                self.formatter.write_str(&text[start..])
             }
         }
 
-        match self.1 {
-            Escape::Exact => fmt::Display::fmt(&self.0, f),
-            escape => fmt::Write::write_fmt(&mut Escaping(f, escape), format_args!("{}", self.0)),
+        match self.escape {
+            Escape::Exact => Display::fmt(&self.value, f),
+            escape => fmt::Write::write_fmt(
+                &mut Escaping {
+                    formatter: f,
+                    escape,
+                },
+                format_args!("{}", self.value),
+            ),
         }
     }
 }
@@ -768,8 +803,8 @@ fn write_json_cell(
     output.write_all(b"}")
 }
 
-struct CellOutput<'a> {
-    sheet: &'a str,
+struct CellOutput<'sheet> {
+    sheet: &'sheet str,
     json: bool,
     /// `cells` includes addresses and types, and omits formatting-only cells.
     records: bool,
@@ -794,15 +829,17 @@ fn write_cell(
         }
         *first = false;
         write_json_cell(output, format.sheet, cell, content)
-    } else if format.records {
-        let kind = value_type(&content.value);
-        writeln!(
-            output,
-            "{cell}\t{kind}\t{}",
-            Escaped(&content.value, format.escape)
-        )
     } else {
-        writeln!(output, "{}", Escaped(&content.value, format.escape))
+        let value = Escaped {
+            value: &content.value,
+            escape: format.escape,
+        };
+        if format.records {
+            let kind = value_type(&content.value);
+            writeln!(output, "{cell}\t{kind}\t{value}")
+        } else {
+            writeln!(output, "{value}")
+        }
     }
 }
 
@@ -866,7 +903,7 @@ fn write_read_cells(
     Ok(())
 }
 
-fn cmd_help(args: &[OsString], output: &mut impl Write) -> Result<(), Failure> {
+fn run_help(args: &[OsString], output: &mut impl Write) -> Result<(), Failure> {
     let help = match &args[2..] {
         [] => USAGE,
         [topic] => match topic.to_str() {
@@ -885,9 +922,9 @@ fn cmd_help(args: &[OsString], output: &mut impl Write) -> Result<(), Failure> {
     Ok(())
 }
 
-fn cmd_list(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_list(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let args = line.positionals(&[Slot::Path("INPUT")], 1, "sheetpatch list [--json] INPUT")?;
-    let workbook = Source::new(line.command, &args[0])?.open()?;
+    let workbook = Source::try_new(line.command, &args[0])?.open()?;
     let sheets = workbook.sheets();
     if line.flag {
         write_json_array(output, sheets, |output, sheet| {
@@ -901,22 +938,26 @@ fn cmd_list(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resu
     } else {
         let escape = Escape::names(terminal);
         for sheet in sheets {
-            writeln!(output, "{}", Escaped(sheet.name(), escape))?;
+            let name = Escaped {
+                value: sheet.name(),
+                escape,
+            };
+            writeln!(output, "{name}")?;
         }
     }
     Ok(())
 }
 
-fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let args = line.positionals(
         &[Slot::Path("INPUT"), Slot::Text, Slot::Cell],
         3,
         "sheetpatch get [--json] INPUT SHEET CELL [CELL ...]",
     )?;
     let sheet = line.text(1)?;
-    let ranges = (2..args.len())
+    let ranges: Vec<CellRange> = (2..args.len())
         .map(|index| parse_range("get", line.text(index)?))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<_, _>>()?;
     // Count before expanding, so that a whole-sheet range fails without
     // allocating an address for every cell.
     let count = ranges.iter().fold(0u64, |count, range| {
@@ -932,7 +973,7 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     }
     let mut cells = Vec::with_capacity(count as usize);
     cells.extend(ranges.into_iter().flat_map(CellRange::cells));
-    let workbook = Source::new(line.command, &args[0])?.open()?;
+    let workbook = Source::try_new(line.command, &args[0])?.open()?;
     let view = workbook.prepare_sheet(sheet)?;
     write_read_cells(
         &view,
@@ -948,7 +989,7 @@ fn cmd_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     )
 }
 
-fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let args = line.positionals(
         &[Slot::Path("INPUT"), Slot::Text, Slot::Range],
         2,
@@ -959,7 +1000,7 @@ fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
         .get(2)
         .map(|_| parse_range("cells", line.text(2)?))
         .transpose()?;
-    let workbook = Source::new(line.command, &args[0])?.open()?;
+    let workbook = Source::try_new(line.command, &args[0])?.open()?;
     let view = workbook.prepare_sheet(sheet)?;
     // Filter the worksheet's own cells; a large range is never expanded.
     let cells: Vec<CellRef> = view
@@ -980,7 +1021,7 @@ fn cmd_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     )
 }
 
-fn cmd_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let args = line.positionals(
         &[
             Slot::Path("INPUT"),
@@ -1002,16 +1043,16 @@ fn cmd_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
         ValueError::Arity(message) => Failure::Usage(message),
         ValueError::Invalid(message) => Failure::invalid("set", message),
     })?;
-    let edit = CellEdit::at(sheet, cell, value)
+    let edit = CellEdit::try_new_at(sheet, cell, value)
         .map_err(|error| Failure::invalid("set", error.to_string()))?;
-    let source = Source::new(line.command, &args[0])?;
-    let destination = Destination::new(line.command, &args[1], terminal)?;
+    let source = Source::try_new(line.command, &args[0])?;
+    let destination = Destination::try_new(line.command, &args[1], terminal)?;
     let mut workbook = source.open()?;
     workbook.apply_edits([edit])?;
-    destination.save(&workbook, false, output)
+    destination.save(&workbook, ObsoleteRecords::Keep, output)
 }
 
-fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let (input, destination, patch) = if line.flag {
         let args = line.positionals(
             &[Slot::Path("INPUT"), Slot::Path("PATCH.tsv")],
@@ -1036,9 +1077,9 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
             "INPUT and PATCH.tsv cannot both read standard input (-)".into(),
         ));
     }
-    let source = Source::new(line.command, input)?;
+    let source = Source::try_new(line.command, input)?;
     let destination = destination
-        .map(|arg| Destination::new(line.command, arg, terminal))
+        .map(|arg| Destination::try_new(line.command, arg, terminal))
         .transpose()?;
     let Patch {
         edits,
@@ -1055,7 +1096,7 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
             None => Failure::Workbook(error),
         })?;
     match destination {
-        Some(destination) => destination.save(&workbook, false, output),
+        Some(destination) => destination.save(&workbook, ObsoleteRecords::Keep, output),
         None => {
             workbook.write_to(io::sink())?;
             let noun = if count == 1 { "row" } else { "rows" };
@@ -1065,16 +1106,16 @@ fn cmd_patch(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     }
 }
 
-fn cmd_compact(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
+fn run_compact(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Result<(), Failure> {
     let args = line.positionals(
         &[Slot::Path("INPUT"), Slot::Path("OUTPUT")],
         2,
         "sheetpatch compact INPUT OUTPUT",
     )?;
-    let source = Source::new(line.command, &args[0])?;
-    let destination = Destination::new(line.command, &args[1], terminal)?;
+    let source = Source::try_new(line.command, &args[0])?;
+    let destination = Destination::try_new(line.command, &args[1], terminal)?;
     let workbook = source.open()?;
-    destination.save(&workbook, true, output)
+    destination.save(&workbook, ObsoleteRecords::Remove, output)
 }
 
 /// Run one command. `terminal` reports whether `output` is a terminal.
@@ -1083,7 +1124,7 @@ fn run(args: &[OsString], output: &mut impl Write, terminal: bool) -> Result<(),
         return Err(Failure::Usage("missing command".into()));
     };
     let command = match name.to_str() {
-        Some("help") => return cmd_help(args, output),
+        Some("help") => return run_help(args, output),
         Some(flag @ ("--help" | "-h" | "--version" | "-V")) => {
             if let Some(extra) = args.get(2) {
                 return Err(Failure::Usage(format!(
@@ -1112,26 +1153,28 @@ fn run(args: &[OsString], output: &mut impl Write, terminal: bool) -> Result<(),
         return Ok(());
     }
     match command {
-        Command::List => cmd_list(&line, output, terminal),
-        Command::Get => cmd_get(&line, output, terminal),
-        Command::Cells => cmd_cells(&line, output, terminal),
-        Command::Set => cmd_set(&line, output, terminal),
-        Command::Patch => cmd_patch(&line, output, terminal),
-        Command::Compact => cmd_compact(&line, output, terminal),
+        Command::List => run_list(&line, output, terminal),
+        Command::Get => run_get(&line, output, terminal),
+        Command::Cells => run_cells(&line, output, terminal),
+        Command::Set => run_set(&line, output, terminal),
+        Command::Patch => run_patch(&line, output, terminal),
+        Command::Compact => run_compact(&line, output, terminal),
     }
 }
 
 fn write_failure(output: &mut impl Write, failure: &Failure, terminal: bool) -> io::Result<()> {
     // Diagnostics can contain paths and workbook metadata. Keep their control
     // characters from reaching a terminal, while retaining help line breaks.
-    writeln!(
-        output,
-        "sheetpatch: {}",
-        Escaped(failure, Escape::values(terminal))
-    )
+    let failure = Escaped {
+        value: failure,
+        escape: Escape::values(terminal),
+    };
+    writeln!(output, "sheetpatch: {failure}")
 }
 
 fn main() -> ExitCode {
+    use std::io::IsTerminal as _;
+
     let args: Vec<OsString> = env::args_os().collect();
     let stdout = io::stdout();
     let terminal = stdout.is_terminal();
@@ -1163,17 +1206,19 @@ mod common;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, iter};
 
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/libreoffice.xlsx"
     );
-    const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    const OFFICE_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-    const PACKAGE_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_NAMESPACE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PACKAGE_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
     fn args(values: &[&str]) -> Vec<OsString> {
-        std::iter::once("sheetpatch")
+        iter::once("sheetpatch")
             .chain(values.iter().copied())
             .map(OsString::from)
             .collect()
@@ -1194,18 +1239,19 @@ mod tests {
         let relationships: String = (0..names.len())
             .map(|index| {
                 format!(
-                    "<Relationship Id='s{index}' Type='{OFFICE_NS}/worksheet' Target='worksheets/sheet{index}.xml'/>"
+                    "<Relationship Id='s{index}' Type='{OFFICE_NAMESPACE}/worksheet' Target='worksheets/sheet{index}.xml'/>"
                 )
             })
             .collect();
         let workbook = format!(
-            "<workbook xmlns='{MAIN_NS}' xmlns:r='{OFFICE_NS}'><sheets>{sheets}</sheets></workbook>"
+            "<workbook xmlns='{MAIN_NAMESPACE}' xmlns:r='{OFFICE_NAMESPACE}'><sheets>{sheets}</sheets></workbook>"
         );
         let root = format!(
-            "<Relationships xmlns='{PACKAGE_NS}'><Relationship Id='office' Type='{OFFICE_NS}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
+            "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='office' Type='{OFFICE_NAMESPACE}/officeDocument' Target='xl/workbook.xml'/></Relationships>"
         );
-        let rels = format!("<Relationships xmlns='{PACKAGE_NS}'>{relationships}</Relationships>");
-        let worksheet = format!("<worksheet xmlns='{MAIN_NS}'><sheetData/></worksheet>");
+        let workbook_relationships =
+            format!("<Relationships xmlns='{PACKAGE_NAMESPACE}'>{relationships}</Relationships>");
+        let worksheet = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData/></worksheet>");
         let paths: Vec<String> = (0..names.len())
             .map(|index| format!("xl/worksheets/sheet{index}.xml"))
             .collect();
@@ -1216,7 +1262,7 @@ mod tests {
             ),
             ("_rels/.rels", root.as_bytes()),
             ("xl/workbook.xml", workbook.as_bytes()),
-            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", workbook_relationships.as_bytes()),
         ];
         entries.extend(
             paths
@@ -1238,7 +1284,10 @@ mod tests {
     fn patch_error(source: &[u8]) -> String {
         match read_patch(source, "test") {
             Err(Failure::Invalid { command, message }) => {
-                assert_eq!(command, "patch");
+                assert_eq!(
+                    command, "patch",
+                    "a rejected row should point to the patch format's help"
+                );
                 message
             }
             other => panic!("unexpected patch result: {other:?}"),
@@ -1279,7 +1328,7 @@ mod tests {
             for index in text_indexes {
                 let mut args = args.clone();
                 args[index] = invalid.clone();
-                match run(&args, &mut Vec::new(), false) {
+                match run(&args, &mut Vec::new(), /* terminal: */ false) {
                     Err(Failure::Invalid { message, .. }) => {
                         assert!(message.starts_with(&format!("Argument {index} ")));
                     }
@@ -1318,16 +1367,17 @@ mod tests {
 
     #[test]
     fn terminal_output_escapes_controls_and_other_output_is_exact() {
+        let escaped = |value: &dyn Display, escape| Escaped { value, escape }.to_string();
         let text = "a\u{1b}]0;title\u{7}\u{1b}[2J\tb\nc\r\0\u{7f}\u{85}\u{9b}\u{a0}é😀";
-        assert_eq!(Escaped(text, Escape::values(false)).to_string(), text);
-        assert_eq!(Escaped(text, Escape::names(false)).to_string(), text);
+        assert_eq!(escaped(&text, Escape::values(/* terminal: */ false)), text);
+        assert_eq!(escaped(&text, Escape::names(/* terminal: */ false)), text);
         assert_eq!(
-            Escaped(text, Escape::values(true)).to_string(),
+            escaped(&text, Escape::values(/* terminal: */ true)),
             "a\\u{1b}]0;title\\u{7}\\u{1b}[2J\tb\nc\\u{d}\\u{0}\\u{7f}\\u{85}\\u{9b}\u{a0}é😀"
         );
         // Names are listed one per line, so tabs and line feeds are escaped too.
         assert_eq!(
-            Escaped(text, Escape::names(true)).to_string(),
+            escaped(&text, Escape::names(/* terminal: */ true)),
             "a\\u{1b}]0;title\\u{7}\\u{1b}[2J\\u{9}b\\u{a}c\\u{d}\\u{0}\\u{7f}\\u{85}\\u{9b}\u{a0}é😀"
         );
         // Values use their own display; only text and error tokens hold controls.
@@ -1339,9 +1389,12 @@ mod tests {
             (CellValue::Blank, ""),
             (CellValue::Text("x\ty\u{1b}".into()), "x\ty\\u{1b}"),
         ] {
-            assert_eq!(Escaped(&value, Escape::values(true)).to_string(), expected);
             assert_eq!(
-                Escaped(&value, Escape::values(false)).to_string(),
+                escaped(&value, Escape::values(/* terminal: */ true)),
+                expected
+            );
+            assert_eq!(
+                escaped(&value, Escape::values(/* terminal: */ false)),
                 value.to_string()
             );
         }
@@ -1357,7 +1410,7 @@ mod tests {
         let workbook = parts.get_mut("xl/workbook.xml").unwrap();
         let xml = String::from_utf8(workbook.clone()).unwrap();
         *workbook = xml.replace("r:id='s0'", "").into_bytes();
-        std::fs::write(
+        fs::write(
             &path,
             common::stored_archive(
                 &parts
@@ -1368,8 +1421,12 @@ mod tests {
         )
         .unwrap();
         let mut output = Vec::new();
-        let failure =
-            run(&args(&["list", path.to_str().unwrap()]), &mut output, false).unwrap_err();
+        let failure = run(
+            &args(&["list", path.to_str().unwrap()]),
+            &mut output,
+            /* terminal: */ false,
+        )
+        .unwrap_err();
         assert!(output.is_empty());
         assert!(failure.to_string().contains("\u{1b}[2Jspoofed"));
         for failure in [
@@ -1383,25 +1440,25 @@ mod tests {
             ),
         ] {
             let mut plain = Vec::new();
-            write_failure(&mut plain, &failure, false).unwrap();
+            write_failure(&mut plain, &failure, /* terminal: */ false).unwrap();
             assert_eq!(
                 String::from_utf8(plain).unwrap(),
                 format!("sheetpatch: {failure}\n")
             );
             let mut terminal = Vec::new();
-            write_failure(&mut terminal, &failure, true).unwrap();
+            write_failure(&mut terminal, &failure, /* terminal: */ true).unwrap();
             let terminal = String::from_utf8(terminal).unwrap();
             assert!(terminal.contains("\\u{1b}"), "{terminal:?}");
             assert!(
                 terminal
                     .chars()
-                    .all(|ch| !ch.is_control() || matches!(ch, '\t' | '\n')),
+                    .all(|character| !character.is_control() || matches!(character, '\t' | '\n')),
                 "{terminal:?}"
             );
         }
         let failure = Failure::Usage("expected INPUT\tOUTPUT".into());
         let mut terminal = Vec::new();
-        write_failure(&mut terminal, &failure, true).unwrap();
+        write_failure(&mut terminal, &failure, /* terminal: */ true).unwrap();
         assert_eq!(
             String::from_utf8(terminal).unwrap(),
             format!("sheetpatch: {failure}\n")
@@ -1442,7 +1499,7 @@ mod tests {
             run(
                 &args(&[command, "--json", path, "Notes", "A2"]),
                 &mut json,
-                true,
+                /* terminal: */ true,
             )
             .unwrap();
             assert!(
@@ -1461,7 +1518,7 @@ mod tests {
         // that the budget can end the buffered prefix before or after a cell.
         let long = "long ".repeat(12);
         let sheet = format!(
-            "<worksheet xmlns='{MAIN_NS}'><sheetData>\
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>\
              <row r='1'><c r='A1' t='s'><v>1</v></c><c r='B1'><v>12.5</v></c>\
              <c r='C1' s='1'/><c r='D1'><f>B1*2</f><v>25</v></c></row>\
              <row r='2'><c r='A2' t='inlineStr'><is><t>x&#13;&#x9b;2J&#x7f;&#9;y&#10;z</t></is></c>\
@@ -1469,7 +1526,7 @@ mod tests {
              <row r='3'><c r='A3' t='inlineStr'><is><t>{long}</t></is></c>\
              <c r='B3'><v>not-a-number</v></c></row></sheetData></worksheet>"
         );
-        let mut parts = common::payloads(&std::fs::read(FIXTURE).unwrap());
+        let mut parts = common::payloads(&fs::read(FIXTURE).unwrap());
         parts.insert("xl/worksheets/sheet1.xml".into(), sheet.into_bytes());
         let entries: Vec<_> = parts
             .iter()
@@ -1542,11 +1599,11 @@ mod tests {
         }
         let long = "x".repeat(1000);
         let sheet = format!(
-            "<worksheet xmlns='{MAIN_NS}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData><row r='1'><c r='A1'><v>1</v></c>\
              <c r='B1' t='inlineStr'><is><t>{long}</t></is></c>\
              <c r='C1'><f>{long}</f><v>2</v></c></row></sheetData></worksheet>"
         );
-        let mut parts = common::payloads(&std::fs::read(FIXTURE).unwrap());
+        let mut parts = common::payloads(&fs::read(FIXTURE).unwrap());
         parts.insert("xl/worksheets/sheet1.xml".into(), sheet.into_bytes());
         let entries: Vec<_> = parts
             .iter()
@@ -1587,7 +1644,7 @@ mod tests {
     fn terminal_lists_escape_every_control_in_sheet_names() {
         let directory = common::TempDir::new();
         let path = directory.join("names.xlsx");
-        std::fs::write(
+        fs::write(
             &path,
             named_sheets(&[
                 "Two&#10;Lines",
@@ -1611,7 +1668,12 @@ mod tests {
             assert_eq!(String::from_utf8(output).unwrap(), expected);
         }
         let mut json = Vec::new();
-        run(&args(&["list", "--json", path]), &mut json, true).unwrap();
+        run(
+            &args(&["list", "--json", path]),
+            &mut json,
+            /* terminal: */ true,
+        )
+        .unwrap();
         let json = String::from_utf8(json).unwrap();
         assert!(
             json.starts_with("[{\"name\":\"Two\\nLines\",\"path\":"),
@@ -1627,7 +1689,7 @@ mod tests {
             vec!["set", FIXTURE, "-", "Data", "A1", "text", "x"],
         ] {
             let mut output = Vec::new();
-            match run(&args(&command), &mut output, true) {
+            match run(&args(&command), &mut output, /* terminal: */ true) {
                 Err(Failure::Invalid { message, .. }) => {
                     assert!(message.contains("terminal"), "{message}");
                 }
@@ -1660,7 +1722,11 @@ mod tests {
             vec!["list", "--json", FIXTURE],
         ] {
             // `main` ends text output quietly when its reader closed the pipe.
-            match run(&args(&command), &mut FailedWriter, false) {
+            match run(
+                &args(&command),
+                &mut FailedWriter,
+                /* terminal: */ false,
+            ) {
                 Err(Failure::Output(error)) => {
                     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
                 }
@@ -1669,14 +1735,18 @@ mod tests {
         }
         let directory = common::TempDir::new();
         let patch = directory.join("p.tsv");
-        std::fs::write(&patch, "Data\tA1\ttext\tx\n").unwrap();
+        fs::write(&patch, "Data\tA1\ttext\tx\n").unwrap();
         for command in [
             vec!["compact", FIXTURE, "-"],
             vec!["set", FIXTURE, "-", "Data", "A1", "text", "x"],
             vec!["patch", FIXTURE, "-", patch.to_str().unwrap()],
         ] {
             // A truncated workbook is a failure, even behind a closed pipe.
-            match run(&args(&command), &mut FailedWriter, false) {
+            match run(
+                &args(&command),
+                &mut FailedWriter,
+                /* terminal: */ false,
+            ) {
                 Err(failure @ Failure::Context(_, sheetpatch::Error::Io(_))) => {
                     assert_eq!(failure.exit_code(), 1);
                     assert_eq!(
@@ -1747,12 +1817,12 @@ mod tests {
         assert_eq!(patch.row_count, 2);
         assert_eq!(patch.edits.len(), 2);
         let edit = &patch.edits[0];
-        assert_eq!(patch.lines.lines[0], (3, 3));
+        assert_eq!(patch.lines.lines[0], EditLines { first: 3, last: 3 });
         assert_eq!(edit.sheet(), "Data & Notes");
         assert_eq!(edit.cell().to_string(), "B2");
         assert_eq!(edit.value(), &CellValue::Text("  left\tright  ".into()));
         let edit = &patch.edits[1];
-        assert_eq!(patch.lines.lines[1], (4, 4));
+        assert_eq!(patch.lines.lines[1], EditLines { first: 4, last: 4 });
         assert_eq!(edit.sheet(), "#Data");
         assert_eq!(edit.value(), &CellValue::Text(String::new()));
     }

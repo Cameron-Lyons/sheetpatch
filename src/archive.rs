@@ -4,19 +4,17 @@
 //! opaque gaps are copied verbatim. This avoids decoding unrelated parts and
 //! introducing unreferenced local records that some spreadsheet readers reject.
 
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-    fmt::Display,
-    io::{Read, Write},
-    num::NonZero,
-    ops::Range,
-};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Display;
+use std::io::{self, Read, Write};
+use std::num::NonZero;
+use std::ops::Range;
+use std::thread::{self, Scope, ScopedJoinHandle};
+use std::{iter, panic};
 
-use flate2::{
-    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
-    write::DeflateEncoder,
-};
+use flate2::write::DeflateEncoder;
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
 use crate::{Error, Result};
 
@@ -25,8 +23,8 @@ const CENTRAL: u32 = 0x0201_4b50;
 const END: u32 = 0x0605_4b50;
 const DESCRIPTOR: u32 = 0x0807_4b50;
 const ZIP64_LOCATOR: u32 = 0x0706_4b50;
-// Legacy .xls files and password-encrypted OOXML packages are not ZIP archives
-// but OLE compound files.
+/// Legacy .xls files and password-encrypted OOXML packages are not ZIP archives
+/// but OLE compound files.
 const OLE_SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 
 const LOCAL_HEADER_LEN: usize = 30;
@@ -64,14 +62,14 @@ const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as 
 // Level 4 is the fastest level that keeps lazy matching. For worksheet XML it
 // produces archives about as small as the default level 6, several times faster.
 const DEFLATE_LEVEL: u32 = 4;
-// Replacements longer than two segments are deflated in segments of this
-// length, several at once. Each segment starts without the previous one's
-// history, which costs about 0.1% in size.
+/// Replacements longer than two segments are deflated in segments of this
+/// length, several at once. Each segment starts without the previous one's
+/// history, which costs about 0.1% in size.
 const DEFLATE_SEGMENT: usize = 1 << 20;
 const MAX_DEFLATE_THREADS: usize = 8;
 
 pub(crate) trait PartChanges {
-    // Names are unique; iteration order is also the validation error order.
+    /// Names are unique; iteration order is also the validation error order.
     fn parts(&self) -> impl Iterator<Item = (&str, &[u8])>;
 
     fn is_empty(&self) -> bool {
@@ -116,14 +114,33 @@ impl Sizes {
 
     /// Whether header fields agree with the actual values. A header followed
     /// by a data descriptor may leave any field zero instead.
-    fn matches(self, actual: Self, has_descriptor: bool) -> bool {
+    fn matches(self, actual: Self, data_descriptor: DataDescriptor) -> bool {
+        let zero_allowed = data_descriptor == DataDescriptor::Present;
         [
             (self.crc, actual.crc),
             (self.compressed_size, actual.compressed_size),
             (self.size, actual.size),
         ]
         .into_iter()
-        .all(|(header, actual)| header == actual || (has_descriptor && header == 0))
+        .all(|(header, actual)| header == actual || (zero_allowed && header == 0))
+    }
+}
+
+/// Whether a data descriptor follows a member's data, as its general-purpose
+/// flags announce. Its headers may then leave the CRC-32 and sizes zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataDescriptor {
+    Absent,
+    Present,
+}
+
+impl DataDescriptor {
+    fn of(flags: u16) -> Self {
+        if flags & FLAG_DESCRIPTOR == 0 {
+            Self::Absent
+        } else {
+            Self::Present
+        }
     }
 }
 
@@ -149,24 +166,32 @@ pub(crate) struct Archive {
 }
 
 /// A central-directory header whose variable fields lie within the directory.
-struct CentralHeader<'a> {
+struct CentralHeader<'bytes> {
     flags: u16,
     method: u16,
     sizes: Sizes,
-    name: &'a str,
-    extra: &'a [u8],
+    name: &'bytes str,
+    extra: &'bytes [u8],
     local_start: usize,
     record: Range<usize>,
 }
 
 /// A local header whose fixed fields, name and extra field end by a limit.
-struct LocalHeader<'a> {
+struct LocalHeader<'bytes> {
     flags: u16,
     method: u16,
     sizes: Sizes,
-    raw_name: &'a [u8],
-    extra: &'a [u8],
+    raw_name: &'bytes [u8],
+    extra: &'bytes [u8],
     data_start: usize,
+}
+
+/// The local header of an obsolete record that compaction understands, with
+/// the codec of its data and its member name.
+struct ObsoleteRecord<'bytes> {
+    header: LocalHeader<'bytes>,
+    codec: Codec,
+    name: &'bytes str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,11 +222,19 @@ impl Codec {
     }
 }
 
-struct ChangePlan<'a> {
-    // Keep only changed entry indexes, their codecs and borrowed payloads,
-    // ordered by their physical local-record positions for a single merge
-    // during emission.
-    data: Vec<(usize, Codec, &'a [u8])>,
+/// A validated replacement for a member's data.
+struct Change<'changes> {
+    /// The member's index in `Archive::entries`.
+    index: usize,
+    codec: Codec,
+    data: &'changes [u8],
+}
+
+struct ChangePlan<'changes> {
+    /// Only the changed members' indexes, codecs and borrowed payloads,
+    /// ordered by their physical local-record positions for a single merge
+    /// during emission.
+    changes: Vec<Change<'changes>>,
 }
 
 #[derive(Clone, Copy)]
@@ -210,8 +243,18 @@ enum RecordPolicy {
     Compact,
 }
 
-// `None` means more than one structurally plausible descriptor points to that
-// payload start. Compaction refuses this ambiguity rather than choosing one.
+/// Where emitted local records end, and where they placed each member.
+struct LocalLayout {
+    /// The output position after the local records, where the directory starts.
+    position: usize,
+    /// Each member's new local-record offset.
+    offsets: Vec<u32>,
+    /// The new sizes of replaced members.
+    replacements: Vec<Option<Sizes>>,
+}
+
+/// `None` means more than one structurally plausible descriptor points to that
+/// payload start. Compaction refuses this ambiguity rather than choosing one.
 type StoredDescriptors = HashMap<usize, Option<StoredDescriptor>>;
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -265,7 +308,7 @@ fn read_at_most(reader: impl Read, file_len: Option<u64>, limit: u64) -> Result<
         if let Ok(len) = usize::try_from(len) {
             bytes
                 .try_reserve_exact(len)
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         }
     }
     // One byte past the limit shows that the input is too long.
@@ -319,7 +362,7 @@ fn zip32(value: usize, description: &str) -> Result<u32> {
 fn check_extra(mut bytes: &[u8], name: &str) -> Result<()> {
     // A long name can have thousands of stale Unicode path fields. Hash it
     // only once, rather than once per field, to keep validation linear.
-    let mut name_crc = None;
+    let mut name_crc: Option<u32> = None;
     while !bytes.is_empty() {
         if bytes.len() < 4 {
             return Err(invalid("truncated ZIP extra field"));
@@ -487,7 +530,12 @@ fn check_end_records(
     local_len: usize,
     reemit: impl FnOnce(&mut Probe) -> Result<()>,
 ) -> Result<()> {
-    debug_assert!(base == 0 || tail.len() >= END_TAIL_LEN);
+    debug_assert!(
+        base == 0 || tail.len() >= END_TAIL_LEN,
+        "the end-record rules need the output's last {END_TAIL_LEN} bytes, but only {} \
+         follow {base} dropped ones",
+        tail.len()
+    );
     let ambiguous = || {
         unsupported(
             "saving would make the ZIP end-of-directory record ambiguous: the saved \
@@ -527,9 +575,14 @@ fn check_end_records(
         earlier.dedup();
         let mut probe = Probe::new(earlier);
         reemit(&mut probe)?;
-        debug_assert_eq!(probe.position, base + local_len);
+        debug_assert_eq!(
+            probe.position,
+            base + local_len,
+            "emission is deterministic, so writing the local records again must end where \
+             they did"
+        );
         probe.write_all(&tail[local_len..])?;
-        if probe.words.iter().any(|&(_, word)| word == central) {
+        if probe.words.iter().any(|word| word.bytes == central) {
             return Err(ambiguous());
         }
     }
@@ -569,7 +622,7 @@ fn member_name(raw_name: &[u8], flags: u16) -> Result<&str> {
             "non-ASCII ZIP member names require the UTF-8 flag",
         ));
     }
-    std::str::from_utf8(raw_name).map_err(|_| unsupported("ZIP member names must be UTF-8"))
+    str::from_utf8(raw_name).map_err(|_| unsupported("ZIP member names must be UTF-8"))
 }
 
 fn central_header(bytes: &[u8], position: usize, end: usize) -> Result<CentralHeader<'_>> {
@@ -670,14 +723,14 @@ fn emit<W: Write>(writer: &mut W, position: &mut usize, bytes: &[u8]) -> Result<
 }
 
 /// Passes output on to a writer, keeping the last `len` bytes written.
-struct KeepTail<'a, W> {
-    writer: &'a mut W,
+struct KeepTail<'writer, W> {
+    writer: &'writer mut W,
     len: usize,
     tail: Vec<u8>,
 }
 
-impl<'a, W: Write> KeepTail<'a, W> {
-    fn new(writer: &'a mut W, len: usize) -> Self {
+impl<'writer, W: Write> KeepTail<'writer, W> {
+    fn new(writer: &'writer mut W, len: usize) -> Self {
         Self {
             writer,
             len,
@@ -693,7 +746,7 @@ impl<'a, W: Write> KeepTail<'a, W> {
 }
 
 impl<W: Write> Write for KeepTail<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = self.writer.write(bytes)?;
         let kept = &bytes[written.saturating_sub(self.len)..written];
         // Trim only once the buffer doubles, so each byte moves at most once.
@@ -704,41 +757,54 @@ impl<W: Write> Write for KeepTail<'_, W> {
         Ok(written)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
+}
+
+/// The four bytes written at an offset.
+struct Word {
+    offset: usize,
+    bytes: [u8; 4],
 }
 
 /// Discards output, recording the four bytes at each of some offsets.
 struct Probe {
     position: usize,
-    /// Each offset, in ascending order, and the bytes written there.
-    words: Vec<(usize, [u8; 4])>,
+    /// The words at each offset, in ascending order.
+    words: Vec<Word>,
 }
 
 impl Probe {
     fn new(offsets: Vec<usize>) -> Self {
-        debug_assert!(offsets.is_sorted());
+        debug_assert!(
+            offsets.is_sorted(),
+            "writes find words by binary search, so callers sort the offsets"
+        );
         Self {
             position: 0,
-            words: offsets.into_iter().map(|offset| (offset, [0; 4])).collect(),
+            words: offsets
+                .into_iter()
+                .map(|offset| Word {
+                    offset,
+                    bytes: [0; 4],
+                })
+                .collect(),
         }
     }
 }
 
 impl Write for Probe {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let start = self.position;
         self.position += bytes.len();
-        let first = self
-            .words
-            .partition_point(|&(offset, _)| offset + 4 <= start);
-        for (offset, word) in &mut self.words[first..] {
-            if *offset >= self.position {
+        let first = self.words.partition_point(|word| word.offset + 4 <= start);
+        for word in &mut self.words[first..] {
+            if word.offset >= self.position {
                 break;
             }
-            for (index, byte) in word.iter_mut().enumerate() {
-                if let Some(&value) = (*offset + index)
+            for (index, byte) in word.bytes.iter_mut().enumerate() {
+                if let Some(&value) = (word.offset + index)
                     .checked_sub(start)
                     .and_then(|at| bytes.get(at))
                 {
@@ -749,7 +815,7 @@ impl Write for Probe {
         Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -768,7 +834,7 @@ impl Entry {
     }
 
     /// Validate a member's local record against its central header.
-    fn new(bytes: &[u8], central: &CentralHeader<'_>, central_start: usize) -> Result<Self> {
+    fn try_new(bytes: &[u8], central: &CentralHeader<'_>, central_start: usize) -> Result<Self> {
         let name = central.name;
         let Some(local) = local_header(bytes, central.local_start, central_start)? else {
             return Err(invalid(format!("invalid ZIP local header for {name}")));
@@ -781,8 +847,8 @@ impl Entry {
         }
         check_extra(local.extra, name)?;
         let sizes = central.sizes;
-        let has_descriptor = central.flags & FLAG_DESCRIPTOR != 0;
-        if !local.sizes.matches(sizes, has_descriptor) {
+        let data_descriptor = DataDescriptor::of(central.flags);
+        if !local.sizes.matches(sizes, data_descriptor) {
             return Err(invalid(format!(
                 "conflicting ZIP sizes or checksum for {name}"
             )));
@@ -798,10 +864,9 @@ impl Entry {
                 "ZIP member {name} exceeds local-record bounds"
             )));
         }
-        let local_end = if has_descriptor {
-            descriptor_end(bytes, data_end, central_start, sizes, name)?
-        } else {
-            data_end
+        let local_end = match data_descriptor {
+            DataDescriptor::Present => descriptor_end(bytes, data_end, central_start, sizes, name)?,
+            DataDescriptor::Absent => data_end,
         };
         Ok(Self {
             name: name.to_owned(),
@@ -817,7 +882,7 @@ impl Entry {
 }
 
 impl Archive {
-    pub(crate) fn new(original: Vec<u8>) -> Result<Self> {
+    pub(crate) fn try_new(original: Vec<u8>) -> Result<Self> {
         if original.starts_with(&OLE_SIGNATURE) {
             return Err(unsupported(
                 "legacy .xls and password-encrypted workbooks (OLE compound files) are not supported",
@@ -857,7 +922,7 @@ impl Archive {
                 .entry(name.to_ascii_lowercase())
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(entries.len()));
-            let entry = Entry::new(&original, &central, central_start)?;
+            let entry = Entry::try_new(&original, &central, central_start)?;
             position = entry.central.end;
             entries.push(entry);
         }
@@ -921,7 +986,7 @@ impl Archive {
         let output = match codec {
             Codec::Stored => compressed.to_vec(),
             Codec::Deflated => {
-                let mut decoder = Decompress::new(false);
+                let mut decoder = Decompress::new(/* zlib_header: */ false);
                 // The declared length also bounds malformed streams that expand
                 // beyond their header, rather than trusting that header.
                 let mut output = Vec::with_capacity(sizes.size as usize + 1);
@@ -989,8 +1054,11 @@ impl Archive {
             }
         };
         let mut output = KeepTail::new(writer, self.local_tail_len());
-        let (mut position, offsets, replacements) =
-            self.emit_local_records(plan, &mut output, preserve_gaps)?;
+        let LocalLayout {
+            mut position,
+            offsets,
+            replacements,
+        } = self.emit_local_records(plan, &mut output, preserve_gaps)?;
         let local_tail = output.into_tail();
         self.emit_directory(
             writer,
@@ -1020,12 +1088,12 @@ impl Archive {
         plan: &ChangePlan<'_>,
         writer: &mut W,
         preserve_gaps: bool,
-    ) -> Result<(usize, Vec<u32>, Vec<Option<Sizes>>)> {
+    ) -> Result<LocalLayout> {
         let mut position = 0;
         let mut original_position = 0;
-        let mut replacements = vec![None; self.entries.len()];
-        let mut offsets = vec![0; self.entries.len()];
-        let mut pending = plan.data.iter().peekable();
+        let mut replacements: Vec<Option<Sizes>> = vec![None; self.entries.len()];
+        let mut offsets: Vec<u32> = vec![0; self.entries.len()];
+        let mut pending = plan.changes.iter().peekable();
         // Both policies keep the physical local-record order.
         for &index in &self.local_order {
             let entry = &self.entries[index];
@@ -1040,7 +1108,9 @@ impl Archive {
                 )?;
             }
             offsets[index] = zip32(position, "ZIP local-record offset")?;
-            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&Change { codec, data, .. }) =
+                pending.next_if(|change| change.index == index)
+            {
                 replacements[index] =
                     Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
             } else {
@@ -1059,7 +1129,11 @@ impl Archive {
                 &self.original[original_position..self.central_start],
             )?;
         }
-        Ok((position, offsets, replacements))
+        Ok(LocalLayout {
+            position,
+            offsets,
+            replacements,
+        })
     }
 
     /// Reproduce pre-1.0 append saves to exercise migration and compaction.
@@ -1071,7 +1145,7 @@ impl Archive {
         }
         let mut plan = self.validate_changes(changes)?;
         // Legacy appends emit replacements in central-directory order.
-        plan.data.sort_unstable_by_key(|change| change.0);
+        plan.changes.sort_unstable_by_key(|change| change.index);
         // These saves only build test inputs, so the end-record check reads
         // all of their local records from memory.
         let mut local = Vec::new();
@@ -1081,11 +1155,13 @@ impl Archive {
             &mut position,
             &self.original[..self.central_start],
         )?;
-        let mut replacements = vec![None; self.entries.len()];
-        let mut offsets = Vec::with_capacity(self.entries.len());
-        let mut pending = plan.data.iter().peekable();
+        let mut replacements: Vec<Option<Sizes>> = vec![None; self.entries.len()];
+        let mut offsets: Vec<u32> = Vec::with_capacity(self.entries.len());
+        let mut pending = plan.changes.iter().peekable();
         for (index, entry) in self.entries.iter().enumerate() {
-            if let Some(&(_, codec, data)) = pending.next_if(|change| change.0 == index) {
+            if let Some(&Change { codec, data, .. }) =
+                pending.next_if(|change| change.index == index)
+            {
                 offsets.push(zip32(position, "ZIP local-record offset")?);
                 replacements[index] =
                     Some(self.emit_replacement(entry, codec, data, &mut local, &mut position)?);
@@ -1122,7 +1198,7 @@ impl Archive {
     fn validate_changes<'a>(&self, changes: &'a impl PartChanges) -> Result<ChangePlan<'a>> {
         let parts = changes.parts();
         let mut plan = ChangePlan {
-            data: Vec::with_capacity(parts.size_hint().0),
+            changes: Vec::with_capacity(parts.size_hint().0),
         };
         for (name, data) in parts {
             let Some(&index) = self.index.get(name) else {
@@ -1134,10 +1210,10 @@ impl Archive {
                 return Err(over_read_limit(format_args!("ZIP member {name}")));
             }
             let codec = self.entries[index].codec()?;
-            plan.data.push((index, codec, data));
+            plan.changes.push(Change { index, codec, data });
         }
-        plan.data
-            .sort_unstable_by_key(|&(index, ..)| self.entries[index].local_record.start);
+        plan.changes
+            .sort_unstable_by_key(|change| self.entries[change.index].local_record.start);
         Ok(plan)
     }
 
@@ -1150,11 +1226,11 @@ impl Archive {
         position: &mut usize,
     ) -> Result<Sizes> {
         let size = zip32(data.len(), "ZIP member size")?;
-        let compressed = match codec {
+        let compressed: Vec<Cow<'_, [u8]>> = match codec {
             Codec::Stored => vec![Cow::Borrowed(data)],
             Codec::Deflated => deflate(data)?.into_iter().map(Cow::Owned).collect(),
         };
-        let compressed_len = compressed.iter().map(|piece| piece.len()).sum();
+        let compressed_len: usize = compressed.iter().map(|piece| piece.len()).sum();
         let compressed_size = zip32(compressed_len, "compressed ZIP member size")?;
         let sizes = Sizes {
             crc: crc32(data),
@@ -1233,7 +1309,11 @@ impl Archive {
             tail.extend_from_slice(&header);
             tail.extend_from_slice(&record[CENTRAL_HEADER_LEN..]);
         }
-        debug_assert_eq!(tail.len() - local_tail.len(), central_size as usize);
+        debug_assert_eq!(
+            tail.len() - local_tail.len(),
+            central_size as usize,
+            "central records are copied whole, so the directory keeps the input's size"
+        );
         tail.extend_from_slice(&ending);
         let base = *position - local_tail.len();
         check_end_records(&tail, base, local_tail.len(), reemit)?;
@@ -1244,7 +1324,7 @@ impl Archive {
     /// record or a recognizable obsolete one, so compaction drops nothing opaque.
     fn check_compactable(&self) -> Result<()> {
         let mut position = 0;
-        let mut stored_descriptors = None;
+        let mut stored_descriptors: Option<StoredDescriptors> = None;
         for &index in &self.local_order {
             let entry = &self.entries[index];
             while position < entry.local_record.start {
@@ -1273,11 +1353,7 @@ impl Archive {
     /// understands, ending by `gap_end`, the end of the gap holding it.
     /// `Ok(None)` means it is not one; name encodings and extra fields that
     /// `Archive::new` would refuse in an active member are errors.
-    fn obsolete_header(
-        &self,
-        start: usize,
-        gap_end: usize,
-    ) -> Result<Option<(LocalHeader<'_>, Codec, &str)>> {
+    fn obsolete_header(&self, start: usize, gap_end: usize) -> Result<Option<ObsoleteRecord<'_>>> {
         let Some(header) = local_header(&self.original, start, gap_end)? else {
             return Ok(None);
         };
@@ -1308,7 +1384,11 @@ impl Archive {
             return Ok(None);
         }
         check_extra(header.extra, name)?;
-        Ok(Some((header, codec, name)))
+        Ok(Some(ObsoleteRecord {
+            header,
+            codec,
+            name,
+        }))
     }
 
     fn orphan_end(
@@ -1321,24 +1401,26 @@ impl Archive {
             unsupported("cannot compact opaque ZIP prefix, gaps, or unrecognized obsolete records")
         };
         let bytes = &self.original;
-        let Some((
-            LocalHeader {
-                flags,
-                sizes: header,
-                data_start,
-                ..
-            },
+        let Some(ObsoleteRecord {
+            header:
+                LocalHeader {
+                    flags,
+                    sizes: header,
+                    data_start,
+                    ..
+                },
             codec,
             name,
-        )) = self.obsolete_header(start, gap_end)?
+        }) = self.obsolete_header(start, gap_end)?
         else {
             return Err(opaque());
         };
         // An obsolete record ends within its gap, which bounds every search.
-        let has_descriptor = flags & FLAG_DESCRIPTOR != 0;
+        let data_descriptor = DataDescriptor::of(flags);
+        let streaming = data_descriptor == DataDescriptor::Present && header.compressed_size == 0;
         let actual = match codec {
             Codec::Deflated => {
-                let end = if has_descriptor && header.compressed_size == 0 {
+                let end = if streaming {
                     gap_end
                 } else {
                     add(data_start, header.compressed_size as usize)?
@@ -1348,7 +1430,7 @@ impl Archive {
                 }
                 inspect_deflate(&bytes[data_start..end], name)?
             }
-            Codec::Stored if has_descriptor && header.compressed_size == 0 => {
+            Codec::Stored if streaming => {
                 let descriptors =
                     stored_descriptors.get_or_insert_with(|| self.stored_descriptors());
                 return self.stored_orphan_end(data_start, gap_end, header, name, descriptors);
@@ -1365,99 +1447,107 @@ impl Archive {
                 }
             }
         };
-        if !header.matches(actual, has_descriptor) {
+        if !header.matches(actual, data_descriptor) {
             return Err(opaque());
         }
         let data_end = add(data_start, actual.compressed_size as usize)?;
-        if has_descriptor {
-            descriptor_end(bytes, data_end, gap_end, actual, name).map_err(not_obsolete)
-        } else {
-            Ok(data_end)
+        match data_descriptor {
+            DataDescriptor::Present => {
+                descriptor_end(bytes, data_end, gap_end, actual, name).map_err(not_obsolete)
+            }
+            DataDescriptor::Absent => Ok(data_end),
         }
     }
 
-    // Stored streams carry no end marker. Index descriptors immediately before
-    // recognizable local headers or the central directory in a single pass.
-    // Their size fields identify the possible payload start. The index avoids scanning
-    // the rest of the archive separately for every obsolete streaming member.
+    /// Stored streams carry no end marker. Index descriptors immediately before
+    /// recognizable local headers or the central directory in a single pass.
+    /// Their size fields identify the possible payload start. The index avoids
+    /// scanning the rest of the archive separately for every obsolete streaming
+    /// member.
     fn stored_descriptors(&self) -> StoredDescriptors {
-        let mut descriptors = HashMap::new();
+        let mut descriptors: StoredDescriptors = HashMap::new();
         let local_signature = LOCAL.to_le_bytes();
         let directory = self.central_start..self.central_start;
-        // Active records are already bounded and cannot contain obsolete
-        // records. Only scan gaps, retaining the active start after each gap.
-        let boundaries = self
+        let active_records = self
             .local_order
             .iter()
             .map(|&index| &self.entries[index].local_record)
-            .chain(std::iter::once(&directory))
-            .scan(0, |previous_end, record| {
-                let gap = *previous_end..record.start;
-                *previous_end = record.end;
-                Some(gap)
-            })
-            .flat_map(|gap| {
-                let start = gap.start;
-                let end = gap.end;
-                self.original[gap]
-                    .windows(4)
-                    .enumerate()
-                    .filter(move |(_, bytes)| *bytes == local_signature)
-                    .map(move |(offset, _)| (start + offset, start, end))
-                    .chain(std::iter::once((end, start, end)))
-            });
-        for (boundary, gap_start, gap_end) in boundaries {
-            for signed in [false, true] {
-                let length = if signed {
-                    SIGNED_DESCRIPTOR_LEN
-                } else {
-                    DESCRIPTOR_LEN
-                };
-                let Some(data_end) = boundary.checked_sub(length) else {
-                    continue;
-                };
-                if signed && u32_at(&self.original, data_end).ok() != Some(DESCRIPTOR) {
-                    continue;
-                }
-                // Both forms end with these fields, entirely before the boundary.
-                let sizes = Sizes::read(&self.original, boundary - DESCRIPTOR_LEN)
-                    .expect("descriptor fields in bounds");
-                if sizes.size != sizes.compressed_size || sizes.size as usize > MAX_READ {
-                    continue;
-                }
-                let Some(data_start) = data_end.checked_sub(sizes.size as usize) else {
-                    continue;
-                };
-                // An obsolete stream must lie entirely within one gap. Known
-                // active records cannot be payload or descriptors of another
-                // member, even when their bytes imitate a valid header.
-                if data_start < gap_start {
-                    continue;
-                }
-                // A signature inside stored payload is not a record boundary.
-                // Only index descriptors whose following header could be an
-                // active member or an obsolete member compaction understands.
-                if boundary != self.central_start
-                    && !self.recognizable_local_header(boundary, gap_end)
-                {
-                    continue;
-                }
-                let descriptor = StoredDescriptor {
-                    data_end,
-                    end: boundary,
-                    sizes,
-                };
-                descriptors
-                    .entry(data_start)
-                    .and_modify(|candidate| {
-                        if *candidate != Some(descriptor) {
-                            *candidate = None;
-                        }
-                    })
-                    .or_insert(Some(descriptor));
+            .chain(iter::once(&directory));
+        // Active records are already bounded and cannot contain obsolete
+        // records. Only scan gaps, retaining the active start after each gap.
+        let mut gap_start = 0;
+        for record in active_records {
+            let gap_end = record.start;
+            let signatures = self.original[gap_start..gap_end]
+                .windows(4)
+                .enumerate()
+                .filter(|(_, bytes)| *bytes == local_signature)
+                .map(|(offset, _)| gap_start + offset);
+            let boundaries = signatures.chain(iter::once(gap_end));
+            for boundary in boundaries {
+                self.index_stored_descriptors(&mut descriptors, boundary, gap_start..gap_end);
             }
+            gap_start = record.end;
         }
         descriptors
+    }
+
+    /// Add to `descriptors` the stored descriptors of either form that end at
+    /// `boundary`, a local signature in `gap` or the end of it.
+    fn index_stored_descriptors(
+        &self,
+        descriptors: &mut StoredDescriptors,
+        boundary: usize,
+        gap: Range<usize>,
+    ) {
+        for signed in [false, true] {
+            let length = if signed {
+                SIGNED_DESCRIPTOR_LEN
+            } else {
+                DESCRIPTOR_LEN
+            };
+            let Some(data_end) = boundary.checked_sub(length) else {
+                continue;
+            };
+            if signed && u32_at(&self.original, data_end).ok() != Some(DESCRIPTOR) {
+                continue;
+            }
+            // Both forms end with these fields, entirely before the boundary.
+            let sizes = Sizes::read(&self.original, boundary - DESCRIPTOR_LEN)
+                .expect("boundaries lie within the archive, after a whole descriptor");
+            if sizes.size != sizes.compressed_size || sizes.size as usize > MAX_READ {
+                continue;
+            }
+            let Some(data_start) = data_end.checked_sub(sizes.size as usize) else {
+                continue;
+            };
+            // An obsolete stream must lie entirely within one gap. Known
+            // active records cannot be payload or descriptors of another
+            // member, even when their bytes imitate a valid header.
+            if data_start < gap.start {
+                continue;
+            }
+            // A signature inside stored payload is not a record boundary.
+            // Only index descriptors whose following header could be an
+            // active member or an obsolete member compaction understands.
+            if boundary != self.central_start && !self.recognizable_local_header(boundary, gap.end)
+            {
+                continue;
+            }
+            let descriptor = StoredDescriptor {
+                data_end,
+                end: boundary,
+                sizes,
+            };
+            descriptors
+                .entry(data_start)
+                .and_modify(|candidate| {
+                    if *candidate != Some(descriptor) {
+                        *candidate = None;
+                    }
+                })
+                .or_insert(Some(descriptor));
+        }
     }
 
     fn recognizable_local_header(&self, start: usize, gap_end: usize) -> bool {
@@ -1493,7 +1583,7 @@ impl Archive {
         };
         // The header's compressed size is zero here; its CRC and size must be
         // zero or agree with the descriptor.
-        if !header.matches(descriptor.sizes, true)
+        if !header.matches(descriptor.sizes, DataDescriptor::Present)
             || crc32(&self.original[data_start..descriptor.data_end]) != descriptor.sizes.crc
         {
             return Err(unsupported(format!(
@@ -1539,7 +1629,7 @@ fn deflate(data: &[u8]) -> Result<Vec<Vec<u8>>> {
         encoder.write_all(data)?;
         return Ok(vec![encoder.finish()?]);
     }
-    let threads = std::thread::available_parallelism()
+    let threads = thread::available_parallelism()
         .map_or(1, NonZero::get)
         .min(MAX_DEFLATE_THREADS)
         .min(data.len().div_ceil(segment));
@@ -1566,19 +1656,19 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
         .enumerate()
         .map(|(index, group)| (index * per_thread, group));
     let (first, group) = groups.next().expect("data is nonempty");
-    std::thread::scope(|scope| {
-        let others: Vec<_> = groups
-            .map(|(first, group)| {
-                let thread = spawn_scoped(scope, move || compress(first, group));
-                (first, group, thread)
-            })
-            .collect();
+    thread::scope(|scope| {
+        // Start every other group's thread before compressing this group.
+        let mut others = Vec::new();
+        for (first, group) in groups {
+            let thread = spawn_scoped(scope, move || compress(first, group));
+            others.push((first, group, thread));
+        }
         let mut output = compress(first, group)?;
         for (first, group, thread) in others {
             output.extend(match thread {
                 Ok(thread) => thread
                     .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?,
+                    .unwrap_or_else(|payload| panic::resume_unwind(payload))?,
                 Err(_) => compress(first, group)?,
             });
         }
@@ -1589,21 +1679,24 @@ fn deflate_segments(data: &[u8], segment: usize, threads: usize) -> Result<Vec<V
 /// Start a thread in `scope`, which fails like any thread start, for example
 /// under a limit on the user's processes.
 fn spawn_scoped<'scope, T: Send + 'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
+    scope: &'scope Scope<'scope, '_>,
     run: impl FnOnce() -> T + Send + 'scope,
-) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+) -> io::Result<ScopedJoinHandle<'scope, T>> {
     #[cfg(test)]
     if tests::SPAWN_FAILS.get() {
-        return Err(std::io::ErrorKind::WouldBlock.into());
+        return Err(io::ErrorKind::WouldBlock.into());
     }
-    std::thread::Builder::new().spawn_scoped(scope, run)
+    thread::Builder::new().spawn_scoped(scope, run)
 }
 
 /// Deflate one segment of a stream. Every segment but the last ends with a
 /// sync flush, which byte-aligns it without ending the stream, so the next
 /// segment's blocks can follow it.
 fn deflate_segment(data: &[u8], last: bool) -> Result<Vec<u8>> {
-    let mut compressor = Compress::new(Compression::new(DEFLATE_LEVEL), false);
+    let mut compressor = Compress::new(
+        Compression::new(DEFLATE_LEVEL),
+        /* zlib_header: */ false,
+    );
     let flush = if last {
         FlushCompress::Finish
     } else {
@@ -1614,7 +1707,7 @@ fn deflate_segment(data: &[u8], last: bool) -> Result<Vec<u8>> {
         let consumed = compressor.total_in() as usize;
         let status = compressor
             .compress_vec(&data[consumed..], &mut output, flush)
-            .map_err(std::io::Error::other)?;
+            .map_err(io::Error::other)?;
         // A flush is complete once a call consumed all input and left room
         // in the output; until then the compressor may hold pending bytes.
         // Stopping early would silently truncate the stream, which saves
@@ -1632,7 +1725,7 @@ fn deflate_segment(data: &[u8], last: bool) -> Result<Vec<u8>> {
 }
 
 fn inspect_deflate(compressed: &[u8], name: &str) -> Result<Sizes> {
-    let mut decoder = Decompress::new(false);
+    let mut decoder = Decompress::new(/* zlib_header: */ false);
     let mut buffer = [0; 8192];
     let mut crc = crc32fast::Hasher::new();
     loop {
@@ -1692,27 +1785,44 @@ mod tests {
         bytes
     }
 
-    fn fixture(descriptor: bool) -> Vec<u8> {
+    /// Where a fixture member stores its CRC-32 and sizes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Descriptor {
+        /// In its local header, without a data descriptor.
+        Absent,
+        /// In a data descriptor without a signature.
+        Unsigned,
+        /// In a data descriptor that starts with its signature.
+        Signed,
+    }
+
+    /// The compression method of a decorated fixture member.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Method {
+        Stored,
+        /// Method 99, which saves preserve but never read or replace.
+        Opaque,
+    }
+
+    fn fixture(descriptor: Descriptor) -> Vec<u8> {
         named_fixture(b"part.xml", 0, descriptor)
     }
 
-    fn named_fixture(name: &[u8], flags: u16, descriptor: bool) -> Vec<u8> {
-        stored_fixture(name, b"<part/>", flags, descriptor.then_some(true))
+    fn named_fixture(name: &[u8], flags: u16, descriptor: Descriptor) -> Vec<u8> {
+        stored_fixture(name, b"<part/>", flags, descriptor)
     }
 
-    fn stored_fixture(name: &[u8], data: &[u8], flags: u16, descriptor: Option<bool>) -> Vec<u8> {
+    fn stored_fixture(name: &[u8], data: &[u8], flags: u16, descriptor: Descriptor) -> Vec<u8> {
         let crc = crc32(data);
-        let flags = flags
-            | if descriptor.is_some() {
-                FLAG_DESCRIPTOR
-            } else {
-                0
-            };
+        let flags = match descriptor {
+            Descriptor::Absent => flags,
+            Descriptor::Unsigned | Descriptor::Signed => flags | FLAG_DESCRIPTOR,
+        };
         let mut bytes = vec![0; 30];
         set_u32(&mut bytes, 0, LOCAL);
         set_u16(&mut bytes, 4, 20);
         set_u16(&mut bytes, 6, flags);
-        if descriptor.is_none() {
+        if descriptor == Descriptor::Absent {
             set_u32(&mut bytes, 14, crc);
             set_u32(&mut bytes, 18, data.len() as u32);
             set_u32(&mut bytes, 22, data.len() as u32);
@@ -1720,10 +1830,10 @@ mod tests {
         set_u16(&mut bytes, 26, name.len() as u16);
         bytes.extend_from_slice(name);
         bytes.extend_from_slice(data);
-        if let Some(signed) = descriptor {
-            if signed {
-                bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
-            }
+        if descriptor == Descriptor::Signed {
+            bytes.extend_from_slice(&DESCRIPTOR.to_le_bytes());
+        }
+        if descriptor != Descriptor::Absent {
             bytes.extend_from_slice(&crc.to_le_bytes());
             bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1754,8 +1864,8 @@ mod tests {
 
     #[test]
     fn no_change_is_byte_identical() {
-        let original = fixture(false);
-        let archive = Archive::new(original.clone()).unwrap();
+        let original = fixture(Descriptor::Absent);
+        let archive = Archive::try_new(original.clone()).unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
         assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
@@ -1765,11 +1875,14 @@ mod tests {
 
     #[test]
     fn opc_part_lookup_preserves_spelling_and_refuses_equivalent_duplicates() {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         assert_eq!(archive.part_name("PART.XML").unwrap(), Some("part.xml"));
         assert_eq!(archive.part_name("missing.xml").unwrap(), None);
-        let original = combine(fixture(false), decorate_fixture(b"PART.XML", false));
-        let archive = Archive::new(original.clone()).unwrap();
+        let original = combine(
+            fixture(Descriptor::Absent),
+            decorate_fixture(b"PART.XML", Method::Stored),
+        );
+        let archive = Archive::try_new(original.clone()).unwrap();
         assert!(archive.part_name("part.xml").is_err());
         // ZIP indexing itself remains exact, so opaque duplicate OPC names do
         // not prevent preserving an otherwise unaccessed archive member.
@@ -1780,9 +1893,9 @@ mod tests {
 
     #[test]
     fn appends_replacement_and_retains_original_records_and_comment() {
-        for descriptor in [false, true] {
+        for descriptor in [Descriptor::Absent, Descriptor::Signed] {
             let original = fixture(descriptor);
-            let archive = Archive::new(original.clone()).unwrap();
+            let archive = Archive::try_new(original.clone()).unwrap();
             let changes =
                 BTreeMap::from([("part.xml".into(), b"<part changed=\"yes\"/>".to_vec())]);
             let edited = append(&archive, &changes);
@@ -1791,7 +1904,7 @@ mod tests {
                 &original[..archive.central_start]
             );
             assert!(edited.ends_with(b"comment"));
-            let reopened = Archive::new(edited).unwrap();
+            let reopened = Archive::try_new(edited).unwrap();
             assert_eq!(reopened.read("part.xml").unwrap(), changes["part.xml"]);
             assert_eq!(reopened.entries[0].flags & 8, 0);
         }
@@ -1799,9 +1912,9 @@ mod tests {
 
     #[test]
     fn replacements_leave_no_unreferenced_records_and_preserve_untouched_metadata() {
-        let original = Archive::new(combine(
-            decorate_fixture(b"part.xml", false),
-            decorate_fixture(b"keep.xml", true),
+        let original = Archive::try_new(combine(
+            decorate_fixture(b"part.xml", Method::Stored),
+            decorate_fixture(b"keep.xml", Method::Opaque),
         ))
         .unwrap();
         // Central-directory order need not match physical local-record order.
@@ -1809,7 +1922,7 @@ mod tests {
         bytes.extend_from_slice(&original.original[original.entries[1].central.clone()]);
         bytes.extend_from_slice(&original.original[original.entries[0].central.clone()]);
         bytes.extend_from_slice(&original.original[original.end..]);
-        let mut archive = Archive::new(bytes).unwrap();
+        let mut archive = Archive::try_new(bytes).unwrap();
         let untouched = &archive.entries[archive.index["keep.xml"]];
         let local = archive.original[untouched.local_record.clone()].to_vec();
         let central = archive.original[untouched.central.clone()].to_vec();
@@ -1819,7 +1932,7 @@ mod tests {
             let mut compacted = Vec::new();
             archive.compact_to(&changes, &mut compacted).unwrap();
             assert_eq!(edited, compacted);
-            archive = Archive::new(edited).unwrap();
+            archive = Archive::try_new(edited).unwrap();
             let changed = &archive.entries[archive.index["part.xml"]];
             let untouched = &archive.entries[archive.index["keep.xml"]];
             // All bytes before the directory belong to exactly two records.
@@ -1838,8 +1951,11 @@ mod tests {
 
     #[test]
     fn replacements_preserve_opaque_prefixes_gaps_and_tails() {
-        let original =
-            Archive::new(combine(fixture(false), decorate_fixture(b"keep.xml", true))).unwrap();
+        let original = Archive::try_new(combine(
+            fixture(Descriptor::Absent),
+            decorate_fixture(b"keep.xml", Method::Opaque),
+        ))
+        .unwrap();
         let prefix = b"opaque prefix";
         let gap = b"opaque gap";
         let tail = b"opaque tail";
@@ -1860,11 +1976,11 @@ mod tests {
         let mut ending = original.original[original.end..].to_vec();
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
-        let archive = Archive::new(bytes).unwrap();
+        let archive = Archive::try_new(bytes).unwrap();
         let edited = archive
             .write(&BTreeMap::from([("part.xml".into(), b"updated".to_vec())]))
             .unwrap();
-        let updated = Archive::new(edited).unwrap();
+        let updated = Archive::try_new(edited).unwrap();
         let first = &updated.entries[0];
         let second = &updated.entries[1];
         assert_eq!(&updated.original[..first.local_record.start], prefix);
@@ -1885,14 +2001,14 @@ mod tests {
 
     #[test]
     fn replacements_preserve_changed_member_metadata_and_large_archive_comments() {
-        let mut original = decorate_fixture(b"part.xml", false);
+        let mut original = decorate_fixture(b"part.xml", Method::Stored);
         let end = original.len() - 29;
         original.truncate(end + 22);
         set_u16(&mut original, end + 20, u16::MAX);
-        original.extend(std::iter::repeat_n(b'!', u16::MAX as usize));
-        let archive = Archive::new(original).unwrap();
+        original.extend(iter::repeat_n(b'!', u16::MAX as usize));
+        let archive = Archive::try_new(original).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"updated payload".to_vec())]);
-        let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        let updated = Archive::try_new(archive.write(&changes).unwrap()).unwrap();
         assert_eq!(updated.read("part.xml").unwrap(), changes["part.xml"]);
 
         let before = &archive.entries[0];
@@ -1920,46 +2036,52 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_member_and_truncated_archives() {
-        let original = fixture(false);
+        let original = fixture(Descriptor::Absent);
         for end in 0..original.len() {
-            assert!(Archive::new(original[..end].to_vec()).is_err());
+            assert!(Archive::try_new(original[..end].to_vec()).is_err());
         }
         let mut corrupted = original;
         corrupted[30 + b"part.xml".len()] ^= 1;
-        let archive = Archive::new(corrupted).unwrap();
+        let archive = Archive::try_new(corrupted).unwrap();
         assert!(archive.read("part.xml").is_err());
     }
 
     #[test]
     fn rejects_zip64_and_inconsistent_offsets() {
-        let mut bytes = fixture(false);
+        let mut bytes = fixture(Descriptor::Absent);
         let end = bytes.len() - 29;
         set_u32(&mut bytes, end + 16, u32::MAX);
-        assert!(matches!(Archive::new(bytes), Err(Error::Unsupported(_))));
-        let mut bytes = fixture(false);
+        assert!(matches!(
+            Archive::try_new(bytes),
+            Err(Error::Unsupported(_))
+        ));
+        let mut bytes = fixture(Descriptor::Absent);
         let end = bytes.len() - 29;
         set_u32(&mut bytes, end + 16, 1);
-        assert!(Archive::new(bytes).is_err());
+        assert!(Archive::try_new(bytes).is_err());
     }
 
     #[test]
     fn rejects_archives_other_readers_could_interpret_differently() {
-        // fixture(false) has its local header at 0..38 with the name at 30,
-        // data at 38..45, the central record at 45..99, and the end record
-        // with its comment at 99..128. Member names have their own tests,
-        // such as rejects_empty_nul_and_duplicate_member_names.
+        // fixture(Descriptor::Absent) has its local header at 0..38 with the
+        // name at 30, data at 38..45, the central record at 45..99, and the
+        // end record with its comment at 99..128. Member names have their own
+        // tests, such as rejects_empty_nul_and_duplicate_member_names.
         const DIRECTORY: usize = 45;
         const END_RECORD: usize = 99;
         const ZIP64_EXTRA: [u8; 12] = [1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let base = Archive::new(fixture(false)).unwrap();
+        let base = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         assert_eq!((base.central_start, base.end), (DIRECTORY, END_RECORD));
         let edited = |surgery: fn(&mut Vec<u8>)| {
-            let mut bytes = fixture(false);
+            let mut bytes = fixture(Descriptor::Absent);
             surgery(&mut bytes);
             bytes
         };
-        let mut fewer_entries = combine(fixture(false), decorate_fixture(b"keep.xml", false));
-        let end = Archive::new(fewer_entries.clone()).unwrap().end;
+        let mut fewer_entries = combine(
+            fixture(Descriptor::Absent),
+            decorate_fixture(b"keep.xml", Method::Stored),
+        );
+        let end = Archive::try_new(fewer_entries.clone()).unwrap().end;
         set_u16(&mut fewer_entries, end + 8, 1);
         set_u16(&mut fewer_entries, end + 10, 1);
         let multi_disk = || unsupported("multi-disk ZIP workbooks are not supported");
@@ -2102,7 +2224,7 @@ mod tests {
             ),
         ];
         for (case, bytes, expected) in cases {
-            match (Archive::new(bytes), &expected) {
+            match (Archive::try_new(bytes), &expected) {
                 (Err(Error::InvalidWorkbook(actual)), Error::InvalidWorkbook(message))
                 | (Err(Error::Unsupported(actual)), Error::Unsupported(message)) => {
                     assert_eq!(actual, *message, "{case}");
@@ -2113,7 +2235,7 @@ mod tests {
     }
 
     fn deflate_fixture(compressed: &[u8]) -> Vec<u8> {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         let entry = &archive.entries[0];
         let mut bytes = archive.original[entry.local_header.clone()].to_vec();
         set_u16(&mut bytes, 8, 8);
@@ -2138,14 +2260,19 @@ mod tests {
         compressed.extend_from_slice(b"<part/>");
         let truncated = deflate_fixture(&compressed);
         compressed.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-        let valid = Archive::new(deflate_fixture(&compressed)).unwrap();
+        let valid = Archive::try_new(deflate_fixture(&compressed)).unwrap();
         assert_eq!(valid.read("part.xml").unwrap(), b"<part/>");
-        assert!(Archive::new(truncated).unwrap().read("part.xml").is_err());
+        assert!(
+            Archive::try_new(truncated)
+                .unwrap()
+                .read("part.xml")
+                .is_err()
+        );
         let changed = valid
             .write(&BTreeMap::from([("part.xml".into(), b"changed".to_vec())]))
             .unwrap();
         assert_eq!(
-            Archive::new(changed).unwrap().read("part.xml").unwrap(),
+            Archive::try_new(changed).unwrap().read("part.xml").unwrap(),
             b"changed"
         );
     }
@@ -2154,7 +2281,7 @@ mod tests {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(b"<part/>").unwrap();
         let compressed = encoder.finish().unwrap();
-        let archive = Archive::new(deflate_fixture(&compressed)).unwrap();
+        let archive = Archive::try_new(deflate_fixture(&compressed)).unwrap();
         let entry = &archive.entries[0];
         let mut bytes = archive.original[entry.local_header.clone()].to_vec();
         set_u16(&mut bytes, 6, 8);
@@ -2178,8 +2305,8 @@ mod tests {
         bytes
     }
 
-    fn decorate_fixture(name: &[u8; 8], opaque_method: bool) -> Vec<u8> {
-        let archive = Archive::new(fixture(true)).unwrap();
+    fn decorate_fixture(name: &[u8; 8], method: Method) -> Vec<u8> {
+        let archive = Archive::try_new(fixture(Descriptor::Signed)).unwrap();
         let entry = &archive.entries[0];
         let extra = [0xef, 0xbe, 3, 0, b'x', b'y', b'z'];
         let mut bytes = archive.original[entry.local_header.clone()].to_vec();
@@ -2187,7 +2314,7 @@ mod tests {
         set_u16(&mut bytes, 28, extra.len() as u16);
         set_u16(&mut bytes, 10, 0x1234);
         set_u16(&mut bytes, 12, 0x5678);
-        if opaque_method {
+        if method == Method::Opaque {
             set_u16(&mut bytes, 8, 99);
         }
         bytes.extend_from_slice(&extra);
@@ -2201,7 +2328,7 @@ mod tests {
         set_u16(&mut central, 32, 4);
         set_u16(&mut central, 36, 0x789a);
         set_u32(&mut central, 38, 0xcdef_4321);
-        if opaque_method {
+        if method == Method::Opaque {
             set_u16(&mut central, 10, 99);
         }
         central.extend_from_slice(&extra);
@@ -2223,7 +2350,7 @@ mod tests {
         let mut centrals = Vec::new();
         let mut ending = None;
         for part in parts {
-            let part = Archive::new(part).unwrap();
+            let part = Archive::try_new(part).unwrap();
             let offset = bytes.len();
             bytes.extend_from_slice(&part.original[..part.central_start]);
             let mut central = part.original[part.central_start..part.end].to_vec();
@@ -2247,9 +2374,14 @@ mod tests {
 
     #[test]
     fn many_replacements_follow_local_order_and_retain_central_order_and_metadata() {
-        let archive = Archive::new(combine_members((0..96).map(|index| {
+        let archive = Archive::try_new(combine_members((0..96).map(|index| {
             let name: [u8; 8] = format!("part{index:04}").into_bytes().try_into().unwrap();
-            decorate_fixture(&name, index % 3 != 0)
+            let method = if index % 3 == 0 {
+                Method::Stored
+            } else {
+                Method::Opaque
+            };
+            decorate_fixture(&name, method)
         })))
         .unwrap();
         let mut reordered = archive.original[..archive.central_start].to_vec();
@@ -2257,7 +2389,7 @@ mod tests {
             reordered.extend_from_slice(&archive.original[entry.central.clone()]);
         }
         reordered.extend_from_slice(&archive.original[archive.end..]);
-        let archive = Archive::new(reordered).unwrap();
+        let archive = Archive::try_new(reordered).unwrap();
         let changes: BTreeMap<_, _> = (0..96)
             .step_by(3)
             .map(|index| {
@@ -2267,7 +2399,7 @@ mod tests {
                 )
             })
             .collect();
-        let obsolete = Archive::new(append(&archive, &changes)).unwrap();
+        let obsolete = Archive::try_new(append(&archive, &changes)).unwrap();
         for (archive, has_obsolete_records) in [(&archive, false), (&obsolete, true)] {
             let preserved = archive.write(&changes).unwrap();
             let mut compacted = Vec::new();
@@ -2278,7 +2410,7 @@ mod tests {
                 assert_eq!(compacted, preserved);
             }
             for output in [preserved, compacted] {
-                let reopened = Archive::new(output).unwrap();
+                let reopened = Archive::try_new(output).unwrap();
                 assert_eq!(
                     reopened
                         .entries
@@ -2325,7 +2457,7 @@ mod tests {
 
     #[test]
     fn borrowed_changes_keep_validation_order_and_fail_before_output() {
-        struct BorrowedChanges<'a>(&'a [(&'a str, &'a [u8])]);
+        struct BorrowedChanges<'changes>(&'changes [(&'changes str, &'changes [u8])]);
 
         impl PartChanges for BorrowedChanges<'_> {
             fn parts(&self) -> impl Iterator<Item = (&str, &[u8])> {
@@ -2333,13 +2465,13 @@ mod tests {
             }
         }
 
-        let original = fixture(false);
-        let archive = Archive::new(original.clone()).unwrap();
+        let original = fixture(Descriptor::Absent);
+        let archive = Archive::try_new(original.clone()).unwrap();
         let empty = BorrowedChanges(&[]);
         assert_eq!(archive.write(&empty).unwrap(), original);
         let valid = BorrowedChanges(&[("part.xml", b"borrowed replacement")]);
         assert_eq!(
-            Archive::new(archive.write(&valid).unwrap())
+            Archive::try_new(archive.write(&valid).unwrap())
                 .unwrap()
                 .read("part.xml")
                 .unwrap(),
@@ -2368,19 +2500,19 @@ mod tests {
             limit: usize,
         }
         impl Write for ShortWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 if self.bytes.len() == self.limit {
-                    return Err(std::io::Error::other("injected failure"));
+                    return Err(io::Error::other("injected failure"));
                 }
                 let length = bytes.len().min(3).min(self.limit - self.bytes.len());
                 self.bytes.extend_from_slice(&bytes[..length]);
                 Ok(length)
             }
-            fn flush(&mut self) -> std::io::Result<()> {
+            fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }
-        let archive = Archive::new(fixture(true)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Signed)).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"changed".to_vec())]);
         for changes in [&BTreeMap::new(), &changes] {
             let expected = archive.write(changes).unwrap();
@@ -2414,7 +2546,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_changes_before_streaming_any_bytes() {
-        let archive = Archive::new(decorate_fixture(b"part.xml", true)).unwrap();
+        let archive = Archive::try_new(decorate_fixture(b"part.xml", Method::Opaque)).unwrap();
         let opaque = |result: Result<()>| {
             matches!(
                 result,
@@ -2436,13 +2568,13 @@ mod tests {
 
     #[test]
     fn patched_zip_members_remain_opaque_and_cannot_be_read_or_replaced() {
-        let mut patched = fixture(false);
-        let archive = Archive::new(patched.clone()).unwrap();
+        let mut patched = fixture(Descriptor::Absent);
+        let archive = Archive::try_new(patched.clone()).unwrap();
         let central = archive.entries[0].central.start;
         set_u16(&mut patched, 6, 0x20);
         set_u16(&mut patched, central + 8, 0x20);
-        let original = combine(patched, decorate_fixture(b"keep.xml", false));
-        let archive = Archive::new(original.clone()).unwrap();
+        let original = combine(patched, decorate_fixture(b"keep.xml", Method::Stored));
+        let archive = Archive::try_new(original.clone()).unwrap();
         assert!(matches!(
             archive.read("part.xml"),
             Err(Error::Unsupported(message)) if message.contains("patched")
@@ -2458,7 +2590,7 @@ mod tests {
         assert!(output.is_empty());
         let changes = BTreeMap::from([("keep.xml".into(), b"replacement".to_vec())]);
         let output = archive.write(&changes).unwrap();
-        let reopened = Archive::new(output).unwrap();
+        let reopened = Archive::try_new(output).unwrap();
         assert_eq!(reopened.read("keep.xml").unwrap(), b"replacement");
         let before = &archive.entries[archive.index["part.xml"]];
         let after = &reopened.entries[reopened.index["part.xml"]];
@@ -2470,11 +2602,11 @@ mod tests {
 
     #[test]
     fn compaction_never_discards_obsolete_patched_zip_members() {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
         let mut original = append(&archive, &changes);
         set_u16(&mut original, 6, 0x20);
-        let archive = Archive::new(original.clone()).unwrap();
+        let archive = Archive::try_new(original.clone()).unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
         assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
         let mut output = Vec::new();
@@ -2484,20 +2616,20 @@ mod tests {
 
     #[test]
     fn compaction_keeps_clean_archives_and_all_descriptor_forms_byte_identical() {
-        let mut unsigned = fixture(true);
+        let mut unsigned = fixture(Descriptor::Signed);
         let signed_offset = 30 + b"part.xml".len() + b"<part/>".len();
         unsigned.drain(signed_offset..signed_offset + 4);
         let end = unsigned.len() - 29;
         let offset = u32_at(&unsigned, end + 16).unwrap() - 4;
         set_u32(&mut unsigned, end + 16, offset);
         for original in [
-            fixture(false),
-            fixture(true),
+            fixture(Descriptor::Absent),
+            fixture(Descriptor::Signed),
             unsigned,
-            deflate_descriptor_fixture(false),
-            deflate_descriptor_fixture(true),
+            deflate_descriptor_fixture(/* signed: */ false),
+            deflate_descriptor_fixture(/* signed: */ true),
         ] {
-            let archive = Archive::new(original.clone()).unwrap();
+            let archive = Archive::try_new(original.clone()).unwrap();
             let mut output = Vec::new();
             archive.compact_to(&BTreeMap::new(), &mut output).unwrap();
             assert_eq!(output, original);
@@ -2506,12 +2638,15 @@ mod tests {
                 &BTreeMap::from([("part.xml".into(), b"new".to_vec())]),
             );
             let mut compacted = Vec::new();
-            Archive::new(changed)
+            Archive::try_new(changed)
                 .unwrap()
                 .compact_to(&BTreeMap::new(), &mut compacted)
                 .unwrap();
             assert_eq!(
-                Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+                Archive::try_new(compacted)
+                    .unwrap()
+                    .read("part.xml")
+                    .unwrap(),
                 b"new"
             );
         }
@@ -2520,10 +2655,10 @@ mod tests {
     #[test]
     fn repeated_compaction_stays_small_and_preserves_untouched_records_and_metadata() {
         let original = combine(
-            decorate_fixture(b"part.xml", false),
-            decorate_fixture(b"keep.xml", true),
+            decorate_fixture(b"part.xml", Method::Stored),
+            decorate_fixture(b"keep.xml", Method::Opaque),
         );
-        let archive = Archive::new(original).unwrap();
+        let archive = Archive::try_new(original).unwrap();
         let untouched = &archive.entries[1];
         let local = archive.original[untouched.local_record.clone()].to_vec();
         let central = archive.original[untouched.central.clone()].to_vec();
@@ -2534,7 +2669,7 @@ mod tests {
                 BTreeMap::from([("part.xml".into(), format!("value {index}").into_bytes())]);
             let appended = append(&current, &changes);
             let mut compacted = Vec::new();
-            let appended = Archive::new(appended).unwrap();
+            let appended = Archive::try_new(appended).unwrap();
             appended
                 .compact_to(&BTreeMap::new(), &mut compacted)
                 .unwrap();
@@ -2544,7 +2679,7 @@ mod tests {
             } else {
                 stable_size = Some(compacted.len());
             }
-            current = Archive::new(compacted).unwrap();
+            current = Archive::try_new(compacted).unwrap();
             assert_eq!(current.read("part.xml").unwrap(), changes["part.xml"]);
             let untouched = &current.entries[1];
             assert_eq!(current.original[untouched.local_record.clone()], local);
@@ -2562,30 +2697,33 @@ mod tests {
 
     #[test]
     fn compaction_applies_pending_changes_without_retaining_the_previous_member() {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
         let mut compacted = Vec::new();
         archive.compact_to(&changes, &mut compacted).unwrap();
         let expected_len = archive.original.len() - b"<part/>".len() + b"updated".len();
         assert_eq!(compacted.len(), expected_len);
         assert_eq!(
-            Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+            Archive::try_new(compacted)
+                .unwrap()
+                .read("part.xml")
+                .unwrap(),
             b"updated"
         );
     }
 
     #[test]
     fn compaction_checks_obsolete_deflate_payloads_across_output_chunks() {
-        let archive = Archive::new(deflate_descriptor_fixture(true)).unwrap();
+        let archive = Archive::try_new(deflate_descriptor_fixture(/* signed: */ true)).unwrap();
         let large = b"123456789".repeat(3000);
-        let archive = Archive::new(
+        let archive = Archive::try_new(
             archive
                 .write(&BTreeMap::from([("part.xml".into(), large.clone())]))
                 .unwrap(),
         )
         .unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), large);
-        let appended = Archive::new(append(
+        let appended = Archive::try_new(append(
             &archive,
             &BTreeMap::from([("part.xml".into(), b"updated".to_vec())]),
         ))
@@ -2596,7 +2734,10 @@ mod tests {
             .unwrap();
         assert!(compacted.len() < appended.original.len());
         assert_eq!(
-            Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+            Archive::try_new(compacted)
+                .unwrap()
+                .read("part.xml")
+                .unwrap(),
             b"updated"
         );
     }
@@ -2604,14 +2745,14 @@ mod tests {
     /// Bytes from a fixed pseudo-random sequence, which deflate cannot shrink.
     fn noise(length: usize) -> Vec<u8> {
         let mut state = 0x2545_f491_u32;
-        (0..length)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect()
+        let mut bytes = Vec::with_capacity(length);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            bytes.push(state as u8);
+        }
+        bytes
     }
 
     fn cells(count: usize) -> Vec<u8> {
@@ -2636,7 +2777,7 @@ mod tests {
                 // Inflating stops at the end of the last segment and not
                 // before: only that segment ends the stream.
                 let compressed = segments.concat();
-                let mut decoder = Decompress::new(false);
+                let mut decoder = Decompress::new(/* zlib_header: */ false);
                 let mut output = Vec::with_capacity(length + 1);
                 let status = decoder
                     .decompress_vec(&compressed, &mut output, FlushDecompress::Finish)
@@ -2667,11 +2808,11 @@ mod tests {
         let large = cells(4000);
         let segments = deflate_segments(&large, SEGMENT, 1).unwrap();
         assert!(segments.len() > MAX_DEFLATE_THREADS);
-        let archive = Archive::new(deflate_descriptor_fixture(true)).unwrap();
+        let archive = Archive::try_new(deflate_descriptor_fixture(/* signed: */ true)).unwrap();
         let written = archive
             .write(&BTreeMap::from([("part.xml".into(), large.clone())]))
             .unwrap();
-        let reopened = Archive::new(written.clone()).unwrap();
+        let reopened = Archive::try_new(written.clone()).unwrap();
         assert_eq!(reopened.read("part.xml").unwrap(), large);
         // Threads compressed the segments, with the same bytes as one.
         let entry = &reopened.entries[0];
@@ -2683,7 +2824,7 @@ mod tests {
         assert!(sizes == entry.sizes);
         // Compaction recognizes the multi-segment record once obsolete.
         let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
-        let appended = Archive::new(append(&reopened, &changes)).unwrap();
+        let appended = Archive::try_new(append(&reopened, &changes)).unwrap();
         let mut compacted = Vec::new();
         appended
             .compact_to(&BTreeMap::new(), &mut compacted)
@@ -2700,9 +2841,9 @@ mod tests {
     fn compacts_many_stored_streaming_orphans_in_one_gap() {
         let original = combine_members((0..64).map(|index| {
             let name: [u8; 8] = format!("part{index:04}").into_bytes().try_into().unwrap();
-            decorate_fixture(&name, false)
+            decorate_fixture(&name, Method::Stored)
         }));
-        let archive = Archive::new(original).unwrap();
+        let archive = Archive::try_new(original).unwrap();
         let changes: BTreeMap<_, _> = (0..64)
             .map(|index| {
                 (
@@ -2711,13 +2852,13 @@ mod tests {
                 )
             })
             .collect();
-        let appended = Archive::new(append(&archive, &changes)).unwrap();
+        let appended = Archive::try_new(append(&archive, &changes)).unwrap();
         let mut compacted = Vec::new();
         appended
             .compact_to(&BTreeMap::new(), &mut compacted)
             .unwrap();
         assert!(compacted.len() < appended.original.len());
-        let compacted = Archive::new(compacted).unwrap();
+        let compacted = Archive::try_new(compacted).unwrap();
         for (name, expected) in changes {
             assert_eq!(compacted.read(&name).unwrap(), expected);
         }
@@ -2725,7 +2866,7 @@ mod tests {
 
     #[test]
     fn stored_orphan_payload_signatures_do_not_create_false_descriptor_ambiguity() {
-        let archive = Archive::new(fixture(true)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Signed)).unwrap();
         let entry = &archive.entries[0];
         let mut payload = b"prefix".to_vec();
         // These bytes mimic a descriptor pointing to the real payload start,
@@ -2741,7 +2882,7 @@ mod tests {
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&false_size.to_le_bytes());
         payload.extend_from_slice(&false_size.to_le_bytes());
-        let false_header = named_fixture("é.xml".as_bytes(), 0, false);
+        let false_header = named_fixture("é.xml".as_bytes(), 0, Descriptor::Absent);
         payload.extend_from_slice(&false_header[..LOCAL_HEADER_LEN + "é.xml".len()]);
         payload.extend_from_slice(b"ordinary payload after the encoded name");
         let checksum = crc32(&payload);
@@ -2760,21 +2901,21 @@ mod tests {
         let mut ending = archive.original[archive.end..].to_vec();
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
-        let archive = Archive::new(combine_members([
+        let archive = Archive::try_new(combine_members([
             bytes,
-            named_fixture("é.xml".as_bytes(), FLAG_UTF8, false),
-            decorate_fixture(b"keep.xml", true),
+            named_fixture("é.xml".as_bytes(), FLAG_UTF8, Descriptor::Absent),
+            decorate_fixture(b"keep.xml", Method::Opaque),
         ]))
         .unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), payload);
         let opaque_record = archive.original[archive.entries[2].local_record.clone()].to_vec();
         let changes = BTreeMap::from([("part.xml".into(), b"replacement".to_vec())]);
-        let archive = Archive::new(append(&archive, &changes)).unwrap();
+        let archive = Archive::try_new(append(&archive, &changes)).unwrap();
         let mut compacted = Vec::new();
         archive
             .compact_to(&BTreeMap::new(), &mut compacted)
             .unwrap();
-        let archive = Archive::new(compacted).unwrap();
+        let archive = Archive::try_new(compacted).unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), b"replacement");
         assert_eq!(
             archive.original[archive.entries[2].local_record.clone()],
@@ -2784,9 +2925,9 @@ mod tests {
 
     #[test]
     fn active_payloads_cannot_supply_obsolete_stored_descriptors() {
-        for signed in [false, true] {
-            let original = stored_fixture(b"part.xml", b"old", 0, Some(signed));
-            let old = Archive::new(original.clone()).unwrap();
+        for descriptor in [Descriptor::Unsigned, Descriptor::Signed] {
+            let original = stored_fixture(b"part.xml", b"old", 0, descriptor);
+            let old = Archive::try_new(original.clone()).unwrap();
             let old_data_start = old.entries[0].data.start;
             let keep_data_start = old.central_start + LOCAL_HEADER_LEN + b"keep.xml".len();
             for tail in [false, true] {
@@ -2797,21 +2938,21 @@ mod tests {
                 payload.extend_from_slice(&false_size.to_le_bytes());
                 if !tail {
                     // A complete apparent record inside active payload.
-                    let false_header = fixture(false);
+                    let false_header = fixture(Descriptor::Absent);
                     payload
                         .extend_from_slice(&false_header[..LOCAL_HEADER_LEN + b"part.xml".len()]);
                     payload.extend_from_slice(b"remaining payload");
                 }
                 for opaque in [false, true] {
-                    let mut keep = stored_fixture(b"keep.xml", &payload, 0, None);
+                    let mut keep = stored_fixture(b"keep.xml", &payload, 0, Descriptor::Absent);
                     if opaque {
-                        let central = Archive::new(keep.clone()).unwrap().central_start;
+                        let central = Archive::try_new(keep.clone()).unwrap().central_start;
                         set_u16(&mut keep, 8, 99);
                         set_u16(&mut keep, central + 10, 99);
                     }
-                    let archive = Archive::new(combine(original.clone(), keep)).unwrap();
+                    let archive = Archive::try_new(combine(original.clone(), keep)).unwrap();
                     let changes = BTreeMap::from([("part.xml".into(), b"new".to_vec())]);
-                    let appended = Archive::new(append(&archive, &changes)).unwrap();
+                    let appended = Archive::try_new(append(&archive, &changes)).unwrap();
                     // In the tail case, the next real active record starts
                     // immediately after the apparent descriptor.
                     let keep = &appended.entries[1];
@@ -2821,7 +2962,7 @@ mod tests {
                         .compact_to(&BTreeMap::new(), &mut compacted)
                         .unwrap();
                     assert_eq!(compacted.len(), appended.original.len() - old.central_start);
-                    let compacted = Archive::new(compacted).unwrap();
+                    let compacted = Archive::try_new(compacted).unwrap();
                     assert_eq!(compacted.read("part.xml").unwrap(), b"new");
                     assert_eq!(
                         compacted.original[compacted.entries[1].local_record.clone()],
@@ -2837,17 +2978,17 @@ mod tests {
 
     #[test]
     fn ambiguous_descriptors_inside_obsolete_payload_still_refuse_compaction() {
-        for signed in [false, true] {
+        for descriptor in [Descriptor::Unsigned, Descriptor::Signed] {
             let mut payload = b"prefix".to_vec();
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
-            let false_header = fixture(false);
+            let false_header = fixture(Descriptor::Absent);
             payload.extend_from_slice(&false_header[..LOCAL_HEADER_LEN + b"part.xml".len()]);
             payload.extend_from_slice(b"remaining obsolete payload");
             let archive =
-                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
-            let appended = Archive::new(append(
+                Archive::try_new(stored_fixture(b"part.xml", &payload, 0, descriptor)).unwrap();
+            let appended = Archive::try_new(append(
                 &archive,
                 &BTreeMap::from([("part.xml".into(), b"new".to_vec())]),
             ))
@@ -2867,19 +3008,20 @@ mod tests {
         // As above, but the false header declares a ZIP64 compressed size,
         // which no obsolete record compaction removes can have. So its
         // preceding descriptor is payload too, and only one remains.
-        for signed in [false, true] {
+        for descriptor in [Descriptor::Unsigned, Descriptor::Signed] {
             let mut payload = b"prefix".to_vec();
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
-            let mut false_header = fixture(false)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
+            let mut false_header =
+                fixture(Descriptor::Absent)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
             set_u32(&mut false_header, 18, u32::MAX);
             payload.extend_from_slice(&false_header);
             payload.extend_from_slice(b"remaining obsolete payload");
             let archive =
-                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+                Archive::try_new(stored_fixture(b"part.xml", &payload, 0, descriptor)).unwrap();
             let changes = BTreeMap::from([("part.xml".into(), b"new".to_vec())]);
-            let appended = Archive::new(append(&archive, &changes)).unwrap();
+            let appended = Archive::try_new(append(&archive, &changes)).unwrap();
             let mut compacted = Vec::new();
             appended
                 .compact_to(&BTreeMap::new(), &mut compacted)
@@ -2890,10 +3032,10 @@ mod tests {
 
     #[test]
     fn obsolete_header_candidates_cannot_extend_into_active_records() {
-        for signed in [false, true] {
+        for descriptor in [Descriptor::Unsigned, Descriptor::Signed] {
             let replacement = b"new";
             let active_length = LOCAL_HEADER_LEN + b"part.xml".len() + replacement.len();
-            let descriptor_length = if signed {
+            let descriptor_length = if descriptor == Descriptor::Signed {
                 SIGNED_DESCRIPTOR_LEN
             } else {
                 DESCRIPTOR_LEN
@@ -2902,7 +3044,8 @@ mod tests {
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
             payload.extend_from_slice(&6u32.to_le_bytes());
-            let mut false_header = fixture(false)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
+            let mut false_header =
+                fixture(Descriptor::Absent)[..LOCAL_HEADER_LEN + b"part.xml".len()].to_vec();
             // One unknown extra field would swallow the real descriptor and
             // the next active member if parsed past this obsolete gap.
             let extra_length = descriptor_length + active_length;
@@ -2911,9 +3054,9 @@ mod tests {
             payload.extend_from_slice(&0xbeefu16.to_le_bytes());
             payload.extend_from_slice(&(extra_length as u16).to_le_bytes());
             let archive =
-                Archive::new(stored_fixture(b"part.xml", &payload, 0, Some(signed))).unwrap();
+                Archive::try_new(stored_fixture(b"part.xml", &payload, 0, descriptor)).unwrap();
             let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
-            let appended = Archive::new(append(&archive, &changes)).unwrap();
+            let appended = Archive::try_new(append(&archive, &changes)).unwrap();
             let mut compacted = Vec::new();
             appended
                 .compact_to(&BTreeMap::new(), &mut compacted)
@@ -2925,8 +3068,8 @@ mod tests {
     #[test]
     fn stored_orphan_payload_with_many_false_long_names_compacts_exactly() {
         for (fill, repeats) in [(0, 4096), (1, 18 * 1024 * 1024 / 64)] {
-            let original = fixture(true);
-            let archive = Archive::new(original.clone()).unwrap();
+            let original = fixture(Descriptor::Signed);
+            let archive = Archive::try_new(original.clone()).unwrap();
             let entry = &archive.entries[0];
             // Each apparent header has a 16 KiB name spanning hundreds of later
             // headers. Zero-filled headers have impossible NUL-containing names;
@@ -2954,7 +3097,7 @@ mod tests {
             let mut ending = archive.original[archive.end..].to_vec();
             set_u32(&mut ending, 16, central_start as u32);
             bytes.extend_from_slice(&ending);
-            let archive = Archive::new(bytes).unwrap();
+            let archive = Archive::try_new(bytes).unwrap();
             let mut compacted = Vec::new();
             archive
                 .compact_to(&BTreeMap::new(), &mut compacted)
@@ -2965,7 +3108,7 @@ mod tests {
 
     #[test]
     fn compaction_refuses_opaque_prefix_gaps_and_unrecognized_orphans_without_writing() {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         for prefix in [false, true] {
             let mut bytes = if prefix {
                 b"opaque".to_vec()
@@ -2985,7 +3128,7 @@ mod tests {
             let mut ending = archive.original[archive.end..].to_vec();
             set_u32(&mut ending, 16, central_start as u32);
             bytes.extend_from_slice(&ending);
-            let with_gap = Archive::new(bytes.clone()).unwrap();
+            let with_gap = Archive::try_new(bytes.clone()).unwrap();
             assert_eq!(with_gap.write(&BTreeMap::new()).unwrap(), bytes);
             let mut output = Vec::new();
             assert!(matches!(
@@ -2994,7 +3137,7 @@ mod tests {
             ));
             assert!(output.is_empty());
         }
-        let unrelated = Archive::new(decorate_fixture(b"keep.xml", false)).unwrap();
+        let unrelated = Archive::try_new(decorate_fixture(b"keep.xml", Method::Stored)).unwrap();
         let mut bytes = archive.original[..archive.central_start].to_vec();
         bytes.extend_from_slice(&unrelated.original[..unrelated.central_start]);
         let central_start = bytes.len();
@@ -3002,7 +3145,7 @@ mod tests {
         let mut ending = archive.original[archive.end..].to_vec();
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
-        let archive = Archive::new(bytes).unwrap();
+        let archive = Archive::try_new(bytes).unwrap();
         let mut output = Vec::new();
         assert!(matches!(
             archive.compact_to(&BTreeMap::new(), &mut output),
@@ -3020,17 +3163,17 @@ mod tests {
         // Corrupt the first payload byte of every encoding, or the checksum
         // in a streaming stored header, which must be zero or match.
         for (original, corrupt_header_byte) in [
-            (fixture(false), None),
-            (fixture(true), None),
+            (fixture(Descriptor::Absent), None),
+            (fixture(Descriptor::Signed), None),
             (deflate_fixture(&stored_block), None),
-            (deflate_descriptor_fixture(true), None),
-            (fixture(true), Some(14)),
+            (deflate_descriptor_fixture(/* signed: */ true), None),
+            (fixture(Descriptor::Signed), Some(14)),
         ] {
-            let archive = Archive::new(original).unwrap();
+            let archive = Archive::try_new(original).unwrap();
             let mut bytes = append(&archive, &changes);
             bytes[corrupt_header_byte.unwrap_or(archive.entries[0].data.start)] ^= 1;
             // Readers never see the obsolete record, and saves keep it.
-            let archive = Archive::new(bytes.clone()).unwrap();
+            let archive = Archive::try_new(bytes.clone()).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"updated");
             assert_eq!(archive.write(&BTreeMap::new()).unwrap(), bytes);
             // Compaction cannot verify it, so it refuses to discard it.
@@ -3045,14 +3188,14 @@ mod tests {
 
     #[test]
     fn rejects_end_of_directory_signatures_after_the_selected_record() {
-        let original = fixture(false);
+        let original = fixture(Descriptor::Absent);
         let end = original.len() - 29;
         // Signatures before the selected record, such as in stored member
         // data, are not candidates for readers that scan back from the end.
-        let archive = Archive::new(original.clone()).unwrap();
+        let archive = Archive::try_new(original.clone()).unwrap();
         let embedded = [b"stored ".as_slice(), &END.to_le_bytes(), b" data"].concat();
         let changes = BTreeMap::from([("part.xml".into(), embedded.clone())]);
-        let stored = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        let stored = Archive::try_new(archive.write(&changes).unwrap()).unwrap();
         assert_eq!(stored.read("part.xml").unwrap(), embedded);
         // Backward-scanning readers select the last signature even when its
         // comment does not reach EOF: here an EOCD with an empty comment plus
@@ -3067,7 +3210,7 @@ mod tests {
             bytes.extend_from_slice(&(comment.len() as u16).to_le_bytes());
             bytes.extend_from_slice(&comment);
             assert!(matches!(
-                Archive::new(bytes),
+                Archive::try_new(bytes),
                 Err(Error::InvalidWorkbook(message))
                     if message == "ambiguous ZIP end-of-directory records"
             ));
@@ -3080,8 +3223,14 @@ mod tests {
         // whose directory it can read. Here a stale member and its directory
         // precede the live member, and an end record for that directory hides
         // in the comment of the live directory's last entry.
-        let stale = Archive::new(fixture(false)).unwrap();
-        let live = Archive::new(stored_fixture(b"part.xml", b"<live/>", 0, None)).unwrap();
+        let stale = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
+        let live = Archive::try_new(stored_fixture(
+            b"part.xml",
+            b"<live/>",
+            0,
+            Descriptor::Absent,
+        ))
+        .unwrap();
         let with_decoy = |edit: fn(&mut [u8])| {
             let mut bytes = stale.original[..stale.end].to_vec();
             let live_start = bytes.len();
@@ -3102,7 +3251,7 @@ mod tests {
             bytes
         };
         assert!(matches!(
-            Archive::new(with_decoy(|_| {})),
+            Archive::try_new(with_decoy(|_| {})),
             Err(Error::InvalidWorkbook(message))
                 if message == "ambiguous ZIP end-of-directory records"
         ));
@@ -3120,7 +3269,7 @@ mod tests {
         set_u32(&mut ending, 16, central_start as u32);
         adjacent.extend_from_slice(&ending);
         assert!(matches!(
-            Archive::new(adjacent),
+            Archive::try_new(adjacent),
             Err(Error::InvalidWorkbook(message))
                 if message == "ambiguous ZIP end-of-directory records"
         ));
@@ -3151,9 +3300,9 @@ mod tests {
         ];
         let changes = BTreeMap::from([("part.xml".into(), b"<new/>".to_vec())]);
         for edit in unreadable {
-            let archive = Archive::new(with_decoy(edit)).unwrap();
+            let archive = Archive::try_new(with_decoy(edit)).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"<live/>");
-            let saved = Archive::new(archive.write(&changes).unwrap()).unwrap();
+            let saved = Archive::try_new(archive.write(&changes).unwrap()).unwrap();
             assert_eq!(saved.read("part.xml").unwrap(), b"<new/>");
         }
     }
@@ -3163,15 +3312,18 @@ mod tests {
         // The embedded archive's own end record lies in the tail window, but
         // its directory offset is relative to that archive and finds no
         // central-directory header in this one.
-        let inner = fixture(false);
-        let original = combine(fixture(false), stored_fixture(b"embedded", &inner, 0, None));
-        let archive = Archive::new(original).unwrap();
+        let inner = fixture(Descriptor::Absent);
+        let original = combine(
+            fixture(Descriptor::Absent),
+            stored_fixture(b"embedded", &inner, 0, Descriptor::Absent),
+        );
+        let archive = Archive::try_new(original).unwrap();
         let inner_end = archive.entries[1].data.start + inner.len() - 29;
         assert_eq!(u32_at(&archive.original, inner_end).unwrap(), END);
         assert!(archive.original.len() - inner_end < END_LEN + u16::MAX as usize);
         assert_eq!(archive.read("embedded").unwrap(), inner);
         let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
-        let updated = Archive::new(archive.write(&changes).unwrap()).unwrap();
+        let updated = Archive::try_new(archive.write(&changes).unwrap()).unwrap();
         assert_eq!(updated.read("part.xml").unwrap(), b"updated");
         assert_eq!(updated.read("embedded").unwrap(), inner);
     }
@@ -3181,18 +3333,21 @@ mod tests {
         // Python truncates names at NUL, and readers differ on which of two
         // duplicate members they select.
         for (bytes, expected) in [
-            (named_fixture(b"", 0, false), "empty ZIP member name"),
             (
-                named_fixture(b"a\0b.xml", 0, false),
+                named_fixture(b"", 0, Descriptor::Absent),
+                "empty ZIP member name",
+            ),
+            (
+                named_fixture(b"a\0b.xml", 0, Descriptor::Absent),
                 "ZIP member name contains NUL: a\0b.xml",
             ),
             (
-                combine(fixture(false), fixture(true)),
+                combine(fixture(Descriptor::Absent), fixture(Descriptor::Signed)),
                 "duplicate ZIP member: part.xml",
             ),
         ] {
             assert!(matches!(
-                Archive::new(bytes),
+                Archive::try_new(bytes),
                 Err(Error::InvalidWorkbook(message)) if message == expected
             ));
         }
@@ -3203,18 +3358,21 @@ mod tests {
         // Some readers treat '\' as '/', so for them the second member here
         // would alias the first, and the last of the two would win.
         let mut aliased = combine(
-            named_fixture(b"xl/part.xml", 0, false),
-            named_fixture(b"xl_part.xml", 0, false),
+            named_fixture(b"xl/part.xml", 0, Descriptor::Absent),
+            named_fixture(b"xl_part.xml", 0, Descriptor::Absent),
         );
         // `combine` opens its parts, so respell the second name afterwards.
-        let second = &Archive::new(aliased.clone()).unwrap().entries[1];
+        let second = &Archive::try_new(aliased.clone()).unwrap().entries[1];
         for name_start in [second.local_header.start + 30, second.central.start + 46] {
             aliased[name_start + 2] = b'\\';
         }
         let message = "ZIP member name contains a backslash: xl\\part.xml";
-        for bytes in [aliased, named_fixture(b"xl\\part.xml", 0, false)] {
+        for bytes in [
+            aliased,
+            named_fixture(b"xl\\part.xml", 0, Descriptor::Absent),
+        ] {
             assert!(matches!(
-                Archive::new(bytes),
+                Archive::try_new(bytes),
                 Err(Error::InvalidWorkbook(actual)) if actual == message
             ));
         }
@@ -3259,7 +3417,7 @@ mod tests {
 
     /// `bytes` with its archive comment replaced by `comment`.
     fn with_comment(mut bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
-        let end = Archive::new(bytes.clone()).unwrap().end;
+        let end = Archive::try_new(bytes.clone()).unwrap().end;
         bytes.truncate(end + END_LEN);
         set_u16(&mut bytes, end + 20, comment.len() as u16);
         bytes.extend_from_slice(comment);
@@ -3276,14 +3434,15 @@ mod tests {
     ) -> (Result<()>, Vec<u8>) {
         let local_tail = vec![0; position.min(archive.local_tail_len())];
         let mut output = Vec::new();
+        let mut output_position = position;
         let result = archive.emit_directory(
             &mut output,
-            &mut position.clone(),
+            &mut output_position,
             &local_tail,
             offsets,
             replacements,
             |probe| {
-                std::io::copy(&mut std::io::repeat(0).take(position as u64), probe)?;
+                io::copy(&mut io::repeat(0).take(position as u64), probe)?;
                 Ok(())
             },
         );
@@ -3311,7 +3470,8 @@ mod tests {
             (0x5000_0000, comment(&[6], 0x054b), true),
             (0x5000_0000, comment(&[7], 0x054b), false),
         ] {
-            let archive = Archive::new(with_comment(fixture(false), &comment)).unwrap();
+            let archive =
+                Archive::try_new(with_comment(fixture(Descriptor::Absent), &comment)).unwrap();
             let (result, output) = emit_directory_at(&archive, offset as usize, &[0], &[None]);
             if refused {
                 assert!(matches!(
@@ -3336,7 +3496,7 @@ mod tests {
         padding.extend_from_slice(&1483_u16.to_le_bytes());
         padding.resize(4 + 1483, 0);
         let input = with_comment(extra_fixture(&[], &padding), b"12345");
-        let mut archive = Archive::new(input).unwrap();
+        let mut archive = Archive::try_new(input).unwrap();
         assert_eq!(archive.end - archive.central_start, 0x0605);
         set_u16(&mut archive.original, archive.end + 8, 0x4b50);
         set_u16(&mut archive.original, archive.end + 10, 0x4b50);
@@ -3380,11 +3540,11 @@ mod tests {
         //
         // First the field is a new checksum, at header offset 16, and the
         // member's internal attributes, which saves copy, count the rest.
-        let mut bytes = fixture(false);
-        let central = Archive::new(bytes.clone()).unwrap().central_start;
+        let mut bytes = fixture(Descriptor::Absent);
+        let central = Archive::try_new(bytes.clone()).unwrap().central_start;
         let rest = bytes.len() - (central + 16) - END_LEN;
         set_u16(&mut bytes, central + 36, rest as u16);
-        let archive = Archive::new(bytes).unwrap();
+        let archive = Archive::try_new(bytes).unwrap();
         let new_sizes = |crc| {
             Some(Sizes {
                 crc,
@@ -3406,7 +3566,11 @@ mod tests {
         let name = b"xl/media/image0000.png";
         let rest = u16::from_le_bytes(*b"00") as usize;
         let comment = vec![b'c'; 42 + END_LEN + rest - (CENTRAL_HEADER_LEN + name.len() + END_LEN)];
-        let archive = Archive::new(with_comment(named_fixture(name, 0, false), &comment)).unwrap();
+        let archive = Archive::try_new(with_comment(
+            named_fixture(name, 0, Descriptor::Absent),
+            &comment,
+        ))
+        .unwrap();
         let position = END as usize + 0x100;
         let (result, output) = emit_directory_at(&archive, position, &[END], &[None]);
         assert!(refused_as_ambiguous(result));
@@ -3428,7 +3592,7 @@ mod tests {
             // With a 17-byte name those bytes start inside the offset.
             (b"docProps/app.xmlx", ZIP64_LOCATOR, false),
         ] {
-            let archive = Archive::new(named_fixture(name, 0, false)).unwrap();
+            let archive = Archive::try_new(named_fixture(name, 0, Descriptor::Absent)).unwrap();
             let position = offset as usize + 0x100;
             let (result, output) = emit_directory_at(&archive, position, &[offset], &[None]);
             if refused {
@@ -3450,7 +3614,7 @@ mod tests {
 
     /// `bytes` with `comment` as its last central-directory entry's comment.
     fn with_entry_comment(bytes: Vec<u8>, comment: &[u8]) -> Vec<u8> {
-        let archive = Archive::new(bytes).unwrap();
+        let archive = Archive::try_new(bytes).unwrap();
         let record = archive.entries.last().unwrap().central.clone();
         let old = u16_at(&archive.original, record.start + 32).unwrap() as usize;
         let mut bytes = archive.original[..record.end - old].to_vec();
@@ -3494,11 +3658,11 @@ mod tests {
         // directory spans part.xml's central header and ends exactly where
         // the decoy, that entry's comment, starts.
         let cases = [
-            with_entry_comment(fixture(false), &decoy(49, CENTRAL_HEADER_LEN)),
+            with_entry_comment(fixture(Descriptor::Absent), &decoy(49, CENTRAL_HEADER_LEN)),
             with_entry_comment(
                 combine(
-                    fixture(false),
-                    stored_fixture(b"fill.bin", &filler(100), 0, None),
+                    fixture(Descriptor::Absent),
+                    stored_fixture(b"fill.bin", &filler(100), 0, Descriptor::Absent),
                 ),
                 &decoy(
                     45 + 4 + LOCAL_HEADER_LEN + b"fill.bin".len() + 100,
@@ -3506,12 +3670,12 @@ mod tests {
                 ),
             ),
             with_entry_comment(
-                fixture(false),
+                fixture(Descriptor::Absent),
                 &decoy(49, CENTRAL_HEADER_LEN + b"part.xml".len()),
             ),
         ];
         for original in cases {
-            let archive = Archive::new(original).unwrap();
+            let archive = Archive::try_new(original).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
             for (replacement, refused) in
                 [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)]
@@ -3530,7 +3694,7 @@ mod tests {
                         assert_eq!(output.len(), archive.central_start + 4);
                     } else {
                         result.unwrap();
-                        let reopened = Archive::new(output).unwrap();
+                        let reopened = Archive::try_new(output).unwrap();
                         assert_eq!(reopened.read("part.xml").unwrap(), replacement);
                     }
                 }
@@ -3548,13 +3712,19 @@ mod tests {
             let at = data.len() - 100;
             set_u32(&mut data, at, END);
             set_u16(&mut data, at + 20, comment);
-            let bytes = combine(stored_fixture(b"big.bin", &data, 0, None), fixture(false));
+            let bytes = combine(
+                stored_fixture(b"big.bin", &data, 0, Descriptor::Absent),
+                fixture(Descriptor::Absent),
+            );
             (bytes, at)
         };
         let (bytes, at) = layout(0);
-        let record = Archive::new(bytes.clone()).unwrap().entries[0].data.start + at;
+        let record = Archive::try_new(bytes.clone()).unwrap().entries[0]
+            .data
+            .start
+            + at;
         let (original, _) = layout((bytes.len() + 4 - record - END_LEN) as u16);
-        let archive = Archive::new(original).unwrap();
+        let archive = Archive::try_new(original).unwrap();
         assert!(archive.entries[0].local_record.len() > archive.local_tail_len());
         for (replacement, refused) in [(b"<part/>abcd".as_slice(), true), (b"<part/>abc", false)] {
             let changes = BTreeMap::from([("part.xml".into(), replacement.to_vec())]);
@@ -3564,7 +3734,7 @@ mod tests {
                 assert!(refused_as_ambiguous(result));
             } else {
                 result.unwrap();
-                let reopened = Archive::new(output).unwrap();
+                let reopened = Archive::try_new(output).unwrap();
                 assert_eq!(reopened.read("part.xml").unwrap(), replacement);
             }
         }
@@ -3579,9 +3749,9 @@ mod tests {
         // the output's kept tail, so only the records written again show it.
         let mut filler = vec![0; END_TAIL_LEN + 4096];
         set_u32(&mut filler, 100, CENTRAL);
-        let base = Archive::new(combine(
-            fixture(false),
-            stored_fixture(b"fill.bin", &filler, 0, None),
+        let base = Archive::try_new(combine(
+            fixture(Descriptor::Absent),
+            stored_fixture(b"fill.bin", &filler, 0, Descriptor::Absent),
         ))
         .unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"<part/>abcd".to_vec())]);
@@ -3590,14 +3760,14 @@ mod tests {
         for (directory, refused) in [(moved, true), (moved + 1, false)] {
             let original =
                 with_entry_comment(appended.clone(), &decoy(directory, CENTRAL_HEADER_LEN));
-            let archive = Archive::new(original).unwrap();
+            let archive = Archive::try_new(original).unwrap();
             let mut output = Vec::new();
             let result = archive.compact_to(&BTreeMap::new(), &mut output);
             if refused {
                 assert!(refused_as_ambiguous(result));
             } else {
                 result.unwrap();
-                let compacted = Archive::new(output).unwrap();
+                let compacted = Archive::try_new(output).unwrap();
                 assert_eq!(compacted.entries[1].local_record.start, 0);
                 assert_eq!(compacted.read("part.xml").unwrap(), b"<part/>abcd");
             }
@@ -3609,12 +3779,12 @@ mod tests {
         // Accepts at most three bytes per write, like a pipe.
         struct ShortWriter(Vec<u8>);
         impl Write for ShortWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 let length = bytes.len().min(3);
                 self.0.extend_from_slice(&bytes[..length]);
                 Ok(length)
             }
-            fn flush(&mut self) -> std::io::Result<()> {
+            fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
         }
@@ -3650,7 +3820,7 @@ mod tests {
     }
 
     fn extra_fixture(local_extra: &[u8], central_extra: &[u8]) -> Vec<u8> {
-        let archive = Archive::new(fixture(false)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         let entry = &archive.entries[0];
         let mut bytes = archive.original[entry.local_header.clone()].to_vec();
         set_u16(&mut bytes, 28, local_extra.len() as u16);
@@ -3676,7 +3846,7 @@ mod tests {
         for version in [0, 1, 2] {
             let renamed = unicode_path(name, b"evil.xml", version);
             let same = unicode_path(name, name, version);
-            let late = [same.clone(), renamed.clone()].concat();
+            let late = [same.as_slice(), renamed.as_slice()].concat();
             for (local, central) in [
                 (&Vec::new(), &renamed),
                 (&renamed, &Vec::new()),
@@ -3687,7 +3857,7 @@ mod tests {
                 (&late, &same),
             ] {
                 assert!(matches!(
-                    Archive::new(extra_fixture(local, central)),
+                    Archive::try_new(extra_fixture(local, central)),
                     Err(Error::InvalidWorkbook(message)) if message.contains("Unicode path")
                 ));
             }
@@ -3697,18 +3867,19 @@ mod tests {
         let same = unicode_path(name, name, 1);
         let stale = unicode_path(b"part.bin", b"evil.xml", 1);
         let short = [0x75, 0x70, 4, 0, 1, 0, 0, 0].to_vec();
-        let both = [same.clone(), stale.clone(), short.clone()].concat();
+        let both = [same.as_slice(), stale.as_slice(), short.as_slice()].concat();
         let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
         let versions = [0, 2].map(|version| unicode_path(name, name, version));
-        for extra in [same, stale, short, both].into_iter().chain(versions) {
+        let extras = [same, stale, short, both].into_iter().chain(versions);
+        for extra in extras {
             let original = extra_fixture(&extra, &extra);
-            let archive = Archive::new(original.clone()).unwrap();
+            let archive = Archive::try_new(original.clone()).unwrap();
             assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
             assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
             let mut compacted = Vec::new();
             archive.compact_to(&changes, &mut compacted).unwrap();
             assert_eq!(compacted, archive.write(&changes).unwrap());
-            let updated = Archive::new(compacted).unwrap();
+            let updated = Archive::try_new(compacted).unwrap();
             assert_eq!(updated.read("part.xml").unwrap(), b"updated");
         }
     }
@@ -3732,16 +3903,19 @@ mod tests {
     fn compaction_refuses_obsolete_records_renamed_by_unicode_path_fields() {
         for version in [0, 1, 2] {
             let same = unicode_path(b"part.xml", b"part.xml", version);
-            let archive = Archive::new(extra_fixture(&same, &same)).unwrap();
+            let archive = Archive::try_new(extra_fixture(&same, &same)).unwrap();
             let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);
             let appended = append(&archive, &changes);
             let mut compacted = Vec::new();
-            Archive::new(appended.clone())
+            Archive::try_new(appended.clone())
                 .unwrap()
                 .compact_to(&BTreeMap::new(), &mut compacted)
                 .unwrap();
             assert_eq!(
-                Archive::new(compacted).unwrap().read("part.xml").unwrap(),
+                Archive::try_new(compacted)
+                    .unwrap()
+                    .read("part.xml")
+                    .unwrap(),
                 b"updated"
             );
             // The obsolete record at offset 0 is opaque to normal saves, but
@@ -3749,7 +3923,7 @@ mod tests {
             let mut renamed = appended;
             let unicode_name = 30 + b"part.xml".len() + 9;
             renamed[unicode_name..unicode_name + 8].copy_from_slice(b"evil.xml");
-            let archive = Archive::new(renamed.clone()).unwrap();
+            let archive = Archive::try_new(renamed.clone()).unwrap();
             assert_eq!(archive.write(&BTreeMap::new()).unwrap(), renamed);
             let mut output = Vec::new();
             assert!(matches!(
@@ -3773,14 +3947,14 @@ mod tests {
         };
         assert!(too_long(read_at_most(&input[..], None, 9)));
         // An endless stream is not read beyond the limit.
-        assert!(too_long(read_at_most(std::io::repeat(0), None, 1 << 16)));
+        assert!(too_long(read_at_most(io::repeat(0), None, 1 << 16)));
         // A file length over the limit is refused before reading, although
         // these 10 bytes would fit. One within the limit only reserves
         // capacity, so a stale length changes neither the result nor the limit.
         assert!(too_long(read_at_most(&input[..], Some(11), 10)));
         assert_eq!(read_at_most(&input[..], Some(10), 10).unwrap(), input);
         assert_eq!(read_at_most(&input[..], Some(4), 10).unwrap(), input);
-        assert!(too_long(read_at_most(std::io::repeat(0), Some(4), 10)));
+        assert!(too_long(read_at_most(io::repeat(0), Some(4), 10)));
         assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
     }
 
@@ -3789,11 +3963,11 @@ mod tests {
         let mut bytes = vec![0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
         bytes.resize(4096, 0);
         assert!(matches!(
-            Archive::new(bytes),
+            Archive::try_new(bytes),
             Err(Error::Unsupported(message)) if message.contains("OLE compound files")
         ));
         assert!(matches!(
-            Archive::new(vec![0; 4096]),
+            Archive::try_new(vec![0; 4096]),
             Err(Error::InvalidWorkbook(_))
         ));
     }
@@ -3805,16 +3979,16 @@ mod tests {
             flushes: usize,
         }
         impl Write for Flushes {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.bytes.extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> {
+            fn flush(&mut self) -> io::Result<()> {
                 self.flushes += 1;
                 Ok(())
             }
         }
-        let archive = Archive::new(fixture(true)).unwrap();
+        let archive = Archive::try_new(fixture(Descriptor::Signed)).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), b"changed".to_vec())]);
         for changes in [&BTreeMap::new(), &changes] {
             for compact in [false, true] {
@@ -3835,14 +4009,16 @@ mod tests {
 
     #[test]
     fn rejects_encryption_flags_and_accepts_informational_flags() {
-        let central = Archive::new(fixture(false)).unwrap().entries[0]
+        let central = Archive::try_new(fixture(Descriptor::Absent))
+            .unwrap()
+            .entries[0]
             .central
             .start;
         let flagged = |flags: u16| {
-            let mut bytes = fixture(false);
+            let mut bytes = fixture(Descriptor::Absent);
             set_u16(&mut bytes, 6, flags);
             set_u16(&mut bytes, central + 8, flags);
-            Archive::new(bytes)
+            Archive::try_new(bytes)
         };
         // Traditional encryption, strong encryption, and masked local headers.
         for flags in [0x0001, 0x0040, 0x2000, 0x0002 | 0x0040] {
@@ -3868,30 +4044,30 @@ mod tests {
             ("part.xml", FLAG_UTF8),
             ("é.xml", FLAG_UTF8),
         ] {
-            for descriptor in [false, true] {
+            for descriptor in [Descriptor::Absent, Descriptor::Signed] {
                 let original = named_fixture(name.as_bytes(), flags, descriptor);
-                let archive = Archive::new(original.clone()).unwrap();
+                let archive = Archive::try_new(original.clone()).unwrap();
                 assert_eq!(archive.read(name).unwrap(), b"<part/>");
                 assert_eq!(archive.write(&BTreeMap::new()).unwrap(), original);
                 let changes = BTreeMap::from([(name.into(), b"updated".to_vec())]);
-                let appended = Archive::new(append(&archive, &changes)).unwrap();
+                let appended = Archive::try_new(append(&archive, &changes)).unwrap();
                 let mut compacted = Vec::new();
                 appended
                     .compact_to(&BTreeMap::new(), &mut compacted)
                     .unwrap();
                 assert_eq!(compacted, archive.write(&changes).unwrap());
-                let updated = Archive::new(compacted).unwrap();
+                let updated = Archive::try_new(compacted).unwrap();
                 assert_eq!(updated.read(name).unwrap(), b"updated");
                 assert_eq!(updated.entries[0].flags & FLAG_UTF8, flags);
             }
         }
         // An explicitly encoded active member remains opaque when its method
         // is unsupported; compaction preserves it without decoding its data.
-        let mut bytes = named_fixture("é.xml".as_bytes(), FLAG_UTF8, false);
-        let central = Archive::new(bytes.clone()).unwrap().central_start;
+        let mut bytes = named_fixture("é.xml".as_bytes(), FLAG_UTF8, Descriptor::Absent);
+        let central = Archive::try_new(bytes.clone()).unwrap().central_start;
         set_u16(&mut bytes, 8, 99);
         set_u16(&mut bytes, central + 10, 99);
-        let archive = Archive::new(bytes.clone()).unwrap();
+        let archive = Archive::try_new(bytes.clone()).unwrap();
         let mut compacted = Vec::new();
         archive
             .compact_to(&BTreeMap::new(), &mut compacted)
@@ -3901,25 +4077,25 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_name_encodings_and_conflicting_encoding_flags() {
-        for descriptor in [false, true] {
+        for descriptor in [Descriptor::Absent, Descriptor::Signed] {
             for name in ["é.xml".as_bytes(), b"\xe9.xml"] {
                 assert!(matches!(
-                    Archive::new(named_fixture(name, 0, descriptor)),
+                    Archive::try_new(named_fixture(name, 0, descriptor)),
                     Err(Error::Unsupported(message))
                         if message == "non-ASCII ZIP member names require the UTF-8 flag"
                 ));
             }
             assert!(matches!(
-                Archive::new(named_fixture(b"\xe9.xml", FLAG_UTF8, descriptor)),
+                Archive::try_new(named_fixture(b"\xe9.xml", FLAG_UTF8, descriptor)),
                 Err(Error::Unsupported(message)) if message == "ZIP member names must be UTF-8"
             ));
             let original = named_fixture("é.xml".as_bytes(), FLAG_UTF8, descriptor);
-            let central = Archive::new(original.clone()).unwrap().central_start;
+            let central = Archive::try_new(original.clone()).unwrap().central_start;
             for flag_at in [6, central + 8] {
                 let mut bytes = original.clone();
                 let flags = u16_at(&bytes, flag_at).unwrap() & !FLAG_UTF8;
                 set_u16(&mut bytes, flag_at, flags);
-                let result = Archive::new(bytes);
+                let result = Archive::try_new(bytes);
                 if flag_at == 6 {
                     assert!(matches!(
                         result,
@@ -3939,16 +4115,16 @@ mod tests {
     #[test]
     fn compaction_refuses_obsolete_names_without_an_explicit_encoding() {
         let name = "é.xml";
-        for descriptor in [false, true] {
+        for descriptor in [Descriptor::Absent, Descriptor::Signed] {
             let archive =
-                Archive::new(named_fixture(name.as_bytes(), FLAG_UTF8, descriptor)).unwrap();
+                Archive::try_new(named_fixture(name.as_bytes(), FLAG_UTF8, descriptor)).unwrap();
             let changes = BTreeMap::from([(name.into(), b"updated".to_vec())]);
             let mut bytes = append(&archive, &changes);
             // Only the obsolete record loses its encoding flag. Normal saves
             // preserve it, while compaction must understand it before removal.
             let flags = u16_at(&bytes, 6).unwrap() & !FLAG_UTF8;
             set_u16(&mut bytes, 6, flags);
-            let archive = Archive::new(bytes.clone()).unwrap();
+            let archive = Archive::try_new(bytes.clone()).unwrap();
             assert_eq!(archive.read(name).unwrap(), b"updated");
             assert_eq!(archive.write(&BTreeMap::new()).unwrap(), bytes);
             let mut compacted = Vec::new();
@@ -3967,14 +4143,14 @@ mod tests {
         let mut compressed = vec![1, 7, 0, 0xf8, 0xff];
         compressed.extend_from_slice(b"<part/>");
         let valid = deflate_fixture(&compressed);
-        let archive = Archive::new(valid.clone()).unwrap();
+        let archive = Archive::try_new(valid.clone()).unwrap();
         assert_eq!(archive.read("part.xml").unwrap(), b"<part/>");
         let central = archive.entries[0].central.start;
         let mut oversized = valid;
         set_u32(&mut oversized, 22, MAX_READ as u32 + 1);
         set_u32(&mut oversized, central + 24, MAX_READ as u32 + 1);
         assert!(matches!(
-            Archive::new(oversized).unwrap().read("part.xml"),
+            Archive::try_new(oversized).unwrap().read("part.xml"),
             Err(Error::Unsupported(message))
                 if message == "ZIP member part.xml exceeds the 64 MiB read limit"
         ));
@@ -3982,14 +4158,17 @@ mod tests {
 
     #[test]
     fn rejects_overlapping_local_records() {
-        let keep = Archive::new(decorate_fixture(b"keep.xml", false)).unwrap();
+        let keep = Archive::try_new(decorate_fixture(b"keep.xml", Method::Stored)).unwrap();
         let record = keep.original[keep.entries[0].local_record.clone()].to_vec();
-        let separate = combine(fixture(false), decorate_fixture(b"keep.xml", false));
-        assert_eq!(Archive::new(separate).unwrap().entries.len(), 2);
+        let separate = combine(
+            fixture(Descriptor::Absent),
+            decorate_fixture(b"keep.xml", Method::Stored),
+        );
+        assert_eq!(Archive::try_new(separate).unwrap().entries.len(), 2);
         // A stored payload that is itself the other member's complete record.
-        let part = Archive::new(fixture(false)).unwrap();
+        let part = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
         let changes = BTreeMap::from([("part.xml".into(), record)]);
-        let part = Archive::new(part.write(&changes).unwrap()).unwrap();
+        let part = Archive::try_new(part.write(&changes).unwrap()).unwrap();
         let mut bytes = part.original[..part.central_start].to_vec();
         let central_start = bytes.len();
         bytes.extend_from_slice(&part.original[part.entries[0].central.clone()]);
@@ -4003,7 +4182,7 @@ mod tests {
         set_u32(&mut ending, 16, central_start as u32);
         bytes.extend_from_slice(&ending);
         assert!(matches!(
-            Archive::new(bytes),
+            Archive::try_new(bytes),
             Err(Error::InvalidWorkbook(message)) if message == "overlapping ZIP local records"
         ));
     }
