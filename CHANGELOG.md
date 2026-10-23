@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-10-23
+
+This release brings the code in line with the Google Rust Style Guide. Its API
+changes are compatible: fallible constructors gain `try_new` names, the old
+names are deprecated rather than removed, and more results are `#[must_use]`.
+Reading, editing, and saving behave as in 1.0.0, except after a panic while
+the table-part cache was locked, described below.
 
 ### Rust API
 

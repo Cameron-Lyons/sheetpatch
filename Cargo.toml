@@ -1,6 +1,6 @@
 [package]
 name = "sheetpatch"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Surgical cell edits in existing Excel workbooks, preserving untouched package parts"
