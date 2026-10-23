@@ -93,15 +93,15 @@ an earlier candidate does not carry over.
 
 ## Publication
 
-1. Confirm Cargo.toml and Cargo.lock both contain `1.0.0`, and update the changelog
+1. Confirm Cargo.toml and Cargo.lock both contain `1.1.0`, and update the changelog
    from release candidate to the actual release date.
 2. Commit the candidate in a normal Git checkout and require the complete CI
    matrix to pass for that exact commit. Do not release from an unverified tree.
 3. Run the online dry run above, confirm crates.io ownership and credentials,
    then run `cargo publish --locked` when publication is authorized.
-4. Tag that same commit `v1.0.0` and attach the changelog to the GitHub release.
+4. Tag that same commit `v1.1.0` and attach the changelog to the GitHub release.
 5. Confirm the published crate installs with
-   `cargo install sheetpatch --version 1.0.0 --locked`, reports
-   `sheetpatch 1.0.0`, and that its docs.rs documentation builds successfully.
+   `cargo install sheetpatch --version 1.1.0 --locked`, reports
+   `sheetpatch 1.1.0`, and that its docs.rs documentation builds successfully.
 
 Preparing the package does not publish it, create a release, or run remote CI.

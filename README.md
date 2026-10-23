@@ -15,7 +15,7 @@ Requires Rust 1.88 or later. Add the crate dependency:
 
 ```toml
 [dependencies]
-sheetpatch = "1.0"
+sheetpatch = "1.1"
 ```
 
 To use a local checkout instead, use `sheetpatch = { path = "/path/to/sheetpatch" }`.
