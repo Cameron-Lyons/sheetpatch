@@ -5,6 +5,28 @@ use std::iter;
 const FIXTURE: &[u8] = include_bytes!("fixtures/libreoffice.xlsx");
 
 #[test]
+fn both_read_apis_enforce_the_same_limit_before_consuming_known_oversized_batches() {
+    let book = Workbook::from_bytes(FIXTURE.to_vec()).unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    let addresses =
+        || iter::repeat_n("A1", (1 << 24) + 1).inspect(|_| panic!("oversized input consumed"));
+    let cells = || iter::repeat_n(CellRef::try_new(1, 1).unwrap(), (1 << 24) + 1);
+    for result in [
+        book.get_cells("Data", addresses()),
+        view.get_cells(addresses()),
+        book.get_cells_at("Data", cells()),
+        view.get_cells_at(cells()),
+    ] {
+        assert!(matches!(result, Err(Error::Unsupported(_))));
+    }
+    assert!(matches!(
+        book.get_cells("Missing", addresses()),
+        Err(Error::SheetNotFound(_))
+    ));
+    assert_eq!(book.to_bytes().unwrap(), FIXTURE);
+}
+
+#[test]
 fn typed_access_keeps_input_order_styles_cached_formulas_and_the_original_baseline() {
     let mut book = Workbook::from_bytes(FIXTURE.to_vec()).unwrap();
     let a1 = CellRef::try_new(1, 1).unwrap();

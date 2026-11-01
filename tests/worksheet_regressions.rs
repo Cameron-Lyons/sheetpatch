@@ -77,6 +77,40 @@ fn unsupported_message(result: sheetpatch::Result<()>) -> String {
 }
 
 #[test]
+fn oversized_generated_worksheet_refuses_the_transaction_and_keeps_pending_edits() {
+    let mut book =
+        Workbook::from_bytes(include_bytes!("fixtures/libreoffice.xlsx").to_vec()).unwrap();
+    book.set_cell("Data", "A2", "earlier pending change")
+        .unwrap();
+    let before = book.to_bytes().unwrap();
+    let mut edits = vec![CellEdit::try_new("Data", "A2", "must not commit").unwrap()];
+    // Each value is individually valid, but its XML representation needs
+    // seven bytes per NUL. Together they exceed the 64 MiB part limit.
+    let text = "\0".repeat(32_767);
+    edits.extend((2..302).map(|row| {
+        CellEdit::try_new_at("Notes", CellRef::try_new(row, 1).unwrap(), text.clone()).unwrap()
+    }));
+    assert!(matches!(
+        book.apply_edits(edits),
+        Err(Error::Unsupported(message))
+            if message == "worksheet \"Notes\": patched worksheet exceeds the 64 MiB part limit"
+    ));
+    assert!(book.has_changes());
+    assert_eq!(book.to_bytes().unwrap(), before);
+    assert_eq!(
+        value(&book, "A2"),
+        CellValue::from("earlier pending change")
+    );
+    // A refusal has not left an oversized pending part behind: subsequent
+    // edits can still be read, saved, and reopened.
+    book.set_cell("Notes", "A2", "small replacement").unwrap();
+    assert_eq!(
+        reopened(&book).get_cell("Notes", "A2").unwrap().value,
+        CellValue::from("small replacement")
+    );
+}
+
+#[test]
 fn xml_references_decode_consistently_across_cell_values_and_no_ops() {
     let escaped = "&amp;&lt;&gt;&apos;&quot;&#9;&#10;&#13;&#x1F600;&#xFEFF;&#95;x0041_";
     let expected_text = "&<>'\"\t\n\r😀\u{feff}A";

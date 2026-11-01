@@ -167,3 +167,97 @@ fn reads_of_a_whole_grid_range_are_refused_before_allocating() {
     assert_eq!(contents[0].value, CellValue::Number(1.0));
     assert_eq!(contents[1].style_index, Some(1));
 }
+
+#[test]
+fn indexed_contents_are_replayable_and_include_pending_and_style_only_cells() {
+    let mut book =
+        Workbook::from_bytes(include_bytes!("fixtures/libreoffice.xlsx").to_vec()).unwrap();
+    book.set_cell("Data", "E1", CellValue::Blank).unwrap();
+    book.set_cell("Data", "B3", "pending & \r\0").unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    let expected: Vec<_> = view
+        .cells()
+        .map(|cell| (cell, view.get_cell_at(cell).unwrap()))
+        .collect();
+    assert_eq!(expected.last().unwrap().0.to_string(), "B3");
+    assert!(
+        expected
+            .iter()
+            .any(|(_, content)| content.formula.is_some())
+    );
+    assert!(expected.iter().any(|(_, content)| content.value.is_blank()));
+    for range in [None, Some("A1:XFD1048576".parse().unwrap())] {
+        for _ in 0..2 {
+            let contents = view
+                .cell_contents_in(range)
+                .collect::<sheetpatch::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(contents, expected);
+        }
+    }
+    let mut cursor = view.cell_contents();
+    assert_eq!(cursor.next().unwrap().unwrap(), expected[0]);
+    let checkpoint = cursor.clone();
+    assert_eq!(
+        cursor.collect::<sheetpatch::Result<Vec<_>>>().unwrap(),
+        expected[1..]
+    );
+    assert_eq!(
+        checkpoint.collect::<sheetpatch::Result<Vec<_>>>().unwrap(),
+        expected[1..]
+    );
+    let selected = view
+        .cell_contents_in(Some("B1:C3".parse().unwrap()))
+        .collect::<sheetpatch::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|(cell, _)| cell.to_string())
+            .collect::<Vec<_>>(),
+        ["B1", "C1", "B3"]
+    );
+}
+
+#[test]
+fn indexed_contents_filter_before_decoding_and_keep_error_context() {
+    let book = book(&format!(
+        "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>\
+         <row r='1'><c r='A1'><v>7</v></c>\
+         <c r='B1'><v>broken</v></c><c r='C1' t='s'><v>0</v></c>\
+         <c r='D1' t='b'><v>true</v></c></row>\
+         <row r='3'><c r='A3' s='2'/></row></sheetData></worksheet>"
+    ));
+    let view = book.prepare_sheet("Data").unwrap();
+    let selected = view
+        .cell_contents_in(Some("A1:A1048576".parse().unwrap()))
+        .collect::<sheetpatch::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0].1.value, CellValue::Number(7.0));
+    assert_eq!(selected[1].1.style_index, Some(2));
+    // An error is attributed exactly as an ordinary read, and does not
+    // consume later entries. Starting a new iterator repeats those results.
+    for _ in 0..2 {
+        for (address, result) in view.cells().zip(view.cell_contents()) {
+            let direct = view.get_cell_at(address);
+            match (direct, result) {
+                (Ok(expected), Ok((cell, content))) => {
+                    assert_eq!(cell, address);
+                    assert_eq!(content, expected);
+                }
+                (Err(expected), Err(error)) => {
+                    assert_eq!(error.to_string(), expected.to_string());
+                    assert!(error.to_string().contains("worksheet \"Data\""));
+                    assert!(error.to_string().contains(&address.to_string()));
+                }
+                pair => panic!("mismatched reads for {address}: {pair:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        view.cell_contents_in(Some("Z1:Z9".parse().unwrap()))
+            .count(),
+        0
+    );
+}

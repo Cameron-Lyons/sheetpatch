@@ -8,7 +8,7 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
-  # Weekly re-audit of the unchanged lockfile against new advisories.
+  # Weekly dependency audit, fresh property seeds, fuzzing, and measurements.
   schedule:
     - cron: "23 5 * * 1"
 
@@ -42,7 +42,9 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
       - name: Formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --all --manifest-path fuzz/Cargo.toml -- --check
       # The Google Rust Style Guide's one-module-per-`use` import grouping and
       # macro-matcher formatting are unstable rustfmt options, so a pinned
       # nightly rustfmt checks them. Installing it leaves stable the default.
@@ -50,8 +52,11 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-10-22 --profile minimal --component rustfmt
           cargo +nightly-2026-10-22 fmt --all -- --check --config imports_granularity=Module,format_macro_matchers=true
+          cargo +nightly-2026-10-22 fmt --all --manifest-path fuzz/Cargo.toml -- --check --config imports_granularity=Module,format_macro_matchers=true
       - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       # Lints cfg(windows) code, which the Linux pass above never compiles.
       - name: Clippy (Windows target)
         run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
@@ -111,6 +116,7 @@ jobs:
       - name: Benchmark correctness checks
         env:
           SHEETPATCH_BENCH_SAMPLES: "1"
+          SHEETPATCH_BENCH_SAMPLE_MS: "0"
           SHEETPATCH_BENCH_OPERATIONS: bulk_at,prepared_single_reads,shared_prepared_reads
         run: cargo bench --locked --bench editing
       - name: Verify publishable package
@@ -153,6 +159,94 @@ jobs:
       - name: Export, edit, and reopen normal and compacted workbooks
         run: cargo test --locked --release --test libreoffice -- --ignored
 
+  resilience:
+    name: Randomized properties and malformed-input fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SHEETPATCH_PROPERTY_CASES: ${{ github.event_name == 'schedule' && '256' || '32' }}
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '60' || '10' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly-2026-10-22
+      - name: Record a fresh reproducible seed
+        run: |
+          seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+          if [ "$seed" = 0 ]; then seed=1; fi
+          echo "SHEETPATCH_PROPERTY_SEED=$seed" >> "$GITHUB_ENV"
+          mkdir -p target
+          echo "$seed" > target/resilience-seed.txt
+          echo "Property and fuzz seed: $seed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Randomized properties
+        run: cargo test --locked --test properties
+      - name: Install pinned fuzz runner
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fetch locked fuzz dependencies
+        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Exercise seeded malformed-input targets
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          for target in workbook worksheet text; do
+            cargo fuzz run "$target" -- \
+              -seed="$SHEETPATCH_PROPERTY_SEED" -max_total_time="$FUZZ_SECONDS" \
+              -max_len=65536 -rss_limit_mb=2048 -timeout=15
+          done
+      - name: Retain seed, corpus, and any failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: resilience-${{ github.sha }}
+          path: |
+            target/resilience-seed.txt
+            fuzz/corpus
+            fuzz/artifacts
+          retention-days: 30
+
+  performance:
+    name: Record performance and peak memory
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Build release CLI
+        run: cargo build --locked --release
+      - name: Install native memory measurement tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends time
+      - name: Record runner and compiler
+        run: |
+          mkdir -p target/measurements
+          rustc -Vv > target/measurements/compiler.txt
+          lscpu > target/measurements/cpu.txt
+          git rev-parse HEAD > target/measurements/commit.txt
+      - name: Calibrated library measurements
+        env:
+          SHEETPATCH_BENCH_SAMPLES: "7"
+          SHEETPATCH_BENCH_OPERATIONS: bulk_at,get_cells_at,prepared_single_reads,indexed_cell_reads,lookup_cell_reads,unchanged_bulk,write_to_sink,wide_bulk_at,shared_prepared_reads,insert_bulk_at,control_text_bulk_at
+        run: cargo bench --locked --bench editing > target/measurements/library.csv
+      - name: CLI time and peak resident memory
+        run: python3 scripts/benchmark.py --candidate target/release/sheetpatch --samples 7 --output target/measurements/cli.json
+      # History is retained for comparison. Shared runner timings are evidence,
+      # not a hard regression threshold; interleave binaries on one quiet host
+      # with scripts/benchmark.py --baseline before accepting a speedup claim.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: performance-${{ github.sha }}
+          path: target/measurements
+          retention-days: 90
+
   advisories:
     name: Dependency advisories
     runs-on: ubuntu-latest
@@ -167,12 +261,14 @@ jobs:
       # Fails on vulnerable, unsound, or yanked locked dependencies; unmaintained
       # notices are reported as warnings.
       - name: Audit Cargo.lock against the RustSec advisory database
-        run: cargo audit --deny unsound --deny yanked
+        run: |
+          cargo audit --deny unsound --deny yanked
+          cargo audit --file fuzz/Cargo.lock --deny unsound --deny yanked
 
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [quality, tests, package, interoperability, advisories]
+    needs: [quality, tests, package, interoperability, resilience, performance, advisories]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -184,9 +280,16 @@ jobs:
           PACKAGE: ${{ needs.package.result }}
           INTEROPERABILITY: ${{ needs.interoperability.result }}
           ADVISORIES: ${{ needs.advisories.result }}
+          RESILIENCE: ${{ needs.resilience.result }}
+          PERFORMANCE: ${{ needs.performance.result }}
         run: |
           test "$ADVISORIES" = success
-          # Scheduled runs only re-audit dependencies; other jobs are skipped.
+          test "$RESILIENCE" = success
+          if [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; then
+            test "$PERFORMANCE" = success
+          fi
+          # The scheduled resilience, measurements, and audit jobs are checked;
+          # ordinary release/quality jobs are deliberately skipped on a timer.
           if [ "$EVENT" = schedule ]; then
             exit 0
           fi

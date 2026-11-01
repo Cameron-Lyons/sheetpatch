@@ -232,20 +232,31 @@ mod permissions {
         fs::metadata(path).unwrap().gid()
     }
 
-    /// The user's groups other than the one its new files receive; none when
-    /// `id` is missing or fails, so tests that need one are skipped.
-    fn other_groups(default: u32) -> Vec<u32> {
+    /// Other groups the process can actually assign on this filesystem.
+    /// User namespaces can report supplementary groups that cannot be assigned.
+    fn other_groups(directory: &Path, default: u32) -> Vec<u32> {
+        use std::os::unix::fs::MetadataExt;
+
         let groups = Command::new("id")
             .arg("-G")
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
             .unwrap_or_default();
-        groups
+        let path = directory.join("assignable-group-probe");
+        let file = File::create(&path).unwrap();
+        let groups = groups
             .split_whitespace()
             .filter_map(|gid| gid.parse().ok())
             .filter(|&gid| gid != default)
-            .collect()
+            .filter(|&gid| {
+                unix_fs::fchown(&file, None, Some(gid)).is_ok()
+                    && file.metadata().unwrap().gid() == gid
+            })
+            .collect();
+        drop(file);
+        fs::remove_file(path).unwrap();
+        groups
     }
 
     #[test]
@@ -255,7 +266,8 @@ mod permissions {
         let input = source(&directory, 0o640);
         let default = gid(&input);
         // Skip without a second group to give the source.
-        let Some(&other) = other_groups(default).first() else {
+        let Some(&other) = other_groups(directory.path(), default).first() else {
+            eprintln!("skipping alternate-group cases: no other group can be assigned");
             return;
         };
         unix_fs::chown(&input, None, Some(other)).unwrap();

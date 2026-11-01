@@ -68,6 +68,47 @@ impl<'workbook> WorksheetView<'workbook> {
         self.worksheet.cells()
     }
 
+    /// Read every existing cell in row-major order without collecting its
+    /// address or searching the worksheet index again.
+    ///
+    /// Cells holding only formatting are included. Values are decoded lazily;
+    /// calling this method again starts a fresh traversal of the same view.
+    /// Shared strings are loaded only when a visited cell needs them.
+    /// Cloning the iterator keeps its current position without decoding cells.
+    ///
+    /// # Errors
+    ///
+    /// Each item fails like [`Self::get_cell_at`] for that cell. An error does
+    /// not prevent visiting subsequent cells.
+    pub fn cell_contents(
+        &self,
+    ) -> impl Iterator<Item = Result<(CellRef, CellContent)>> + Clone + '_ {
+        self.cell_contents_in(None)
+    }
+
+    /// Read existing cells inside `range`, or every existing cell for `None`.
+    ///
+    /// The range is tested before decoding, and is never expanded into empty
+    /// cells. A whole-grid range therefore costs the same as [`Self::cell_contents`].
+    /// Cells outside the range cannot produce value or shared-string errors.
+    ///
+    /// # Errors
+    ///
+    /// Each item fails like [`Self::get_cell_at`] for that cell, with the same
+    /// worksheet, cell, or package-part context.
+    pub fn cell_contents_in(
+        &self,
+        range: Option<CellRange>,
+    ) -> impl Iterator<Item = Result<(CellRef, CellContent)>> + Clone + '_ {
+        self.worksheet
+            .cell_contents_in(
+                range,
+                || self.workbook.shared_strings(),
+                self.workbook.uses_1904_dates(),
+            )
+            .map(|result| result.map_err(|error| self.workbook.read_context(self.sheet, error)))
+    }
+
     /// The smallest range containing every cell element, or `None` for a
     /// worksheet without cells.
     ///
@@ -144,13 +185,18 @@ impl<'workbook> WorksheetView<'workbook> {
             .map_err(|error| self.workbook.read_context(self.sheet, error))
     }
 
-    /// Read multiple addresses, retaining input order and duplicate requests.
+    /// Read at most 16,777,216 (2²⁴) addresses, retaining input order and
+    /// duplicate requests.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCellReference`](crate::Error::InvalidCellReference)
-    /// for the first invalid address, before reading any cell, and otherwise
-    /// fails like [`Self::get_cell`] for the first cell that cannot be read.
+    /// Returns [`Error::Unsupported`](crate::Error::Unsupported) when the
+    /// iterator's size hint already exceeds the limit, before parsing any
+    /// address. Otherwise returns
+    /// [`Error::InvalidCellReference`](crate::Error::InvalidCellReference) for
+    /// the first invalid address within the limit, or `Error::Unsupported`
+    /// upon exceeding it, before reading any cell. Reads otherwise fail like
+    /// [`Self::get_cell`] for the first cell that cannot be read.
     /// Results that cannot be allocated return
     /// [`Error::Io`](crate::Error::Io) of kind
     /// [`std::io::ErrorKind::OutOfMemory`].

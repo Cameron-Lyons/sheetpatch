@@ -2,9 +2,11 @@ use super::index::{self, RowEntry, WorksheetIndex};
 use super::parse::Element;
 use super::read::{self, SharedStrings, StoredValue};
 use super::{errors, protection, validation};
+use crate::archive::MAX_PART_SIZE;
 use crate::xml::{self, Attributes};
 use crate::{CellRef, CellValue, Error, Result};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 struct Edit {
     start: usize,
@@ -12,11 +14,34 @@ struct Edit {
     bytes: Vec<u8>,
 }
 
+fn check_part_size(length: usize) -> Result<()> {
+    if length > MAX_PART_SIZE {
+        return Err(errors::unsupported(format!(
+            "patched worksheet exceeds the {} MiB part limit",
+            MAX_PART_SIZE >> 20
+        )));
+    }
+    Ok(())
+}
+
+// Newly generated markup is part of the final XML, so it cannot exceed the
+// part limit even when every original byte will be removed.
+fn append_markup(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let length = output
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
+    check_part_size(length)?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
 /// Nonoverlapping changes against the original worksheet's absolute byte spans.
 /// Existing cell/row/extension bytes are copied only when the final XML is emitted.
 #[derive(Default)]
 pub(super) struct EditPlan {
     edits: Vec<Edit>,
+    inserted_bytes: usize,
 }
 
 impl EditPlan {
@@ -24,24 +49,34 @@ impl EditPlan {
         self.edits.is_empty()
     }
 
-    fn push(&mut self, edit: Edit) {
+    fn push(&mut self, edit: Edit) -> Result<()> {
+        let inserted_bytes = self
+            .inserted_bytes
+            .checked_add(edit.bytes.len())
+            .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
+        check_part_size(inserted_bytes)?;
+        self.inserted_bytes = inserted_bytes;
         self.edits.push(edit);
+        Ok(())
     }
 
     // Turns an empty element `<name/>` into `<name>contents</name>`.
-    fn expand(&mut self, source: &str, element: &Element, mut contents: Vec<u8>) {
+    fn expand(&mut self, source: &str, element: &Element, mut contents: Vec<u8>) -> Result<()> {
         let open_end = element.open_end();
         self.push(Edit {
             start: open_end - 2,
             end: open_end - 1,
             bytes: Vec::new(),
-        });
-        contents.extend_from_slice(format!("</{}>", element.name(source)).as_bytes());
+        })?;
+        append_markup(
+            &mut contents,
+            format!("</{}>", element.name(source)).as_bytes(),
+        )?;
         self.push(Edit {
             start: open_end,
             end: open_end,
             bytes: contents,
-        });
+        })
     }
 
     /// The original XML with every planned edit applied.
@@ -63,6 +98,7 @@ impl EditPlan {
         length = length
             .checked_add(xml.len() - position)
             .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
+        check_part_size(length)?;
         let mut output = Vec::with_capacity(length);
         position = 0;
         for edit in self.edits {
@@ -106,21 +142,10 @@ fn attribute_edit(
     }
 }
 
+#[cfg(test)]
 pub(super) fn text_escaped(text: &str) -> String {
-    // Excel escapes come first: characters XML cannot carry are stored as
-    // `_xHHHH_`, and literal tokens are escaped so Excel shows the exact user
-    // string rather than interpreting, for example, _x0041_ as A.
-    let text = xml::excel_escaped(text);
     let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\r' => output.push_str("&#13;"),
-            _ => output.push(character),
-        }
-    }
+    xml::append_cell_text(&mut output, text);
     output
 }
 
@@ -134,21 +159,35 @@ fn value_type(value: &CellValue) -> Option<&'static str> {
 }
 
 fn payload(source: &str, prefix: &Element, value: &CellValue) -> Vec<u8> {
+    let mut output = String::new();
+    append_payload(&mut output, source, prefix, value);
+    output.into_bytes()
+}
+
+fn append_payload(output: &mut String, source: &str, prefix: &Element, value: &CellValue) {
     let v = prefix.qualified(source, "v");
     match value {
         CellValue::Text(text) => {
             let is = prefix.qualified(source, "is");
             let t = prefix.qualified(source, "t");
-            format!(
-                "<{is}><{t} xml:space=\"preserve\">{}</{t}></{is}>",
-                text_escaped(text)
-            )
-            .into_bytes()
+            write!(output, "<{is}><{t} xml:space=\"preserve\">")
+                .expect("writing to a String cannot fail");
+            xml::append_cell_text(output, text);
+            write!(output, "</{t}></{is}>").expect("writing to a String cannot fail");
         }
-        CellValue::Number(number) => format!("<{v}>{number}</{v}>").into_bytes(),
-        CellValue::Bool(boolean) => format!("<{v}>{}</{v}>", u8::from(*boolean)).into_bytes(),
-        CellValue::Error(error) => format!("<{v}>{}</{v}>", text_escaped(error)).into_bytes(),
-        CellValue::Blank => Vec::new(),
+        CellValue::Number(number) => {
+            write!(output, "<{v}>{number}</{v}>").expect("writing to a String cannot fail");
+        }
+        CellValue::Bool(boolean) => {
+            write!(output, "<{v}>{}</{v}>", u8::from(*boolean))
+                .expect("writing to a String cannot fail");
+        }
+        CellValue::Error(error) => {
+            write!(output, "<{v}>").expect("writing to a String cannot fail");
+            xml::append_cell_text(output, error);
+            write!(output, "</{v}>").expect("writing to a String cannot fail");
+        }
+        CellValue::Blank => {}
     }
 }
 
@@ -160,12 +199,17 @@ fn new_cell(
     value: &CellValue,
 ) -> Vec<u8> {
     let c = context.qualified(source, "c");
-    let style = style.map_or(String::new(), |style| format!(" s=\"{style}\""));
-    let kind = value_type(value).map_or(String::new(), |kind| format!(" t=\"{kind}\""));
-    let mut output = format!("<{c} r=\"{cell}\"{style}{kind}>").into_bytes();
-    output.extend(payload(source, context, value));
-    output.extend_from_slice(format!("</{c}>").as_bytes());
-    output
+    let mut output = format!("<{c} r=\"{cell}\"");
+    if let Some(style) = style {
+        write!(output, " s=\"{style}\"").expect("writing to a String cannot fail");
+    }
+    if let Some(kind) = value_type(value) {
+        write!(output, " t=\"{kind}\"").expect("writing to a String cannot fail");
+    }
+    output.push('>');
+    append_payload(&mut output, source, context, value);
+    write!(output, "</{c}>").expect("writing to a String cannot fail");
+    output.into_bytes()
 }
 
 // The workbook-wide inputs that decide whether an edit rewrites a cell's
@@ -181,7 +225,6 @@ struct CurrentValues<F> {
 // change rather than blocking its replacement; `validate_payload` already
 // refused unfamiliar markup that a replacement would discard.
 fn unchanged_value<'s>(
-    xml: &[u8],
     index: &WorksheetIndex,
     cell: &Element,
     payload: usize,
@@ -193,7 +236,7 @@ fn unchanged_value<'s>(
     if matches!(value, CellValue::Blank) {
         return false;
     }
-    match read::decode_payload(xml, index, cell, payload, current.date1904) {
+    match read::decode_payload(index, cell, payload, current.date1904) {
         Ok(StoredValue::Value(old)) => old == *value,
         // The table is loaded only to compare text. An entry that cannot be
         // decoded, like a table that cannot be loaded, leaves a change.
@@ -208,7 +251,6 @@ fn unchanged_value<'s>(
 }
 
 fn patched_cell<'s>(
-    xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
     cell_index: usize,
@@ -229,7 +271,7 @@ fn patched_cell<'s>(
             .map_err(|error| error.context(address))?;
     }
     let unchanged = if let Some(child) = value_child {
-        unchanged_value(xml, index, cell, child, value, current)
+        unchanged_value(index, cell, child, value, current)
     } else {
         matches!(value, CellValue::Blank) && cell.attribute(attributes, "t").is_none()
     };
@@ -248,11 +290,11 @@ fn patched_cell<'s>(
     }
     let value_bytes = payload(source, cell, value);
     if let Some(type_edit) = attribute_edit(cell, attributes, "t", value_type(value)) {
-        edits.push(type_edit);
+        edits.push(type_edit)?;
     }
     if cell.empty {
         if !value_bytes.is_empty() {
-            edits.expand(source, cell, value_bytes);
+            edits.expand(source, cell, value_bytes)?;
         }
         return Ok(true);
     }
@@ -261,7 +303,7 @@ fn patched_cell<'s>(
             start: elements[child].start(),
             end: elements[child].end(),
             bytes: value_bytes,
-        });
+        })?;
     } else if !value_bytes.is_empty() {
         let position = cell
             .children(elements)
@@ -272,7 +314,7 @@ fn patched_cell<'s>(
             start: position,
             end: position,
             bytes: value_bytes,
-        });
+        })?;
     }
     Ok(true)
 }
@@ -380,7 +422,6 @@ type RowChanges<'edits> = [(&'edits CellRef, &'edits CellValue)];
 // Only a row with a changed cell gets wider spans or, when it was empty
 // (`<row/>`), an expansion holding all of its new cells.
 fn patch_existing_row<'s>(
-    xml: &[u8],
     index: &WorksheetIndex,
     row: &RowEntry,
     changes: &RowChanges,
@@ -392,7 +433,7 @@ fn patch_existing_row<'s>(
     let element = &elements[row.element];
     let existing_cells = &index.cells[row.cells.clone()];
     let mut cell_position = 0;
-    let mut changed_columns = Vec::new();
+    let changed_start = changed_cells.len();
     let mut empty_row_cells = Vec::new();
     // Resolve only when a new nonblank cell needs a style. Existing cells and
     // blank edits must not start validating row defaults; later insertions can
@@ -419,7 +460,7 @@ fn patch_existing_row<'s>(
             .get(cell_position)
             .filter(|existing| existing.address == cell);
         if let Some(existing) = existing {
-            if !patched_cell(xml, index, cell, existing.element, value, edits, current)? {
+            if !patched_cell(index, cell, existing.element, value, edits, current)? {
                 continue;
             }
         } else if matches!(value, CellValue::Blank) {
@@ -439,7 +480,7 @@ fn patch_existing_row<'s>(
             };
             let bytes = new_cell(source, element, cell, style, value);
             if element.empty {
-                empty_row_cells.extend(bytes);
+                append_markup(&mut empty_row_cells, &bytes)?;
             } else {
                 let insertion = existing_cells
                     .get(cell_position)
@@ -448,26 +489,27 @@ fn patch_existing_row<'s>(
                     start: insertion,
                     end: insertion,
                     bytes,
-                });
+                })?;
             }
         }
         changed_cells.push(cell);
-        changed_columns.push(cell.column);
     }
-    if changed_columns.is_empty() {
+    if changed_cells.len() == changed_start {
         return Ok(());
     }
     let spans = spans_edit(
         element,
         row.number,
         &index.attributes,
-        changed_columns.into_iter(),
+        changed_cells[changed_start..]
+            .iter()
+            .map(|cell| cell.column),
     )?;
     if let Some(spans) = spans {
-        edits.push(spans);
+        edits.push(spans)?;
     }
     if element.empty {
-        edits.expand(source, element, empty_row_cells);
+        edits.expand(source, element, empty_row_cells)?;
     }
     Ok(())
 }
@@ -485,7 +527,10 @@ fn new_row(
     for &(&cell, value) in changes {
         if !matches!(value, CellValue::Blank) {
             let style = index.column_style(cell)?;
-            cells.extend(new_cell(index.source, data, cell, style, value));
+            append_markup(
+                &mut cells,
+                &new_cell(index.source, data, cell, style, value),
+            )?;
             changed_cells.push(cell);
         }
     }
@@ -494,8 +539,8 @@ fn new_row(
     }
     let row = data.qualified(index.source, "row");
     let mut bytes = format!("<{row} r=\"{number}\">").into_bytes();
-    bytes.extend(cells);
-    bytes.extend_from_slice(format!("</{row}>").as_bytes());
+    append_markup(&mut bytes, &cells)?;
+    append_markup(&mut bytes, format!("</{row}>").as_bytes())?;
     Ok(Some(bytes))
 }
 
@@ -540,7 +585,6 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
 }
 
 pub(super) fn plan_cells<'s>(
-    xml: &[u8],
     index: &WorksheetIndex,
     cells: &BTreeMap<CellRef, CellValue>,
     shared_strings: impl FnMut() -> Option<&'s SharedStrings>,
@@ -564,6 +608,7 @@ pub(super) fn plan_cells<'s>(
     let mut empty_data_rows = Vec::new();
     let mut pending = cells.iter().peekable();
     let mut row_position = 0;
+    let mut changes: Vec<(&CellRef, &CellValue)> = Vec::new();
     while let Some(&(&address, _)) = pending.peek() {
         let number = address.row;
         // Rows and edits are both sorted, so one cursor finds each edited row
@@ -575,14 +620,13 @@ pub(super) fn plan_cells<'s>(
         {
             row_position += 1;
         }
-        let mut changes: Vec<(&CellRef, &CellValue)> = Vec::new();
+        changes.clear();
         while let Some(change) = pending.next_if(|(cell, _)| cell.row == number) {
             changes.push(change);
         }
         let next_row = index.rows.get(row_position);
         if let Some(row) = next_row.filter(|row| row.number == number) {
             patch_existing_row(
-                xml,
                 index,
                 row,
                 &changes,
@@ -592,7 +636,7 @@ pub(super) fn plan_cells<'s>(
             )?;
         } else if let Some(bytes) = new_row(index, number, &changes, &mut changed_cells)? {
             if data.empty {
-                empty_data_rows.extend(bytes);
+                append_markup(&mut empty_data_rows, &bytes)?;
             } else {
                 let insertion = next_row.map_or(data.close_start(), |row| {
                     index.elements[row.element].start()
@@ -601,15 +645,15 @@ pub(super) fn plan_cells<'s>(
                     start: insertion,
                     end: insertion,
                     bytes,
-                });
+                })?;
             }
         }
     }
     if !empty_data_rows.is_empty() {
-        edits.expand(index.source, data, empty_data_rows);
+        edits.expand(index.source, data, empty_data_rows)?;
     }
     if let Some(edit) = dimension_edit(index, &changed_cells)? {
-        edits.push(edit);
+        edits.push(edit)?;
     }
     Ok(edits)
 }

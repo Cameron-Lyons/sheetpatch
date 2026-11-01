@@ -600,9 +600,13 @@ mod tests {
         gid
     }
 
-    /// The process's groups other than `default`, which it may assign.
+    /// The process's groups other than `default` that it can actually assign
+    /// on this filesystem. Membership alone is insufficient in user namespaces
+    /// where a supplementary group may have no usable host mapping.
     #[cfg(unix)]
-    fn other_groups(default: u32) -> Vec<u32> {
+    fn other_groups(directory: &Path, default: u32) -> Vec<u32> {
+        use std::os::unix::fs::MetadataExt;
+
         let output = Command::new("id").arg("-G").output();
         let Some(groups) = output
             .ok()
@@ -610,11 +614,20 @@ mod tests {
         else {
             return Vec::new();
         };
-        groups
+        let path = directory.join("assignable-group-probe");
+        let file = File::create(&path).unwrap();
+        let groups = groups
             .split_whitespace()
             .filter_map(|gid| gid.parse().ok())
             .filter(|&gid| gid != default)
-            .collect()
+            .filter(|&gid| {
+                unix_fs::fchown(&file, None, Some(gid)).is_ok()
+                    && file.metadata().unwrap().gid() == gid
+            })
+            .collect();
+        drop(file);
+        fs::remove_file(path).unwrap();
+        groups
     }
 
     /// A group the process may not give its files, unless it is privileged.
@@ -623,7 +636,7 @@ mod tests {
         let probe = directory.join("foreign-probe");
         fs::write(&probe, b"").unwrap();
         let default = default_gid(directory);
-        let groups = other_groups(default);
+        let groups = other_groups(directory, default);
         let foreign = [0, 65534, 54321].into_iter().find(|&gid| {
             gid != default
                 && !groups.contains(&gid)
@@ -749,7 +762,20 @@ mod tests {
         assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
 
         let socket = directory.join("socket.xlsx");
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let _listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("skipping Unix-socket destination check: {error}");
+                assert_eq!(directory.entries(), 1);
+                return;
+            }
+            Err(error) => panic!("cannot create Unix-socket test fixture: {error}"),
+        };
         let result = write(&socket, None, |_| panic!("rejected before serializing"));
         assert_invalid_input(result, "destination is not a regular file");
         assert!(
@@ -870,7 +896,7 @@ mod tests {
 
         // When the user belongs to another group, a destination in that group
         // keeps it, along with its group permission bits.
-        let other_group = other_groups(default_gid)
+        let other_group = other_groups(&directory.0, default_gid)
             .into_iter()
             .find(|&gid| unix_fs::chown(&destination, None, Some(gid)).is_ok());
         if let Some(gid) = other_group {
@@ -1017,7 +1043,8 @@ mod tests {
         }
 
         // Another group of the user's is assigned along with its group bits.
-        let Some(&other) = other_groups(default).first() else {
+        let Some(&other) = other_groups(&directory.0, default).first() else {
+            eprintln!("skipping alternate-group cases: no other group can be assigned");
             return;
         };
         let destination = directory.join("other.xlsx");

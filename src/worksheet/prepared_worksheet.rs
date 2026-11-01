@@ -1,7 +1,7 @@
 use super::index::WorksheetIndex;
 use super::patch::{self, EditPlan};
 use super::read::{self, ReadError, SharedStrings};
-use crate::{CellContent, CellRef, CellValue, Result};
+use crate::{CellContent, CellRange, CellRef, CellValue, Result};
 #[cfg(test)]
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -36,7 +36,31 @@ impl<'xml> PreparedWorksheet<'xml> {
         mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> StdResult<CellContent, ReadError> {
-        read::cell_content(self.xml, &self.index, cell, &mut shared_strings, date1904)
+        read::cell_content(&self.index, cell, &mut shared_strings, date1904)
+    }
+
+    /// Decodes existing cells directly from their index entries. Range
+    /// filtering precedes decoding, so unrelated bad values remain unread.
+    pub(crate) fn cell_contents_in<'view, 'strings>(
+        &'view self,
+        range: Option<CellRange>,
+        mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>> + Clone + 'view,
+        date1904: bool,
+    ) -> impl Iterator<Item = StdResult<(CellRef, CellContent), ReadError>> + Clone + 'view {
+        self.index
+            .cells
+            .iter()
+            .filter(move |cell| range.is_none_or(|range| range.contains(cell.address)))
+            .map(move |cell| {
+                read::indexed_cell_content(
+                    &self.index,
+                    cell.address,
+                    cell.element,
+                    &mut shared_strings,
+                    date1904,
+                )
+                .map(|content| (cell.address, content))
+            })
     }
 
     /// Reads cells in request order. The shared-string loader is called only
@@ -50,7 +74,7 @@ impl<'xml> PreparedWorksheet<'xml> {
         shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> StdResult<Vec<CellContent>, ReadError> {
-        read::read_cells(self.xml, &self.index, cells, shared_strings, date1904)
+        read::read_cells(&self.index, cells, shared_strings, date1904)
     }
 
     /// Plans writing `cells` into the indexed XML, or returns `None` when
@@ -75,7 +99,7 @@ impl<'xml> PreparedWorksheet<'xml> {
             cells.values().all(|value| value.validate().is_ok()),
             "every public edit path validates its values before planning them"
         );
-        let plan = patch::plan_cells(self.xml, &self.index, cells, shared_strings, date1904)?;
+        let plan = patch::plan_cells(&self.index, cells, shared_strings, date1904)?;
         Ok((!plan.is_empty()).then_some(CellPatch {
             xml: self.xml,
             plan,

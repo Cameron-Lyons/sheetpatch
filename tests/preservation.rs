@@ -980,7 +980,7 @@ fn cli_patch_check_rejects_unsavable_replacements_without_changing_files() {
         .unwrap();
     assert_eq!(checked.status.code(), Some(1));
     assert!(checked.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&checked.stderr).contains("64 MiB read limit"));
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("64 MiB part limit"));
     let applied = Command::new(binary)
         .arg("patch")
         .arg(&input)

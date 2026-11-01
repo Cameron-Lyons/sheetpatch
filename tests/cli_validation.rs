@@ -71,6 +71,78 @@ fn stdin_checks_accept_empty_patches_and_report_raw_edit_counts() {
 }
 
 #[test]
+fn oversized_rows_fail_before_opening_workbooks_or_replacing_destinations() {
+    let directory = TempDir::new();
+    let patch = directory.join("oversized.tsv");
+    let destination = directory.join("unchanged.xlsx");
+    fs::write(&destination, b"existing destination").unwrap();
+    for prefix in ["Data\tA1\ttext\t", "# comment "] {
+        let mut contents = b"Data\tA2\ttext\tvalid first row\n".to_vec();
+        contents.extend_from_slice(prefix.as_bytes());
+        contents.resize(contents.len() + 2 * 1024 * 1024, b'x');
+        contents.push(b'\n');
+        fs::write(&patch, contents).unwrap();
+        for args in [
+            vec!["patch", "--check", "", patch.to_str().unwrap()],
+            vec![
+                "patch",
+                "",
+                destination.to_str().unwrap(),
+                patch.to_str().unwrap(),
+            ],
+        ] {
+            let result = cli(&args);
+            assert_eq!(result.status.code(), Some(2));
+            assert!(result.stdout.is_empty());
+            let message = String::from_utf8(result.stderr).unwrap();
+            assert!(message.contains("Patch line 2: row exceeds"), "{message}");
+            assert!(message.contains("1048576-byte"), "{message}");
+            assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
+        }
+    }
+}
+
+#[test]
+fn patch_text_limit_counts_utf16_before_copying_and_checks_overwritten_rows() {
+    for text in ["雪".repeat(32_767), format!("{}x", "😀".repeat(16_383))] {
+        let patch = format!("Notes\tB2\ttext\t{text}\r\n");
+        let result = check_stdin(FIXTURE, patch.as_bytes());
+        assert!(result.status.success(), "{:?}", result.stderr);
+        assert_eq!(result.stdout, b"Validated 1 patch row.\n");
+        let invalid = format!("Notes\tB2\ttext\t{text}x\nNotes\tB2\ttext\tvalid\n");
+        let result = check_stdin("", invalid.as_bytes());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        let message = String::from_utf8(result.stderr).unwrap();
+        assert!(message.contains("Patch line 1:"), "{message}");
+        assert!(
+            message.contains("32,767 UTF-16 code unit limit"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn malformed_patch_tokens_have_bounded_utf8_safe_diagnostics() {
+    let token = "雪".repeat(20_000);
+    for row in [
+        format!("Data\t{token}\ttext\tvalue\n"),
+        format!("Data\tA1\t{token}\tvalue\n"),
+        format!("Data\tA1\tnumber\t{token}\n"),
+        format!("Data\tA1\tbool\t{token}\n"),
+        format!("Data\tA1\tblank\t{token}\n"),
+    ] {
+        let result = check_stdin("", row.as_bytes());
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        let message = String::from_utf8(result.stderr).unwrap();
+        assert!(message.len() < 1024, "{}-byte diagnostic", message.len());
+        assert!(message.contains("… (60000 bytes)"), "{message}");
+        assert!(message.contains("Patch line 1:"), "{message}");
+    }
+}
+
+#[test]
 fn duplicate_patch_targets_keep_the_last_value_and_count_every_row() {
     let directory = TempDir::new();
     let patch = directory.join("duplicates.tsv");
