@@ -6,6 +6,7 @@ use crate::xml::{self, NamespaceId};
 use crate::{CellContent, CellRef, CellValue, Error, Result};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -33,24 +34,24 @@ impl From<Error> for ReadError {
 
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
-fn element_text(xml: &[u8], element: &Element) -> Result<String> {
+fn element_text<'xml>(source: &'xml str, element: &Element) -> Result<Cow<'xml, str>> {
     if element.has_children() {
         return Err(errors::unsupported(
             "elements inside a simple cell text value",
         ));
     }
     if element.empty {
-        return Ok(String::new());
+        return Ok(Cow::Borrowed(""));
     }
-    let mut content = &xml[element.open_end()..element.close_start()];
+    let content = &source[element.open_end()..element.close_start()];
     // Text without markup, references or carriage returns is its own value.
     if !content
-        .iter()
-        .any(|&byte| matches!(byte, b'<' | b'&' | b'\r'))
+        .bytes()
+        .any(|byte| matches!(byte, b'<' | b'&' | b'\r'))
     {
-        return String::from_utf8(content.to_vec())
-            .map_err(|error| errors::xml_error(error.to_string()));
+        return Ok(Cow::Borrowed(content));
     }
+    let mut content = content.as_bytes();
     let mut text = String::new();
     // A new reader discards a leading UTF-8 byte order mark, which inside an
     // element is the ordinary character U+FEFF. Consume each leading copy, so
@@ -72,7 +73,7 @@ fn element_text(xml: &[u8], element: &Element) -> Result<String> {
                 text.push(xml::reference(&reference)?);
             }
             Event::Comment(_) | Event::PI(_) => {}
-            Event::Eof => return Ok(text),
+            Event::Eof => return Ok(Cow::Owned(text)),
             _ => {
                 return Err(errors::unsupported(
                     "unexpected markup inside a simple cell text value",
@@ -135,15 +136,15 @@ fn rich_text(
     validate_rich_text_structure(source, elements, index, namespace)?;
     let mut text = String::new();
     let mut append = |element: &Element| -> Result<()> {
-        let piece = element_text(source.as_bytes(), element)?;
+        let piece = element_text(source, element)?;
         // Only an underscore can start an Excel escape.
         let piece = if piece.contains('_') {
-            xml::excel_text(&piece)?
+            Cow::Owned(xml::excel_text(&piece)?)
         } else {
             piece
         };
         if text.is_empty() {
-            text = piece;
+            text = piece.into_owned();
         } else {
             text.push_str(&piece);
         }
@@ -400,22 +401,16 @@ pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Op
     )
 }
 
-fn stored_value(
-    xml: &[u8],
-    index: &WorksheetIndex,
-    cell: &Element,
-    date1904: bool,
-) -> Result<StoredValue> {
+fn stored_value(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredValue> {
     match value_payload(index, cell)? {
         None => Ok(StoredValue::Value(CellValue::Blank)),
-        Some(payload_index) => decode_payload(xml, index, cell, payload_index, date1904),
+        Some(payload_index) => decode_payload(index, cell, payload_index, date1904),
     }
 }
 
 // Decodes the cell's payload as reads see it; no-op detection compares an
 // edit against the same value.
 pub(super) fn decode_payload(
-    xml: &[u8],
     index: &WorksheetIndex,
     cell: &Element,
     payload_index: usize,
@@ -440,7 +435,7 @@ pub(super) fn decode_payload(
     if !payload.is(source, namespace, "v") {
         return Err(errors::invalid("non-inline cell has an inline payload"));
     }
-    let text = element_text(xml, payload)?;
+    let text = element_text(source, payload)?;
     // Values that their cell type cannot hold make the workbook malformed;
     // only valid ISO 8601 dates outside the supported forms are unsupported.
     let value = match kind {
@@ -495,12 +490,7 @@ struct StoredCell {
 }
 
 // The cell's style, formula and stored value, read in that order.
-fn stored_cell(
-    xml: &[u8],
-    index: &WorksheetIndex,
-    cell: &Element,
-    date1904: bool,
-) -> Result<StoredCell> {
+fn stored_cell(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredCell> {
     let elements = &index.elements;
     let style_index: Option<u32> = cell
         .attribute(&index.attributes, "s")
@@ -514,17 +504,16 @@ fn stored_cell(
         .children(elements)
         .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
     let formula = errors::unique(formulas, || errors::invalid("cell has multiple formulas"))?
-        .map(|formula| element_text(xml, &elements[formula]))
+        .map(|formula| element_text(index.source, &elements[formula]).map(Cow::into_owned))
         .transpose()?;
     Ok(StoredCell {
         style_index,
         formula,
-        value: stored_value(xml, index, cell, date1904)?,
+        value: stored_value(index, cell, date1904)?,
     })
 }
 
 pub(super) fn cell_content<'a>(
-    xml: &[u8],
     index: &WorksheetIndex,
     address: CellRef,
     shared_strings: &mut impl FnMut() -> Result<Option<&'a SharedStrings>>,
@@ -537,11 +526,23 @@ pub(super) fn cell_content<'a>(
             style_index: None,
         });
     };
+    indexed_cell_content(index, address, cell_index, shared_strings, date1904)
+}
+
+// The address and element come from one entry in the validated cell index.
+// Sequential reads can use it directly without searching that index again.
+pub(super) fn indexed_cell_content<'a>(
+    index: &WorksheetIndex,
+    address: CellRef,
+    cell_index: usize,
+    shared_strings: &mut impl FnMut() -> Result<Option<&'a SharedStrings>>,
+    date1904: bool,
+) -> StdResult<CellContent, ReadError> {
     let StoredCell {
         style_index,
         formula,
         value,
-    } = stored_cell(xml, index, &index.elements[cell_index], date1904)
+    } = stored_cell(index, &index.elements[cell_index], date1904)
         .map_err(|error| error.context(address))?;
     let value = match value {
         StoredValue::Value(value) => value,
@@ -581,7 +582,6 @@ pub(super) fn cell_content<'a>(
 }
 
 pub(super) fn read_cells<'a>(
-    xml: &[u8],
     index: &WorksheetIndex,
     cells: &[CellRef],
     mut shared_strings: impl FnMut() -> Result<Option<&'a SharedStrings>>,
@@ -597,13 +597,7 @@ pub(super) fn read_cells<'a>(
         .try_reserve_exact(cells.len())
         .map_err(|_| Error::Io(io::ErrorKind::OutOfMemory.into()))?;
     for &cell in cells {
-        contents.push(cell_content(
-            xml,
-            index,
-            cell,
-            &mut shared_strings,
-            date1904,
-        )?);
+        contents.push(cell_content(index, cell, &mut shared_strings, date1904)?);
     }
     Ok(contents)
 }

@@ -132,7 +132,9 @@ names for an accessed part are rejected.
 and `style_index`. Its fields are public for reading; it is `#[non_exhaustive]`,
 so it is not constructed outside the crate and destructuring needs `..`.
 `get_cells` reads multiple addresses with one worksheet parse, preserving input
-order. Shared strings and rich text are decoded without changing the workbook;
+order. Both string-address and typed batches return at most 16,777,216 cells;
+an oversized iterator is rejected before any cell is read, and address-buffer
+growth uses fallible allocation. Shared strings and rich text are decoded without changing the workbook;
 formula values are cached results. Shared-formula follower cells may contain
 empty stored formula text.
 
@@ -145,6 +147,11 @@ let sheet = book.prepare_sheet("Summary")?;
 let total = sheet.get_cell("C2")?;
 let details = sheet.get_cells(["C3", "C4", "C3"])?;
 let everything = sheet.get_cells_at(sheet.cells())?;
+// Stream existing cells directly, without collecting addresses or results.
+for cell in sheet.cell_contents() {
+    let (address, content) = cell?;
+    println!("{address}: {}", content.value);
+}
 # Ok::<(), sheetpatch::Error>(())
 ```
 
@@ -159,6 +166,13 @@ reading a range, or read `cells()` as above. The view borrows the workbook;
 drop it before making edits. Dropping the view releases the parsed index.
 Ordinary reads retain cached decompressed XML but release their index after each
 call. Both workbooks and prepared views can be shared across threads.
+
+`cell_contents()` visits existing cells directly through the prepared index,
+including style-only cells. `cell_contents_in(Some(range))` filters addresses
+before decoding and never expands missing cells. Each item returns its own
+read result; starting another iterator replays the view. Use these methods for
+whole-sheet processing with bounded result memory, and `get_cells_at` when a
+specific request order or duplicate addresses are needed.
 
 An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 `Error::ProtectedCell { sheet, cell, reason }`, displayed as
@@ -276,6 +290,10 @@ and tab-free lines beginning with `#` are ignored. Literal multiline values use
 the Rust API. Invalid rows and rows naming a missing worksheet report their line
 number; an edit refused for a protected cell names the last line for that cell,
 as in `Patch line 5: protected cell: worksheet "Summary": D2 contains a formula`.
+Each physical row is limited to 1 MiB, including any BOM and line ending;
+this also applies to comments and empty-looking rows. Oversized input is
+rejected while reading, before buffering the whole row. Text length is checked
+before copying its value, and long diagnostic tokens are abbreviated.
 Every input row is validated, but only the final value for each cell is retained,
 so repeated edits do not accumulate discarded text in memory. Any error leaves
 the destination unchanged.
@@ -424,7 +442,9 @@ in cached results. The original workbook's calculation settings are retained.
 - Existing `.xlsx`, `.xlsm`, `.xltx`, and `.xltm` OOXML packages, including strict
   and transitional SpreadsheetML and namespace-prefixed worksheets.
 - ZIP32 archives; accessed XML parts must use Stored or Deflate compression,
-  be UTF-8 XML 1.0, and be at most 64 MiB, as must saved replacements. Only
+  be UTF-8 XML 1.0, and be at most 64 MiB, as must saved replacements. Edits
+  that would exceed that limit are rejected before committing any worksheet
+  changes or allocating the final replacement XML. Only
   XML's five predefined entities and character references are resolved,
   whatever features other dependencies enable in `quick-xml`. Pending
   worksheet XML of 4 GiB or more cannot be indexed and is refused. Other untouched
@@ -568,10 +588,26 @@ operation subset, verifies `cargo package` and a publishing dry run, then tests,
 installs, and inspects the extracted package. An independent LibreOffice
 export/edit/reopen check runs on Linux. `cargo audit` checks Cargo.lock against
 the RustSec database on every run and weekly, failing on vulnerable, unsound, or
-yanked dependencies; scheduled runs perform only this audit. The aggregate `CI`
+yanked dependencies. Every run also exercises fresh, recorded property-test
+seeds and bounded coverage-guided fuzzing; scheduled runs extend those checks
+and record performance and peak memory alongside the dependency audit. The aggregate `CI`
 check requires every job to succeed. Actions are pinned to full commit hashes,
 workflow permissions are read-only, and Dependabot checks Cargo dependencies and
 GitHub Actions weekly.
+
+The independent `fuzz/` workspace contains seeded `workbook`, `worksheet`, and
+`text` targets. They exercise malformed ZIP and XML, scalar text round trips,
+successful-save readability, and preservation of untouched parts. Fuzzing has
+its own lockfile and development dependencies; these do not enter the library
+or published crate. To reproduce a local run:
+
+```sh
+cargo install cargo-fuzz --version 0.13.2 --locked
+cargo +nightly-2026-10-22 fuzz run worksheet -- -seed=20261101 -max_total_time=60 -max_len=65536 -rss_limit_mb=2048 -timeout=15
+```
+
+CI retains the seed, evolved corpora, and any failure artifacts. Rerun a
+failure with `cargo +nightly-2026-10-22 fuzz run TARGET PATH_TO_ARTIFACT`.
 
 Preservation tests construct workbook archives and independently compare
 decompressed payloads, compressed streams, and central-directory metadata for
@@ -651,7 +687,10 @@ neither parse it again nor change its error. Its decoded text is held in one
 buffer with a 32-bit end offset per entry, rather than one allocation per
 string. Prepared worksheet views reuse a validated index across reads, with
 retention controlled by the view's lifetime; single-cell reads avoid
-allocating a batch result. CLI reads buffer up to 4 MiB of
+allocating a batch result. Simple scalar payloads borrow the validated XML
+instead of allocating a temporary string before parsing a number, boolean,
+date, or shared-string index. CLI `cells` traverses indexed records directly,
+without collecting addresses or searching for them again. CLI reads buffer up to 4 MiB of
 formatted output while validating, with no cell-count cap, so most reads decode
 each cell once. Cells beyond the buffer are validated before printing and then
 read again individually for output.
@@ -675,18 +714,22 @@ Replacement parts keep their member's compression method. Deflated ones are
 recompressed with Deflate level 4, the fastest level that keeps lazy matching.
 A deflated replacement larger than 2 MiB is compressed in fixed 1 MiB segments,
 each ending with a sync flush so that together they form one stream, on up to
-eight threads including the calling thread, and never more than
+eight threads by default including the calling thread, and never more than
 `std::thread::available_parallelism` or the segment count. Its bytes do not
 depend on the thread count and are up to about 0.25% larger than a single
-stream's. Applications that save many large workbooks in parallel may therefore
-oversubscribe the CPU; where a thread cannot be started, for example under a
+stream's. Applications saving workbooks concurrently can cap each workbook's
+workers with `book.set_compression_threads(NonZeroUsize::new(1))`, importing
+`std::num::NonZeroUsize`. The cap applies to every normal and compact save,
+including streams; `None` restores automatic selection, and
+`compression_threads()` reports the configured cap. This setting does not
+change saved bytes or pending edits. Where a thread cannot be started, for example under a
 limit on the user's processes, the calling thread compresses its segments
 instead. Untouched parts keep their original compressed bytes.
 
 Run the dependency-free benchmark with:
 
 ```sh
-SHEETPATCH_BENCH_SAMPLES=3 cargo bench --locked --bench editing
+SHEETPATCH_BENCH_SAMPLES=7 cargo bench --locked --bench editing
 ```
 
 The harness independently checks expected worksheet XML and untouched compressed
@@ -695,6 +738,14 @@ compaction, batch reads, prepared reads, and unchanged batches. It also exercise
 wide rows, unfamiliar cell extensions, shared strings, new-row insertion,
 multiple worksheets, bulk edits across thousands of tables, row-style inheritance,
 and text requiring many Excel escapes.
+Measurements calibrate repeated operations to at least 50 ms per sample,
+include destruction of returned results, and report iteration count, minimum,
+median, 90th percentile, and maximum in microseconds. Fixture construction is
+excluded; the reported distribution is over per-operation averages of timed
+batches, rather than individual request latencies.
+`SHEETPATCH_BENCH_SAMPLE_MS` changes the calibration target; zero
+selects one operation per sample for quick correctness checks. These timing
+boundaries differ from the historical measurements below.
 Use `SHEETPATCH_BENCH_CASES` to select comma-separated cases
 (`narrow_10000`, `narrow_50000`, `guarded`, `wide`, `opaque`, `shared_strings`,
 `insertion`, `multisheet`, `tables`, `row_style`, `control_text`) and
@@ -706,6 +757,27 @@ SHEETPATCH_BENCH_CASES=narrow_50000 \
 SHEETPATCH_BENCH_OPERATIONS=bulk_at,get_cells_at,prepared_single_reads \
 SHEETPATCH_BENCH_SAMPLES=5 cargo bench --locked --bench editing
 ```
+
+For CLI wall time and peak resident memory on Linux or macOS, use Python 3
+and GNU `/usr/bin/time` on Linux or BSD `/usr/bin/time` on macOS:
+
+```sh
+python3 scripts/benchmark.py --candidate target/release/sheetpatch --samples 7 --output target/cli-performance.json
+python3 scripts/benchmark.py --candidate target/release/sheetpatch --baseline /path/to/previous/sheetpatch --samples 7 --output target/comparison.json
+```
+
+The script measures numeric and shared-string whole-sheet reads, a large-sheet
+save, and row insertions. Untimed warmups validate read output, edits, ZIP
+checksums, and untouched records. Each CLI measurement runs in a fresh worker;
+fixture generation and Python startup are excluded, while the native time
+wrapper's startup/exit overhead is included. Native time measures the CLI's
+peak RSS without Python's inherited memory footprint. Use `--time PATH` or
+`SHEETPATCH_TIME` when the executable lives elsewhere. Comparisons alternate binary order
+on the same host and include raw samples, variability, executable hashes, and
+candidate/baseline ratios. Weekly and manually dispatched CI runs retain
+library timings, CLI memory results, and compiler/runner details for 90 days.
+Use a quiet host for acceptance decisions: shared CI runners are useful for
+history, but their noise is unsuitable for a hard performance gate.
 
 ### Measurements
 

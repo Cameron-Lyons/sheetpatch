@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- Added `WorksheetView::cell_contents` and `cell_contents_in` for lazy,
+  replayable reads directly through the prepared index. CLI `cells` uses this
+  path without allocating an address list or repeating index searches.
+- Simple scalar reads borrow their XML text, ordinary single-cell reads avoid
+  a batch allocation, and edits reuse row bookkeeping and append escaped text
+  directly into their payload buffer.
+- Both typed and string-address batch reads now enforce the 16,777,216-cell
+  limit and use fallible address-buffer growth. Known oversized iterators are
+  rejected before address parsing; streamed inputs stop at the same bound.
+- Edits exceeding the 64 MiB worksheet limit now fail before allocating the
+  final XML or committing any worksheet changes, preserving prior pending
+  edits. Previously the limit was enforced when saving.
+- Patch rows are limited to 1 MiB including any BOM and line ending, checked
+  during ingestion. Text is validated before copying and oversized diagnostic
+  tokens are abbreviated. All rows, including comments, share this limit.
+- Added `Workbook::set_compression_threads(Option<NonZeroUsize>)` and
+  `compression_threads` to cap workers for all save methods. `None` retains
+  automatic selection; thread limits do not change archive bytes.
+- Separated archive, XML, and CLI responsibilities into internal modules.
+  Permission-dependent tests probe the needed operating-system capability.
+- Added a separately locked fuzz workspace, seeded parser/text targets, and
+  CI runs with recorded changing property seeds. Scheduled runs extend fuzzing
+  and retain performance history. Benchmarks calibrate repeated operations,
+  include result destruction, and report variability. The included
+  `scripts/benchmark.py` compares CLI time and peak RSS using interleaved runs.
+
 ## 1.1.0 — 2026-10-23
 
 This release brings the code in line with the Google Rust Style Guide. Its API

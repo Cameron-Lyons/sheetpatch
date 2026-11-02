@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::result::Result as StdResult;
@@ -321,6 +322,28 @@ impl Workbook {
         self.date1904
     }
 
+    /// The requested compression thread limit for subsequent saves.
+    ///
+    /// `None` uses the automatic limit of eight threads. A configured limit
+    /// includes the calling thread; the actual number is also bounded by
+    /// available hardware parallelism and the number of compression segments.
+    #[must_use]
+    pub fn compression_threads(&self) -> Option<NonZeroUsize> {
+        self.archive.compression_threads()
+    }
+
+    /// Limit compression threads for all subsequent save and serialization
+    /// methods, including compact saves. `None` restores the automatic limit
+    /// of eight threads; `Some(NonZeroUsize::MIN)` runs compression entirely on
+    /// the calling thread, useful when saving several workbooks concurrently.
+    ///
+    /// The actual number is also bounded by available hardware parallelism
+    /// and the number of compression segments. This changes neither the output
+    /// bytes nor pending edits, and [`Self::reset_changes`] keeps the setting.
+    pub fn set_compression_threads(&mut self, threads: Option<NonZeroUsize>) {
+        self.archive.set_compression_threads(threads);
+    }
+
     /// Set a scalar cell value, inserting a cell/row if needed.
     ///
     /// The cell keeps its style and other attributes. Text and numbers are
@@ -564,9 +587,7 @@ impl Workbook {
     /// as described in [errors while reading](Self#errors-while-reading).
     pub fn get_cell(&self, sheet: &str, address: &str) -> Result<CellContent> {
         let index = self.sheet_index(sheet)?;
-        Ok(self
-            .read_cells_in_sheet(index, &[address.parse()?])?
-            .remove(0))
+        self.read_cell_in_sheet(index, address.parse()?)
     }
 
     /// Read a cell using an already validated, one-based address.
@@ -579,18 +600,23 @@ impl Workbook {
     /// Fails like [`Self::get_cell`], other than for the address.
     pub fn get_cell_at(&self, sheet: &str, cell: CellRef) -> Result<CellContent> {
         let index = self.sheet_index(sheet)?;
-        Ok(self.read_cells_in_sheet(index, &[cell])?.remove(0))
+        self.read_cell_in_sheet(index, cell)
     }
 
     /// Read many cells with one worksheet parse, retaining input order.
+    /// One read returns at most 16,777,216 (2²⁴) cells.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SheetNotFound`] if no worksheet has this name, then
-    /// [`Error::InvalidCellReference`] for the first invalid address, before
-    /// reading any cell, and otherwise fails like [`Self::get_cell`] for the
-    /// first cell that cannot be read. Results that cannot be allocated
-    /// return [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`].
+    /// Returns [`Error::SheetNotFound`] before reading the addresses if no
+    /// worksheet has this name. A known batch length over the limit returns
+    /// [`Error::Unsupported`] before parsing addresses; otherwise the first
+    /// invalid address within the limit returns [`Error::InvalidCellReference`],
+    /// and exceeding the limit returns [`Error::Unsupported`]. No cells are
+    /// read until the addresses have been validated. Otherwise fails like
+    /// [`Self::get_cell`] for the first cell that cannot be read. Results that
+    /// cannot be allocated return [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cells<I, S>(&self, sheet: &str, addresses: I) -> Result<Vec<CellContent>>
     where
         I: IntoIterator<Item = S>,
@@ -623,6 +649,17 @@ impl Workbook {
     ) -> Result<Vec<CellContent>> {
         let index = self.sheet_index(sheet)?;
         self.read_cells_in_sheet(index, &read_batch::collect_cells(cells)?)
+    }
+
+    fn read_cell_in_sheet(&self, index: usize, cell: CellRef) -> Result<CellContent> {
+        let sheet = &self.sheets[index];
+        let worksheet = self
+            .current_sheet(index)
+            .and_then(PreparedWorksheet::parse)
+            .map_err(|error| sheet.context(error))?;
+        worksheet
+            .read_cell(cell, || self.shared_strings(), self.date1904)
+            .map_err(|error| self.read_context(sheet, error))
     }
 
     fn read_cells_in_sheet(&self, index: usize, cells: &[CellRef]) -> Result<Vec<CellContent>> {
@@ -787,8 +824,9 @@ impl Workbook {
     /// accumulate as obsolete copies. Central-directory offsets may change.
     /// Without edits this returns the original bytes. Pending edits are retained.
     /// Changed worksheets keep their compression method; a deflated one larger
-    /// than 2 MiB is compressed in 1 MiB segments on up to eight threads,
-    /// including the calling thread.
+    /// than 2 MiB is compressed in 1 MiB segments on up to eight threads by
+    /// default, including the calling thread. [`Self::set_compression_threads`]
+    /// configures that limit without changing the output bytes.
     ///
     /// # Errors
     ///

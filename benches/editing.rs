@@ -1,8 +1,10 @@
 //! Reproducible benchmarks without a benchmarking dependency.
-//! Run `SHEETPATCH_BENCH_SAMPLES=3 cargo bench --bench editing`.
+//! Run `SHEETPATCH_BENCH_SAMPLES=7 cargo bench --bench editing`.
 //! Cold reads and edits include workbook loading; warm reads and saves reuse a book.
 //! Prepared lookups exclude view construction; `prepare_and_read` includes it.
 //! All timings exclude fixture construction.
+//! Timings include dropping returned values; batches calibrate to at least
+//! 50 ms by default. Set SHEETPATCH_BENCH_SAMPLE_MS=0 for one iteration.
 //! Filter comma-separated case names with `SHEETPATCH_BENCH_CASES` and operation
 //! names with `SHEETPATCH_BENCH_OPERATIONS`; unset filters run every workload.
 //! Example: `SHEETPATCH_BENCH_CASES=wide SHEETPATCH_BENCH_OPERATIONS=wide_bulk_at`.
@@ -13,12 +15,15 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+#[path = "support/measurement.rs"]
+mod measurement;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
-use std::{env, hint, io};
+use std::{env, io};
 
 use common::{ZipEntry, ZipLayout};
+use measurement::Measurement;
 use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -55,6 +60,8 @@ const OPERATIONS: &[&str] = &[
     "warm_single_reads",
     "prepared_single_reads",
     "prepare_and_read",
+    "indexed_cell_reads",
+    "lookup_cell_reads",
     "wide_bulk_at",
     "opaque_bulk_at",
     "opaque_unchanged",
@@ -212,19 +219,11 @@ fn sequential(input: &[u8], edits: &[(String, CellValue)]) -> Workbook {
     book
 }
 
-fn measure<T>(samples: usize, label: &str, mut operation: impl FnMut() -> T) -> Option<Duration> {
+fn measure<T>(samples: usize, label: &str, operation: impl FnMut() -> T) -> Option<Measurement> {
     if !selected("SHEETPATCH_BENCH_OPERATIONS", label) {
         return None;
     }
-    let mut times = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        let started = Instant::now();
-        let result = hint::black_box(operation());
-        times.push(started.elapsed());
-        drop(result);
-    }
-    times.sort_unstable();
-    Some(times[times.len() / 2])
+    Some(measurement::measure(samples, operation))
 }
 
 fn samples() -> usize {
@@ -236,12 +235,19 @@ fn samples() -> usize {
                 .filter(|&samples| samples > 0)
                 .expect("SHEETPATCH_BENCH_SAMPLES must be a positive integer")
         })
-        .unwrap_or(3)
+        .unwrap_or(7)
 }
 
-fn report(label: &str, cells: usize, count: usize, samples: usize, elapsed: Option<Duration>) {
+fn report(label: &str, cells: usize, count: usize, samples: usize, elapsed: Option<Measurement>) {
     if let Some(elapsed) = elapsed {
-        println!("{label},{cells},{count},{samples},{}", elapsed.as_micros());
+        println!(
+            "{label},{cells},{count},{samples},{},{:.3},{:.3},{:.3},{:.3}",
+            elapsed.iterations,
+            elapsed.median.as_secs_f64() * 1e6,
+            elapsed.min.as_secs_f64() * 1e6,
+            elapsed.p90.as_secs_f64() * 1e6,
+            elapsed.max.as_secs_f64() * 1e6,
+        );
     }
 }
 
@@ -567,6 +573,46 @@ fn repeated_reads(
 // Keep the new API benchmarks together so the common workloads can also run
 // against an older checkout with a small view adapter for baseline comparison.
 fn prepared_reads(samples: usize, book: &Workbook, queries: &[CellRef], cells: usize) {
+    if selected("SHEETPATCH_BENCH_OPERATIONS", "indexed_cell_reads")
+        || selected("SHEETPATCH_BENCH_OPERATIONS", "lookup_cell_reads")
+    {
+        let view = book.prepare_sheet("Data").unwrap();
+        let indexed = || {
+            view.cell_contents().fold(0.0, |total, item| {
+                total + item.unwrap().1.value.as_number().unwrap_or(0.0)
+            })
+        };
+        let lookups = || {
+            view.cells().fold(0.0, |total, address| {
+                total
+                    + view
+                        .get_cell_at(address)
+                        .unwrap()
+                        .value
+                        .as_number()
+                        .unwrap_or(0.0)
+            })
+        };
+        assert_eq!(
+            indexed(),
+            lookups(),
+            "direct iteration and lookups must agree"
+        );
+        report(
+            "indexed_cell_reads",
+            cells,
+            cells,
+            samples,
+            measure(samples, "indexed_cell_reads", indexed),
+        );
+        report(
+            "lookup_cell_reads",
+            cells,
+            cells,
+            samples,
+            measure(samples, "lookup_cell_reads", lookups),
+        );
+    }
     if selected("SHEETPATCH_BENCH_OPERATIONS", "prepared_single_reads") {
         let view = book.prepare_sheet("Data").unwrap();
         let expected = book.get_cells_at("Data", queries.iter().copied()).unwrap();
@@ -893,7 +939,7 @@ fn main() {
     validate_filter("SHEETPATCH_BENCH_CASES", CASE_NAMES);
     validate_filter("SHEETPATCH_BENCH_OPERATIONS", OPERATIONS);
     let samples = samples();
-    println!("operation,cells,edits,samples,median_us");
+    println!("operation,cells,edits,samples,iterations,median_us,min_us,p90_us,max_us");
     for &(cells, count) in CASES {
         if !selected("SHEETPATCH_BENCH_CASES", &format!("narrow_{cells}")) {
             continue;

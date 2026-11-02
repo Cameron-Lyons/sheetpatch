@@ -1,0 +1,38 @@
+[package]
+name = "sheetpatch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sheetpatch = { path = ".." }
+crc32fast = "1.5"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "workbook"
+path = "fuzz_targets/workbook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "worksheet"
+path = "fuzz_targets/worksheet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
