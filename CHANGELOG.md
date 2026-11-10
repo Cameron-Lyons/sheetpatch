@@ -1,10 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 — release candidate
+
+This release adds streaming cell iteration and a per-workbook compression
+thread limit, reduces read and edit overhead, and bounds batch and patch
+resource use. The Rust API remains compatible with 1.1; Rust 1.88 is still the
+minimum supported version.
 
 - Added `WorksheetView::cell_contents` and `cell_contents_in` for lazy,
   replayable reads directly through the prepared index. CLI `cells` uses this
   path without allocating an address list or repeating index searches.
+  Range reads use binary searches to skip stored cells outside their bounds,
+  so repeated small ranges no longer scan the whole prepared worksheet.
 - Simple scalar reads borrow their XML text, ordinary single-cell reads avoid
   a batch allocation, and edits reuse row bookkeeping and append escaped text
   directly into their payload buffer.

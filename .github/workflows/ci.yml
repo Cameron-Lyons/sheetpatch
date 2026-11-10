@@ -117,7 +117,7 @@ jobs:
         env:
           SHEETPATCH_BENCH_SAMPLES: "1"
           SHEETPATCH_BENCH_SAMPLE_MS: "0"
-          SHEETPATCH_BENCH_OPERATIONS: bulk_at,prepared_single_reads,shared_prepared_reads
+          SHEETPATCH_BENCH_OPERATIONS: bulk_at,prepared_single_reads,prepared_range_reads,indexed_cell_reads,shared_prepared_reads
         run: cargo bench --locked --bench editing
       - name: Verify publishable package
         run: cargo package --locked
@@ -234,7 +234,7 @@ jobs:
       - name: Calibrated library measurements
         env:
           SHEETPATCH_BENCH_SAMPLES: "7"
-          SHEETPATCH_BENCH_OPERATIONS: bulk_at,get_cells_at,prepared_single_reads,indexed_cell_reads,lookup_cell_reads,unchanged_bulk,write_to_sink,wide_bulk_at,shared_prepared_reads,insert_bulk_at,control_text_bulk_at
+          SHEETPATCH_BENCH_OPERATIONS: bulk_at,get_cells_at,prepared_single_reads,prepared_range_reads,indexed_cell_reads,lookup_cell_reads,unchanged_bulk,write_to_sink,wide_bulk_at,shared_prepared_reads,insert_bulk_at,control_text_bulk_at
         run: cargo bench --locked --bench editing > target/measurements/library.csv
       - name: CLI time and peak resident memory
         run: python3 scripts/benchmark.py --candidate target/release/sheetpatch --samples 7 --output target/measurements/cli.json

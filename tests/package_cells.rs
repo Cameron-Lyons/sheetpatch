@@ -108,6 +108,24 @@ fn sparse_and_style_only_cells_define_the_used_range_rather_than_the_dimension()
             CellValue::from("x")
         ]
     );
+    // Range corners can fall on stored cells or in the gaps around them.
+    // Rows inside the range can also have cells outside its columns.
+    for (range, expected) in [
+        ("B3:F9", &["D3", "B7", "F7", "C9"][..]),
+        ("D3:F7", &["D3", "F7"][..]),
+        ("C4:E9", &["C9"][..]),
+        ("A4:E8", &["B7"][..]),
+        ("B7:B7", &["B7"][..]),
+        ("C7:E7", &[][..]),
+        ("A1:B2", &[][..]),
+        ("A10:XFD1048576", &[][..]),
+    ] {
+        let selected: Vec<_> = view
+            .cell_contents_in(Some(range.parse().unwrap()))
+            .map(|cell| cell.unwrap().0.to_string())
+            .collect();
+        assert_eq!(selected, expected, "{range}");
+    }
 }
 
 #[test]

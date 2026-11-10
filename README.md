@@ -15,7 +15,7 @@ Requires Rust 1.88 or later. Add the crate dependency:
 
 ```toml
 [dependencies]
-sheetpatch = "1.1"
+sheetpatch = "1.2"
 ```
 
 To use a local checkout instead, use `sheetpatch = { path = "/path/to/sheetpatch" }`.
@@ -169,10 +169,11 @@ call. Both workbooks and prepared views can be shared across threads.
 
 `cell_contents()` visits existing cells directly through the prepared index,
 including style-only cells. `cell_contents_in(Some(range))` filters addresses
-before decoding and never expands missing cells. Each item returns its own
-read result; starting another iterator replays the view. Use these methods for
-whole-sheet processing with bounded result memory, and `get_cells_at` when a
-specific request order or duplicate addresses are needed.
+before decoding, uses binary searches to skip stored cells outside the range's
+first and last addresses, and never expands missing cells. Each item returns
+its own read result; starting another iterator replays the view. Use these
+methods for whole-sheet processing with bounded result memory, and
+`get_cells_at` when a specific request order or duplicate addresses are needed.
 
 An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 `Error::ProtectedCell { sheet, cell, reason }`, displayed as
@@ -549,8 +550,8 @@ Three direct dependencies, and a fourth on Linux; XML parsing, compression, and
 
 - [`quick-xml`](https://docs.rs/quick-xml/0.42.0/quick_xml/): namespace-aware parsing.
 - [`flate2`](https://docs.rs/flate2/1.1.10/flate2/): pure Rust Deflate compression.
-- [`crc32fast`](https://docs.rs/crc32fast/1.5.2/crc32fast/): optimized ZIP checksums.
-- [`rustix`](https://docs.rs/rustix/1.1.5/rustix/) (Linux only, `fs` and `std`
+- [`crc32fast`](https://docs.rs/crc32fast/1.5.4/crc32fast/): optimized ZIP checksums.
+- [`rustix`](https://docs.rs/rustix/1.1.6/rustix/) (Linux only, `fs` and `std`
   features): reads a file's access ACL for saves, so the crate keeps
   `forbid(unsafe_code)`.
 
@@ -754,7 +755,7 @@ harness. For example:
 
 ```sh
 SHEETPATCH_BENCH_CASES=narrow_50000 \
-SHEETPATCH_BENCH_OPERATIONS=bulk_at,get_cells_at,prepared_single_reads \
+SHEETPATCH_BENCH_OPERATIONS=bulk_at,get_cells_at,prepared_single_reads,prepared_range_reads \
 SHEETPATCH_BENCH_SAMPLES=5 cargo bench --locked --bench editing
 ```
 

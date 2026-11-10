@@ -90,6 +90,8 @@ impl<'workbook> WorksheetView<'workbook> {
     ///
     /// The range is tested before decoding, and is never expanded into empty
     /// cells. A whole-grid range therefore costs the same as [`Self::cell_contents`].
+    /// The index skips stored cells before and after the range, so a narrow
+    /// band of rows does not require scanning the whole worksheet.
     /// Cells outside the range cannot produce value or shared-string errors.
     ///
     /// # Errors
