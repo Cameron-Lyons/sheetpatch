@@ -24,7 +24,7 @@ use std::{env, io};
 
 use common::{ZipEntry, ZipLayout};
 use measurement::Measurement;
-use sheetpatch::{CellEdit, CellRef, CellValue, Workbook};
+use sheetpatch::{CellEdit, CellRange, CellRef, CellValue, Workbook};
 
 const MAIN_NAMESPACE: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
@@ -59,6 +59,7 @@ const OPERATIONS: &[&str] = &[
     "cold_single_read",
     "warm_single_reads",
     "prepared_single_reads",
+    "prepared_range_reads",
     "prepare_and_read",
     "indexed_cell_reads",
     "lookup_cell_reads",
@@ -573,6 +574,43 @@ fn repeated_reads(
 // Keep the new API benchmarks together so the common workloads can also run
 // against an older checkout with a small view adapter for baseline comparison.
 fn prepared_reads(samples: usize, book: &Workbook, queries: &[CellRef], cells: usize) {
+    if selected("SHEETPATCH_BENCH_OPERATIONS", "prepared_range_reads") {
+        let view = book.prepare_sheet("Data").unwrap();
+        let ranges: Vec<_> = queries
+            .iter()
+            .map(|&first| {
+                CellRange::new(
+                    first,
+                    CellRef::try_new(first.row() + 7, first.column()).unwrap(),
+                )
+            })
+            .collect();
+        let expected: f64 = book
+            .get_cells_at("Data", ranges.iter().flat_map(|range| range.cells()))
+            .unwrap()
+            .iter()
+            .map(|cell| cell.value.as_number().unwrap())
+            .sum();
+        let read = || {
+            ranges
+                .iter()
+                .flat_map(|&range| view.cell_contents_in(Some(range)))
+                .map(|cell| cell.unwrap().1.value.as_number().unwrap())
+                .sum::<f64>()
+        };
+        assert_eq!(
+            read(),
+            expected,
+            "range iteration must agree with batch reads"
+        );
+        report(
+            "prepared_range_reads",
+            cells,
+            ranges.len() * 8,
+            samples,
+            measure(samples, "prepared_range_reads", read),
+        );
+    }
     if selected("SHEETPATCH_BENCH_OPERATIONS", "indexed_cell_reads")
         || selected("SHEETPATCH_BENCH_OPERATIONS", "lookup_cell_reads")
     {

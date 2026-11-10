@@ -47,8 +47,16 @@ impl<'xml> PreparedWorksheet<'xml> {
         mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>> + Clone + 'view,
         date1904: bool,
     ) -> impl Iterator<Item = StdResult<(CellRef, CellContent), ReadError>> + Clone + 'view {
-        self.index
-            .cells
+        let mut cells = self.index.cells.as_slice();
+        if let Some(range) = range {
+            // Addresses are sorted row by row. Skip the cells before and after
+            // the requested rectangle without visiting unrelated rows; the
+            // filter below still excludes other columns of the rows inside it.
+            let first = cells.partition_point(|cell| cell.address < range.first());
+            let last = cells.partition_point(|cell| cell.address <= range.last());
+            cells = &cells[first..last];
+        }
+        cells
             .iter()
             .filter(move |cell| range.is_none_or(|range| range.contains(cell.address)))
             .map(move |cell| {
