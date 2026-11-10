@@ -43,6 +43,8 @@ const CASE_NAMES: &[&str] = &[
     "tables",
     "control_text",
     "row_style",
+    "read_paths",
+    "empty_rows",
 ];
 const OPERATIONS: &[&str] = &[
     "sequential",
@@ -74,6 +76,16 @@ const OPERATIONS: &[&str] = &[
     "table_warm_bulk_at",
     "control_text_bulk_at",
     "row_style_bulk_at",
+    "narrow_column_reads",
+    "wide_range_reads",
+    "whole_sheet_reads",
+    "ordered_batch_reads",
+    "sparse_batch_reads",
+    "shuffled_batch_reads",
+    "duplicate_batch_reads",
+    "blank_batch_reads",
+    "empty_row_range_reads",
+    "sparse_row_range_reads",
 ];
 
 fn selected(variable: &str, name: &str) -> bool {
@@ -969,6 +981,126 @@ fn extra_workloads(samples: usize) {
     }
 }
 
+// Prepared reads isolate index traversal from XML parsing. The wide fixture
+// exposes the columns that a narrow rectangle should skip; independent values
+// also check the order, duplicates and missing cells of each batch.
+fn read_paths(samples: usize) {
+    let rows = 2_000;
+    let columns = 128;
+    let count = rows as usize * usize::from(columns);
+    let input = fixture_with_sheet(&wide_worksheet(rows, columns, &BTreeMap::new()));
+    let book = Workbook::from_bytes(input).unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    let rectangle = |first_row, first_column, last_row, last_column| {
+        CellRange::new(
+            CellRef::try_new(first_row, first_column).unwrap(),
+            CellRef::try_new(last_row, last_column).unwrap(),
+        )
+    };
+    for (label, range) in [
+        ("narrow_column_reads", Some(rectangle(501, 64, 1500, 64))),
+        ("wide_range_reads", Some(rectangle(501, 1, 1500, columns))),
+        ("whole_sheet_reads", None),
+    ] {
+        let expected_range = range.unwrap_or_else(|| rectangle(1, 1, rows, columns));
+        let expected: f64 = expected_range
+            .cells()
+            .map(|cell| f64::from((cell.row() - 1) * u32::from(columns) + u32::from(cell.column())))
+            .sum();
+        let read = || {
+            view.cell_contents_in(range)
+                .map(|cell| cell.unwrap().1.value.as_number().unwrap())
+                .sum::<f64>()
+        };
+        assert_eq!(
+            read(),
+            expected,
+            "{label}: range values must match the fixture"
+        );
+        report(
+            label,
+            count,
+            expected_range.cell_count() as usize,
+            samples,
+            measure(samples, label, read),
+        );
+    }
+    let dense: Vec<_> = rectangle(1001, 1, 1050, columns).cells().collect();
+    let sparse: Vec<_> = rectangle(1, 1, rows, columns).cells().step_by(31).collect();
+    let mut shuffled = sparse.clone();
+    let mut state = 0x1234_5678u32;
+    for index in (1..shuffled.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        shuffled.swap(index, state as usize % (index + 1));
+    }
+    let duplicates: Vec<_> = sparse.iter().flat_map(|&cell| [cell; 4]).collect();
+    let blanks: Vec<_> = rectangle(1991, 1, 2010, columns * 2).cells().collect();
+    for (label, cells) in [
+        ("ordered_batch_reads", dense),
+        ("sparse_batch_reads", sparse),
+        ("shuffled_batch_reads", shuffled),
+        ("duplicate_batch_reads", duplicates),
+        ("blank_batch_reads", blanks),
+    ] {
+        let read = || view.get_cells_at(cells.iter().copied()).unwrap();
+        let values = read();
+        assert_eq!(values.len(), cells.len(), "{label}: retain every request");
+        for (cell, content) in cells.iter().zip(&values) {
+            let expected = if cell.row() <= rows && cell.column() <= columns {
+                CellValue::from((cell.row() - 1) * u32::from(columns) + u32::from(cell.column()))
+            } else {
+                CellValue::Blank
+            };
+            assert_eq!(
+                content.value, expected,
+                "{label}: incorrect value at {cell}"
+            );
+        }
+        drop(values);
+        report(
+            label,
+            count,
+            cells.len(),
+            samples,
+            measure(samples, label, read),
+        );
+    }
+}
+
+// Row formatting can create many rows without creating any cell elements.
+// Range traversal should cost the stored cells, not every such empty row.
+fn empty_row_reads(samples: usize) {
+    let rows = 20_000;
+    for populated in [false, true] {
+        let mut xml = format!("<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>");
+        for row in 1..=rows {
+            if populated && [1, rows / 2, rows].contains(&row) {
+                write!(xml, "<row r='{row}'><c r='B{row}'><v>{row}</v></c></row>").unwrap();
+            } else {
+                write!(xml, "<row r='{row}' s='0' customFormat='1'/>").unwrap();
+            }
+        }
+        xml.push_str("</sheetData></worksheet>");
+        let book = Workbook::from_bytes(fixture_with_sheet(xml.as_bytes())).unwrap();
+        let view = book.prepare_sheet("Data").unwrap();
+        let range: CellRange = format!("B1:B{rows}").parse().unwrap();
+        let read = || {
+            view.cell_contents_in(Some(range))
+                .map(|cell| cell.unwrap().1.value.as_number().unwrap())
+                .sum::<f64>()
+        };
+        let (label, cells, expected) = if populated {
+            ("sparse_row_range_reads", 3, f64::from(1 + rows / 2 + rows))
+        } else {
+            ("empty_row_range_reads", 0, 0.0)
+        };
+        assert_eq!(read(), expected, "empty rows must not produce cells");
+        report(label, cells, cells, samples, measure(samples, label, read));
+    }
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         println!("Run cargo bench --bench editing for release-profile measurements.");
@@ -1176,6 +1308,12 @@ fn main() {
     }
     if selected("SHEETPATCH_BENCH_CASES", "tables") {
         table_batches(samples);
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "read_paths") {
+        read_paths(samples);
+    }
+    if selected("SHEETPATCH_BENCH_CASES", "empty_rows") {
+        empty_row_reads(samples);
     }
     extra_workloads(samples);
 }
