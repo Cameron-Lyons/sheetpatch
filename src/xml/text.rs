@@ -5,6 +5,17 @@ use quick_xml::events::BytesRef;
 #[cfg(test)]
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::io;
+
+/// Copy text into a result without aborting when its allocation is refused.
+pub(crate) fn copy_text(text: &str) -> Result<String> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    output.push_str(text);
+    Ok(output)
+}
 
 fn valid_char(character: char) -> bool {
     matches!(character,
@@ -154,7 +165,7 @@ fn append_escaped(output: &mut String, text: &str, xml: bool) {
 // Decode only once so the escaped underscore in `_x005F_x0041_` stays literal.
 pub(crate) fn excel_text(text: &str) -> Result<String> {
     let Some(mut position) = text.find('_') else {
-        return Ok(text.to_owned());
+        return copy_text(text);
     };
     let bytes = text.as_bytes();
     let unit_at = |position: usize| {
@@ -169,7 +180,12 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
     let unpaired = || Error::Unsupported("unpaired UTF-16 surrogate in Excel text escape".into());
     // Copy ordinary UTF-8 spans directly instead of converting the entire
     // value to a temporary UTF-16 buffer merely because it has an underscore.
-    let mut output = String::with_capacity(text.len());
+    // Decoding never lengthens the spelling, so this one fallible reservation
+    // covers every push below, including ordinary spans and surrogate pairs.
+    let mut output = String::new();
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     let mut start = 0;
     loop {
         output.push_str(&text[start..position]);
@@ -199,10 +215,13 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
         }
     }
     output.push_str(&text[start..]);
-    // Escapes can shorten text considerably. Decoded text, such as a cell's
-    // value or a sheet name, should not retain the capacity of its spelling.
-    output.shrink_to_fit();
-    Ok(output)
+    // Escapes can shorten text considerably. Keep decoded text compact, but
+    // do not use shrink_to_fit: its reallocation can abort on failure too.
+    if output.len() < output.capacity() {
+        copy_text(&output)
+    } else {
+        Ok(output)
+    }
 }
 
 #[cfg(test)]

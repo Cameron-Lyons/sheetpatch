@@ -100,6 +100,13 @@ use std::sync::{Mutex, OnceLock};
 /// as a shared-string table that cannot be loaded, name that part's path in
 /// the archive instead.
 ///
+/// Result vectors and copied cell text use fallible allocations, returning
+/// [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`] when refused.
+/// The batch cell-count limit does not bound the total text returned: repeated
+/// addresses each own their value and formula. For large results, consume
+/// [`WorksheetView::cell_contents`] incrementally or request smaller batches.
+/// This does not make every allocation in parsing or dependency code fallible.
+///
 /// Text with an unpaired UTF-16 surrogate escape, such as `_xD83D_` alone,
 /// is valid but cannot be returned as a Rust string, so reading it returns
 /// [`Error::Unsupported`]. In the shared-string table this concerns only
@@ -120,8 +127,8 @@ pub struct Workbook {
     // The outcome of the table's first load. Untouched parts never change,
     // so a table that fails to load fails the same way on every later use.
     // `Error` is not `RefUnwindSafe` only because an `io::Error` can box any
-    // source. A kept error never changes, and loading the table from memory
-    // never fails with an I/O error, so the workbook stays unwind-safe.
+    // source. A kept error never changes, and allocation errors carry only an
+    // ErrorKind rather than a user-supplied source, so the workbook stays unwind-safe.
     shared_strings: OnceLock<StdResult<SharedStrings, AssertUnwindSafe<Error>>>,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.

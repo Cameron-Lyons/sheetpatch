@@ -13,4 +13,4 @@ pub(crate) use attributes::{
 };
 pub(crate) use document::{DocumentRules, trim_whitespace};
 pub(crate) use namespace::{NameKind, NamespaceId, NamespacePool, NamespaceReader};
-pub(crate) use text::{append_cell_text, excel_text, reference};
+pub(crate) use text::{append_cell_text, copy_text, excel_text, reference};
