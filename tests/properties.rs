@@ -17,7 +17,9 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::{env, iter, thread};
 
 use common::{ZipEntry, ZipLayout};
-use sheetpatch::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Workbook};
+use sheetpatch::{
+    CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Workbook, WorksheetView,
+};
 
 const DEFAULT_SEED: u64 = 0x5ee7_5eed_2026_1011;
 
@@ -2029,6 +2031,96 @@ fn rejected_batch(rng: &mut Rng, sheets: &[SheetModel]) -> Batch {
 
 // ---------------------------------------------------------------- checks
 
+/// Checks the streaming path against the independent cell model, including
+/// the cursor state copied after a randomly chosen prefix. Empty selections
+/// and an exhausted cloned cursor must not resume at a later stored cell.
+fn check_streamed_reads(
+    case: Case,
+    stage: &str,
+    view: &WorksheetView<'_>,
+    sheet: &SheetModel,
+    rng: &mut Rng,
+) {
+    let first = pick_cell(rng, sheet);
+    let last = pick_cell(rng, sheet);
+    let rectangle = CellRange::new(first, last);
+    let reversed: CellRange = format!("{}:{}", rectangle.last(), rectangle.first())
+        .parse()
+        .or_fail(case, "reversed range");
+    let absent = (1..=CellRef::MAX_COLUMN)
+        .map(|column| cell(CellRef::MAX_ROW, column))
+        .find(|address| !sheet.cells.contains_key(address))
+        .expect("generated sheets never fill the last row");
+    let whole = CellRange::new(cell(1, 1), cell(CellRef::MAX_ROW, CellRef::MAX_COLUMN));
+    let all = view
+        .cell_contents()
+        .collect::<sheetpatch::Result<Vec<_>>>()
+        .or_fail(
+            case,
+            format_args!("{stage}: cell_contents on {:?}", sheet.name),
+        );
+    assert_eq!(
+        all.len(),
+        sheet.cells.len(),
+        "{case} {stage}: streamed count"
+    );
+    for ((address, content), (&expected_address, expected)) in all.iter().zip(&sheet.cells) {
+        assert_eq!(
+            *address, expected_address,
+            "{case} {stage}: streamed address"
+        );
+        assert!(
+            expected.matches(content),
+            "{case} {stage}: streamed {}!{address} differs from the model",
+            sheet.name
+        );
+    }
+    for range in [
+        None,
+        Some(whole),
+        Some(rectangle),
+        Some(reversed),
+        Some(absent.into()),
+    ] {
+        let expected: Vec<_> = sheet
+            .cells
+            .iter()
+            .filter(|(address, _)| range.is_none_or(|range| range.contains(**address)))
+            .collect();
+        let split = rng.below(expected.len() + 1);
+        let mut cursor = view.cell_contents_in(range);
+        let check = |item: Option<sheetpatch::Result<(CellRef, CellContent)>>,
+                     expected: &(&CellRef, &Expected)| {
+            let (address, content) = item
+                .unwrap_or_else(|| panic!("{case} {stage}: early end of {range:?}"))
+                .or_fail(case, format_args!("{stage}: streamed {range:?}"));
+            assert_eq!(address, *expected.0, "{case} {stage}: {range:?} address");
+            assert!(
+                expected.1.matches(&content),
+                "{case} {stage}: streamed {}!{address} in {range:?} differs from the model",
+                sheet.name
+            );
+        };
+        for expected in &expected[..split] {
+            check(cursor.next(), expected);
+        }
+        let checkpoint = cursor.clone();
+        for mut tail in [cursor, checkpoint] {
+            for expected in &expected[split..] {
+                check(tail.next(), expected);
+            }
+            assert!(
+                tail.next().is_none(),
+                "{case} {stage}: extra cell in {range:?}"
+            );
+            assert!(
+                tail.next().is_none(),
+                "{case} {stage}: cursor resumed after end"
+            );
+        }
+    }
+}
+
 /// Reads every modelled cell plus probes, in shuffled order with repeats,
 /// through each read API, and compares them with the model.
 fn check_reads(case: Case, stage: &str, book: &Workbook, sheets: &[SheetModel], rng: &mut Rng) {
@@ -2092,6 +2184,7 @@ fn check_reads(case: Case, stage: &str, book: &Workbook, sheets: &[SheetModel], 
             .or_fail(case, format_args!("{stage}: prepare_sheet({name:?})"));
         assert_eq!(view.sheet().name(), name, "{case} {stage}: view name");
         assert_eq!(view.sheet().path(), sheet.path, "{case} {stage}: view path");
+        check_streamed_reads(case, stage, &view, sheet, rng);
         let viewed = view
             .get_cells_at(cells.iter().copied())
             .or_fail(case, format_args!("{stage}: view.get_cells_at on {name:?}"));

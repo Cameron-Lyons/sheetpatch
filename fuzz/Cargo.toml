@@ -36,3 +36,17 @@ path = "fuzz_targets/text.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "shared_strings"
+path = "fuzz_targets/shared_strings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_parts"
+path = "fuzz_targets/package_parts.rs"
+test = false
+doc = false
+bench = false

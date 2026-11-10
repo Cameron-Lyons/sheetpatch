@@ -273,6 +273,35 @@ fn indexed_contents_filter_before_decoding_and_keep_error_context() {
             }
         }
     }
+    // Cloning before or after a failing item preserves the next address,
+    // including within a range that starts on an unreadable value.
+    let range: CellRange = "B1:D1".parse().unwrap();
+    let expected: Vec<_> = view
+        .cells()
+        .filter(|&address| range.contains(address))
+        .map(|address| {
+            view.get_cell_at(address)
+                .map(|content| (address, content))
+                .map_err(|error| error.to_string())
+        })
+        .collect();
+    for split in 0..=expected.len() {
+        let mut cursor = view.cell_contents_in(Some(range));
+        for expected in &expected[..split] {
+            assert_eq!(
+                &cursor.next().unwrap().map_err(|error| error.to_string()),
+                expected
+            );
+        }
+        let checkpoint = cursor.clone();
+        for tail in [cursor, checkpoint] {
+            assert_eq!(
+                tail.map(|item| item.map_err(|error| error.to_string()))
+                    .collect::<Vec<_>>(),
+                expected[split..]
+            );
+        }
+    }
     assert_eq!(
         view.cell_contents_in(Some("Z1:Z9".parse().unwrap()))
             .count(),
