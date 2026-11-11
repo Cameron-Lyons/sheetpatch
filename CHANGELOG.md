@@ -27,6 +27,21 @@ minimum supported version.
 - Added `Workbook::set_compression_threads(Option<NonZeroUsize>)` and
   `compression_threads` to cap workers for all save methods. `None` retains
   automatic selection; thread limits do not change archive bytes.
+- Read result text and formulas now use fallible allocations, reporting
+  `Error::Io` with `OutOfMemory` when a reservation is refused. Regression
+  tests inject allocation failure in a child process and verify later reads
+  still succeed. Batch cell limits do not cap aggregate text bytes; streaming
+  reads or smaller batches keep result retention bounded.
+- Range iteration skips unrelated columns through each row's existing index.
+  Ordered batch reads reuse lookup positions while preserving duplicates,
+  blank cells, input order, and the first read error.
+- Streaming iterators are checked against the randomized workbook model,
+  including filtered ranges and cloned cursors. New `shared_strings` and
+  `package_parts` fuzz targets wrap mutated parts in valid ZIPs, reaching
+  parsers directly and checking successful-save preservation.
+- Split package discovery into focused metadata, relationship, URI, table,
+  and XML parsing modules. Moved detailed benchmark instructions and history
+  into the packaged PERFORMANCE.md guide.
 - Separated archive, XML, and CLI responsibilities into internal modules.
   Permission-dependent tests probe the needed operating-system capability.
 - Added a separately locked fuzz workspace, seeded parser/text targets, and
