@@ -35,6 +35,10 @@ minimum supported version.
 - Range iteration skips unrelated columns through each row's existing index.
   Ordered batch reads reuse lookup positions while preserving duplicates,
   blank cells, input order, and the first read error.
+- Streaming cell iterators expose remaining size bounds, exact for whole-sheet
+  reads and ranges spanning every column, so collecting their results avoids
+  repeated vector growth. Sparse reads spanning every column also skip
+  redundant column filtering.
 - Streaming iterators are checked against the randomized workbook model,
   including filtered ranges and cloned cursors. New `shared_strings` and
   `package_parts` fuzz targets wrap mutated parts in valid ZIPs, reaching
@@ -49,6 +53,9 @@ minimum supported version.
   and retain performance history. Benchmarks calibrate repeated operations,
   include result destruction, and report variability. The included
   `scripts/benchmark.py` compares CLI time and peak RSS using interleaved runs.
+- Dependabot maintains both Cargo workspaces. Installed-package smoke tests
+  now cover range streaming and patch/save/reopen, including formula and
+  untouched ZIP-record preservation.
 
 ## 1.1.0 — 2026-10-23
 

@@ -447,8 +447,7 @@ in cached results. The original workbook's calculation settings are retained.
   that would exceed that limit are rejected before committing any worksheet
   changes or allocating the final replacement XML. Only
   XML's five predefined entities and character references are resolved,
-  whatever features other dependencies enable in `quick-xml`. Pending
-  worksheet XML of 4 GiB or more cannot be indexed and is refused. Other untouched
+  whatever features other dependencies enable in `quick-xml`. Other untouched
   compression methods are retained without decoding. ZIP patched-data entries can
   only be preserved untouched. Workbooks are held in memory; `Workbook::open`,
   `Workbook::from_reader`, and CLI standard input refuse input larger than the
@@ -593,8 +592,8 @@ yanked dependencies. Every run also exercises fresh, recorded property-test
 seeds and bounded coverage-guided fuzzing; scheduled runs extend those checks
 and record performance and peak memory alongside the dependency audit. The aggregate `CI`
 check requires every job to succeed. Actions are pinned to full commit hashes,
-workflow permissions are read-only, and Dependabot checks Cargo dependencies and
-GitHub Actions weekly.
+workflow permissions are read-only, and Dependabot checks Cargo dependencies in
+both the crate and fuzz workspaces, plus GitHub Actions, weekly.
 
 The independent `fuzz/` workspace contains seeded `workbook`, `worksheet`,
 `text`, `shared_strings`, and `package_parts` targets. They exercise malformed

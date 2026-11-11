@@ -139,8 +139,8 @@ impl DocumentRules {
     /// Checks a whole part's size, encoding and characters, and returns it as
     /// text with the rules for its events.
     pub(crate) fn source(xml: &[u8]) -> Result<(&str, Self)> {
-        // Pending worksheet XML is not size-limited until it is saved, so the
-        // compact records' offset range is enforced here.
+        // Enforce the compact records' offset range at the parser boundary,
+        // independently of the archive and edit size limits.
         if xml.len() >= u32::MAX as usize {
             return Err(Error::Unsupported(
                 "XML part exceeds the 4 GiB index limit".into(),
