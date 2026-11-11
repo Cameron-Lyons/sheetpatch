@@ -6,6 +6,7 @@ use crate::{CellRange, CellRef, CellValue, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::result::Result as StdResult;
+use std::slice;
 
 // A worksheet reference such as a merge, formula group or dimension range.
 // Unlike `CellRange`'s parser, this accepts `$` markers anywhere and refuses
@@ -107,6 +108,110 @@ pub(super) struct CellEntry {
     pub(super) address: CellRef,
     /// The cell's index in `WorksheetIndex::elements`.
     pub(super) element: usize,
+}
+
+/// Existing cells in a rectangle. Whole-sheet traversal uses one contiguous
+/// slice; rectangular traversal seeks its columns separately in each row.
+#[derive(Clone)]
+pub(super) struct CellEntries<'index> {
+    cells: &'index [CellEntry],
+    remaining: slice::Iter<'index, CellEntry>,
+    rows: slice::Iter<'index, RowEntry>,
+    first_column: u16,
+    last_column: u16,
+    filter_remaining: bool,
+}
+
+fn cell_columns(cells: &[CellEntry], first: u16, last: u16) -> &[CellEntry] {
+    let start = cells.partition_point(|cell| cell.address.column < first);
+    let cells = &cells[start..];
+    let end = cells.partition_point(|cell| cell.address.column <= last);
+    &cells[..end]
+}
+
+impl<'index> Iterator for CellEntries<'index> {
+    type Item = &'index CellEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // When there are fewer cells than rows, filtering the cell span avoids
+        // walking large runs of empty/styled rows just to find the next cell.
+        if self.filter_remaining {
+            return self.remaining.find(|cell| {
+                self.first_column <= cell.address.column && cell.address.column <= self.last_column
+            });
+        }
+        loop {
+            if let Some(cell) = self.remaining.next() {
+                return Some(cell);
+            }
+            let row = self.rows.next()?;
+            let cells = &self.cells[row.cells.clone()];
+            self.remaining = cell_columns(cells, self.first_column, self.last_column).iter();
+        }
+    }
+
+    fn fold<B, F>(self, initial: B, mut fold: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        // Choose the traversal once for reductions, rather than testing the
+        // sparse/dense mode again for every cell in a whole-sheet sum or fold.
+        if self.filter_remaining {
+            return self
+                .remaining
+                .filter(|cell| {
+                    self.first_column <= cell.address.column
+                        && cell.address.column <= self.last_column
+                })
+                .fold(initial, fold);
+        }
+        let mut result = self.remaining.fold(initial, &mut fold);
+        for row in self.rows {
+            let cells = &self.cells[row.cells.clone()];
+            result = cell_columns(cells, self.first_column, self.last_column)
+                .iter()
+                .fold(result, &mut fold);
+        }
+        result
+    }
+}
+
+/// Lookup state for nondecreasing addresses. Adjacent cells and duplicates
+/// reuse the current position; larger gaps seek within the current row.
+pub(super) struct CellCursor<'index> {
+    cells: &'index [CellEntry],
+    rows: &'index [RowEntry],
+    row: Option<u32>,
+    remaining: &'index [CellEntry],
+}
+
+// Move a sorted lookup's lower bound. Adjacent entries need one comparison;
+// a gap uses binary search rather than walking every skipped entry.
+fn seek<'index, T>(remaining: &mut &'index [T], before: impl Fn(&T) -> bool) -> Option<&'index T> {
+    let (entry, rest) = remaining.split_first()?;
+    if before(entry) {
+        *remaining = rest;
+        if rest.first().is_some_and(&before) {
+            *remaining = &rest[rest.partition_point(before)..];
+        }
+    }
+    remaining.first()
+}
+
+impl CellCursor<'_> {
+    pub(super) fn cell(&mut self, address: CellRef) -> Option<usize> {
+        if self.row != Some(address.row) {
+            self.remaining = seek(&mut self.rows, |row| row.number < address.row)
+                .filter(|row| row.number == address.row)
+                .map_or(&[], |row| &self.cells[row.cells.clone()]);
+            self.row = Some(address.row);
+        }
+        seek(&mut self.remaining, |cell| {
+            cell.address.column < address.column
+        })
+        .filter(|cell| cell.address.column == address.column)
+        .map(|cell| cell.element)
+    }
 }
 
 // A shared-formula group: its first cell, and whether any member of the
@@ -480,6 +585,66 @@ impl<'xml> WorksheetIndex<'xml> {
             .binary_search_by_key(&address.column, |cell| cell.address.column)
             .ok()?;
         Some(cells[cell].element)
+    }
+
+    pub(super) fn cell_cursor(&self) -> CellCursor<'_> {
+        CellCursor {
+            cells: &self.cells,
+            rows: &self.rows,
+            row: None,
+            remaining: &[],
+        }
+    }
+
+    pub(super) fn cells_in(&self, range: Option<CellRange>) -> CellEntries<'_> {
+        let mut entries = CellEntries {
+            cells: &self.cells,
+            remaining: self.cells.iter(),
+            rows: [].iter(),
+            first_column: 1,
+            last_column: CellRef::MAX_COLUMN,
+            filter_remaining: false,
+        };
+        if self.cells.is_empty() {
+            return entries;
+        }
+        if let Some(range) = range {
+            entries.first_column = range.first().column;
+            entries.last_column = range.last().column;
+            if self.cells.len() <= self.rows.len() {
+                // Empty or narrow rows make the cell index cheaper to search
+                // than the row index. This also skips arbitrarily many empty
+                // rows between a few stored cells.
+                let first = self
+                    .cells
+                    .partition_point(|cell| cell.address < range.first());
+                let last = self
+                    .cells
+                    .partition_point(|cell| cell.address <= range.last());
+                entries.remaining = self.cells[first..last].iter();
+                entries.filter_remaining = true;
+                return entries;
+            }
+            let first = self
+                .rows
+                .partition_point(|row| row.number < range.first().row);
+            let last = self
+                .rows
+                .partition_point(|row| row.number <= range.last().row);
+            let rows = &self.rows[first..last];
+            let start = rows.first().map_or(0, |row| row.cells.start);
+            let end = rows.last().map_or(start, |row| row.cells.end);
+            let all_columns =
+                range.first().column == 1 && range.last().column == CellRef::MAX_COLUMN;
+            if all_columns || end - start <= rows.len() {
+                entries.remaining = self.cells[start..end].iter();
+                entries.filter_remaining = !all_columns;
+            } else {
+                entries.remaining = [].iter();
+                entries.rows = rows.iter();
+            }
+        }
+        entries
     }
 
     // Whether an existing cell has a main-namespace formula child, the same

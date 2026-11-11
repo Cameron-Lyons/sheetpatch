@@ -35,7 +35,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 cargo build --locked --release --all-targets --all-features
 SHEETPATCH_BENCH_SAMPLES=1 \
 SHEETPATCH_BENCH_SAMPLE_MS=0 \
-SHEETPATCH_BENCH_OPERATIONS=bulk_at,prepared_single_reads,prepared_range_reads,indexed_cell_reads,shared_prepared_reads \
+SHEETPATCH_BENCH_OPERATIONS=bulk_at,prepared_single_reads,prepared_range_reads,indexed_cell_reads,shared_prepared_reads,narrow_column_reads,ordered_batch_reads \
 cargo bench --locked --bench editing
 cargo audit --deny unsound --deny yanked
 cargo audit --file fuzz/Cargo.lock --deny unsound --deny yanked

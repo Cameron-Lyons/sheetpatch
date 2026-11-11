@@ -553,13 +553,17 @@ pub(super) fn cell_content<'a>(
     date1904: bool,
 ) -> StdResult<CellContent, ReadError> {
     let Some(cell_index) = index.cell(address) else {
-        return Ok(CellContent {
-            value: CellValue::Blank,
-            formula: None,
-            style_index: None,
-        });
+        return Ok(blank_cell());
     };
     indexed_cell_content(index, address, cell_index, shared_strings, date1904)
+}
+
+fn blank_cell() -> CellContent {
+    CellContent {
+        value: CellValue::Blank,
+        formula: None,
+        style_index: None,
+    }
 }
 
 // The address and element come from one entry in the validated cell index.
@@ -629,8 +633,21 @@ pub(super) fn read_cells<'a>(
     contents
         .try_reserve_exact(cells.len())
         .map_err(|_| Error::Io(io::ErrorKind::OutOfMemory.into()))?;
-    for &cell in cells {
-        contents.push(cell_content(index, cell, &mut shared_strings, date1904)?);
+    if cells.windows(2).all(|pair| pair[0] <= pair[1]) {
+        let mut cursor = index.cell_cursor();
+        for &cell in cells {
+            let content = match cursor.cell(cell) {
+                Some(element) => {
+                    indexed_cell_content(index, cell, element, &mut shared_strings, date1904)?
+                }
+                None => blank_cell(),
+            };
+            contents.push(content);
+        }
+    } else {
+        for &cell in cells {
+            contents.push(cell_content(index, cell, &mut shared_strings, date1904)?);
+        }
     }
     Ok(contents)
 }
