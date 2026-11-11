@@ -132,6 +132,23 @@ fn cell_columns(cells: &[CellEntry], first: u16, last: u16) -> &[CellEntry] {
 impl<'index> Iterator for CellEntries<'index> {
     type Item = &'index CellEntry;
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining.len();
+        if self.filter_remaining {
+            return (0, Some(remaining));
+        }
+        // The current slice already matches the columns. Future rows may
+        // contain unrelated columns, but their cell span bounds the rest.
+        // With no future rows, including whole-sheet and full-width reads,
+        // the length is exact and collectors can reserve once.
+        let rows = self.rows.as_slice();
+        let future = rows
+            .first()
+            .zip(rows.last())
+            .map_or(0, |(first, last)| last.cells.end - first.cells.start);
+        (remaining, Some(remaining + future))
+    }
+
     fn next(&mut self) -> Option<Self::Item> {
         // When there are fewer cells than rows, filtering the cell span avoids
         // walking large runs of empty/styled rows just to find the next cell.
@@ -622,7 +639,8 @@ impl<'xml> WorksheetIndex<'xml> {
                     .cells
                     .partition_point(|cell| cell.address <= range.last());
                 entries.remaining = self.cells[first..last].iter();
-                entries.filter_remaining = true;
+                entries.filter_remaining =
+                    entries.first_column != 1 || entries.last_column != CellRef::MAX_COLUMN;
                 return entries;
             }
             let first = self

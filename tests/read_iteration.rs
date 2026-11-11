@@ -186,3 +186,54 @@ fn ranges_over_empty_rows_visit_only_matching_stored_cells() {
         );
     }
 }
+
+#[test]
+fn streaming_size_hints_bound_every_remaining_result() {
+    // Twelve cells in eight rows use row seeking for narrow ranges. The
+    // same cells in twenty-four rows use the sparse cell-filtering path.
+    for row_count in [8, 24] {
+        let mut rows = String::new();
+        for row in 1..=row_count {
+            write!(rows, "<row r='{row}'>").unwrap();
+            if [1, 3, 8].contains(&row) {
+                for column in 1..=4 {
+                    let cell = CellRef::try_new(row, column).unwrap();
+                    // Errors still produce an item and count toward the hint.
+                    let value = if column == 1 { "bad number" } else { "1" };
+                    write!(rows, "<c r='{cell}'><v>{value}</v></c>").unwrap();
+                }
+            }
+            rows.push_str("</row>");
+        }
+        let book = book(&rows);
+        let view = book.prepare_sheet("Data").unwrap();
+        for range in [
+            None,
+            Some("A1:XFD1048576"),
+            Some("A2:XFD7"),
+            Some("B1:C8"),
+            Some("C4:D8"),
+            Some("A2:D2"),
+            Some("A25:XFD26"),
+        ] {
+            let range = range.map(|range| range.parse::<CellRange>().unwrap());
+            let expected = view
+                .cells()
+                .filter(|&cell| range.is_none_or(|range| range.contains(cell)))
+                .count();
+            let mut contents = view.cell_contents_in(range);
+            for remaining in (0..=expected).rev() {
+                let (lower, upper) = contents.size_hint();
+                assert!(lower <= remaining, "{row_count} rows, {range:?}");
+                assert!(upper.is_some_and(|upper| upper >= remaining));
+                if range.is_none_or(|range| range.width() == CellRef::MAX_COLUMN) {
+                    assert_eq!((lower, upper), (remaining, Some(remaining)));
+                }
+                assert_eq!(contents.clone().size_hint(), (lower, upper));
+                assert_eq!(contents.next().is_some(), remaining != 0);
+            }
+            assert_eq!(contents.size_hint(), (0, Some(0)));
+            assert!(contents.next().is_none());
+        }
+    }
+}
