@@ -168,6 +168,8 @@ impl<'workbook> WorksheetView<'workbook> {
     /// [`Error::InvalidWorkbook`](crate::Error::InvalidWorkbook), or
     /// [`Error::Unsupported`](crate::Error::Unsupported), as described in
     /// [errors while reading](Workbook#errors-while-reading).
+    /// Refused allocations for copied text return [`Error::Io`](crate::Error::Io)
+    /// of kind [`std::io::ErrorKind::OutOfMemory`].
     pub fn get_cell(&self, address: &str) -> Result<CellContent> {
         self.get_cell_at(address.parse()?)
     }

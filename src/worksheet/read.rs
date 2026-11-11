@@ -32,6 +32,33 @@ impl From<Error> for ReadError {
     }
 }
 
+fn owned_text(text: Cow<'_, str>) -> Result<String> {
+    match text {
+        Cow::Borrowed(text) => xml::copy_text(text),
+        Cow::Owned(text) => Ok(text),
+    }
+}
+
+fn append_text(output: &mut String, text: &str) -> Result<()> {
+    output
+        .try_reserve(text.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    output.push_str(text);
+    Ok(())
+}
+
+// Normalize XML 1.0 literal line endings directly into the result, avoiding
+// an infallibly allocated intermediate string from the event decoder.
+fn append_xml_text(output: &mut String, text: &str) -> Result<()> {
+    let mut pieces = text.split('\r');
+    append_text(output, pieces.next().unwrap_or_default())?;
+    for piece in pieces {
+        append_text(output, "\n")?;
+        append_text(output, piece.strip_prefix('\n').unwrap_or(piece))?;
+    }
+    Ok(())
+}
+
 // XML normalizes literal CR/CRLF before expanding character references. Doing
 // that in the opposite order would silently turn a deliberate &#13; into LF.
 fn element_text<'xml>(source: &'xml str, element: &Element) -> Result<Cow<'xml, str>> {
@@ -57,20 +84,24 @@ fn element_text<'xml>(source: &'xml str, element: &Element) -> Result<Cow<'xml, 
     // element is the ordinary character U+FEFF. Consume each leading copy, so
     // the reader never starts at one.
     while let Some(rest) = content.strip_prefix("\u{feff}".as_bytes()) {
-        text.push('\u{feff}');
+        append_text(&mut text, "\u{feff}")?;
         content = rest;
     }
     let mut reader = Reader::from_reader(content);
     loop {
         match reader.read_event().map_err(Error::xml)? {
             Event::Text(value) => {
-                text.push_str(&value.xml10_content());
+                append_xml_text(&mut text, &value)?;
             }
             Event::CData(value) => {
-                text.push_str(&value.xml10_content());
+                append_xml_text(&mut text, &value)?;
             }
             Event::GeneralRef(reference) => {
-                text.push(xml::reference(&reference)?);
+                let mut buffer = [0; 4];
+                append_text(
+                    &mut text,
+                    xml::reference(&reference)?.encode_utf8(&mut buffer),
+                )?;
             }
             Event::Comment(_) | Event::PI(_) => {}
             Event::Eof => return Ok(Cow::Owned(text)),
@@ -144,9 +175,9 @@ fn rich_text(
             piece
         };
         if text.is_empty() {
-            text = piece.into_owned();
+            text = owned_text(piece)?;
         } else {
-            text.push_str(&piece);
+            append_text(&mut text, &piece)?;
         }
         Ok(())
     };
@@ -235,6 +266,8 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
             && elements[index].is(source, namespace, "si")
             && let Err(error) = match rich_text(source, elements, index, namespace) {
                 Ok(text) => strings.push(&text),
+                // Memory exhaustion is not an undecodable string entry.
+                Err(error @ Error::Io(_)) => Err(error),
                 Err(error) => strings.push_undecodable(error, &mut distinct_errors),
             }
         {
@@ -281,8 +314,8 @@ pub(crate) struct SharedStrings {
     // Each distinct decoding error once, so that a table of many damaged
     // entries costs little more than their indexes. `Error` is not
     // `RefUnwindSafe` only because an `io::Error` can box any source. A kept
-    // error never changes, and decoding never fails with an I/O error, so
-    // the table, and a workbook holding it, stay unwind-safe.
+    // error never changes. Allocation errors contain only an ErrorKind, not
+    // a user-supplied source, so the table and workbook stay unwind-safe.
     errors: Vec<AssertUnwindSafe<Error>>,
 }
 
@@ -504,7 +537,7 @@ fn stored_cell(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result
         .children(elements)
         .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
     let formula = errors::unique(formulas, || errors::invalid("cell has multiple formulas"))?
-        .map(|formula| element_text(index.source, &elements[formula]).map(Cow::into_owned))
+        .map(|formula| element_text(index.source, &elements[formula]).and_then(owned_text))
         .transpose()?;
     Ok(StoredCell {
         style_index,
@@ -557,7 +590,7 @@ pub(super) fn indexed_cell_content<'a>(
                     ))
                 })?;
             match strings.get(position) {
-                Some(Ok(text)) => CellValue::Text(text.to_owned()),
+                Some(Ok(text)) => CellValue::Text(xml::copy_text(text)?),
                 // Only the cells that use an undecodable entry fail.
                 Some(Err(error)) => {
                     return Err(ReadError::UndecodableString {
@@ -590,8 +623,8 @@ pub(super) fn read_cells<'a>(
     if cells.is_empty() {
         return Ok(Vec::new());
     }
-    // Reserve every result at once, so that a batch too large for memory is
-    // an error rather than an aborting allocation partway through.
+    // Reserve the result slots fallibly. Text and formula copies also use
+    // fallible growth; the cell-count limit does not cap their total bytes.
     let mut contents = Vec::new();
     contents
         .try_reserve_exact(cells.len())
