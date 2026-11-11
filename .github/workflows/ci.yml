@@ -187,11 +187,13 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fetch locked fuzz dependencies
         run: cargo fetch --locked --manifest-path fuzz/Cargo.toml
+      - name: Structured fuzz fixture checks
+        run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
       - name: Exercise seeded malformed-input targets
         env:
           CARGO_NET_OFFLINE: "true"
         run: |
-          for target in workbook worksheet text; do
+          for target in workbook worksheet text shared_strings package_parts; do
             cargo fuzz run "$target" -- \
               -seed="$SHEETPATCH_PROPERTY_SEED" -max_total_time="$FUZZ_SECONDS" \
               -max_len=65536 -rss_limit_mb=2048 -timeout=15

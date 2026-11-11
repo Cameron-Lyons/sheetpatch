@@ -25,6 +25,7 @@ cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnin
 rustup target add x86_64-pc-windows-msvc
 cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+cargo test --locked --manifest-path fuzz/Cargo.toml --lib
 cargo test --locked --lib --features quick-xml/escape-html
 cargo test --locked --doc --all-features
 cargo +1.88.0 test --locked --all-targets --all-features

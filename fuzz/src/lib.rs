@@ -3,8 +3,11 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
 
-use sheetpatch::{CellRef, CellValue, Workbook};
+pub mod parts;
+
+use sheetpatch::{CellContent, CellRange, CellRef, CellValue, Workbook, WorksheetView};
 use std::collections::BTreeSet;
+use std::mem;
 
 pub const MAX_INPUT: usize = 1 << 20;
 const SHEET: &str = "xl/worksheets/sheet1.xml";
@@ -13,14 +16,94 @@ const OPAQUE: &str = "custom/opaque.bin";
 /// The independent test writer puts arbitrary XML into a valid package, so
 /// mutation reaches worksheet parsing without first solving ZIP checksums.
 pub fn fixture(worksheet: &[u8], opaque: &[u8]) -> Vec<u8> {
-    common::stored_archive(&[
+    fixture_with_parts(worksheet, opaque, &[])
+}
+
+/// Rebuilds ZIP headers and checksums around mutated package XML. Replacing
+/// one part leaves its relationships and the other parts valid, allowing
+/// mutation to reach the selected parser directly.
+pub fn fixture_with_parts<'a>(
+    worksheet: &'a [u8],
+    opaque: &'a [u8],
+    replacements: &[(&'a str, &'a [u8])],
+) -> Vec<u8> {
+    let mut parts: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='xml' ContentType='application/xml'/></Types>"),
         ("_rels/.rels", b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='office' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='xl/workbook.xml'/></Relationships>"),
         ("xl/workbook.xml", b"<workbook xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><sheets><sheet name='Data' sheetId='1' r:id='sheet'/></sheets></workbook>"),
         ("xl/_rels/workbook.xml.rels", b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='sheet' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' Target='worksheets/sheet1.xml'/></Relationships>"),
         (SHEET, worksheet),
         (OPAQUE, opaque),
-    ])
+    ];
+    for &(name, xml) in replacements {
+        if let Some(part) = parts.iter_mut().find(|part| part.0 == name) {
+            part.1 = xml;
+        } else {
+            parts.push((name, xml));
+        }
+    }
+    common::stored_archive(&parts)
+}
+
+fn compare_read(
+    actual: sheetpatch::Result<(CellRef, CellContent)>,
+    expected: sheetpatch::Result<(CellRef, CellContent)>,
+) {
+    match (actual, expected) {
+        (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+        (Err(actual), Err(expected)) => {
+            assert_eq!(mem::discriminant(&actual), mem::discriminant(&expected));
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+        pair => panic!("streamed and individual reads disagree: {pair:?}"),
+    }
+}
+
+/// The first bounded prefix includes successes and failures, so one malformed
+/// value cannot hide later cells. Clone the cursor after a prefix and verify
+/// that replay starts at the same address, even after an error.
+fn check_view(view: &WorksheetView<'_>) {
+    let addresses: Vec<_> = view.cells().take(64).collect();
+    for (&address, result) in addresses.iter().zip(view.cell_contents()) {
+        compare_read(
+            result,
+            view.get_cell_at(address).map(|content| (address, content)),
+        );
+    }
+    let range = addresses
+        .first()
+        .zip(addresses.last())
+        .map(|(&first, &last)| CellRange::new(first, last));
+    let single = addresses.first().copied().map(CellRange::from);
+    for range in [None, range, single] {
+        let expected: Vec<_> = view
+            .cells()
+            .filter(|&address| range.is_none_or(|range| range.contains(address)))
+            .take(64)
+            .collect();
+        let split = expected.len() / 2;
+        let mut cursor = view.cell_contents_in(range).take(64);
+        for &address in &expected[..split] {
+            compare_read(
+                cursor.next().expect("every selected cell must be visited"),
+                view.get_cell_at(address).map(|content| (address, content)),
+            );
+        }
+        let checkpoint = cursor.clone();
+        for mut tail in [cursor, checkpoint] {
+            for &address in &expected[split..] {
+                compare_read(
+                    tail.next()
+                        .expect("a cloned iterator must retain its position"),
+                    view.get_cell_at(address).map(|content| (address, content)),
+                );
+            }
+            assert!(
+                tail.next().is_none(),
+                "an iterator visited an unselected cell"
+            );
+        }
+    }
 }
 
 /// Reads are bounded independently of a hostile worksheet's cell count. An
@@ -40,17 +123,24 @@ pub fn exercise(mut book: Workbook) {
     let mut changed = BTreeSet::new();
     for (name, path) in sheets {
         if let Ok(view) = book.prepare_sheet(&name) {
-            for address in view.cells().take(64) {
-                let _ = view.get_cell_at(address);
-            }
+            check_view(&view);
         }
-        let before = book.to_bytes().ok();
-        if book.set_cell(&name, "A1", true).is_err() {
+        let mut edited = None;
+        // The table/header and formula seeds can protect A1. A second target
+        // lets those inputs still exercise a successful edit and save.
+        for address in ["A1", "B2"] {
+            let before = book.to_bytes().ok();
+            if book.set_cell(&name, address, true).is_ok() {
+                edited = Some(address);
+                break;
+            }
             if let Some(before) = before {
                 assert_eq!(book.to_bytes().unwrap(), before, "failed edits are atomic");
             }
-            continue;
         }
+        let Some(address) = edited else {
+            continue;
+        };
         changed.insert(path);
         for (output, preserve_gaps) in [(book.to_bytes(), true), (book.to_bytes_compact(), false)] {
             // Layout ambiguity and opaque compaction gaps may refuse a save.
@@ -59,7 +149,7 @@ pub fn exercise(mut book: Workbook) {
                     Workbook::from_bytes(saved.clone()).expect("successful saves must reopen");
                 check_preserved(&original, &saved, &changed, preserve_gaps);
                 assert_eq!(
-                    reopened.get_cell(&name, "A1").unwrap().value,
+                    reopened.get_cell(&name, address).unwrap().value,
                     CellValue::Bool(true)
                 );
             }

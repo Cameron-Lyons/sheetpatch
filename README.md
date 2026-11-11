@@ -596,11 +596,15 @@ check requires every job to succeed. Actions are pinned to full commit hashes,
 workflow permissions are read-only, and Dependabot checks Cargo dependencies and
 GitHub Actions weekly.
 
-The independent `fuzz/` workspace contains seeded `workbook`, `worksheet`, and
-`text` targets. They exercise malformed ZIP and XML, scalar text round trips,
-successful-save readability, and preservation of untouched parts. Fuzzing has
-its own lockfile and development dependencies; these do not enter the library
-or published crate. To reproduce a local run:
+The independent `fuzz/` workspace contains seeded `workbook`, `worksheet`,
+`text`, `shared_strings`, and `package_parts` targets. They exercise malformed
+ZIP and XML, scalar text round trips, streaming-read equivalence, successful-save
+readability, and preservation of untouched parts. Structured targets put mutated
+shared strings and package metadata inside valid ZIPs, so mutation reaches those
+parsers without first repairing ZIP checksums. Fuzzing has its own lockfile and
+development dependencies; these do not enter the library or published crate.
+`cargo test --locked --manifest-path fuzz/Cargo.toml --lib` checks that these
+fixtures reach the intended parsers. To reproduce a local run:
 
 ```sh
 cargo install cargo-fuzz --version 0.13.2 --locked
