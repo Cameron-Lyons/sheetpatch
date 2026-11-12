@@ -236,6 +236,22 @@ fn unchanged_value<'s>(
     if matches!(value, CellValue::Blank) {
         return false;
     }
+    // A different scalar type cannot compare equal. In particular, replacing
+    // a large stored string with a number must not decode and allocate the old
+    // text merely to discard it. Payload validation still precedes this check,
+    // so unfamiliar markup and metadata retain their existing protections.
+    let kind = cell
+        .attribute(&index.attributes, "t")
+        .map_or("n", |attribute| attribute.value);
+    if !matches!(
+        (value, kind),
+        (CellValue::Text(_), "inlineStr" | "str" | "s")
+            | (CellValue::Number(_), "n" | "d")
+            | (CellValue::Bool(_), "b")
+            | (CellValue::Error(_), "e")
+    ) {
+        return false;
+    }
     match read::decode_payload(index, cell, payload, current.date1904) {
         Ok(StoredValue::Value(old)) => old == *value,
         // The table is loaded only to compare text. An entry that cannot be

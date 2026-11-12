@@ -441,6 +441,55 @@ fn buffered_read_output_stops_before_stored_text_over_the_budget() {
 }
 
 #[test]
+fn buffered_read_output_bounds_escapes_and_sheet_names() {
+    struct Writes(Vec<usize>, Vec<u8>);
+    impl Write for Writes {
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.write(bytes).map(|_| ())
+        }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.push(bytes.len());
+            self.1.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut workbook = Workbook::open(FIXTURE).unwrap();
+    workbook
+        .set_cell("Data", "A1", "\u{1f}".repeat(150))
+        .unwrap();
+    let view = workbook.prepare_sheet("Data").unwrap();
+    let cells = ["B1", "A1", "C1"].map(|address| address.parse().unwrap());
+    let long_name = "\u{1f}".repeat(150);
+    for (json, sheet, escape) in [
+        (false, "Data", Escape::Controls),
+        (true, "Data", Escape::Exact),
+        (true, long_name.as_str(), Escape::Exact),
+    ] {
+        let format = || CellOutput {
+            sheet,
+            json,
+            records: false,
+            escape,
+        };
+        let mut expected = Vec::new();
+        write_read_cells(&view, &cells, usize::MAX, &mut expected, format()).unwrap();
+        for budget in [200, 1, 0, expected.len() - 1, expected.len()] {
+            let mut output = Writes(Vec::new(), Vec::new());
+            write_read_cells(&view, &cells, budget, &mut output, format()).unwrap();
+            assert!(
+                output.0[0] <= budget,
+                "json={json}, budget={budget}: buffered {} bytes",
+                output.0[0]
+            );
+            assert_eq!(output.1, expected, "json={json}, budget={budget}");
+        }
+    }
+}
+
+#[test]
 fn indexed_output_replays_only_values_after_its_buffered_prefix() {
     use std::cell::Cell;
 
@@ -469,7 +518,8 @@ fn indexed_output_replays_only_values_after_its_buffered_prefix() {
     );
     assert_eq!(
         visits.iter().map(Cell::get).collect::<Vec<_>>(),
-        [1, 1, 1, 2, 2]
+        // The first two lines use 19 bytes; the third would exceed 20.
+        [1, 1, 2, 2, 2]
     );
 }
 

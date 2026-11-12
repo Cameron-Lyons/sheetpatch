@@ -126,7 +126,9 @@ chart sheets are retained as opaque parts. `sheet(name)` finds one worksheet,
 whose edits are refused. Worksheet names match exactly, including case. Package
 discovery resolves URI-escaped relationship targets and compares part paths
 without ASCII case, retaining the actual ZIP member names. Ambiguous equivalent
-names for an accessed part are rejected.
+names for an accessed part are rejected. Relationship types recognize surrounding
+XML whitespace, as their URI schema type requires, including when identifying
+tables and digital signatures.
 
 `get_cell` returns a `CellContent` with a scalar `value`, stored `formula` text,
 and `style_index`. Its fields are public for reading; it is `#[non_exhaustive]`,
@@ -261,11 +263,12 @@ spill and other formula-range cells without a formula of their own have a `null`
 formula. An empty worksheet prints nothing, or `[]`.
 
 Both commands validate all requested values before printing anything. While
-validating they buffer up to 4 MiB of formatted output, so a read whose output
-fits decodes each cell once; cells after that prefix are read again
-individually for output. A value whose stored text would overflow the buffer
-ends the prefix before it is copied, so repeated or oversized stored strings
-cannot multiply memory use.
+validating they buffer up to 4 MiB of formatted output, including escaping and
+repeated sheet names, so a read whose output fits decodes each cell once;
+cells after that prefix are read again individually for output. A value whose
+stored text would overflow the buffer ends the prefix before it is copied,
+and a cell whose formatting exceeds the remaining budget is streamed after
+validation instead. Buffer growth uses fallible allocation.
 
 `list` prints worksheet names in workbook order, hidden ones included.
 `list --json` returns objects with `name`, package `path`, and `visibility`
