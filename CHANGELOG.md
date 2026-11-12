@@ -7,6 +7,14 @@ thread limit, reduces read and edit overhead, and bounds batch and patch
 resource use. The Rust API remains compatible with 1.1; Rust 1.88 is still the
 minimum supported version.
 
+- Relationship types accept surrounding XML whitespace, matching their URI
+  schema type. Such whitespace no longer hides worksheets or shared strings,
+  or bypasses table-header and digital-signature edit protections.
+- CLI read buffering now applies the 4 MiB limit to actual formatted bytes,
+  including escaped controls and repeated JSON sheet names. Buffer growth is
+  fallible; cells that do not fit are streamed after validation.
+- Changing a cell's scalar type avoids decoding and copying the old text just
+  to determine that it differs, while retaining payload and metadata guards.
 - Added `WorksheetView::cell_contents` and `cell_contents_in` for lazy,
   replayable reads directly through the prepared index. CLI `cells` uses this
   path without allocating an address list or repeating index searches.

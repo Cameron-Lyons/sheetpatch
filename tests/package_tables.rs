@@ -127,6 +127,34 @@ fn table_body_and_cells_outside_tables_remain_editable() {
 }
 
 #[test]
+fn relationship_type_whitespace_cannot_bypass_table_header_protection() {
+    for padding in [" ", "\t\r\n", "&#x9;&#xA;&#xD;"] {
+        let mut padded = parts("ref='A1:B3'");
+        let relationships = padded.get_mut(SHEET_RELATIONSHIPS).unwrap();
+        *relationships = relationships.replace(
+            &format!("Type='{OFFICE_NAMESPACE}/table'"),
+            &format!("Type='{padding}{OFFICE_NAMESPACE}/table{padding}'"),
+        );
+        // Shared strings must also be selected after type normalization,
+        // since reading the current header value is part of its guard.
+        let relationships = padded.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *relationships = relationships.replace(
+            &format!("Type='{OFFICE_NAMESPACE}/sharedStrings'"),
+            &format!("Type='{padding}{OFFICE_NAMESPACE}/sharedStrings{padding}'"),
+        );
+        let original = archive(&padded);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_refused(book.set_cell("Data", "B1", "Changed"), "B1");
+        assert_refused(book.set_cell("Data", "A1", "Changed"), "A1");
+        book.set_cell("Data", "A1", "Name").unwrap();
+        assert_eq!(book.to_bytes().unwrap(), original);
+        book.set_cell("Data", "B2", 7).unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+    }
+}
+
+#[test]
 fn table_relationships_resolve_independently_of_legacy_zip_name_spelling() {
     for (target, sheet_path, relationships_path) in [
         (

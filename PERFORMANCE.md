@@ -44,6 +44,8 @@ spans of the part.
 One patch plan applies payload and attribute changes directly to worksheet spans;
 unchanged cell extensions are copied only into the final output. Edits that
 leave a worksheet unchanged retain its current XML without copying it. Shared
+and inline text is not decoded just to compare it with a replacement of a
+different scalar type; payload and metadata protections still apply. Shared
 strings are decoded while streaming, releasing each entry's XML as it completes,
 and Excel text escapes are decoded without converting ordinary UTF-8 to a
 temporary UTF-16 buffer. Numeric and predefined XML text references are decoded
@@ -59,9 +61,10 @@ allocating a batch result. Simple scalar payloads borrow the validated XML
 instead of allocating a temporary string before parsing a number, boolean,
 date, or shared-string index. CLI `cells` traverses indexed records directly,
 without collecting addresses or searching for them again. CLI reads buffer up to 4 MiB of
-formatted output while validating, with no cell-count cap, so most reads decode
-each cell once. Cells beyond the buffer are validated before printing and then
-read again individually for output.
+formatted output while validating, including escapes and repeated JSON sheet
+names, with no cell-count cap, so most reads decode each cell once. Buffer
+growth is fallible and bounded by that limit. Cells beyond the buffer are
+validated before printing and then read again individually for output.
 
 Streaming saves borrow ZIP metadata and hold one replacement compressed part at
 a time, in addition to the input archive, cached original XML, and pending

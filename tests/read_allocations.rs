@@ -1,9 +1,9 @@
-//! Reject one result allocation in a child process, so an infallible allocation
-//! regression fails this test instead of aborting the whole integration suite.
+//! Reject a selected text allocation in a child process, so an infallible
+//! allocation regression fails this test instead of aborting the whole suite.
 
 mod common;
 
-use sheetpatch::{CellRef, Error, Workbook};
+use sheetpatch::{CellRef, CellValue, Error, Workbook};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::ErrorKind;
 use std::process::Command;
@@ -137,6 +137,48 @@ fn read_result_allocations_report_out_of_memory() {
         assert!(
             output.status.success(),
             "{case}: allocation failure killed or failed the child: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn changing_scalar_type_does_not_copy_the_old_value() {
+    if let Ok(case) = env::var(CHILD_CASE) {
+        let mut workbook = Workbook::from_bytes(fixture(&case)).unwrap();
+        let replacement = if case == "error" {
+            CellValue::Bool(true)
+        } else {
+            CellValue::Number(7.0)
+        };
+        FAIL_NEXT_TEXT.store(true, Ordering::SeqCst);
+        let result = workbook.set_cell("Data", "A1", replacement.clone());
+        let armed = FAIL_NEXT_TEXT.swap(false, Ordering::SeqCst);
+        result.unwrap();
+        assert!(
+            armed,
+            "changing scalar type must not allocate a copy of the old text"
+        );
+        assert_eq!(workbook.get_cell("Data", "A1").unwrap().value, replacement);
+        return;
+    }
+
+    for case in [
+        "shared", "inline", "escaped", "decoded", "string", "error", "markup",
+    ] {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "changing_scalar_type_does_not_copy_the_old_value",
+                "--nocapture",
+            ])
+            .env(CHILD_CASE, case)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: type change copied the old text or failed: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

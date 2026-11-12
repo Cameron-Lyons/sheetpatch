@@ -593,6 +593,38 @@ fn signed_packages_are_reported_before_any_edit() {
 }
 
 #[test]
+fn relationship_type_whitespace_does_not_hide_worksheets_or_signatures() {
+    for padding in [" ", "\t\r\n", "&#x9;&#xA;&#xD;"] {
+        let mut padded = parts("", "", "");
+        for path in ["_rels/.rels", "xl/_rels/workbook.xml.rels"] {
+            let relationships = padded.get_mut(path).unwrap();
+            *relationships = relationships
+                .replace("Type='", &format!("Type='{padding}"))
+                .replace("' Target=", &format!("{padding}' Target="));
+        }
+        let original = stored(&padded);
+        let book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(book.sheets().len(), 2, "{padding}");
+        assert_eq!(book.get_cell("Data", "B1").unwrap().value, 45_306.into());
+        assert_eq!(book.to_bytes().unwrap(), original);
+
+        let relationships = padded.get_mut("_rels/.rels").unwrap();
+        *relationships = relationships.replace(
+            "</Relationships>",
+            &format!("<Relationship Id='signature' Type='{padding}{SIGNATURE_ORIGIN}{padding}' Target='custom/origin.sigs'/></Relationships>"),
+        );
+        let original = stored(&padded);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert!(book.is_signed(), "{padding}");
+        assert!(matches!(
+            book.set_cell("Data", "B1", 1),
+            Err(Error::Unsupported(message)) if message.contains("signed")
+        ));
+        assert_eq!(book.to_bytes().unwrap(), original);
+    }
+}
+
+#[test]
 fn debug_output_summarizes_the_workbook_without_its_xml() {
     let mut book =
         Workbook::from_bytes(archive("<workbookPr date1904='1'/>", "", " state='hidden'")).unwrap();

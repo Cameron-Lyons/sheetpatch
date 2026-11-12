@@ -10,8 +10,8 @@ fn relationship_node(_: usize, namespace: &str, local: &str, _: Option<&Node>) -
     namespace == PACKAGE_NAMESPACE && local == "Relationship"
 }
 
-// The relationships parser before it validated relationships as they
-// stream: it retained every relationship element, then checked them.
+// The retaining reference parser, with the same schema normalization rules:
+// it retains every relationship element, then checks them.
 fn reference_relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
     let nodes = part::xml_nodes(bytes, relationship_node)?;
     if nodes[0].local != "Relationships" || &*nodes[0].namespace != PACKAGE_NAMESPACE {
@@ -43,7 +43,7 @@ fn reference_relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
         }
         result.push(Relationship {
             id,
-            kind: required("Type")?,
+            kind: xml::trim_whitespace(&required("Type")?).to_owned(),
             target: required("Target")?,
             external: mode == "External",
         });
@@ -56,6 +56,29 @@ type Summary = StdResult<Vec<Relationship>, String>;
 
 fn summary(relationships: Result<Vec<Relationship>>) -> Summary {
     relationships.map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn relationship_type_matching_trims_only_surrounding_xml_whitespace() {
+    let table = format!("{OFFICE_NAMESPACE}/table");
+    for (kind, selected) in [
+        (table.clone(), true),
+        (format!(" &#x9;{table}&#xD;&#xA; "), true),
+        (format!("\u{85}{table}\u{a0}"), false),
+        (format!("{OFFICE_NAMESPACE}/TABLE"), false),
+        (format!("{OFFICE_NAMESPACE}/%74able"), false),
+        (format!("{OFFICE_NAMESPACE}/ta&#x9;ble"), false),
+        ("urn:vendor:table".into(), false),
+    ] {
+        let xml = format!(
+            "<Relationships xmlns='{PACKAGE_NAMESPACE}'><Relationship Id='a' Type='{kind}' Target='table.xml'/></Relationships>"
+        );
+        let relationships = parse(xml.as_bytes(), &|_, kind| kind == table).unwrap();
+        assert_eq!(relationships.len(), usize::from(selected), "{kind}");
+        if selected {
+            assert_eq!(relationships[0].kind, table);
+        }
+    }
 }
 
 #[test]
@@ -94,6 +117,7 @@ fn streamed_relationships_match_the_retaining_reference() {
         .collect();
     let children = [
         format!("<Relationship Id='a' Type='{OFFICE_NAMESPACE}/table' Target='t.xml'/>"),
+        format!("<Relationship Id='padded' Type=' &#x9;{OFFICE_NAMESPACE}/table&#xA; ' Target='t.xml'/>"),
         format!("<Relationship Id='b' Type='{OFFICE_NAMESPACE}/hyperlink' Target='https://example.com/' TargetMode='External'/>"),
         format!("<Relationship Id='c' Type='{OFFICE_NAMESPACE}/worksheet' Target='s.xml' TargetMode='Internal'></Relationship>"),
         "<Relationship Id='a&#98;' Type='t' Target='&#120;&amp;'/>".to_owned(),
