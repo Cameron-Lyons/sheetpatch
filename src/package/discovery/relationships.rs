@@ -1,7 +1,7 @@
 //! Streaming validation and selection of package relationships.
 use super::namespaces::PACKAGE_NAMESPACE;
 use super::part::{self, Tag};
-use crate::{Error, Result};
+use crate::{Error, Result, xml};
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -90,10 +90,16 @@ fn relationship<'xml>(
         }
     };
     let kind = required("Type")?;
+    // OPC's opc-relationships.xsd gives Type the xsd:anyURI datatype,
+    // whose whitespace facet collapses XML whitespace. Recognize known
+    // types after trimming: padding must not hide table-header guards or
+    // a package's signature origin. Known types contain no inner whitespace.
+    // ECMA-376 Part 2, Annex C.5 (Relationships Part).
+    let kind = xml::trim_whitespace(&kind);
     let target = required("Target")?;
-    let relationship = keep(&id, &kind).then(|| Relationship {
+    let relationship = keep(&id, kind).then(|| Relationship {
         id: id.to_string(),
-        kind: kind.into_owned(),
+        kind: kind.to_owned(),
         target: target.into_owned(),
         external,
     });

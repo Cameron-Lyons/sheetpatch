@@ -225,12 +225,74 @@ fn stored_len(content: &CellContent, json: bool) -> usize {
     value.saturating_add(formula)
 }
 
+/// Bounds both formatted bytes and buffer growth. A cell that exceeds the
+/// remaining budget is rolled back and streamed after validation instead.
+struct PrefixBuffer<'buffer> {
+    bytes: &'buffer mut Vec<u8>,
+    budget: usize,
+    full: bool,
+}
+
+impl Write for PrefixBuffer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.budget - self.bytes.len() {
+            self.full = true;
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(256)
+                .max(needed)
+                .min(self.budget);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn buffer_cell(
+    buffer: &mut Vec<u8>,
+    budget: usize,
+    cell: CellRef,
+    content: &CellContent,
+    format: &CellOutput<'_>,
+    first: &mut bool,
+) -> io::Result<bool> {
+    if stored_len(content, format.json) > budget - buffer.len() {
+        return Ok(false);
+    }
+    let start = buffer.len();
+    let was_first = *first;
+    let mut writer = PrefixBuffer {
+        bytes: buffer,
+        budget,
+        full: false,
+    };
+    let result = write_cell(&mut writer, cell, content, format, first);
+    if writer.full {
+        writer.bytes.truncate(start);
+        *first = was_first;
+        return Ok(false);
+    }
+    result.map(|()| true)
+}
+
 /// Validate every requested value before emitting any output. While
-/// validating, buffer the output of cells until it exceeds `budget` bytes;
+/// validating, buffer complete cells up to `budget` formatted bytes;
 /// only the cells after that prefix are read a second time. A cell whose
 /// stored text would exceed the budget ends the prefix before it is formatted,
-/// so the buffer outgrows the budget only by its last cell's formatting and
-/// escapes.
+/// and formatting or escaping that exceeds it rolls back that cell's output.
 pub(super) fn write_read_cells(
     view: &WorksheetView<'_>,
     cells: &[CellRef],
@@ -262,26 +324,30 @@ where
     I: Iterator<Item = sheetpatch::Result<(CellRef, CellContent)>> + Clone,
 {
     let mut buffer = Vec::new();
-    if format.json {
-        buffer.push(b'[');
+    if format.json && budget > 0 {
+        PrefixBuffer {
+            bytes: &mut buffer,
+            budget,
+            full: false,
+        }
+        .write_all(b"[")?;
     }
     let mut first = true;
     let mut remaining = cells.clone();
-    let mut buffering = true;
+    let mut buffering = budget > 0;
     while let Some(cell) = cells.next() {
         let (cell, content) = cell?;
         if buffering {
-            let stored = stored_len(&content, format.json);
-            if buffer.len().saturating_add(stored) > budget {
-                buffering = false;
-            } else {
-                write_cell(&mut buffer, cell, &content, &format, &mut first)?;
+            buffering = buffer_cell(&mut buffer, budget, cell, &content, &format, &mut first)?;
+            if buffering {
                 remaining = cells.clone();
-                buffering = buffer.len() <= budget;
             }
         }
     }
     output.write_all(&buffer)?;
+    if format.json && budget == 0 {
+        output.write_all(b"[")?;
+    }
     // Release the buffer before the remaining cells are read again.
     drop(buffer);
     for cell in remaining {
