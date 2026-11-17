@@ -112,9 +112,8 @@ pub(super) fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch
     let mut line_number = 0usize;
     loop {
         line_number += 1;
-        let invalid = |message: String| {
-            Failure::invalid("patch", format!("Patch line {line_number}: {message}"))
-        };
+        let invalid =
+            |message: String| Failure::invalid_row(format!("Patch line {line_number}: {message}"));
         match read_row(&mut reader, &mut row) {
             Ok(()) if row.is_empty() => break,
             Ok(()) => (),
@@ -166,22 +165,26 @@ pub(super) fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch
             return Err(invalid("expected SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE".into()));
         };
         let cell = args::parse_cell(cell).map_err(invalid)?;
-        let value = args::parse_value(kind, fields.next()).map_err(|error| match error {
+        let text = fields.next();
+        let value = args::parse_value(kind, text).map_err(|error| match error {
             ValueError::Arity(message) | ValueError::Invalid(message) => invalid(message),
         })?;
-        let edit =
-            CellEdit::try_new_at(sheet, cell, value).map_err(|error| invalid(error.to_string()))?;
+        let edit = args::cell_edit(sheet, cell, value, text).map_err(invalid)?;
         patch.row_count += 1;
         let lines = &mut patch.lines;
         if let Some(&index) = lines.targets.get(sheet).and_then(|cells| cells.get(&cell)) {
             lines.lines[index].last = line_number;
             patch.edits[index] = edit;
         } else {
-            lines
-                .targets
-                .entry(sheet.to_owned())
-                .or_default()
-                .insert(cell, patch.edits.len());
+            // Most rows name a sheet already seen, whose name is not copied.
+            let index = patch.edits.len();
+            if let Some(cells) = lines.targets.get_mut(sheet) {
+                cells.insert(cell, index);
+            } else {
+                lines
+                    .targets
+                    .insert(sheet.to_owned(), HashMap::from([(cell, index)]));
+            }
             lines.lines.push(EditLines {
                 first: line_number,
                 last: line_number,
@@ -194,7 +197,7 @@ pub(super) fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch
 
 pub(super) fn read_patch_arg(path: &OsStr) -> Result<Patch, Failure> {
     if path == "-" {
-        return read_patch(io::stdin().lock(), "from standard input");
+        return read_patch(streams::stdin(), "from standard input");
     }
     let origin = streams::quoted_path(path);
     let file = File::open(path)

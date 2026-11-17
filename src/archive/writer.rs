@@ -27,6 +27,8 @@ struct ChangePlan<'changes> {
 #[derive(Clone, Copy)]
 enum RecordPolicy {
     PreserveGaps,
+    // Drops obsolete records and recognized gaps, once `check_compactable`
+    // has accepted the archive.
     Compact,
 }
 
@@ -89,8 +91,37 @@ impl<W: Write> Write for KeepTail<'_, W> {
 
 impl Archive {
     pub(crate) fn write(&self, changes: &impl PartChanges) -> Result<Vec<u8>> {
+        // Gaps and obsolete records are kept, so the output is the input's
+        // size before replacements change it. Their new sizes are known only
+        // once each is compressed, so the buffer then grows as a `Vec` does.
         let mut output = Vec::with_capacity(self.original.len());
         self.write_to(changes, &mut output)?;
+        Ok(output)
+    }
+
+    pub(crate) fn compact(&self, changes: &impl PartChanges) -> Result<Vec<u8>> {
+        let plan = self.validate_changes(changes)?;
+        // An archive that cannot be compacted is refused before its output
+        // is reserved.
+        self.check_compactable()?;
+        // Without replacements, the output is exactly the active local
+        // records, the directory and the end record; obsolete records can be
+        // most of the input. Replacements change sizes that are known only
+        // once each is compressed, so the buffer then grows from empty.
+        let mut output = if changes.is_empty() {
+            Vec::with_capacity(
+                self.entries
+                    .iter()
+                    .map(|entry| entry.local_record.len())
+                    .fold(
+                        self.original.len() - self.central_start,
+                        usize::saturating_add,
+                    ),
+            )
+        } else {
+            Vec::new()
+        };
+        self.emit_records(&plan, &mut output, RecordPolicy::Compact)?;
         Ok(output)
     }
 
@@ -124,13 +155,7 @@ impl Archive {
         writer: &mut W,
         policy: RecordPolicy,
     ) -> Result<()> {
-        let preserve_gaps = match policy {
-            RecordPolicy::PreserveGaps => true,
-            RecordPolicy::Compact => {
-                self.check_compactable()?;
-                false
-            }
-        };
+        let preserve_gaps = matches!(policy, RecordPolicy::PreserveGaps);
         let mut output = KeepTail::new(writer, self.local_tail_len());
         let LocalLayout {
             mut position,
@@ -272,6 +297,7 @@ impl Archive {
         writer: &mut W,
     ) -> Result<()> {
         let plan = self.validate_changes(changes)?;
+        self.check_compactable()?;
         self.emit_records(&plan, writer, RecordPolicy::Compact)?;
         writer.flush()?;
         Ok(())

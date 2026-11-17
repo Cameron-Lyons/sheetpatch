@@ -104,6 +104,12 @@ impl<'xml> Attributes<'xml> {
         }
     }
 
+    /// The XML whose spans the records index.
+    #[inline]
+    pub(crate) fn source(&self) -> &'xml str {
+        self.source
+    }
+
     pub(crate) fn view(&self, index: usize) -> AttributeView<'_> {
         let record = &self.records[index];
         // The parser checked that these spans lie on character boundaries.

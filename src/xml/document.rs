@@ -119,8 +119,12 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<()> {
     Ok(())
 }
 
-// quick-xml returns namespace declarations without attribute normalization.
 const BYTE_ORDER_MARK: &[u8] = &[0xef, 0xbb, 0xbf];
+
+// How a UTF-16 part can begin: with a byte order mark, or with the `<?` of an
+// XML declaration, in either byte order. No well-formed UTF-8 part begins
+// with any of these.
+const UTF16_STARTS: [&[u8]; 4] = [b"\xff\xfe", b"\xfe\xff", b"<\0?\0", b"\0<\0?"];
 
 /// The rules every XML part follows as a whole: its size, encoding and
 /// characters, its declaration, one root element, and what may appear outside
@@ -145,6 +149,11 @@ impl DocumentRules {
             return Err(Error::Unsupported(
                 "XML part exceeds the 4 GiB index limit".into(),
             ));
+        }
+        // OPC permits UTF-16 parts too. One is valid XML outside the
+        // supported scope, like a UTF-8 part that declares another encoding.
+        if UTF16_STARTS.iter().any(|start| xml.starts_with(start)) {
+            return Err(Error::Unsupported("only UTF-8 XML is supported".into()));
         }
         let source = str::from_utf8(xml)
             .map_err(|error| Error::Xml(format!("XML must be UTF-8: {error}")))?;

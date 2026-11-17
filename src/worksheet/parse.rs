@@ -65,9 +65,13 @@ impl Element {
     pub(super) fn name<'s>(&self, source: &'s str) -> &'s str {
         &source[self.name_span()]
     }
+    // Names are short, so this searches bytes, which costs less than a `str`
+    // search there; a colon is ASCII, so it never splits a character.
     pub(super) fn local_name<'s>(&self, source: &'s str) -> &'s str {
         let name = self.name(source);
-        name.rsplit_once(':').map_or(name, |(_, local)| local)
+        name.bytes()
+            .rposition(|byte| byte == b':')
+            .map_or(name, |colon| &name[colon + 1..])
     }
     pub(super) fn is(&self, source: &str, namespace: NamespaceId, name: &str) -> bool {
         // Callers name an unprefixed local name, so it matches the whole
@@ -99,10 +103,14 @@ impl Element {
             name,
         )
     }
-    pub(super) fn qualified(&self, source: &str, name: &str) -> String {
-        self.name(source)
-            .rsplit_once(':')
-            .map_or_else(|| name.to_owned(), |(prefix, _)| format!("{prefix}:{name}"))
+    /// The name's prefix and its colon, such as `x:`, or `""` for an
+    /// unprefixed name. New elements in the element's namespace use it. Like
+    /// `local_name`, it searches the name's bytes.
+    pub(super) fn prefix<'s>(&self, source: &'s str) -> &'s str {
+        let name = self.name(source);
+        name.bytes()
+            .rposition(|byte| byte == b':')
+            .map_or("", |colon| &name[..=colon])
     }
 
     pub(super) fn has_children(&self) -> bool {

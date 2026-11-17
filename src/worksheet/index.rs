@@ -110,8 +110,52 @@ pub(super) struct CellEntry {
     pub(super) element: usize,
 }
 
-/// Existing cells in a rectangle. Whole-sheet traversal uses one contiguous
-/// slice; rectangular traversal seeks its columns separately in each row.
+/// The most cells per requested row number that a range read filters by
+/// column, rather than seeking the columns in each row, on a worksheet with no
+/// more cells than rows. Seeking there also visits the empty rows, so it pays
+/// only for rows so wide that searching them beats scanning them, whether or
+/// not the requested columns hold cells. Other worksheets seek rows averaging
+/// more than one cell: scanning costs less only when the requested columns
+/// are full, which the index cannot tell.
+const FILTERED_CELLS_PER_ROW: usize = 128;
+
+/// The most row numbers missing between a worksheet's first and last rows for
+/// which row searches confine themselves to a number's window, which holds no
+/// more records than there are missing numbers. Each window starts at its own
+/// offset, so searching wide ones would not share the first probes, and their
+/// cache lines, with other searches of all records.
+const NARROW_ROW_WINDOW: usize = 64;
+
+/// The fewest row records per missing row number for which row searches use
+/// windows. A window holds about as many records as there are missing
+/// numbers, and finding it costs about as much as four steps of a search of
+/// all records, so it pays only among many more records than that.
+const RECORDS_PER_MISSING_ROW: usize = 16;
+
+/// How row records are found by number, chosen from the row numbers missing
+/// between the first row and the last.
+// `Full` comes first, as the variant that costs least to test for, since its
+// searches gain the least from the others' shortcuts.
+#[derive(Clone, Copy)]
+enum RowSearch {
+    /// Every record is searched, among rows missing many numbers or too few
+    /// records for a window to pay, or at most one row.
+    Full,
+    /// At most `NARROW_ROW_WINDOW` are missing, and at most one per
+    /// `RECORDS_PER_MISSING_ROW` records: a number's window is searched.
+    Windowed,
+    /// None are missing, so a number's record, if any, is at its offset from
+    /// `first`, the first row's number.
+    Gapless { first: u32 },
+}
+
+/// Existing cells in a rectangle. On a worksheet with no more cells than rows,
+/// the cells between the rectangle's corners form one slice, filtered by
+/// column unless it averages more than `FILTERED_CELLS_PER_ROW` cells per
+/// requested row number. Otherwise the requested rows' cells form one slice,
+/// walked directly for whole rows and filtered by column when the rows average
+/// at most one cell. In the remaining cases each row's columns are sought
+/// separately.
 #[derive(Clone)]
 pub(super) struct CellEntries<'index> {
     cells: &'index [CellEntry],
@@ -150,12 +194,13 @@ impl<'index> Iterator for CellEntries<'index> {
     }
 
     fn next(&mut self) -> Option<Self::Item> {
-        // When there are fewer cells than rows, filtering the cell span avoids
-        // walking large runs of empty/styled rows just to find the next cell.
+        // Filtering a span of narrow rows avoids seeking in each row, and
+        // never visits the empty or styled rows between its cells.
         if self.filter_remaining {
-            return self.remaining.find(|cell| {
-                self.first_column <= cell.address.column && cell.address.column <= self.last_column
-            });
+            let (first, last) = (self.first_column, self.last_column);
+            return self
+                .remaining
+                .find(|cell| first <= cell.address.column && cell.address.column <= last);
         }
         loop {
             if let Some(cell) = self.remaining.next() {
@@ -174,12 +219,12 @@ impl<'index> Iterator for CellEntries<'index> {
         // Choose the traversal once for reductions, rather than testing the
         // sparse/dense mode again for every cell in a whole-sheet sum or fold.
         if self.filter_remaining {
+            // Moved into the closure, the bounds stay in registers rather than
+            // being reloaded for every cell the fold's call might change.
+            let (first, last) = (self.first_column, self.last_column);
             return self
                 .remaining
-                .filter(|cell| {
-                    self.first_column <= cell.address.column
-                        && cell.address.column <= self.last_column
-                })
+                .filter(move |cell| first <= cell.address.column && cell.address.column <= last)
                 .fold(initial, fold);
         }
         let mut result = self.remaining.fold(initial, &mut fold);
@@ -498,15 +543,16 @@ fn hidden_containers(
 // A worksheet's structure is indexed once. Byte spans remain relative to the
 // original document, so unrelated whitespace, prefixes and markup never move.
 pub(super) struct WorksheetIndex<'xml> {
-    /// The worksheet XML, which holds every element name and raw value.
-    pub(super) source: &'xml str,
     pub(super) elements: Vec<Element>,
+    /// Attribute spans, with the worksheet XML that holds every element name
+    /// and raw value, which `source` returns.
     pub(super) attributes: Attributes<'xml>,
     /// Every cell of `sheetData` in document order.
     pub(super) cells: Vec<CellEntry>,
     pub(super) namespace: NamespaceId,
     pub(super) data_index: usize,
     pub(super) rows: Vec<RowEntry>,
+    row_search: RowSearch,
     pub(super) formula_ranges: Vec<CellRange>,
     pub(super) merged_ranges: Vec<CellRange>,
     /// The first formula cell whose shared, array, or data-table group lacks a
@@ -516,6 +562,12 @@ pub(super) struct WorksheetIndex<'xml> {
 }
 
 impl<'xml> WorksheetIndex<'xml> {
+    /// The worksheet XML, which holds every element name and raw value.
+    #[inline]
+    pub(super) fn source(&self) -> &'xml str {
+        self.attributes.source()
+    }
+
     pub(super) fn parse(xml: &'xml [u8]) -> Result<Self> {
         let document = parse::parse(xml)?;
         let namespace = worksheet_namespace(&document)?;
@@ -562,14 +614,32 @@ impl<'xml> WorksheetIndex<'xml> {
             column_styles = Err("column definitions inside an unsupported XML container");
         }
         let incomplete_formula_group = formulas.first_incomplete_group();
+        // Row numbers strictly increase, so this never underflows.
+        let missing_rows = rows.first().zip(rows.last()).map_or(0, |(first, last)| {
+            (last.number - first.number) as usize + 1 - rows.len()
+        });
+        // A worksheet of at most one row has nothing to narrow, and a search
+        // of all its records costs least.
+        let row_search = match (missing_rows, rows.as_slice()) {
+            (_, [] | [_]) => RowSearch::Full,
+            (0, [first, ..]) => RowSearch::Gapless {
+                first: first.number,
+            },
+            (..=NARROW_ROW_WINDOW, rows)
+                if missing_rows * RECORDS_PER_MISSING_ROW <= rows.len() =>
+            {
+                RowSearch::Windowed
+            }
+            _ => RowSearch::Full,
+        };
         Ok(Self {
-            source,
             elements,
             attributes,
             cells,
             namespace,
             data_index,
             rows,
+            row_search,
             formula_ranges: formulas.ranges,
             merged_ranges,
             incomplete_formula_group,
@@ -592,12 +662,72 @@ impl<'xml> WorksheetIndex<'xml> {
             .map(|definition| definition.style))
     }
 
+    /// The row records that can hold the position of `number`, the count of
+    /// records numbered below it. Row numbers strictly increase, so the first
+    /// and last numbers confine it to as many records as there are numbers
+    /// missing.
+    fn row_window(&self, number: u32) -> Range<usize> {
+        let (Some(first), Some(last)) = (self.rows.first(), self.rows.last()) else {
+            return 0..0;
+        };
+        // Record `i` is numbered from `first + i` to `last - (len - 1 - i)`.
+        let high = (number.saturating_sub(first.number) as usize).min(self.rows.len());
+        let low = (number as usize + self.rows.len() - 1)
+            .saturating_sub(last.number as usize)
+            .min(high);
+        low..high
+    }
+
+    /// The positions of the row records numbered from `first` through `last`.
+    #[inline]
+    fn rows_numbered(&self, first: u32, last: u32) -> Range<usize> {
+        match self.row_search {
+            RowSearch::Full => {
+                self.rows.partition_point(|row| row.number < first)
+                    ..self.rows.partition_point(|row| row.number <= last)
+            }
+            RowSearch::Windowed => {
+                self.windowed_rows_before(first)..self.windowed_rows_before(last + 1)
+            }
+            RowSearch::Gapless { first: start } => {
+                let before =
+                    |number: u32| (number.saturating_sub(start) as usize).min(self.rows.len());
+                before(first)..before(last + 1)
+            }
+        }
+    }
+
+    /// The number of row records numbered below `number`, which is where that
+    /// row's record is or would be, among rows missing few numbers.
+    fn windowed_rows_before(&self, number: u32) -> usize {
+        let window = self.row_window(number);
+        window.start + self.rows[window].partition_point(|row| row.number < number)
+    }
+
+    // Inlined, as HEAD's search of all records alone was: as a call, the
+    // choice of search measurably slowed reads of cells that are not stored.
+    #[inline]
     pub(super) fn cell(&self, address: CellRef) -> Option<usize> {
-        let row = self
-            .rows
-            .binary_search_by_key(&address.row, |row| row.number)
-            .ok()?;
-        let cells = &self.cells[self.rows[row].cells.clone()];
+        // Among rows numbered with many gaps, an exact search of all records
+        // measured about 12% faster than a search for the row's position for
+        // single-cell reads.
+        let row = match self.row_search {
+            RowSearch::Full => {
+                let row = self
+                    .rows
+                    .binary_search_by_key(&address.row, |row| row.number)
+                    .ok()?;
+                &self.rows[row]
+            }
+            RowSearch::Windowed => {
+                let row = self.windowed_rows_before(address.row);
+                self.rows.get(row).filter(|row| row.number == address.row)?
+            }
+            RowSearch::Gapless { first } => {
+                self.rows.get(address.row.checked_sub(first)? as usize)?
+            }
+        };
+        let cells = &self.cells[row.cells.clone()];
         let cell = cells
             .binary_search_by_key(&address.column, |cell| cell.address.column)
             .ok()?;
@@ -613,6 +743,7 @@ impl<'xml> WorksheetIndex<'xml> {
         }
     }
 
+    #[inline]
     pub(super) fn cells_in(&self, range: Option<CellRange>) -> CellEntries<'_> {
         let mut entries = CellEntries {
             cells: &self.cells,
@@ -628,35 +759,59 @@ impl<'xml> WorksheetIndex<'xml> {
         if let Some(range) = range {
             entries.first_column = range.first().column;
             entries.last_column = range.last().column;
-            if self.cells.len() <= self.rows.len() {
-                // Empty or narrow rows make the cell index cheaper to search
-                // than the row index. This also skips arbitrarily many empty
-                // rows between a few stored cells.
-                let first = self
-                    .cells
-                    .partition_point(|cell| cell.address < range.first());
-                let last = self
-                    .cells
-                    .partition_point(|cell| cell.address <= range.last());
-                entries.remaining = self.cells[first..last].iter();
-                entries.filter_remaining =
-                    entries.first_column != 1 || entries.last_column != CellRef::MAX_COLUMN;
-                return entries;
-            }
-            let first = self
-                .rows
-                .partition_point(|row| row.number < range.first().row);
-            let last = self
-                .rows
-                .partition_point(|row| row.number <= range.last().row);
-            let rows = &self.rows[first..last];
-            let start = rows.first().map_or(0, |row| row.cells.start);
-            let end = rows.last().map_or(start, |row| row.cells.end);
             let all_columns =
                 range.first().column == 1 && range.last().column == CellRef::MAX_COLUMN;
-            if all_columns || end - start <= rows.len() {
+            let (first_row, last_row) = (range.first().row, range.last().row);
+            // A worksheet with no more cells than rows, such as a table
+            // followed by many formatted empty rows, or a form holding a few
+            // values among them. The cell index is the shorter one to search,
+            // and the cells between the range's corners form one span of it,
+            // which is filtered by column, never visiting the empty rows
+            // between them, unless it averages more than
+            // `FILTERED_CELLS_PER_ROW` cells per requested row number: then
+            // the requested rows are wide, and their columns are sought in
+            // each one. Searching all of the index shares the first probes
+            // with other searches.
+            let row_heavy = self.cells.len() <= self.rows.len();
+            if row_heavy {
+                let start = self
+                    .cells
+                    .partition_point(|cell| cell.address < range.first());
+                let end = self
+                    .cells
+                    .partition_point(|cell| cell.address <= range.last());
+                let requested = (last_row - first_row) as usize + 1;
+                if all_columns || end - start <= requested * FILTERED_CELLS_PER_ROW {
+                    entries.remaining = self.cells[start..end].iter();
+                    entries.filter_remaining = !all_columns;
+                    return entries;
+                }
+            }
+            // Otherwise the requested rows' cells form one span, walked
+            // directly for whole rows, filtered when the rows average at most
+            // one cell, and otherwise sought in each row, as are the wide rows
+            // of a worksheet with no more cells than rows.
+            let rows = &self.rows[self.rows_numbered(first_row, last_row)];
+            let start = rows.first().map_or(0, |row| row.cells.start);
+            let end = rows.last().map_or(start, |row| row.cells.end);
+            if all_columns {
                 entries.remaining = self.cells[start..end].iter();
-                entries.filter_remaining = !all_columns;
+            } else if !row_heavy && end - start <= rows.len() {
+                // The first row's cells before the requested columns, and the
+                // last row's after them, need not be filtered.
+                let (start, end) = match (rows.first(), rows.last()) {
+                    (Some(top), Some(bottom)) => (
+                        top.cells.start
+                            + self.cells[top.cells.clone()]
+                                .partition_point(|cell| cell.address.column < range.first().column),
+                        bottom.cells.start
+                            + self.cells[bottom.cells.clone()]
+                                .partition_point(|cell| cell.address.column <= range.last().column),
+                    ),
+                    _ => (start, end),
+                };
+                entries.remaining = self.cells[start..end].iter();
+                entries.filter_remaining = true;
             } else {
                 entries.remaining = [].iter();
                 entries.rows = rows.iter();
@@ -671,7 +826,7 @@ impl<'xml> WorksheetIndex<'xml> {
         self.cell(address).is_some_and(|cell| {
             self.elements[cell]
                 .children(&self.elements)
-                .any(|child| self.elements[child].is(self.source, self.namespace, "f"))
+                .any(|child| self.elements[child].is(self.source(), self.namespace, "f"))
         })
     }
 
@@ -689,5 +844,402 @@ impl<'xml> WorksheetIndex<'xml> {
         }
         validation::validate_ranges(cells, &self.formula_ranges, RangeKind::Formula)?;
         validation::validate_ranges(cells, &self.merged_ranges, RangeKind::Merged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    // Random worksheets, under every kind of row search and with rows wider
+    // than `FILTERED_CELLS_PER_ROW` among empty ones, and random ranges and
+    // lookups in them: every way of reading a range, and every lookup, must
+    // find what a search of every cell finds.
+    #[test]
+    fn random_ranges_and_lookups_match_full_searches() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut seen = [0usize; 3];
+        let mut row_heavy_wide = 0;
+        for case in 0..400 {
+            // Row numbers: gapless, a few missing, or many missing.
+            let size = match next(4) {
+                0 => 3,
+                1 => 40,
+                2 => 400,
+                _ => 2000,
+            };
+            let rows = 1 + next(size) as u32;
+            let start = 1 + next(50) as u32;
+            let mut numbers: Vec<u32> = Vec::new();
+            let mode = next(3);
+            let mut number = start;
+            for _ in 0..rows {
+                numbers.push(number);
+                number += match mode {
+                    0 => 1,
+                    1 => {
+                        if next(60) == 0 {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 1 + next(4) as u32,
+                };
+                if number > CellRef::MAX_ROW {
+                    break;
+                }
+            }
+            // Cells: most rows empty, some narrow, a few wider than 128 cells.
+            let mut xml = String::from(
+                "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData>",
+            );
+            let empty_share = next(4);
+            // Mostly empty rows with a few wide ones: no more cells than rows.
+            let sparse_wide = next(3) == 0 && numbers.len() >= 40;
+            let mut wide_rows = Vec::new();
+            for (position, &row) in numbers.iter().enumerate() {
+                let kind = next(20);
+                let width: u16 = if sparse_wide {
+                    if position == numbers.len() / 2 || next(numbers.len() as u64 / 4 + 1) == 0 {
+                        129 + next(200) as u16
+                    } else {
+                        0
+                    }
+                } else if kind < empty_share * 5 {
+                    0
+                } else if kind == 19 {
+                    129 + next(200) as u16
+                } else {
+                    1 + next(6) as u16
+                };
+                if width > 128 {
+                    wide_rows.push(row);
+                }
+                if width == 0 {
+                    write!(xml, "<row r='{row}'/>").unwrap();
+                    continue;
+                }
+                write!(xml, "<row r='{row}'>").unwrap();
+                let mut column = 1 + next(3) as u16;
+                for _ in 0..width {
+                    write!(xml, "<c r='{}'/>", CellRef { row, column }).unwrap();
+                    column += 1 + u16::from(next(5) == 0);
+                    if column > 400 {
+                        break;
+                    }
+                }
+                xml.push_str("</row>");
+            }
+            xml.push_str("</sheetData></worksheet>");
+            let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+            row_heavy_wide +=
+                usize::from(index.cells.len() <= index.rows.len() && !wide_rows.is_empty());
+            seen[match index.row_search {
+                RowSearch::Full => 0,
+                RowSearch::Windowed => 1,
+                RowSearch::Gapless { .. } => 2,
+            }] += 1;
+            let last = *numbers.last().unwrap();
+            for _ in 0..40 {
+                let r1 = if !wide_rows.is_empty() && next(2) == 0 {
+                    let row = wide_rows[next(wide_rows.len() as u64) as usize];
+                    row.saturating_sub(next(2) as u32).max(1)
+                } else {
+                    1 + next(u64::from(last) + 5) as u32
+                };
+                let span = match next(3) {
+                    0 => 2,
+                    1 => 50,
+                    _ => u64::from(last) + 10,
+                };
+                let r2 = r1 + next(span) as u32;
+                let c1 = 1 + next(450) as u16;
+                let c2 = if next(5) == 0 {
+                    CellRef::MAX_COLUMN
+                } else {
+                    c1 + next(300) as u16
+                };
+                let first = CellRef {
+                    row: r1.min(CellRef::MAX_ROW),
+                    column: if next(6) == 0 { 1 } else { c1 },
+                };
+                let second = CellRef {
+                    row: r2.min(CellRef::MAX_ROW),
+                    column: c2.min(CellRef::MAX_COLUMN),
+                };
+                let range = CellRange::new(first, second);
+                let expected: Vec<_> = index
+                    .cells
+                    .iter()
+                    .map(|cell| cell.address)
+                    .filter(|&address| range.contains(address))
+                    .collect();
+                let entries = index.cells_in(Some(range));
+                let (low, high) = entries.size_hint();
+                assert!(low <= expected.len(), "case {case} {range} size_hint low");
+                assert!(
+                    high.is_none_or(|high| expected.len() <= high),
+                    "case {case} {range} size_hint high"
+                );
+                let found: Vec<_> = entries.map(|cell| cell.address).collect();
+                assert_eq!(found, expected, "case {case} {range} next");
+                let folded = index
+                    .cells_in(Some(range))
+                    .fold(Vec::new(), |mut found, cell| {
+                        found.push(cell.address);
+                        found
+                    });
+                assert_eq!(folded, expected, "case {case} {range} fold");
+                let mut rest = index.cells_in(Some(range));
+                let taken: Vec<_> = rest
+                    .by_ref()
+                    .take(next(3) as usize)
+                    .map(|cell| cell.address)
+                    .collect();
+                let after = rest.fold(taken, |mut found, cell| {
+                    found.push(cell.address);
+                    found
+                });
+                assert_eq!(after, expected, "case {case} {range} fold after next");
+                assert_eq!(
+                    index.cells_in(Some(range)).count(),
+                    expected.len(),
+                    "case {case} {range} count"
+                );
+            }
+            for _ in 0..20 {
+                let address = CellRef {
+                    row: 1 + next(u64::from(last) + 3) as u32,
+                    column: 1 + next(410) as u16,
+                };
+                let expected = index
+                    .cells
+                    .iter()
+                    .find(|cell| cell.address == address)
+                    .map(|cell| cell.element);
+                assert_eq!(index.cell(address), expected, "case {case} {address}");
+            }
+        }
+        // Every kind of search is checked, and so are wide rows among more
+        // empty ones, which a range may seek row by row.
+        assert!(seen.iter().all(|&count| count > 40), "{seen:?}");
+        assert!(row_heavy_wide > 5, "{row_heavy_wide}");
+    }
+
+    // Rows wider than `FILTERED_CELLS_PER_ROW` among many more empty rows:
+    // range reads search the cell index, then seek such rows' columns one by
+    // one, whatever search their rows' numbers choose.
+    #[test]
+    fn wide_rows_among_empty_ones_match_full_searches() {
+        let wide = u16::try_from(FILTERED_CELLS_PER_ROW + 72).unwrap();
+        let gapless: Vec<u32> = (4..=700).collect();
+        let windowed: Vec<u32> = (4..=760).filter(|n| n % 70 != 0).collect();
+        let full: Vec<u32> = (10_000..=10_700).collect();
+        for (empty, search) in [(&gapless, 2), (&windowed, 1), (&full, 0)] {
+            let mut xml = String::from(
+                "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData>",
+            );
+            for row in 1..=3 {
+                write!(xml, "<row r='{row}'>").unwrap();
+                for column in 1..=wide {
+                    write!(xml, "<c r='{}'/>", CellRef { row, column }).unwrap();
+                }
+                xml.push_str("</row>");
+            }
+            for row in empty {
+                write!(xml, "<row r='{row}'/>").unwrap();
+            }
+            xml.push_str("</sheetData></worksheet>");
+            let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+            assert!(index.cells.len() <= index.rows.len());
+            let kind = match index.row_search {
+                RowSearch::Full => 0,
+                RowSearch::Windowed => 1,
+                RowSearch::Gapless { .. } => 2,
+            };
+            assert_eq!(kind, search);
+            for range in [
+                "B1:C3",
+                "B2:C2",
+                "A1:GR3",
+                "GQ1:XFD3",
+                "A2:XFD2",
+                "B1:C2000",
+                "D3:E650",
+                "A5:XFD699",
+                "A1:XFD1048576",
+                "GR1:GR1048576",
+            ] {
+                let range: CellRange = range.parse().unwrap();
+                let expected: Vec<_> = index
+                    .cells
+                    .iter()
+                    .map(|cell| cell.address)
+                    .filter(|&address| range.contains(address))
+                    .collect();
+                let found: Vec<_> = index
+                    .cells_in(Some(range))
+                    .map(|cell| cell.address)
+                    .collect();
+                assert_eq!(found, expected, "{search} {range}");
+                let folded = index
+                    .cells_in(Some(range))
+                    .fold(Vec::new(), |mut found, cell| {
+                        found.push(cell.address);
+                        found
+                    });
+                assert_eq!(folded, expected, "{search} {range} fold");
+                let mut rest = index.cells_in(Some(range));
+                let mut after_next: Vec<_> =
+                    rest.next().map(|cell| cell.address).into_iter().collect();
+                after_next = rest.fold(after_next, |mut found, cell| {
+                    found.push(cell.address);
+                    found
+                });
+                assert_eq!(after_next, expected, "{search} {range} fold after next");
+            }
+        }
+    }
+
+    // Row searches narrowed by row numbers, and range reads that search the
+    // cell index instead, must find what a search of every record finds.
+    #[test]
+    fn narrowed_searches_match_full_searches() {
+        // More records than a narrow window, numbered with gaps.
+        let wide: Vec<u32> = (1..=300).step_by(2).collect();
+        // Enough records per missing number for windows: one with room to
+        // spare, and one with exactly `RECORDS_PER_MISSING_ROW` per number.
+        let windowed: Vec<u32> = (1..=42).filter(|&n| n != 10 && n != 30).collect();
+        let boundary: Vec<u32> = (1..=68).filter(|n| ![5, 20, 21, 50].contains(n)).collect();
+        let layouts: [&[u32]; 12] = [
+            &wide,
+            &windowed,
+            &boundary,
+            &[],
+            &[7],
+            &[1, 2, 3, 4, 5, 6],
+            &[3, 4, 5, 9, 10, 11],
+            &[1, 3, 5, 7, 9, 11, 13, 15, 17],
+            &[2, 100, 101, 102, 1000],
+            &[1, 2, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50],
+            &[CellRef::MAX_ROW],
+            &[1, CellRef::MAX_ROW],
+        ];
+        // The layouts that use each kind of search: full, windowed, gapless.
+        let mut searches = [0; 3];
+        for numbers in layouts {
+            let mut xml = String::from(
+                "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData>",
+            );
+            // Every third row holds cells, so some layouts have fewer cells
+            // than rows; the others are empty rows.
+            for (position, number) in numbers.iter().enumerate() {
+                if position % 3 == 0 {
+                    write!(
+                        xml,
+                        "<row r='{number}'><c r='B{number}'/><c r='D{number}'/></row>"
+                    )
+                } else {
+                    write!(xml, "<row r='{number}'/>")
+                }
+                .unwrap();
+            }
+            xml.push_str("</sheetData></worksheet>");
+            let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+            searches[match index.row_search {
+                RowSearch::Full => 0,
+                RowSearch::Windowed => 1,
+                RowSearch::Gapless { .. } => 2,
+            }] += 1;
+            let last = numbers.last().copied().unwrap_or(0);
+            let rows = (0..=last.saturating_add(2).min(1_000))
+                .chain(last.saturating_sub(2)..=last.saturating_add(2))
+                .chain([CellRef::MAX_ROW]);
+            for number in rows {
+                assert_eq!(
+                    index.rows_numbered(number, number),
+                    index.rows.partition_point(|row| row.number < number)
+                        ..index.rows.partition_point(|row| row.number <= number),
+                    "{numbers:?} at {number}"
+                );
+                if (1..=CellRef::MAX_ROW).contains(&number) {
+                    for column in 1..=5 {
+                        let address = CellRef {
+                            row: number,
+                            column,
+                        };
+                        let expected = index
+                            .cells
+                            .iter()
+                            .find(|cell| cell.address == address)
+                            .map(|cell| cell.element);
+                        assert_eq!(index.cell(address), expected, "{numbers:?} {address}");
+                    }
+                }
+            }
+            let bounds = numbers
+                .iter()
+                .flat_map(|&number| [number.saturating_sub(1).max(1), number, number + 1])
+                .chain([1, CellRef::MAX_ROW])
+                .filter(|&row| row <= CellRef::MAX_ROW)
+                .collect::<Vec<_>>();
+            for &first in &bounds {
+                for &last in bounds.iter().filter(|&&last| last >= first) {
+                    for (first_column, last_column) in [(1, CellRef::MAX_COLUMN), (2, 2), (3, 5)] {
+                        let range = CellRange::new(
+                            CellRef {
+                                row: first,
+                                column: first_column,
+                            },
+                            CellRef {
+                                row: last,
+                                column: last_column,
+                            },
+                        );
+                        let found: Vec<_> = index
+                            .cells_in(Some(range))
+                            .map(|cell| cell.address)
+                            .collect();
+                        let expected: Vec<_> = index
+                            .cells
+                            .iter()
+                            .map(|cell| cell.address)
+                            .filter(|&address| range.contains(address))
+                            .collect();
+                        assert_eq!(found, expected, "{numbers:?} {range}");
+                        // Reductions take `fold`'s own traversal, from the
+                        // start and after `next` has taken a cell.
+                        let fold = |cells: CellEntries<'_>, mut addresses: Vec<CellRef>| {
+                            cells.fold(addresses.len(), |count, cell| {
+                                addresses.push(cell.address);
+                                count + 1
+                            });
+                            addresses
+                        };
+                        assert_eq!(
+                            fold(index.cells_in(Some(range)), Vec::new()),
+                            expected,
+                            "{numbers:?} {range} fold"
+                        );
+                        let mut rest = index.cells_in(Some(range));
+                        let first_cell = rest.next().map(|cell| cell.address);
+                        assert_eq!(
+                            fold(rest, first_cell.into_iter().collect()),
+                            expected,
+                            "{numbers:?} {range} fold after next"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(searches, [9, 2, 1], "every kind of search is checked");
     }
 }

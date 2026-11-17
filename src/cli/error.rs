@@ -28,10 +28,12 @@ pub(super) enum Failure {
     /// Invalid command syntax; the full usage follows the message.
     Usage(String),
     /// An invalid argument value or patch row; a pointer to the command's help
-    /// follows the message.
+    /// follows the message. `format` points a patch row's error to the help on
+    /// the patch format rather than to the command's details.
     Invalid {
         command: &'static str,
         message: String,
+        format: bool,
     },
     /// A workbook could not be read, edited, or written.
     Workbook(sheetpatch::Error),
@@ -49,6 +51,16 @@ impl Failure {
         Self::Invalid {
             command,
             message: message.into(),
+            format: false,
+        }
+    }
+
+    /// An invalid patch row, whose message starts with its line number.
+    pub(super) fn invalid_row(message: String) -> Self {
+        Self::Invalid {
+            command: "patch",
+            message,
+            format: true,
         }
     }
 
@@ -64,17 +76,29 @@ impl Display for Failure {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => write!(f, "{message}\n\n{USAGE}"),
-            Self::Invalid { command, message } => {
-                let topic = if *command == "patch" {
-                    "the format"
-                } else {
-                    "details"
-                };
+            Self::Invalid {
+                command,
+                message,
+                format,
+            } => {
+                let topic = if *format { "the format" } else { "details" };
                 write!(f, "{message}\nRun 'sheetpatch help {command}' for {topic}.")
+            }
+            // A worksheet name comes from arguments or a patch row, which can
+            // be long, so it is bounded like other diagnostic tokens.
+            Self::Workbook(sheetpatch::Error::SheetNotFound(name)) => {
+                write!(f, "worksheet not found: {}", DiagnosticText(name))
             }
             Self::Workbook(error) => write!(f, "{error}"),
             // The context already says what failed; print the bare OS message.
             Self::Context(context, sheetpatch::Error::Io(error)) => write!(f, "{context}: {error}"),
+            Self::Context(context, sheetpatch::Error::SheetNotFound(name)) => {
+                write!(
+                    f,
+                    "{context}: worksheet not found: {}",
+                    DiagnosticText(name)
+                )
+            }
             Self::Context(context, error) => write!(f, "{context}: {error}"),
             Self::Output(error) => write!(f, "cannot write output: {error}"),
         }

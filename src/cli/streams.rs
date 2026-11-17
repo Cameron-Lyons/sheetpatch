@@ -2,8 +2,63 @@ use super::args::Command;
 use super::error::Failure;
 use sheetpatch::Workbook;
 use std::ffi::OsStr;
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::fs::File;
+use std::io::{self, BufRead, Write};
+#[cfg(unix)]
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::path::Path;
+
+// On Unix, std's standard stream handles treat a descriptor that is not open
+// for their direction, such as standard output under `1<file`, as one that
+// silently accepts writes and reads as empty (`EBADF`). The CLI uses a
+// duplicate of the descriptor instead, which reports that error, so a
+// workbook is not discarded with exit code 0 and a patch does not read as
+// empty. Only when no descriptor is free for the duplicate does it fall back
+// to the std handle. A closed descriptor is unaffected: std reopens it as
+// `/dev/null`.
+#[cfg(unix)]
+fn duplicate(stream: BorrowedFd<'_>) -> Option<File> {
+    stream.try_clone_to_owned().ok().map(File::from)
+}
+
+/// Standard output, for every command's results. Its duplicate descriptor is
+/// made at the first write, so a command that writes nothing there, such as
+/// `set` with an OUTPUT file, never holds it, and one that does has already
+/// closed its INPUT.
+#[derive(Default)]
+pub(super) struct Stdout(Option<Box<dyn Write>>);
+
+impl Stdout {
+    fn stream(&mut self) -> &mut dyn Write {
+        &mut **self.0.get_or_insert_with(|| {
+            #[cfg(unix)]
+            if let Some(file) = duplicate(io::stdout().as_fd()) {
+                return Box::new(file);
+            }
+            Box::new(io::stdout().lock())
+        })
+    }
+}
+
+impl Write for Stdout {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.as_mut().map_or(Ok(()), |stream| stream.flush())
+    }
+}
+
+/// Standard input, for a workbook or a patch.
+pub(super) fn stdin() -> Box<dyn BufRead> {
+    #[cfg(unix)]
+    if let Some(file) = duplicate(io::stdin().as_fd()) {
+        return Box::new(io::BufReader::new(file));
+    }
+    Box::new(io::stdin().lock())
+}
 
 pub(super) fn quoted_path(path: &OsStr) -> String {
     format!("'{}'", Path::new(path).display())
@@ -37,7 +92,7 @@ impl<'args> Source<'args> {
                 Failure::Context(format!("cannot read workbook {}", quoted_path(path)), error)
             }),
             // Reading stops once the input exceeds the largest ZIP32 archive.
-            Self::Stdin => Workbook::from_reader(io::stdin().lock()).map_err(|error| {
+            Self::Stdin => Workbook::from_reader(stdin()).map_err(|error| {
                 Failure::Context("cannot read workbook from standard input".into(), error)
             }),
         }

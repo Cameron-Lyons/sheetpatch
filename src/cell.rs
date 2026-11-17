@@ -427,7 +427,8 @@ impl FusedIterator for CellRangeIter {}
 /// `u16`, `u32`) become [`CellValue::Number`]; `bool` becomes
 /// [`CellValue::Bool`]; and `Option<T>` maps `None` to [`CellValue::Blank`].
 /// The 64-bit and pointer-sized integers (`i64`, `u64`, `isize`, `usize`) use
-/// `TryFrom` instead, which rejects values that `f64` cannot hold exactly.
+/// `TryFrom` instead, which rejects magnitudes above 2^53, where `f64` stops
+/// representing every integer.
 /// There is deliberately no `f32` conversion: `0.1f32` would widen to
 /// `0.10000000149011612`.
 ///
@@ -818,8 +819,8 @@ const MAX_EXACT_INTEGER: u64 = 1 << 53;
 
 fn inexact_integer(integer: impl Display) -> Error {
     Error::InvalidValue(format!(
-        "integer {integer} exceeds 2^53 in magnitude, so it cannot be stored exactly as a number; \
-         write it as text"
+        "integer {integer} exceeds 2^53 in magnitude, beyond which numbers do not represent every \
+         integer exactly; write it as text"
     ))
 }
 

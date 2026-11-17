@@ -4,8 +4,7 @@ use crate::{Error, Result};
 use quick_xml::events::BytesRef;
 #[cfg(test)]
 use std::borrow::Cow;
-use std::fmt::Write as _;
-use std::io;
+use std::{io, mem};
 
 /// Copy text into a result without aborting when its allocation is refused.
 pub(crate) fn copy_text(text: &str) -> Result<String> {
@@ -135,38 +134,160 @@ pub(crate) fn append_cell_text(output: &mut String, text: &str) {
     append_escaped(output, text, true);
 }
 
+// Bytes that start a character `append_escaped` may escape. `CHARACTER` marks
+// `_`, which may start a token, ASCII controls XML 1.0 forbids, and 0xEF, which
+// starts U+FFFE and U+FFFF: these are decided by their whole character. `XML`
+// marks `&`, `<`, `>` and carriage return, each escaped as one byte in XML
+// text. No UTF-8 continuation byte is among them, so every other byte is
+// copied in runs.
+const CHARACTER: u8 = 1;
+const XML: u8 = 2;
+const ESCAPE_STARTS: [u8; 256] = {
+    let mut table = [0; 256];
+    let mut byte = 0;
+    while byte < 0x20 {
+        if byte != b'\t' && byte != b'\n' && byte != b'\r' {
+            table[byte as usize] = CHARACTER;
+        }
+        byte += 1;
+    }
+    table[b'_' as usize] = CHARACTER;
+    table[0xef] = CHARACTER;
+    table[b'&' as usize] = XML;
+    table[b'<' as usize] = XML;
+    table[b'>' as usize] = XML;
+    table[b'\r' as usize] = XML;
+    table
+};
+
 fn append_escaped(output: &mut String, text: &str, xml: bool) {
     let bytes = text.as_bytes();
-    for (position, character) in text.char_indices() {
-        if character == '_'
-            && excel_escape_prefix_at(bytes, position)
-            && text[position + 6..]
+    let starts = if xml { CHARACTER | XML } else { CHARACTER };
+    // The start of the bytes not yet copied, and the byte being looked at,
+    // which is always the first byte of a character when it can start one
+    // that is escaped.
+    let mut copied = 0;
+    let mut position = 0;
+    while position < bytes.len() {
+        let byte = bytes[position];
+        let class = ESCAPE_STARTS[usize::from(byte)] & starts;
+        if class == 0 {
+            position += 1;
+            continue;
+        }
+        if class == XML {
+            match byte {
+                b'&' => push_escape(output, text, copied, "&amp;", position),
+                b'<' => push_escape(output, text, copied, "&lt;", position),
+                b'>' => push_escape(output, text, copied, "&gt;", position),
+                _ => push_escape(output, text, copied, "&#13;", position),
+            }
+            position += 1;
+            copied = position;
+            continue;
+        }
+        let character = if byte.is_ascii() {
+            char::from(byte)
+        } else {
+            text[position..]
                 .chars()
                 .next()
-                .is_some_and(|next| next == '_' || !valid_char(next))
-        {
-            output.push_str("_x005F_");
-        } else if valid_char(character) {
-            match (xml, character) {
-                (true, '&') => output.push_str("&amp;"),
-                (true, '<') => output.push_str("&lt;"),
-                (true, '>') => output.push_str("&gt;"),
-                (true, '\r') => output.push_str("&#13;"),
-                _ => output.push(character),
+                .expect("an escapable byte starts a character")
+        };
+        let len = character.len_utf8();
+        if character == '_' {
+            if excel_escape_prefix_at(bytes, position)
+                && text[position + 6..]
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next == '_' || !valid_char(next))
+            {
+                push_escape(output, text, copied, "_x005F_", position);
+                copied = position + len;
             }
-        } else {
-            write!(output, "_x{:04X}_", u32::from(character))
-                .expect("writing to a String cannot fail");
+        } else if !valid_char(character) {
+            let token = forbidden_escape(character);
+            let token = str::from_utf8(&token).expect("an escape token is ASCII");
+            push_escape(output, text, copied, token, position);
+            copied = position + len;
         }
+        position += len;
     }
+    output.push_str(&text[copied..]);
+}
+
+// Copies the unescaped `text` from `copied` to `position`, then pushes
+// `escape`. Always inlined, so that each literal escape is copied inline.
+#[inline(always)]
+fn push_escape(output: &mut String, text: &str, copied: usize, escape: &str, position: usize) {
+    if copied < position {
+        output.push_str(&text[copied..position]);
+    }
+    output.push_str(escape);
+}
+
+// The `_xHHHH_` escape of a character XML 1.0 forbids, all of which are in the
+// BMP.
+fn forbidden_escape(character: char) -> [u8; 7] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let code = u32::from(character);
+    let mut token = *b"_x0000_";
+    for (digit, shift) in token[2..6].iter_mut().zip([12, 8, 4, 0]) {
+        *digit = HEX[((code >> shift) & 0xf) as usize];
+    }
+    token
 }
 
 // ST_Xstring escapes represent UTF-16 code units, including surrogate pairs.
 // Decode only once so the escaped underscore in `_x005F_x0041_` stays literal.
 pub(crate) fn excel_text(text: &str) -> Result<String> {
-    let Some(mut position) = text.find('_') else {
+    // Only an underscore can start an escape, so most text is copied as is.
+    let Some(underscore) = text.find('_') else {
         return copy_text(text);
     };
+    let mut output = String::new();
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    decode_excel_text(&mut output, text, underscore)?;
+    // Escapes can shorten text considerably. Keep decoded text compact, but
+    // do not use shrink_to_fit: its reallocation can abort on failure too.
+    if output.len() < output.capacity() {
+        copy_text(&output)
+    } else {
+        Ok(output)
+    }
+}
+
+// Like `excel_text`, but appends the decoded text to `output`, which grows
+// by at most `text.len()`. On an error, `output` may hold part of it.
+pub(crate) fn append_excel_text(output: &mut String, text: &str) -> Result<()> {
+    // Decoding never lengthens the spelling, so this one fallible reservation
+    // covers every push, including ordinary spans and surrogate pairs.
+    output
+        .try_reserve(text.len())
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    match text.find('_') {
+        Some(underscore) => {
+            // Decoding into a local, rather than through the reference,
+            // measured about 15 fewer instructions per underscore.
+            let mut decoded = mem::take(output);
+            let result = decode_excel_text(&mut decoded, text, underscore);
+            *output = decoded;
+            result
+        }
+        None => {
+            output.push_str(text);
+            Ok(())
+        }
+    }
+}
+
+// Appends `text`, whose first underscore is at `position`, to `output`,
+// which has room for all of it, decoding its escapes. Inlined, as a call
+// measurably slowed reads of short text with underscores.
+#[inline(always)]
+fn decode_excel_text(output: &mut String, text: &str, mut position: usize) -> Result<()> {
     let bytes = text.as_bytes();
     let unit_at = |position: usize| {
         if !excel_escape_prefix_at(bytes, position) || bytes.get(position + 6) != Some(&b'_') {
@@ -180,12 +301,6 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
     let unpaired = || Error::Unsupported("unpaired UTF-16 surrogate in Excel text escape".into());
     // Copy ordinary UTF-8 spans directly instead of converting the entire
     // value to a temporary UTF-16 buffer merely because it has an underscore.
-    // Decoding never lengthens the spelling, so this one fallible reservation
-    // covers every push below, including ordinary spans and surrogate pairs.
-    let mut output = String::new();
-    output
-        .try_reserve_exact(text.len())
-        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     let mut start = 0;
     loop {
         output.push_str(&text[start..position]);
@@ -215,13 +330,7 @@ pub(crate) fn excel_text(text: &str) -> Result<String> {
         }
     }
     output.push_str(&text[start..]);
-    // Escapes can shorten text considerably. Keep decoded text compact, but
-    // do not use shrink_to_fit: its reallocation can abort on failure too.
-    if output.len() < output.capacity() {
-        copy_text(&output)
-    } else {
-        Ok(output)
-    }
+    Ok(())
 }
 
 #[cfg(test)]

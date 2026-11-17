@@ -14,5 +14,6 @@ mod validation;
 
 #[cfg(test)]
 pub(crate) use parse::parse_xml;
+pub(crate) use patch::rewrites_unchanged;
 pub(crate) use prepared_worksheet::{PreparedWorksheet, read_cells};
 pub(crate) use read::{ReadError, SharedStrings, read_shared_strings};

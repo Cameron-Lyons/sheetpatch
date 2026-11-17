@@ -943,6 +943,27 @@ fn repeated_compaction_stays_small_and_preserves_untouched_records_and_metadata(
 }
 
 #[test]
+fn serialized_archives_reserve_what_they_keep() {
+    let mut archive = Archive::try_new(combine(
+        decorate_fixture(b"part.xml", Method::Stored),
+        decorate_fixture(b"keep.xml", Method::Opaque),
+    ))
+    .unwrap();
+    // Each append leaves the previous record behind as an obsolete copy.
+    for index in 0..4 {
+        let changes = BTreeMap::from([("part.xml".into(), vec![b'x'; 4096 + index])]);
+        archive = Archive::try_new(append(&archive, &changes)).unwrap();
+    }
+    let unchanged = archive.write(&BTreeMap::new()).unwrap();
+    assert_eq!(unchanged, archive.original);
+    assert_eq!(unchanged.capacity(), unchanged.len());
+    // Without replacements, compaction reserves exactly the records it keeps.
+    let compacted = archive.compact(&BTreeMap::new()).unwrap();
+    assert!(compacted.len() < archive.original.len() / 2);
+    assert_eq!(compacted.capacity(), compacted.len());
+}
+
+#[test]
 fn compaction_applies_pending_changes_without_retaining_the_previous_member() {
     let archive = Archive::try_new(fixture(Descriptor::Absent)).unwrap();
     let changes = BTreeMap::from([("part.xml".into(), b"updated".to_vec())]);

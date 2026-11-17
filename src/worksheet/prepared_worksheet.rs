@@ -61,7 +61,7 @@ impl<'xml> PreparedWorksheet<'xml> {
 
     /// Reads cells in request order. The shared-string loader is called only
     /// for requested `t="s"` cells, and returns `None` for a workbook without
-    /// a table; the workbook loads its table once and keeps it. `date1904`
+    /// a table; the workbook keeps its table once it loads. `date1904`
     /// selects the workbook's date system for ISO 8601 (`t="d"`) cells, which
     /// read as Excel serials.
     pub(crate) fn read_cells<'strings>(

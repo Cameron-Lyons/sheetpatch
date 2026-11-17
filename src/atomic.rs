@@ -6,7 +6,7 @@ use rustix::fs as rustix_fs;
 use rustix::io as rustix_io;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, is_separator};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,10 +139,10 @@ impl Mode {
     /// Whether `file`, a new file, has an access ACL whose mask matters: one
     /// it inherits from its directory's default ACL.
     fn inherited_acl(self, file: &File) -> bool {
-        // An empty buffer asks only whether the file has an access ACL.
+        // A size query asks only whether the file has an access ACL.
         #[cfg(target_os = "linux")]
-        let has_acl = self.masked != self.plain
-            && rustix_fs::fgetxattr(file, ACCESS_ACL, &mut [0; 0]).is_ok();
+        let has_acl =
+            self.masked != self.plain && rustix_fs::fgetxattr_query(file, ACCESS_ACL).is_ok();
         // Elsewhere both modes are the file's mode bits as they are.
         #[cfg(not(target_os = "linux"))]
         let has_acl = {
@@ -285,13 +285,27 @@ fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> 
 /// Symlinks are followed, so a link to a regular file is accepted and later
 /// replaced by the new file. Anything else that already exists (a directory,
 /// FIFO, device, or socket) cannot be replaced by renaming a workbook over
-/// it, so it is rejected before any output is generated.
+/// it, so it is rejected before any output is generated. So, on Windows, is
+/// a read-only destination, which a rename refuses to replace.
 fn existing_destination(path: &Path) -> io::Result<Option<Metadata>> {
     match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(metadata) if metadata.is_file() => {
+            // The rename replaces a symlink itself rather than its target, so
+            // the attribute that decides is the link's own.
+            #[cfg(windows)]
+            if fs::symlink_metadata(path)?.permissions().readonly() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ));
+            }
+            Ok(Some(metadata))
+        }
+        // Like other I/O errors, this one does not repeat the path, which
+        // callers already name.
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("destination is not a regular file: {}", path.display()),
+            "destination is not a regular file",
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -343,13 +357,27 @@ fn assign_group(file: &File, gid: u32) -> io::Result<bool> {
         || (unix_fs::fchown(file, None, Some(gid)).is_ok() && file.metadata()?.gid() == gid))
 }
 
+/// Give `file` the permission bits `mode`, unless it already has exactly
+/// those. Some mounts, such as vfat, exFAT or CIFS ones that give every file
+/// one owner and mode, let other users create, write and rename files but
+/// refuse their chmod even when it would change nothing.
+#[cfg(unix)]
+fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if file.metadata()?.mode() & 0o7777 == mode {
+        return Ok(());
+    }
+    file.set_permissions(Permissions::from_mode(mode))
+}
+
 /// Create the replacement of `path`, an existing destination with resolved
 /// metadata `destination`, with the destination's group and mode bits before
 /// any contents are written.
 #[cfg(unix)]
 fn create_replacement(path: &Path, destination: &Metadata) -> Result<Temporary> {
-    use std::fs::Permissions;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     // Like the metadata, the ACL is read through symlinks.
     #[cfg(target_os = "linux")]
@@ -363,12 +391,10 @@ fn create_replacement(path: &Path, destination: &Metadata) -> Result<Temporary> 
     let temp = create_temporary(path, Some(mode.plain & 0o700))?;
     let same_group = assign_group(temp.file(), destination.gid())?;
     let inherited_acl = same_group && mode.inherited_acl(temp.file());
-    temp.file()
-        .set_permissions(Permissions::from_mode(replacement_bits(
-            mode,
-            same_group,
-            inherited_acl,
-        )))?;
+    set_mode(
+        temp.file(),
+        replacement_bits(mode, same_group, inherited_acl),
+    )?;
     Ok(temp)
 }
 
@@ -387,8 +413,7 @@ fn create_replacement(path: &Path, destination: &Metadata) -> Result<Temporary> 
 /// assigning that group when the process may.
 #[cfg(unix)]
 fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporary> {
-    use std::fs::Permissions;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let Some(source) = source else {
         return create_temporary(path, None);
@@ -426,14 +451,24 @@ fn create_new(path: &Path, source: Option<SourcePermissions>) -> Result<Temporar
     } else {
         mode & source.mode.plain
     };
-    temp.file()
-        .set_permissions(Permissions::from_mode(replacement_mode(mode, same_group)))?;
+    set_mode(temp.file(), replacement_mode(mode, same_group))?;
     Ok(temp)
 }
 
 #[cfg(not(unix))]
 fn create_new(path: &Path, _: Option<SourcePermissions>) -> Result<Temporary> {
     create_temporary(path, None)
+}
+
+/// Whether `path` ends in a separator or a `.` component. Either makes it name
+/// a directory, although `Path::file_name` ignores both.
+fn names_a_directory(path: &Path) -> bool {
+    let separator = |byte: &u8| is_separator(char::from(*byte));
+    match path.as_os_str().as_encoded_bytes() {
+        [.., last] if separator(last) => true,
+        [.., before, b'.'] => separator(before),
+        _ => false,
+    }
 }
 
 /// Make a completed rename durable.
@@ -473,7 +508,7 @@ pub(crate) fn write(
 ) -> Result<()> {
     use std::io::Write as _;
 
-    if path.file_name().is_none() {
+    if path.file_name().is_none() || names_a_directory(path) {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "destination must name a file").into(),
         );
@@ -739,8 +774,36 @@ mod tests {
         // A trailing separator or `.` component still names the directory.
         let dotted = destination.join(".");
         let result = write(&dotted, None, |_| panic!("rejected before serializing"));
-        assert_invalid_input(result, "destination is not a regular file");
+        assert_invalid_input(result, "destination must name a file");
         assert_eq!(directory.entries(), 1);
+    }
+
+    // `Path::file_name` ignores a trailing separator or `.` component, but a
+    // rename to such a path fails only after the whole output was written.
+    #[test]
+    fn destinations_ending_in_a_separator_are_invalid_input() {
+        let directory = TempDir::new("separator");
+        fs::write(directory.join("book.xlsx"), b"kept").unwrap();
+        let mut suffixes = vec!["/", "/.", "//"];
+        if cfg!(windows) {
+            suffixes.extend(["\\", "\\."]);
+        }
+        for name in ["new.xlsx", "book.xlsx"] {
+            for suffix in &suffixes {
+                let mut destination = directory.join(name).into_os_string();
+                destination.push(suffix);
+                let destination = Path::new(&destination);
+                let result = write(destination, None, |_| {
+                    panic!("{destination:?} must be rejected before serializing")
+                });
+                assert_invalid_input(result, "destination must name a file");
+            }
+        }
+        assert_eq!(fs::read(directory.join("book.xlsx")).unwrap(), b"kept");
+        assert_eq!(directory.entries(), 1);
+        // A name that merely ends in a dot is a file name.
+        write(&directory.join("new."), None, |_| Ok(())).unwrap();
+        assert_eq!(directory.entries(), 2);
     }
 
     #[cfg(unix)]
@@ -1434,6 +1497,30 @@ mod tests {
         assert_eq!(directory.entries(), 1);
     }
 
+    // Some mounts refuse any chmod by a user who does not own the file, even
+    // one that changes nothing. An immutable file refuses chmod the same way,
+    // even from its owner, so it stands in for such a mount here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn modes_a_file_already_has_are_not_applied_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new("immutable");
+        let path = directory.join("locked");
+        fs::write(&path, b"locked").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+        let file = File::open(&path).unwrap();
+        let flags = |flag| Command::new("chflags").arg(flag).arg(&path).status();
+        assert!(flags("uchg").unwrap().success());
+        let unchanged = set_mode(&file, 0o640);
+        let changed = set_mode(&file, 0o600);
+        // Clear the flag before asserting, so the directory can be removed.
+        assert!(flags("nouchg").unwrap().success());
+        unchanged.unwrap();
+        assert_eq!(changed.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(mode(&path), 0o640);
+    }
+
     #[cfg(windows)]
     #[test]
     // Windows-only: this clears the readonly attribute, not Unix world-write bits.
@@ -1445,22 +1532,37 @@ mod tests {
         let mut permissions = fs::metadata(&destination).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&destination, permissions).unwrap();
+
+        // A replacement inherits the readonly attribute, which a symlinked
+        // destination can pass on to a save that then fails. Cleanup clears it.
+        let metadata = fs::metadata(&destination).unwrap();
+        let temp = create_replacement(&destination, &metadata).unwrap();
+        assert!(temp.file().metadata().unwrap().permissions().readonly());
+        drop(temp);
+        assert_eq!(directory.entries(), 1);
+
+        // Windows rejects replacing a readonly destination at rename, so a
+        // save is refused before it generates any output.
+        let mut serialized = false;
         let result = write(&destination, None, |writer| {
-            writer.write_all(b"partial replacement")?;
-            Err(io::Error::other("intentional serialization failure").into())
+            serialized = true;
+            writer.write_all(b"replacement")?;
+            Ok(())
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied),
+            "{result:?}"
+        );
+        assert!(!serialized, "a refused destination must not be serialized");
         assert_eq!(fs::read(&destination).unwrap(), b"original");
         assert_eq!(directory.entries(), 1);
         assert!(fs::metadata(&destination).unwrap().permissions().readonly());
-
-        // Windows also rejects replacing a readonly destination at rename.
-        let result = replace(&destination, b"replacement");
-        assert!(result.is_err());
-        assert_eq!(fs::read(&destination).unwrap(), b"original");
-        assert_eq!(directory.entries(), 1);
+        // Once the destination is writable again, it can be replaced.
         let mut permissions = fs::metadata(&destination).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&destination, permissions).unwrap();
+        replace(&destination, b"replacement").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert_eq!(directory.entries(), 1);
     }
 }

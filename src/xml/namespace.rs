@@ -62,7 +62,14 @@ impl<'xml> NamespaceReader<'xml> {
         &self.namespaces
     }
 
-    fn push(&mut self, tag: &BytesStart<'_>) -> quick_xml::Result<()> {
+    // `declares` is whether the tag spells `xmlns`, which any namespace
+    // declaration does. The resolver scans every attribute of the tag it is
+    // given for one, so a tag that cannot declare any is replaced by an empty
+    // one, which opens the same scope without that scan.
+    fn push(&mut self, tag: &BytesStart<'_>, declares: bool) -> quick_xml::Result<()> {
+        if !declares {
+            return Ok(self.namespaces.push(&BytesStart::new(""))?);
+        }
         match self.namespaces.push(tag) {
             Ok(()) => Ok(()),
             Err(error @ NamespaceError::InvalidXmlPrefixBind(_)) => {
@@ -95,11 +102,11 @@ impl<'xml> NamespaceReader<'xml> {
         }
     }
 
-    fn record_scope(&mut self, tag: &BytesStart<'_>) {
+    fn record_scope(&mut self, tag: &BytesStart<'_>, declares: bool) {
         // Ordinary tags need no second attribute scan. A matching word in a
         // name or value does not itself change bindings.
         let mut previous = Vec::new();
-        if tag.as_ref().contains("xmlns") {
+        if declares {
             let scope = self.namespace_scopes.len();
             for attribute in tag.attributes().with_checks(false) {
                 let Ok(attribute) = attribute else {
@@ -144,8 +151,9 @@ impl<'xml> NamespaceReader<'xml> {
         let event = self.reader.read_event()?;
         match &event {
             Event::Start(tag) | Event::Empty(tag) => {
-                self.push(tag)?;
-                self.record_scope(tag);
+                let declares = tag.as_ref().contains("xmlns");
+                self.push(tag, declares)?;
+                self.record_scope(tag, declares);
                 self.pending_pop = matches!(event, Event::Empty(_));
             }
             Event::End(_) => self.pending_pop = true,

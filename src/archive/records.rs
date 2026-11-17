@@ -204,6 +204,11 @@ pub(super) fn central_directory(bytes: &[u8], end: usize) -> Result<(usize, u16)
     if add(central_start, central_size as usize)? != end {
         return Err(invalid("ZIP central-directory bounds are inconsistent"));
     }
+    // Every entry needs a fixed-size header, so a count the directory cannot
+    // hold is refused before it sizes any allocation.
+    if usize::from(count) * CENTRAL_HEADER_LEN > central_size as usize {
+        return Err(invalid("truncated or invalid ZIP central-directory entry"));
+    }
     Ok((central_start, count))
 }
 

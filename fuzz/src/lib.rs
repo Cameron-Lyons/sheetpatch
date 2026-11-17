@@ -59,6 +59,13 @@ fn compare_read(
     }
 }
 
+/// Whether a read refused a cell's style index, the one refusal that an edit
+/// leaving the cell unchanged keeps; any other is replaced by a change.
+pub fn refuses_style_index(error: &sheetpatch::Error) -> bool {
+    matches!(error, sheetpatch::Error::InvalidWorkbook(message)
+        if message.ends_with("invalid cell style index"))
+}
+
 /// The first bounded prefix includes successes and failures, so one malformed
 /// value cannot hide later cells. Clone the cursor after a prefix and verify
 /// that replay starts at the same address, even after an error.
@@ -130,15 +137,19 @@ pub fn exercise(mut book: Workbook) {
         // lets those inputs still exercise a successful edit and save.
         for address in ["A1", "B2"] {
             let before = book.to_bytes().ok();
+            let refused = book
+                .get_cell(&name, address)
+                .err()
+                .map(|error| error.to_string());
             if book.set_cell(&name, address, true).is_ok() {
-                edited = Some(address);
+                edited = Some((address, before, refused));
                 break;
             }
             if let Some(before) = before {
                 assert_eq!(book.to_bytes().unwrap(), before, "failed edits are atomic");
             }
         }
-        let Some(address) = edited else {
+        let Some((address, before, refused)) = edited else {
             continue;
         };
         changed.insert(path);
@@ -148,10 +159,27 @@ pub fn exercise(mut book: Workbook) {
                 let reopened =
                     Workbook::from_bytes(saved.clone()).expect("successful saves must reopen");
                 check_preserved(&original, &saved, &changed, preserve_gaps);
-                assert_eq!(
-                    reopened.get_cell(&name, address).unwrap().value,
-                    CellValue::Bool(true)
-                );
+                match reopened.get_cell(&name, address) {
+                    Ok(cell) => assert_eq!(cell.value, CellValue::Bool(true)),
+                    // An edit that changes nothing succeeds even where reads
+                    // refuse the cell's style index, which it leaves as it was.
+                    Err(error) => {
+                        assert!(
+                            refuses_style_index(&error),
+                            "a changed cell must read: {error}"
+                        );
+                        assert_eq!(Some(error.to_string()), refused, "a changed cell must read");
+                        assert_eq!(book.to_bytes().ok(), before, "and nothing changed");
+                        // So the cell already held `true`: a change is refused.
+                        let mut changed = Workbook::from_bytes(saved).unwrap();
+                        assert!(
+                            changed
+                                .set_cell(&name, address, false)
+                                .is_err_and(|error| refuses_style_index(&error)),
+                            "a change to the cell must be refused"
+                        );
+                    }
+                }
             }
         }
     }
@@ -259,4 +287,49 @@ pub fn text_round_trip(text: &str) {
         saved,
         "rewriting current text must preserve bytes"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edits_that_change_nothing_keep_a_refused_read() {
+        // `true` is already A1's value, so its edit changes nothing and
+        // succeeds, while reads still refuse the cell's style index.
+        let sheet = b"<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData><row r='1'><c r='A1' t='b' s='x'><v>1</v></c></row></sheetData></worksheet>";
+        let book = Workbook::from_bytes(fixture(sheet, b"opaque")).unwrap();
+        // So `exercise` edits A1 rather than falling back to B2, and reaches
+        // the oracles' refused-read branch.
+        let mut edited = Workbook::from_bytes(fixture(sheet, b"opaque")).unwrap();
+        edited.set_cell("Data", "A1", true).unwrap();
+        assert!(!edited.has_changes());
+        assert!(
+            edited
+                .get_cell("Data", "A1")
+                .is_err_and(|error| refuses_style_index(&error))
+        );
+        exercise(book);
+    }
+
+    #[test]
+    fn edits_replace_values_that_reads_refuse() {
+        // Reads refuse the payload `x`, which an edit replaces, so the edit
+        // must leave a readable `true`: the oracles allow a refused read only
+        // for an unreadable style index.
+        let sheet = b"<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData><row r='1'><c r='A1' t='b'><v>x</v></c></row></sheetData></worksheet>";
+        let book = Workbook::from_bytes(fixture(sheet, b"opaque")).unwrap();
+        assert!(
+            book.get_cell("Data", "A1")
+                .is_err_and(|error| !refuses_style_index(&error))
+        );
+        // So `exercise` edits A1 rather than falling back to B2.
+        let mut edited = Workbook::from_bytes(fixture(sheet, b"opaque")).unwrap();
+        edited.set_cell("Data", "A1", true).unwrap();
+        assert_eq!(
+            edited.get_cell("Data", "A1").unwrap().value,
+            CellValue::Bool(true)
+        );
+        exercise(book);
+    }
 }

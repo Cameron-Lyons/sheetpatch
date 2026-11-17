@@ -1,4 +1,5 @@
 use crate::CellRef;
+use quick_xml::name::NamespaceError;
 use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -110,8 +111,17 @@ impl From<io::Error> for Error {
 impl Error {
     // quick-xml is a pre-1.0 dependency, so its error type is converted only
     // inside the crate rather than through a public `From` implementation.
+    // Its limit on namespace bindings in scope refuses well-formed XML, like
+    // the nesting limit, so that is unsupported rather than malformed.
     pub(crate) fn xml(error: quick_xml::Error) -> Self {
-        Self::Xml(error.to_string())
+        match error {
+            quick_xml::Error::Namespace(NamespaceError::TooManyBindings(limit)) => {
+                Self::Unsupported(format!(
+                    "more than {limit} XML namespace declarations on open elements"
+                ))
+            }
+            error => Self::Xml(error.to_string()),
+        }
     }
 
     // A copy with the same variant and message, for an error that is kept

@@ -51,13 +51,26 @@ and Excel text escapes are decoded without converting ordinary UTF-8 to a
 temporary UTF-16 buffer. Numeric and predefined XML text references are decoded
 directly, avoiding temporary strings for each reference. Writing XML-forbidden
 characters appends Excel escapes directly to the output buffer. The
-shared-string table is decompressed and parsed at most once per workbook, and
-the outcome is kept even when the table is damaged, so later reads and edits
-neither parse it again nor change its error. Its decoded text is held in one
-buffer with a 32-bit end offset per entry, rather than one allocation per
-string. Prepared worksheet views reuse a validated index across reads, with
-retention controlled by the view's lifetime; single-cell reads avoid
-allocating a batch result. Simple scalar payloads borrow the validated XML
+shared-string table is decompressed and parsed once per workbook, and
+concurrent first uses wait for that load. The outcome is kept even when the
+table is damaged, so later reads and edits neither parse it again nor change
+its error; only a transient failure, such as a refused allocation, is not kept,
+so the next call loads the table again. Within one call, such as a batch edit
+and its table header checks or one pass of a cell iterator, a table that cannot
+be loaded is tried at most once. The pass compares a count of failed loads
+rather than keeping state of its own, which would slow the loops that decode
+cells. Entries are decoded directly into one text buffer with
+a 32-bit end offset per entry, rather than one allocation per string, and their
+Excel escapes are decoded in place. An entry whose markup does not fit the
+buffer's spare capacity is read to a temporary string first, so the buffer
+grows exactly as it would for pushing each decoded entry whole; otherwise only
+an entry whose XML holds a reference, CDATA, a comment, a processing
+instruction or a carriage return allocates while it decodes, as does one that
+cannot be decoded, for its error. An inline string's first decoded text run
+becomes its value without another copy.
+Prepared worksheet views reuse a validated index across reads, with retention
+controlled by the view's lifetime; single-cell reads avoid allocating a batch
+result. Simple scalar payloads borrow the validated XML
 instead of allocating a temporary string before parsing a number, boolean,
 date, or shared-string index. CLI `cells` traverses indexed records directly,
 without collecting addresses or searching for them again. CLI reads buffer up to 4 MiB of
@@ -180,7 +193,8 @@ microseconds. Whole-sheet, full-width, shuffled, and small-range controls
 varied by about 4% or less; these small differences are not claimed as gains.
 The empty-row case returns without scanning row records, and its three-cell
 control took 0.116 versus 0.118 microseconds. Sparse sheets filter existing
-cells directly so empty rows do not add work; dense rows seek column bounds.
+cells directly so empty rows do not add work; rows seek column bounds where
+that costs less than scanning their cells.
 Ordered batches retain a row-local cursor, while unordered batches keep the
 ordinary lookup path. Reductions fold contiguous slices without rechecking
 the traversal mode per cell. No additional index is retained, and request and

@@ -84,9 +84,13 @@ fn patch_values(source: &str) -> Vec<CellValue> {
 
 fn patch_error(source: &[u8]) -> String {
     match read_patch(source, "test") {
-        Err(Failure::Invalid { command, message }) => {
-            assert_eq!(
-                command, "patch",
+        Err(Failure::Invalid {
+            command,
+            message,
+            format,
+        }) => {
+            assert!(
+                command == "patch" && format,
                 "a rejected row should point to the patch format's help"
             );
             message
@@ -816,4 +820,42 @@ fn value_errors_quote_the_rejected_input() {
         parse_cell("A1\u{feff}").unwrap_err(),
         "invalid cell reference \"A1\\u{feff}\""
     );
+}
+
+#[test]
+fn missing_worksheet_names_are_bounded_like_other_tokens() {
+    let name = "Y".repeat(1_000);
+    let expected = format!("worksheet not found: \"{}\"… (1000 bytes)", "Y".repeat(256));
+    for failure in [
+        Failure::Workbook(sheetpatch::Error::SheetNotFound(name.clone())),
+        Failure::Context(
+            "Patch line 1".into(),
+            sheetpatch::Error::SheetNotFound(name.clone()),
+        ),
+    ] {
+        let message = failure.to_string();
+        assert!(message.ends_with(&expected), "{message}");
+        assert_eq!(failure.exit_code(), 1);
+    }
+    // Short names are quoted in full, as the library quotes them.
+    let short = || sheetpatch::Error::SheetNotFound("Data \"2\"".into());
+    assert_eq!(Failure::Workbook(short()).to_string(), short().to_string());
+}
+
+#[test]
+fn only_patch_rows_point_to_the_patch_format() {
+    let row =
+        Failure::invalid_row("Patch line 3: expected SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE".into());
+    assert!(
+        row.to_string()
+            .ends_with("\nRun 'sheetpatch help patch' for the format.")
+    );
+    assert_eq!(row.exit_code(), 2);
+    let refusal = Failure::invalid("patch", "refusing to read a workbook from a terminal");
+    assert!(
+        refusal
+            .to_string()
+            .ends_with("\nRun 'sheetpatch help patch' for details.")
+    );
+    assert_eq!(refusal.exit_code(), 2);
 }

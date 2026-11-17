@@ -79,7 +79,11 @@ impl<'workbook> WorksheetView<'workbook> {
     /// # Errors
     ///
     /// Each item fails like [`Self::get_cell_at`] for that cell. An error does
-    /// not prevent visiting subsequent cells.
+    /// not prevent visiting subsequent cells. Once loading the shared-string
+    /// table fails during a traversal, even transiently and even in another
+    /// traversal, later cells that need it return that error rather than
+    /// loading it again, until another call loads the table; a new traversal
+    /// tries again.
     pub fn cell_contents(
         &self,
     ) -> impl Iterator<Item = Result<(CellRef, CellContent)>> + Clone + '_ {
@@ -90,14 +94,19 @@ impl<'workbook> WorksheetView<'workbook> {
     ///
     /// The range is tested before decoding, and is never expanded into empty
     /// cells. A whole-grid range therefore costs the same as [`Self::cell_contents`].
-    /// The index skips unrelated rows and seeks the requested columns in dense
-    /// rows. Sparse spans filter stored cells directly, avoiding empty rows.
+    /// The index skips unrelated rows. On a worksheet with no more cells than
+    /// rows, it filters the cells between the range's corners by column, which
+    /// also skips empty rows, unless they average more than 128 per requested
+    /// row number, when it seeks the requested columns in each row. On others,
+    /// it seeks them whenever the requested rows average more than one cell.
     /// Cells outside the range cannot produce value or shared-string errors.
     ///
     /// # Errors
     ///
     /// Each item fails like [`Self::get_cell_at`] for that cell, with the same
-    /// worksheet, cell, or package-part context.
+    /// worksheet, cell, or package-part context. As for [`Self::cell_contents`],
+    /// a traversal does not load the shared-string table again after a load
+    /// fails.
     pub fn cell_contents_in(
         &self,
         range: Option<CellRange>,
@@ -105,7 +114,7 @@ impl<'workbook> WorksheetView<'workbook> {
         self.worksheet
             .cell_contents_in(
                 range,
-                || self.workbook.shared_strings(),
+                self.workbook.shared_strings_for_pass(),
                 self.workbook.uses_1904_dates(),
             )
             .map(|result| result.map_err(|error| self.workbook.read_context(self.sheet, error)))

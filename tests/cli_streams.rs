@@ -342,6 +342,91 @@ fn full_standard_output_reports_a_write_error() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_standard_stream_open_the_wrong_way_is_an_error() {
+    // std's standard stream handles accept writes to a descriptor open only
+    // for reading, and read one open only for writing as empty.
+    let directory = TempDir::new();
+    let read_only = directory.join("read-only");
+    let write_only = directory.join("write-only");
+    fs::write(&read_only, "").unwrap();
+    let text_error = "sheetpatch: cannot write output: ";
+    let workbook_error = "sheetpatch: cannot write workbook to standard output: ";
+    for (args, prefix) in [
+        (vec!["get", FIXTURE, "Data", "A1"], text_error),
+        (vec!["list", FIXTURE], text_error),
+        (vec!["compact", FIXTURE, "-"], workbook_error),
+        (
+            vec!["set", FIXTURE, "-", "Data", "A1", "text", "x"],
+            workbook_error,
+        ),
+    ] {
+        let output = command(&args)
+            .stdin(Stdio::null())
+            .stdout(fs::File::open(&read_only).unwrap())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let message = String::from_utf8(output.stderr).unwrap();
+        assert!(message.starts_with(prefix), "{message}");
+    }
+    for (args, prefix) in [
+        (
+            vec!["patch", "--check", FIXTURE, "-"],
+            "sheetpatch: cannot read patch from standard input: ",
+        ),
+        (
+            vec!["get", "-", "Data", "A1"],
+            "sheetpatch: cannot read workbook from standard input: ",
+        ),
+    ] {
+        let output = command(&args)
+            .stdin(fs::File::create(&write_only).unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let message = String::from_utf8(output.stderr).unwrap();
+        // The read error itself, not an empty patch or workbook.
+        assert!(message.starts_with(prefix), "{message}");
+        assert!(message.contains(" (os error "), "{message}");
+    }
+    assert_eq!(fs::read(&read_only).unwrap(), b"");
+    assert_eq!(count(&directory), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn commands_run_with_a_single_free_descriptor() {
+    // Standard output is duplicated only when written, after INPUT is closed.
+    let run = |args: &[&str]| {
+        let result = Command::new("/bin/sh")
+            .args(["-c", "exec 3>&-; ulimit -n 4 && exec \"$0\" \"$@\""])
+            .arg(env!("CARGO_BIN_EXE_sheetpatch"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    assert_eq!(run(&["get", FIXTURE, "Data", "A1"]), b"Original text\n");
+    assert_eq!(
+        run(&["cells", FIXTURE, "Data", "A1"]),
+        b"A1\ttext\tOriginal text\n"
+    );
+    let workbook = run(&["set", FIXTURE, "-", "Data", "A1", "number", "1"]);
+    assert_eq!(cell(workbook, "Data", "A1"), CellValue::Number(1.0));
+}
+
 /// A workbook whose 1 MiB of untouched package data outgrows any default
 /// pipe buffer.
 fn large_workbook() -> Vec<u8> {
