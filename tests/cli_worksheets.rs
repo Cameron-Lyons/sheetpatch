@@ -406,7 +406,10 @@ fn cells_rows_for_unwritable_values_and_protected_cells_are_refused_by_patch() {
             vec![
                 (
                     "A1",
-                    invalid("error values must be an Excel error code such as #N/A or #DIV/0!"),
+                    invalid(
+                        "error values must be an Excel error code such as #N/A or #DIV/0!, \
+                         not \"#FOO!\"",
+                    ),
                 ),
                 (
                     "B1",

@@ -14,7 +14,8 @@ use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::result::Result as StdResult;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// An existing OOXML workbook with pending surgical cell edits.
 ///
@@ -98,10 +99,11 @@ use std::sync::{Mutex, OnceLock};
 /// markup-compatibility branch, returns [`Error::Unsupported`].
 /// Messages about a worksheet name it, and messages about another part, such
 /// as a shared-string table that cannot be loaded, name that part's path in
-/// the archive instead.
+/// the archive instead. An [`Error::Io`] names neither.
 ///
 /// Result vectors and copied cell text use fallible allocations, returning
-/// [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`] when refused.
+/// [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`] when refused,
+/// including while the shared-string table loads.
 /// The batch cell-count limit does not bound the total text returned: repeated
 /// addresses each own their value and formula. For large results, consume
 /// [`WorksheetView::cell_contents`] incrementally or request smaller batches.
@@ -124,18 +126,45 @@ pub struct Workbook {
     date1904: bool,
     sheet_indexes: BTreeMap<String, usize>,
     shared_strings_path: Option<String>,
-    // The outcome of the table's first load. Untouched parts never change,
-    // so a table that fails to load fails the same way on every later use.
-    // `Error` is not `RefUnwindSafe` only because an `io::Error` can box any
-    // source. A kept error never changes, and allocation errors carry only an
-    // ErrorKind rather than a user-supplied source, so the workbook stays unwind-safe.
-    shared_strings: OnceLock<StdResult<SharedStrings, AssertUnwindSafe<Error>>>,
+    // The outcome of the table's first load, which concurrent first uses wait
+    // for instead of each decoding a possibly large table.
+    shared_strings: OnceLock<LoadedStrings>,
+    // The loads of the table that have failed with an I/O error so far, which
+    // a pass reads as it begins. It sits in what would otherwise be padding.
+    // After 2^32 failures it wraps, which at worst lets a pass whose count
+    // matched again load the table once more.
+    failed_string_loads: AtomicU32,
     // Header rows of the table parts read so far, by ZIP member name. Several
     // worksheets can relate to one table part, which is then parsed only once.
     table_parts: Mutex<HashMap<String, Option<CellRange>>>,
     // Permission bits and group of the file this workbook was opened from,
     // used as the basis for new save destinations. ACLs are not copied.
     source_permissions: Option<SourcePermissions>,
+}
+
+// The outcome of a shared-string table's first load. Untouched parts never
+// change, so a table that fails to load fails the same way on every later use.
+// An I/O error, such as a refused allocation, is not a property of the part,
+// though: it is reported again only to uses that began before it, and later
+// uses load the table again. `Error` is not `RefUnwindSafe` only because an
+// `io::Error` can box any source. A kept error never changes, and a kept I/O
+// error has no source, so the workbook stays unwind-safe.
+enum LoadedStrings {
+    Table(SharedStrings),
+    Failed(AssertUnwindSafe<Error>),
+    Retrying(Box<StringsRetry>),
+}
+
+// The loads of a table after a first one failed with an I/O error. It is made
+// only then, so a workbook whose table loads keeps none of it.
+struct StringsRetry {
+    // The first failure, without its source.
+    first: AssertUnwindSafe<Error>,
+    // The outcome of the first later load that did not fail with an I/O error.
+    reloaded: OnceLock<StdResult<SharedStrings, AssertUnwindSafe<Error>>>,
+    // Held while such a load runs, so that concurrent uses wait for it, with
+    // the latest I/O error of one, which each failed load replaces.
+    latest: Mutex<Option<Error>>,
 }
 
 // The archive and XML are omitted: they can be many megabytes.
@@ -285,6 +314,7 @@ impl Workbook {
             sheet_indexes,
             shared_strings_path,
             shared_strings: OnceLock::new(),
+            failed_string_loads: AtomicU32::new(0),
             table_parts: Mutex::default(),
             source_permissions: None,
         })
@@ -509,18 +539,25 @@ impl Workbook {
             ));
         }
         let mut staged = Vec::with_capacity(grouped.size_hint().0);
+        // Edits only compare against the table, to recognize a rewrite of a
+        // cell's current text, so a table that cannot be loaded makes them
+        // changes; checking a table header edit needs it, though. It is tried
+        // once per call rather than once for every edit of a shared-string
+        // cell, and the header check reuses that outcome; a later call tries
+        // again.
+        let mut strings = self.shared_strings_for_pass();
+        let mut table: Option<Option<&SharedStrings>> = None;
         for (index, cells) in grouped {
             let in_sheet = |error| self.sheets[index].context(error);
             let original = self.original_sheet(index).map_err(in_sheet)?;
             let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
-            if cells.is_empty() {
-                continue;
-            }
-            // Shared strings only recognize rewriting a cell's current text,
-            // so a table that cannot be loaded leaves such an edit a change.
             let worksheet = PreparedWorksheet::parse(current).map_err(in_sheet)?;
             let Some(patch) = worksheet
-                .plan_cells(&cells, || self.loaded_shared_strings(), self.date1904)
+                .plan_cells(
+                    &cells,
+                    || *table.get_or_insert_with(|| strings().ok().flatten()),
+                    self.date1904,
+                )
                 .map_err(in_sheet)?
             else {
                 continue;
@@ -531,10 +568,12 @@ impl Workbook {
             // the output. A patch error still comes first.
             let headers = self.table_headers(index);
             let patched = patch.apply().map_err(in_sheet)?;
-            self.check_table_headers(index, &worksheet, headers?, &cells)?;
+            self.check_table_headers(index, &worksheet, headers?, &cells, &mut strings)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
+        // It borrows the workbook, which the edits now change.
+        drop(strings);
         for (index, changed) in staged {
             self.sheet_xml[index].current = changed;
         }
@@ -545,14 +584,16 @@ impl Workbook {
     // name, and repairs or removes a table whose header differs. An edit may
     // rewrite a header cell's current value, as it reads, but not change it.
     // `worksheet` is the edited worksheet as it was before the edits, and
-    // `headers` its tables' header rows. Errors name the worksheet or the
-    // package part they concern.
-    fn check_table_headers(
-        &self,
+    // `headers` its tables' header rows, and `shared_strings` supplies the
+    // shared-string table. Errors name the worksheet or the package part they
+    // concern.
+    fn check_table_headers<'workbook>(
+        &'workbook self,
         index: usize,
         worksheet: &PreparedWorksheet<'_>,
         headers: &[CellRange],
         cells: &BTreeMap<CellRef, CellValue>,
+        mut shared_strings: impl FnMut() -> Result<Option<&'workbook SharedStrings>>,
     ) -> Result<()> {
         let sheet = &self.sheets[index];
         let edits = header_cells(cells, headers);
@@ -565,9 +606,13 @@ impl Workbook {
         // header, preserving read-error precedence without retaining copies.
         for (cell, value) in edits {
             let current = worksheet
-                .read_cell(cell, || self.shared_strings(), self.date1904)
+                .read_cell(cell, &mut shared_strings, self.date1904)
                 .map_err(|error| self.read_context(sheet, error))?;
-            if current.value != *value {
+            // The value comparison that an edit's no-op detection uses, so a
+            // header edit is refused exactly when it would change the value
+            // the cell reads as. Clearing a blank cell's empty payload or type
+            // rewrites it without changing that value.
+            if !worksheet::rewrites_unchanged(&current.value, value) {
                 changed_header.get_or_insert(cell);
             }
         }
@@ -797,32 +842,119 @@ impl Workbook {
     }
 
     // The shared-string table, or `None` for a workbook without one. Errors
-    // name the table's part, rather than the worksheet that needed it, and
-    // every read that needs a table that cannot be loaded gets the same error.
+    // name the table's part, rather than the worksheet that needed it. Every
+    // read that needs a damaged table gets the same error, while a transient
+    // failure, such as a refused allocation, leaves the next use to try again.
+    #[inline]
     pub(super) fn shared_strings(&self) -> Result<Option<&SharedStrings>> {
-        self.load_shared_strings()
-            .transpose()
-            .map_err(Error::duplicate)
+        // Reads outside a pass start here, and a pass's closure makes the
+        // same check, so a loaded table is returned before anything else.
+        if let Some(LoadedStrings::Table(strings)) = self.shared_strings.get() {
+            return Ok(Some(strings));
+        }
+        self.shared_strings_since(self.shared_strings_failures())
     }
 
-    // The table if it loads. Edits only compare against it, so a table that
-    // cannot be loaded makes their values changes, not errors.
-    fn loaded_shared_strings(&self) -> Option<&SharedStrings> {
-        self.load_shared_strings()?.ok()
+    // The loads of the table that have failed with an I/O error so far.
+    fn shared_strings_failures(&self) -> u32 {
+        self.failed_string_loads.load(Ordering::Relaxed)
+    }
+
+    // Like `shared_strings`, for one pass over many cells, or one call, that
+    // continues past errors. Once a load fails with an I/O error during the
+    // pass, here or in another pass, later cells get a copy of that error
+    // instead of loading the table again; a later pass tries again. The pass
+    // only counts failures, so the closure has no state of its own, which
+    // keeps the loops that decode cells as fast as without it.
+    pub(super) fn shared_strings_for_pass<'workbook>(
+        &'workbook self,
+    ) -> impl FnMut() -> Result<Option<&'workbook SharedStrings>> + Clone + 'workbook {
+        let failures = self.shared_strings_failures();
+        // A loaded table is returned without calling `shared_strings_since`.
+        move || match self.shared_strings.get() {
+            Some(LoadedStrings::Table(strings)) => Ok(Some(strings)),
+            _ => self.shared_strings_since(failures),
+        }
+    }
+
+    // The table, loaded unless a load has failed with an I/O error since
+    // `failures` failures were counted: then that failure, without another
+    // load, until the table loads. Its callers return a loaded table first.
+    // It stays out of line: inlined into a pass's closure, it measurably
+    // slowed the loops that decode other cells.
+    #[inline(never)]
+    fn shared_strings_since(&self, failures: u32) -> Result<Option<&SharedStrings>> {
+        self.load_shared_strings(failures).transpose()
     }
 
     // Decompresses and parses the table on first use and keeps the outcome,
-    // so a damaged table is not read again for every call. Concurrent first
-    // uses wait for one load, which never touches this cache.
-    fn load_shared_strings(&self) -> Option<StdResult<&SharedStrings, &Error>> {
+    // so a damaged table is not read again for every call. Concurrent uses
+    // wait for one load, whether it succeeds or fails. An I/O error, such as a
+    // refused allocation, is not final, so a use that began after it loads
+    // the table again.
+    fn load_shared_strings(&self, failures: u32) -> Option<Result<&SharedStrings>> {
+        fn kept(
+            loaded: &StdResult<SharedStrings, AssertUnwindSafe<Error>>,
+        ) -> Result<&SharedStrings> {
+            loaded.as_ref().map_err(|error| error.0.duplicate())
+        }
         let path = self.shared_strings_path.as_deref()?;
-        let loaded = self.shared_strings.get_or_init(|| {
+        let load = || {
             self.archive
                 .read(path)
                 .and_then(|xml| worksheet::read_shared_strings(&xml))
-                .map_err(|error| AssertUnwindSafe(error.in_part(path)))
+                .map_err(|error| error.in_part(path))
+        };
+        // The I/O error of a first load that this use ran, which it returns
+        // whole; the copy kept for other uses has no source.
+        let mut failed = None;
+        let first = self.shared_strings.get_or_init(|| match load() {
+            Ok(table) => LoadedStrings::Table(table),
+            Err(error @ Error::Io(_)) => {
+                // Counted before the outcome is published, so a use that
+                // sees the outcome also sees the count.
+                self.failed_string_loads.fetch_add(1, Ordering::Relaxed);
+                LoadedStrings::Retrying(Box::new(StringsRetry {
+                    first: AssertUnwindSafe(failed.insert(error).duplicate()),
+                    reloaded: OnceLock::new(),
+                    latest: Mutex::default(),
+                }))
+            }
+            Err(error) => LoadedStrings::Failed(AssertUnwindSafe(error)),
         });
-        Some(loaded.as_ref().map_err(|error| &error.0))
+        let retry = match first {
+            LoadedStrings::Table(table) => return Some(Ok(table)),
+            LoadedStrings::Failed(error) => return Some(Err(error.0.duplicate())),
+            LoadedStrings::Retrying(retry) => retry,
+        };
+        if let Some(error) = failed {
+            return Some(Err(error));
+        }
+        if let Some(loaded) = retry.reloaded.get() {
+            return Some(kept(loaded));
+        }
+        // A load that panicked leaves nothing inconsistent behind it: the
+        // failure it guards is replaced whole.
+        let mut latest = retry.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(loaded) = retry.reloaded.get() {
+            return Some(kept(loaded));
+        }
+        // The first failure is counted before its outcome is published, and
+        // later ones while this lock is held.
+        if self.failed_string_loads.load(Ordering::Relaxed) != failures {
+            return Some(Err(latest.as_ref().unwrap_or(&retry.first.0).duplicate()));
+        }
+        let loaded = load();
+        if let Err(error @ Error::Io(_)) = loaded {
+            *latest = Some(error.duplicate());
+            self.failed_string_loads.fetch_add(1, Ordering::Relaxed);
+            return Some(Err(error));
+        }
+        Some(kept(
+            retry
+                .reloaded
+                .get_or_init(|| loaded.map_err(AssertUnwindSafe)),
+        ))
     }
 
     /// Serialize the current workbook, replacing changed worksheet ZIP records.
@@ -890,9 +1022,7 @@ impl Workbook {
     ///
     /// Fails like [`Self::write_compact_to`], other than with [`Error::Io`].
     pub fn to_bytes_compact(&self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.write_compact_to(&mut bytes)?;
-        Ok(bytes)
+        self.archive.compact(&self.changed_parts())
     }
 
     /// Save through a temporary file in the destination directory, then rename.
@@ -906,11 +1036,18 @@ impl Workbook {
     /// Saving does not clear pending edits or replace the retained original.
     /// Changed worksheets are compressed as described for [`Self::to_bytes`].
     ///
-    /// The destination must name a file. An existing destination must resolve
-    /// to a regular file: directories, FIFOs, devices, and sockets are rejected
-    /// before output is generated. Both cases return an [`Error::Io`] of kind
+    /// The destination must name a file, so it cannot end in a path separator
+    /// or a `.` component. An existing destination must resolve to a regular
+    /// file: directories, FIFOs, devices, and sockets are rejected before
+    /// output is generated. Both cases return an [`Error::Io`] of kind
     /// [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
-    /// replaced by the new file rather than written through.
+    /// replaced by the new file rather than written through. On Unix, a
+    /// read-only destination is replaced when its directory is writable. On
+    /// Windows, whose rename cannot replace a read-only file, an existing
+    /// destination with the read-only attribute is rejected before output is
+    /// generated, with an [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::PermissionDenied`]; for a symlink, the link's own
+    /// attribute decides.
     /// An existing destination keeps its permission bits; on Unix it also keeps
     /// its group when the process may assign it. Otherwise group bits are cleared,
     /// and other permission bits are limited to those shared by the original
@@ -935,9 +1072,10 @@ impl Workbook {
     /// # Errors
     ///
     /// Returns [`Error::Io`] of kind [`std::io::ErrorKind::InvalidInput`] for
-    /// the destinations described above, and [`Error::Io`] when creating,
-    /// writing, syncing, or renaming the temporary file fails. Otherwise fails
-    /// like [`Self::to_bytes`].
+    /// the destinations described above, of kind
+    /// [`std::io::ErrorKind::PermissionDenied`] for a read-only destination on
+    /// Windows, and [`Error::Io`] when creating, writing, syncing, or renaming
+    /// the temporary file fails. Otherwise fails like [`Self::to_bytes`].
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         atomic::write(path.as_ref(), self.source_permissions, |writer| {
             self.write_to(writer)
@@ -1126,13 +1264,16 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_string_table_is_loaded_once_whatever_the_outcome() {
+    fn a_shared_string_table_that_loads_or_is_damaged_is_kept() {
         // A table that cannot be loaded keeps its first error, and each read
         // that needs the table reports a copy with its variant and message.
         let mut book = shared_string_book("<si><t>first</t></si><x><si><t>hidden</t></si></x>");
         assert!(book.shared_strings.get().is_none());
         let first = book.get_cell("Data", "A1").unwrap_err();
-        assert!(matches!(book.shared_strings.get(), Some(Err(_))));
+        assert!(matches!(
+            book.shared_strings.get(),
+            Some(LoadedStrings::Failed(_))
+        ));
         assert_eq!(
             first.to_string(),
             "unsupported: part \"xl/sharedStrings.xml\": shared string outside the shared-string table"
@@ -1151,12 +1292,19 @@ mod tests {
         book.set_cell("Data", "A1", "first").unwrap();
         book.set_cells("Data", [("A2", "second")]).unwrap();
         assert!(book.has_changes());
-        assert!(matches!(book.shared_strings.get(), Some(Err(_))));
+        // Only an I/O error leads to another load.
+        assert!(matches!(
+            book.shared_strings.get(),
+            Some(LoadedStrings::Failed(_))
+        ));
 
         // A table with an entry that cannot be decoded loads, and is kept.
         let book = shared_string_book("<si><t>first</t></si><si><t>_xD83D_</t></si>");
         assert!(book.get_cell("Data", "A2").is_err());
-        assert!(matches!(book.shared_strings.get(), Some(Ok(_))));
+        assert!(matches!(
+            book.shared_strings.get(),
+            Some(LoadedStrings::Table(_))
+        ));
         assert_eq!(book.get_cell("Data", "A1").unwrap().value, "first".into());
     }
 

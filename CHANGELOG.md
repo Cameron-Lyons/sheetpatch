@@ -40,7 +40,8 @@ minimum supported version.
   tests inject allocation failure in a child process and verify later reads
   still succeed. Batch cell limits do not cap aggregate text bytes; streaming
   reads or smaller batches keep result retention bounded.
-- Range iteration skips unrelated columns through each row's existing index.
+- Range iteration skips unrelated columns through each row's existing index
+  where that costs less than filtering the requested rows' cells.
   Ordered batch reads reuse lookup positions while preserving duplicates,
   blank cells, input order, and the first read error.
 - Streaming cell iterators expose remaining size bounds, exact for whole-sheet
@@ -64,6 +65,124 @@ minimum supported version.
 - Dependabot maintains both Cargo workspaces. Installed-package smoke tests
   now cover range streaming and patch/save/reopen, including formula and
   untouched ZIP-record preservation.
+- A shared-string table whose load ran out of memory is loaded again by the
+  next call. Previously the refused allocation was kept as the table's error,
+  failing every later shared-string read and making rewrites of a cell's own
+  text count as changes for the workbook's lifetime. Within one call, such as
+  a batch edit or one pass of `cell_contents`, the table is tried at most
+  once: after a failed load, including one in another call running at the same
+  time, later cells get that error. Concurrent first uses still wait for a
+  single load, as do concurrent loads after a failure.
+- Saves no longer change the permissions of a replacement file that already
+  has the intended mode. Mounts that fix every file's owner and mode, such as
+  some vfat, exFAT and CIFS mounts, refuse that change from other users, so
+  saving there failed with "Operation not permitted". Saving over a file on
+  such a mount now works. Saving a new file there from a source in another
+  group still fails, since the new file cannot be made owner-only. The Linux
+  ACL check now uses rustix's size query, which requires rustix 1.1.6.
+- Negative zero is written as `0`; Excel has no negative zero. Writing `0`
+  over a stored `-0`, which reads keep, now replaces it, where it used to
+  count as no change; writing `-0` still leaves it.
+- An edit that changes a cell whose style index is not an unsigned 32-bit
+  integer, such as `x`, `-0` or `1e2`, now fails with `Error::InvalidWorkbook`,
+  as reading that cell does, instead of writing the new value beside an index
+  that no read can decode. An edit that leaves such a cell unchanged still
+  succeeds and writes nothing.
+- The `InvalidValue` message for an integer beyond 2^53 now says that numbers
+  past that magnitude do not represent every integer, rather than that the
+  integer itself cannot be stored exactly; the advice to write it as text is
+  unchanged.
+- A part that starts with a UTF-16 byte order mark or a UTF-16 XML declaration
+  now returns `Error::Unsupported`, like a UTF-8 part that declares another
+  encoding, instead of `Error::Xml`.
+- The "destination is not a regular file" error no longer repeats the path,
+  which the CLI already printed.
+- A destination ending in a path separator or `.` component, such as
+  `out/new.xlsx/`, now returns `Error::Io` of kind `InvalidInput` ("destination
+  must name a file") before any output is generated. Previously a missing file
+  so named was generated and written in full, and the final rename then failed
+  with `NotFound` or `NotADirectory`.
+- On Windows, saving over a read-only destination, which the final rename
+  cannot replace, now fails with `PermissionDenied` before any output is
+  generated, rather than after the whole workbook was compressed and written.
+- New cells and rows are written directly into one buffer per insertion point,
+  without per-cell name and markup allocations. Each edit's new markup,
+  whether new cells, new rows or a rewritten value, is written to one reused
+  buffer and ends in an allocation of exactly its size, where a buffer of its
+  own, grown by doubling, could take up to twice that. Markup in a buffer of
+  up to 4 KiB is copied out of it, so the buffer is reused; a larger buffer,
+  and the last edit's, is shrunk to its size instead. Planning can therefore
+  briefly hold up to 4 KiB more than before, which a batch, even a successful
+  one, may peak at; the exactly sized edits usually make a successful batch
+  peak lower. A rewritten value, or a new cell, that starts an edit reserves
+  exactly its payload and the cell's end tag (a number, when its buffer is not
+  yet allocated), so a long text without escapes is no longer reallocated to
+  twice its size for its last few bytes; text whose escapes outgrow the
+  reservation, and an empty row's end tag, grow the buffer by doubling, as
+  before. Cell text is escaped by copying the runs of bytes between escapes at
+  once rather than one character at a time; setting 1 KiB to 32 KiB text cells
+  measured 2 to 71% fewer instructions, more for longer text, larger batches
+  and smaller worksheets. Large batches of new cells measured 1.2 to 1.6 times
+  as fast on Linux and 1.6 to 2.6 times on macOS, whose allocator costs more.
+  Shared strings, including their Excel `_xHHHH_` escapes, are decoded
+  directly into the table's buffer whenever an entry's markup fits the room it
+  has left, which, since decoding never lengthens text, cannot grow it. An
+  entry that may not fit is read to a string of its own first, as every entry
+  was, so the buffer grows and peaks exactly as before. Apart from those, only
+  an entry whose XML holds a character or entity reference, CDATA, a comment,
+  a processing instruction or a carriage return still allocates while it
+  decodes, as does one that cannot be decoded, for its error, so a million
+  other entries take nearly a million fewer allocations, or two million with
+  escapes. Loading tables of 40 to 20,000 entries, plain, escaped, of several
+  runs, of long text or of many underscores, measured up to 19% fewer
+  instructions, and small tables whose entries hold references in several runs
+  about the same. `to_bytes_compact` without pending edits reserves exactly
+  the records it keeps, once it has checked that the archive can be compacted,
+  instead of growing its buffer from empty.
+- In a worksheet missing at most 64 row numbers between its first and last
+  rows, and at most one per 16 row records, row lookups search only the row
+  records that a row's number allows, a single record among rows numbered
+  without gaps. Single-cell reads through a prepared view measured fewer
+  instructions there, from about 1% for stored cells on small worksheets to
+  about 70% for cells that are not stored on tall ones; on other worksheets,
+  within a few instructions of before, more or fewer depending on the build.
+  On a worksheet with no more cells than rows, which used to filter every
+  range's cells, a range read now seeks the requested columns in each row when
+  the cells between its corners average more than 128 per requested row
+  number: a 100-row column of a 700-column block beside a million formatted
+  rows reads in about 7 microseconds instead of 23. Counting failed
+  shared-string loads for each pass, and choosing among these searches, cost a
+  range read up to about 15 instructions more than before on a worksheet with
+  no more cells than rows, or whose rows are searched in full: up to about 16%
+  of a read of a range holding no cells, and under 2% of one holding a few. On
+  other worksheets range reads cost fewer instructions, from a few on small
+  ones to about 300 on tall ones.
+- XML parsing no longer has the namespace resolver scan the attributes of a
+  tag that declares no namespace, since every declaration spells `xmlns`.
+  Parsing worksheets of 100 and 2,000 rows measured about 7.5% fewer
+  instructions, and a single-cell edit about 2.5% fewer.
+- An end-of-central-directory entry count larger than its directory can hold
+  is refused before it sizes any allocation.
+- XML with more than 128 namespace declarations on the elements open at once,
+  not counting one of the reserved `xml` prefix, now returns
+  `Error::Unsupported`, naming the limit, instead of `Error::Xml` with a
+  message that referred to quick-xml's API.
+- Opening a workbook no longer re-splits the workbook part's name for every
+  sheet, which made opening quadratic in the sheet count and the name length;
+  4,000 sheets under a long part name opened in 7 ms instead of 1.7 s.
+- CLI on Unix: standard output open only for reading, as under `1<file`, is
+  now a write error with exit code 1, and standard input open only for
+  writing is a read error. Previously Rust's standard stream handles reported
+  such writes as successful and such input as empty, so a workbook sent to
+  standard output was discarded with exit code 0, and a patch read from
+  standard input was an empty patch. The CLI now reads and writes through a
+  duplicate of the descriptor, falling back to the standard handle only when
+  no descriptor is free for one. A closed standard stream still acts as
+  `/dev/null`.
+- CLI: a missing worksheet's name is shortened like other long diagnostic
+  tokens; a refused error code is quoted, like other refused values; and only
+  invalid patch rows point to the patch format's help, while other `patch`
+  refusals point to its details, as other commands do.
 
 ## 1.1.0 — 2026-10-23
 

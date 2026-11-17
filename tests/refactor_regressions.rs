@@ -82,6 +82,20 @@ fn workbooks_and_their_views_are_unwind_safe_and_return_kept_shared_string_error
     }
 }
 
+// The cell iterators are opaque types, so their auto traits are part of the
+// API; a pass's snapshot of shared-string load failures must not take any
+// away.
+#[test]
+fn cell_iterators_can_cross_threads_and_unwind_boundaries() {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+    fn traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>(_: &T) {}
+    let book = Workbook::from_bytes(fixture()).unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    traits(&view.cell_contents());
+    traits(&view.cell_contents_in(None));
+    traits(&view.cells());
+}
+
 #[test]
 fn prepared_reads_follow_committed_edits_and_reset_and_keep_exact_xml() {
     fn send_sync<T: Send + Sync>() {}

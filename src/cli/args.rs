@@ -1,5 +1,5 @@
 use super::error::{DiagnosticText, Failure};
-use sheetpatch::{CellRange, CellRef, CellValue};
+use sheetpatch::{CellEdit, CellRange, CellRef, CellValue};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -333,6 +333,25 @@ pub(super) fn parse_value(kind: &str, value: Option<&str>) -> Result<CellValue, 
             DiagnosticText(kind)
         ))),
     }
+}
+
+/// The edit of `cell` to `value`, or the message for a refused value. The
+/// library's message for an error value that is not an Excel error code does
+/// not repeat it, so the code, `text` as given, is quoted here like other
+/// rejected values. Only a refused code is formatted.
+pub(super) fn cell_edit(
+    sheet: &str,
+    cell: CellRef,
+    value: CellValue,
+    text: Option<&str>,
+) -> Result<CellEdit, String> {
+    let error_code = matches!(value, CellValue::Error(_));
+    CellEdit::try_new_at(sheet, cell, value).map_err(|error| match (error, text) {
+        (error @ sheetpatch::Error::InvalidValue(_), Some(code)) if error_code => {
+            format!("{error}, not {}", DiagnosticText(code))
+        }
+        (error, _) => error.to_string(),
+    })
 }
 
 pub(super) fn parse_cell(address: &str) -> Result<CellRef, String> {

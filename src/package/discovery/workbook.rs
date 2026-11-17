@@ -5,7 +5,7 @@ use super::namespaces::{
 };
 use super::part::{self, Node};
 use super::relationships::{self, Relationship};
-use super::targets;
+use super::targets::{self, TargetBase};
 use crate::archive::Archive;
 use crate::package::{Sheet, SheetVisibility};
 use crate::{Error, Result, xml};
@@ -252,6 +252,7 @@ fn sheets(
     let mut sheets = Vec::new();
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
+    let mut base: Option<TargetBase> = None;
     for (position, node) in (1usize..).zip(sheet_nodes(nodes)) {
         if in_branch(nodes, node) {
             return Err(Error::Unsupported(
@@ -293,7 +294,22 @@ fn sheets(
         if !namespaces::office_type(&relationship.kind, "worksheet") {
             continue;
         }
-        let uri = targets::resolve_target(workbook_uri, &relationship.target)?;
+        // The workbook URI can be long, so for later worksheets its segments
+        // are prepared once, and each target then costs only its own length.
+        // The first resolves on its own, as a workbook of one sheet needs no
+        // more, and so holds nothing while the rest of its sheet is found.
+        // Either way, the target's syntax is checked first.
+        let uri = if sheets.is_empty() {
+            targets::resolve_target(workbook_uri, &relationship.target)?
+        } else {
+            let target = targets::escaped_target(&relationship.target)?;
+            let base = match &base {
+                Some(base) => base,
+                None => base.insert(TargetBase::try_new(workbook_uri)?),
+            };
+            let (kept, appended) = base.normalize(&target)?;
+            base.join(kept, &appended)
+        };
         let path = targets::part_path(archive, &uri)?;
         if !archive.contains(&path) {
             return Err(Error::InvalidWorkbook(format!(

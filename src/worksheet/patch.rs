@@ -6,14 +6,17 @@ use crate::archive::MAX_PART_SIZE;
 use crate::xml::{self, Attributes};
 use crate::{CellRef, CellValue, Error, Result};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
+use std::mem;
 
 struct Edit {
     start: usize,
     end: usize,
-    bytes: Vec<u8>,
+    bytes: String,
 }
 
+// Newly generated markup is part of the final XML, so it cannot exceed the
+// part limit even when every original byte will be removed.
 fn check_part_size(length: usize) -> Result<()> {
     if length > MAX_PART_SIZE {
         return Err(errors::unsupported(format!(
@@ -24,55 +27,152 @@ fn check_part_size(length: usize) -> Result<()> {
     Ok(())
 }
 
-// Newly generated markup is part of the final XML, so it cannot exceed the
-// part limit even when every original byte will be removed.
-fn append_markup(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-    let length = output
-        .len()
-        .checked_add(bytes.len())
-        .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
-    check_part_size(length)?;
-    output.extend_from_slice(bytes);
-    Ok(())
-}
-
 /// Nonoverlapping changes against the original worksheet's absolute byte spans.
 /// Existing cell/row/extension bytes are copied only when the final XML is emitted.
+///
+/// An edit's new cells, rows and values are written to one reused buffer while
+/// the edit is open. The edit is closed when the next one needs that buffer,
+/// or when planning ends, and then holds an allocation of exactly its size,
+/// where a buffer of its own, grown by doubling, could take up to twice that.
+/// Attribute edits are built at their exact size.
 #[derive(Default)]
 pub(super) struct EditPlan {
     edits: Vec<Edit>,
     inserted_bytes: usize,
+    // Whether the last edit's markup is still being written, usually in the
+    // buffer that `scratch` otherwise holds.
+    open: bool,
+    scratch: String,
 }
+
+// The largest buffer kept for reuse when its edit closes: the markup is copied
+// out of it, so the next edit writes without regrowing a buffer from empty. A
+// larger buffer is shrunk to its markup and kept by the edit. Until planning
+// ends, the kept buffer is held alongside the copies, so planning can briefly
+// hold up to this much more than without reuse; the edits it leaves are
+// exactly sized, so a batch that succeeds usually peaks lower.
+const REUSE_LIMIT: usize = 4 * 1024;
 
 impl EditPlan {
     pub(super) fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }
 
-    fn push(&mut self, edit: Edit) -> Result<()> {
+    fn count_inserted(&mut self, length: usize) -> Result<()> {
         let inserted_bytes = self
             .inserted_bytes
-            .checked_add(edit.bytes.len())
+            .checked_add(length)
             .ok_or_else(|| errors::unsupported("patched XML exceeds addressable memory"))?;
         check_part_size(inserted_bytes)?;
         self.inserted_bytes = inserted_bytes;
-        self.edits.push(edit);
         Ok(())
     }
 
+    // Adds a finished edit. An open edit stays last, so later markup at its
+    // position still extends it. `apply` sorts the edits and no two share a
+    // span, so this order affects only the sort's cost; where a new edit
+    // follows the open one, callers close it first to keep document order.
+    fn push(&mut self, edit: Edit) -> Result<()> {
+        self.count_inserted(edit.bytes.len())?;
+        if self.open {
+            let open = self.edits.len() - 1;
+            self.edits.insert(open, edit);
+        } else {
+            self.edits.push(edit);
+        }
+        Ok(())
+    }
+
+    // Closes the open edit, if any, and adds `edit`, whose markup is usually
+    // the buffer from `take_scratch`, as the open edit.
+    fn push_open(&mut self, edit: Edit) -> Result<()> {
+        self.close(true);
+        self.push(edit)?;
+        self.open = true;
+        Ok(())
+    }
+
+    // Gives the open edit an allocation of exactly its markup's size. With
+    // `reuse`, a buffer up to `REUSE_LIMIT` is kept for the next edit and the
+    // markup copied out of it; otherwise the buffer is shrunk.
+    fn close(&mut self, reuse: bool) {
+        if !mem::take(&mut self.open) {
+            return;
+        }
+        let edit = self
+            .edits
+            .last_mut()
+            .expect("the open edit is the last one");
+        if reuse && edit.bytes.capacity() <= REUSE_LIMIT {
+            let exact = edit.bytes.as_str().to_owned();
+            self.scratch = mem::replace(&mut edit.bytes, exact);
+        } else {
+            edit.bytes.shrink_to_fit();
+        }
+    }
+
+    // Closes the open edit and returns the reused buffer, cleared, for
+    // markup to pass to `push_open` or `expand`.
+    fn take_scratch(&mut self) -> String {
+        self.close(true);
+        let mut scratch = mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch
+    }
+
+    // Returns a buffer from `take_scratch` that no edit used.
+    fn restore_scratch(&mut self, scratch: String) {
+        self.scratch = scratch;
+    }
+
+    // Ends planning: the open edit's buffer is shrunk rather than copied,
+    // since no later edit reuses it, and the reused buffer is freed.
+    fn finish(&mut self) {
+        self.close(false);
+        self.scratch = String::new();
+    }
+
+    // Appends new markup at `position` with `write`. Consecutive insertions at
+    // one position, such as new cells between two existing ones or new rows
+    // after the last, extend one edit: `apply`'s stable sort would emit them
+    // in this order anyway, and each new cell then needs no buffer of its own.
+    fn insert(
+        &mut self,
+        position: usize,
+        write: impl FnOnce(&mut String) -> Result<()>,
+    ) -> Result<()> {
+        let extends_last = self
+            .edits
+            .last()
+            .is_some_and(|edit| edit.start == position && edit.end == position);
+        if !extends_last {
+            let bytes = self.take_scratch();
+            self.push_open(Edit {
+                start: position,
+                end: position,
+                bytes,
+            })?;
+        }
+        let edit = self
+            .edits
+            .last_mut()
+            .expect("an insertion edit was just ensured");
+        let before = edit.bytes.len();
+        write(&mut edit.bytes)?;
+        let added = edit.bytes.len() - before;
+        self.count_inserted(added)
+    }
+
     // Turns an empty element `<name/>` into `<name>contents</name>`.
-    fn expand(&mut self, source: &str, element: &Element, mut contents: Vec<u8>) -> Result<()> {
+    fn expand(&mut self, source: &str, element: &Element, mut contents: String) -> Result<()> {
         let open_end = element.open_end();
         self.push(Edit {
             start: open_end - 2,
             end: open_end - 1,
-            bytes: Vec::new(),
+            bytes: String::new(),
         })?;
-        append_markup(
-            &mut contents,
-            format!("</{}>", element.name(source)).as_bytes(),
-        )?;
-        self.push(Edit {
+        write!(contents, "</{}>", element.name(source)).expect("writing to a String cannot fail");
+        self.push_open(Edit {
             start: open_end,
             end: open_end,
             bytes: contents,
@@ -81,8 +181,17 @@ impl EditPlan {
 
     /// The original XML with every planned edit applied.
     pub(super) fn apply(mut self, xml: &[u8]) -> Result<Vec<u8>> {
-        // Stable order is significant for several new cells/rows at one gap.
+        self.finish();
+        // At one offset, a zero-width insertion sorts before the edit that
+        // starts there. Edits never share a span, because `insert` merges
+        // consecutive insertions at one gap into one edit.
         self.edits.sort_by_key(|edit| (edit.start, edit.end));
+        debug_assert!(
+            self.edits
+                .windows(2)
+                .all(|pair| (pair[0].start, pair[0].end) != (pair[1].start, pair[1].end)),
+            "no two edits share a span"
+        );
         let mut position = 0;
         let mut length = 0usize;
         for edit in &self.edits {
@@ -101,9 +210,11 @@ impl EditPlan {
         check_part_size(length)?;
         let mut output = Vec::with_capacity(length);
         position = 0;
+        // Each edit's markup is freed once copied, rather than all of it being
+        // held until the whole worksheet is written.
         for edit in self.edits {
             output.extend_from_slice(&xml[position..edit.start]);
-            output.extend(edit.bytes);
+            output.extend_from_slice(edit.bytes.as_bytes());
             position = edit.end;
         }
         output.extend_from_slice(&xml[position..]);
@@ -122,22 +233,26 @@ fn attribute_edit(
             Some(value) if value != attribute.value => Some(Edit {
                 start: attribute.value_start(),
                 end: attribute.value_end(),
-                bytes: value.as_bytes().to_vec(),
+                bytes: value.to_owned(),
             }),
             None => Some(Edit {
                 start: attribute.start(),
                 end: attribute.end(),
-                bytes: Vec::new(),
+                bytes: String::new(),
             }),
             _ => None,
         }
     } else {
         // Before the tag's closing `>` or `/>`.
         let position = element.open_end() - if element.empty { 2 } else { 1 };
-        value.map(|value| Edit {
-            start: position,
-            end: position,
-            bytes: format!(" {name}=\"{value}\"").into_bytes(),
+        value.map(|value| {
+            let mut bytes = String::with_capacity(name.len() + value.len() + 4);
+            write!(bytes, " {name}=\"{value}\"").expect("writing to a String cannot fail");
+            Edit {
+                start: position,
+                end: position,
+                bytes,
+            }
         })
     }
 }
@@ -158,48 +273,98 @@ fn value_type(value: &CellValue) -> Option<&'static str> {
     }
 }
 
-fn payload(source: &str, prefix: &Element, value: &CellValue) -> Vec<u8> {
-    let mut output = String::new();
-    append_payload(&mut output, source, prefix, value);
-    output.into_bytes()
+// A number as an edit writes it, formatted on the stack. The buffer holds the
+// longest `f64` as `Display` writes it, a negative subnormal written out in
+// full; a longer one would take the slower path that formats into the edit.
+struct Digits {
+    bytes: [u8; 336],
+    len: usize,
 }
 
-fn append_payload(output: &mut String, source: &str, prefix: &Element, value: &CellValue) {
-    let v = prefix.qualified(source, "v");
+impl fmt::Write for Digits {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len + text.len();
+        let slot = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        slot.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+// Appends the payload elements for `value`, named with `prefix` (see
+// `Element::prefix`). When they start an edit, `ends` is how many bytes the
+// caller writes after them: the payload and those are then reserved exactly,
+// so unless escapes outgrow the text's share, the edit needs neither to
+// double for its last few bytes nor to be shrunk when it closes. A number is
+// measured for this only in a buffer not yet allocated. Shared buffers, and
+// escapes beyond the reservation, grow as a `Vec` does.
+fn append_payload(output: &mut String, prefix: &str, value: &CellValue, ends: Option<usize>) {
+    // Reserves `payload` bytes and the end tags exactly when they start an edit.
+    fn reserve(output: &mut String, ends: Option<usize>, payload: usize) {
+        if let Some(ends) = ends {
+            output.reserve_exact(payload + ends);
+        }
+    }
+    let value_element = "<v></v>".len() + 2 * prefix.len();
     match value {
         CellValue::Text(text) => {
-            let is = prefix.qualified(source, "is");
-            let t = prefix.qualified(source, "t");
-            write!(output, "<{is}><{t} xml:space=\"preserve\">")
+            reserve(
+                output,
+                ends,
+                "<is><t xml:space=\"preserve\"></t></is>".len() + 4 * prefix.len() + text.len(),
+            );
+            write!(output, "<{prefix}is><{prefix}t xml:space=\"preserve\">")
                 .expect("writing to a String cannot fail");
             xml::append_cell_text(output, text);
-            write!(output, "</{t}></{is}>").expect("writing to a String cannot fail");
+            write!(output, "</{prefix}t></{prefix}is>").expect("writing to a String cannot fail");
         }
         CellValue::Number(number) => {
-            write!(output, "<{v}>{number}</{v}>").expect("writing to a String cannot fail");
+            let number = stored_number(*number);
+            // A number is measured first only when it starts an edit in a
+            // buffer not yet allocated, as a plan's first does; a reused or
+            // shared buffer takes it directly.
+            if ends.is_some() && output.capacity() == 0 {
+                let mut digits = Digits {
+                    bytes: [0; 336],
+                    len: 0,
+                };
+                if write!(digits, "{number}").is_ok() {
+                    let digits =
+                        str::from_utf8(&digits.bytes[..digits.len]).expect("a number is ASCII");
+                    reserve(output, ends, value_element + digits.len());
+                    write!(output, "<{prefix}v>{digits}</{prefix}v>")
+                        .expect("writing to a String cannot fail");
+                    return;
+                }
+            }
+            write!(output, "<{prefix}v>{number}</{prefix}v>")
+                .expect("writing to a String cannot fail");
         }
         CellValue::Bool(boolean) => {
-            write!(output, "<{v}>{}</{v}>", u8::from(*boolean))
+            reserve(output, ends, value_element + 1);
+            write!(output, "<{prefix}v>{}</{prefix}v>", u8::from(*boolean))
                 .expect("writing to a String cannot fail");
         }
         CellValue::Error(error) => {
-            write!(output, "<{v}>").expect("writing to a String cannot fail");
+            reserve(output, ends, value_element + error.len());
+            write!(output, "<{prefix}v>").expect("writing to a String cannot fail");
             xml::append_cell_text(output, error);
-            write!(output, "</{v}>").expect("writing to a String cannot fail");
+            write!(output, "</{prefix}v>").expect("writing to a String cannot fail");
         }
         CellValue::Blank => {}
     }
 }
 
-fn new_cell(
-    source: &str,
-    context: &Element,
+// Appends a new cell's markup, named with its row's `prefix`.
+fn append_new_cell(
+    output: &mut String,
+    prefix: &str,
     cell: CellRef,
     style: Option<u32>,
     value: &CellValue,
-) -> Vec<u8> {
-    let c = context.qualified(source, "c");
-    let mut output = format!("<{c} r=\"{cell}\"");
+) -> Result<()> {
+    let starts_edit = output.is_empty();
+    write!(output, "<{prefix}c r=\"{cell}\"").expect("writing to a String cannot fail");
     if let Some(style) = style {
         write!(output, " s=\"{style}\"").expect("writing to a String cannot fail");
     }
@@ -207,9 +372,10 @@ fn new_cell(
         write!(output, " t=\"{kind}\"").expect("writing to a String cannot fail");
     }
     output.push('>');
-    append_payload(&mut output, source, context, value);
-    write!(output, "</{c}>").expect("writing to a String cannot fail");
-    output.into_bytes()
+    let ends = starts_edit.then_some("</c>".len() + prefix.len());
+    append_payload(output, prefix, value, ends);
+    write!(output, "</{prefix}c>").expect("writing to a String cannot fail");
+    check_part_size(output.len())
 }
 
 // The workbook-wide inputs that decide whether an edit rewrites a cell's
@@ -218,6 +384,25 @@ fn new_cell(
 struct CurrentValues<F> {
     shared_strings: F,
     date1904: bool,
+}
+
+// The number an edit writes. Spreadsheet numbers have no negative zero, and
+// Excel never writes one, so -0.0 is stored as 0.
+fn stored_number(number: f64) -> f64 {
+    if number == 0.0 { 0.0 } else { number }
+}
+
+/// Whether writing `new` over a cell that reads as `old` leaves it unchanged:
+/// the same value, where a number is the current one or the one written for
+/// it. A stored -0 reads with its sign, so writing 0 replaces it, while
+/// writing -0 leaves it.
+pub(crate) fn rewrites_unchanged(old: &CellValue, new: &CellValue) -> bool {
+    match (old, new) {
+        (CellValue::Number(old), CellValue::Number(new)) => {
+            old.to_bits() == new.to_bits() || old.to_bits() == stored_number(*new).to_bits()
+        }
+        _ => old == new,
+    }
 }
 
 // Whether `value` is the cell's current payload, as it reads. Decoding the old
@@ -253,7 +438,7 @@ fn unchanged_value<'s>(
         return false;
     }
     match read::decode_payload(index, cell, payload, current.date1904) {
-        Ok(StoredValue::Value(old)) => old == *value,
+        Ok(StoredValue::Value(old)) => rewrites_unchanged(&old, value),
         // The table is loaded only to compare text. An entry that cannot be
         // decoded, like a table that cannot be loaded, leaves a change.
         Ok(StoredValue::SharedString(position)) => match value {
@@ -266,6 +451,22 @@ fn unchanged_value<'s>(
     }
 }
 
+// Refuses a cell whose style index reads refuse.
+fn check_style_index(index: &WorksheetIndex, cell: &Element, address: CellRef) -> Result<()> {
+    read::style_index(index, cell)
+        .map(drop)
+        .map_err(|error| error.context(address))
+}
+
+// The error for a cell whose payload cannot be read. Reads report an
+// unreadable style index first, and so does this.
+#[cold]
+fn refused(index: &WorksheetIndex, cell: &Element, address: CellRef, error: Error) -> Error {
+    check_style_index(index, cell, address)
+        .err()
+        .unwrap_or_else(|| error.context(address))
+}
+
 fn patched_cell<'s>(
     index: &WorksheetIndex,
     address: CellRef,
@@ -275,16 +476,17 @@ fn patched_cell<'s>(
     current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<bool> {
     let (source, elements, attributes, namespace) = (
-        index.source,
+        index.source(),
         &index.elements,
         &index.attributes,
         index.namespace,
     );
     let cell = &elements[cell_index];
-    let value_child = read::value_payload(index, cell).map_err(|error| error.context(address))?;
+    let value_child =
+        read::value_payload(index, cell).map_err(|error| refused(index, cell, address, error))?;
     if let Some(child) = value_child {
         validation::validate_payload(source, elements, attributes, child, namespace)
-            .map_err(|error| error.context(address))?;
+            .map_err(|error| refused(index, cell, address, error))?;
     }
     let unchanged = if let Some(child) = value_child {
         unchanged_value(index, cell, child, value, current)
@@ -294,6 +496,10 @@ fn patched_cell<'s>(
     if unchanged {
         return Ok(false);
     }
+    // A change keeps the cell's style index, which reads refuse unless it is an
+    // unsigned 32-bit integer, so such a cell is refused here too. An edit that
+    // leaves the cell unchanged writes nothing and succeeds, as before.
+    check_style_index(index, cell, address)?;
     // Value metadata can link to rich data in other package parts. Cell metadata
     // has per-type edit/clear flags in the metadata part (ECMA-376 18.9.10), so
     // even a cell-level link may not survive a value change. Without interpreting
@@ -304,29 +510,45 @@ fn patched_cell<'s>(
     if cell.attribute(attributes, "cm").is_some() {
         return Err(errors::protected(address, protection::CELL_METADATA));
     }
-    let value_bytes = payload(source, cell, value);
+    // Taking the buffer closes the previous edit first, so the type edit
+    // follows it in document order, which keeps `apply`'s sort cheap. A row's
+    // spans edit and the dimension edit are still added after the edits that
+    // follow them.
+    let mut value_bytes = edits.take_scratch();
     if let Some(type_edit) = attribute_edit(cell, attributes, "t", value_type(value)) {
         edits.push(type_edit)?;
     }
+    let prefix = cell.prefix(source);
+    // An empty cell (`<c/>`) is expanded, which adds its end tag.
+    let end_tag = if cell.empty {
+        "</c>".len() + prefix.len()
+    } else {
+        0
+    };
+    append_payload(&mut value_bytes, prefix, value, Some(end_tag));
     if cell.empty {
-        if !value_bytes.is_empty() {
+        if value_bytes.is_empty() {
+            edits.restore_scratch(value_bytes);
+        } else {
             edits.expand(source, cell, value_bytes)?;
         }
         return Ok(true);
     }
     if let Some(child) = value_child {
-        edits.push(Edit {
+        edits.push_open(Edit {
             start: elements[child].start(),
             end: elements[child].end(),
             bytes: value_bytes,
         })?;
-    } else if !value_bytes.is_empty() {
+    } else if value_bytes.is_empty() {
+        edits.restore_scratch(value_bytes);
+    } else {
         let position = cell
             .children(elements)
             .map(|child| &elements[child])
             .find(|child| child.is(source, namespace, "extLst"))
             .map_or(cell.close_start(), Element::start);
-        edits.push(Edit {
+        edits.push_open(Edit {
             start: position,
             end: position,
             bytes: value_bytes,
@@ -445,12 +667,19 @@ fn patch_existing_row<'s>(
     changed_cells: &mut Vec<CellRef>,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<()> {
-    let (source, elements) = (index.source, &index.elements);
+    let (source, elements) = (index.source(), &index.elements);
     let element = &elements[row.element];
+    // The prefix of new cells, found once one is needed.
+    let mut prefix = None;
     let existing_cells = &index.cells[row.cells.clone()];
     let mut cell_position = 0;
     let changed_start = changed_cells.len();
-    let mut empty_row_cells = Vec::new();
+    // The new cells of an empty row (`<row/>`). A first cell is written to the
+    // reused buffer. A second moves the row to a buffer of exactly the first
+    // cell's size and frees the reused one, so that a row of many cells grows
+    // as a row built from whole cells does.
+    let mut empty_row_cells: Option<String> = None;
+    let mut cells_in_scratch = false;
     // Resolve only when a new nonblank cell needs a style. Existing cells and
     // blank edits must not start validating row defaults; later insertions can
     // reuse the first result without rescanning attributes or numeric text.
@@ -494,17 +723,25 @@ fn patch_existing_row<'s>(
                 RowStyle::ColumnDefault => index.column_style(cell)?,
                 RowStyle::Custom(style) => (style != 0).then_some(style),
             };
-            let bytes = new_cell(source, element, cell, style, value);
+            let prefix = *prefix.get_or_insert_with(|| element.prefix(source));
             if element.empty {
-                append_markup(&mut empty_row_cells, &bytes)?;
+                if let Some(markup) = &mut empty_row_cells {
+                    if mem::take(&mut cells_in_scratch) {
+                        *markup = markup.as_str().to_owned();
+                    }
+                    append_new_cell(markup, prefix, cell, style, value)?;
+                } else {
+                    let mut first = edits.take_scratch();
+                    append_new_cell(&mut first, prefix, cell, style, value)?;
+                    empty_row_cells = Some(first);
+                    cells_in_scratch = true;
+                }
             } else {
                 let insertion = existing_cells
                     .get(cell_position)
                     .map_or(fallback, |next| elements[next.element].start());
-                edits.push(Edit {
-                    start: insertion,
-                    end: insertion,
-                    bytes,
+                edits.insert(insertion, |markup| {
+                    append_new_cell(markup, prefix, cell, style, value)
                 })?;
             }
         }
@@ -524,40 +761,32 @@ fn patch_existing_row<'s>(
     if let Some(spans) = spans {
         edits.push(spans)?;
     }
-    if element.empty {
-        edits.expand(source, element, empty_row_cells)?;
+    if let Some(cells) = empty_row_cells {
+        edits.expand(source, element, cells)?;
     }
     Ok(())
 }
 
-// The markup of a new row holding a row number's non-blank values, or `None`
-// when every value is blank and the row is not needed.
-fn new_row(
+// Appends a new row holding a row number's values. Blank values need no
+// cell, so the caller only adds a row for changes with a non-blank value.
+fn append_new_row(
+    output: &mut String,
     index: &WorksheetIndex,
     number: u32,
     changes: &RowChanges,
     changed_cells: &mut Vec<CellRef>,
-) -> Result<Option<Vec<u8>>> {
-    let data = &index.elements[index.data_index];
-    let mut cells = Vec::new();
+) -> Result<()> {
+    let prefix = index.elements[index.data_index].prefix(index.source());
+    write!(output, "<{prefix}row r=\"{number}\">").expect("writing to a String cannot fail");
     for &(&cell, value) in changes {
         if !matches!(value, CellValue::Blank) {
             let style = index.column_style(cell)?;
-            append_markup(
-                &mut cells,
-                &new_cell(index.source, data, cell, style, value),
-            )?;
+            append_new_cell(output, prefix, cell, style, value)?;
             changed_cells.push(cell);
         }
     }
-    if cells.is_empty() {
-        return Ok(None);
-    }
-    let row = data.qualified(index.source, "row");
-    let mut bytes = format!("<{row} r=\"{number}\">").into_bytes();
-    append_markup(&mut bytes, &cells)?;
-    append_markup(&mut bytes, format!("</{row}>").as_bytes())?;
-    Ok(Some(bytes))
+    write!(output, "</{prefix}row>").expect("writing to a String cannot fail");
+    Ok(())
 }
 
 // Widens the worksheet's dimension to include every changed cell. A reference
@@ -566,7 +795,7 @@ fn dimension_edit(index: &WorksheetIndex, changed_cells: &[CellRef]) -> Result<O
     if changed_cells.is_empty() {
         return Ok(None);
     }
-    let (source, elements) = (index.source, &index.elements);
+    let (source, elements) = (index.source(), &index.elements);
     let dimension = errors::unique(
         elements[0]
             .children(elements)
@@ -612,7 +841,7 @@ pub(super) fn plan_cells<'s>(
     index.validate_edits(cells)?;
     // The table is needed only to recognize rewriting a shared string's own
     // text; a table that is absent or fails to load leaves such edits as
-    // changes. The workbook loads it once and keeps it.
+    // changes. The caller loads it at most once per call.
     let mut current = CurrentValues {
         shared_strings,
         date1904,
@@ -620,8 +849,9 @@ pub(super) fn plan_cells<'s>(
     let data = &index.elements[index.data_index];
     let mut edits = EditPlan::default();
     let mut changed_cells = Vec::new();
-    // New rows for an empty `<sheetData/>` share one expansion.
-    let mut empty_data_rows = Vec::new();
+    // New rows for an empty `<sheetData/>` share one expansion, written to the
+    // reused buffer once a first row needs it.
+    let mut empty_data_rows: Option<String> = None;
     let mut pending = cells.iter().peekable();
     let mut row_position = 0;
     let mut changes: Vec<(&CellRef, &CellValue)> = Vec::new();
@@ -650,26 +880,233 @@ pub(super) fn plan_cells<'s>(
                 &mut changed_cells,
                 &mut current,
             )?;
-        } else if let Some(bytes) = new_row(index, number, &changes, &mut changed_cells)? {
+        } else if changes
+            .iter()
+            .any(|(_, value)| !matches!(value, CellValue::Blank))
+        {
             if data.empty {
-                append_markup(&mut empty_data_rows, &bytes)?;
+                append_new_row(
+                    empty_data_rows.get_or_insert_with(|| edits.take_scratch()),
+                    index,
+                    number,
+                    &changes,
+                    &mut changed_cells,
+                )?;
             } else {
                 let insertion = next_row.map_or(data.close_start(), |row| {
                     index.elements[row.element].start()
                 });
-                edits.push(Edit {
-                    start: insertion,
-                    end: insertion,
-                    bytes,
+                edits.insert(insertion, |markup| {
+                    append_new_row(markup, index, number, &changes, &mut changed_cells)
                 })?;
             }
         }
     }
-    if !empty_data_rows.is_empty() {
-        edits.expand(index.source, data, empty_data_rows)?;
+    if let Some(rows) = empty_data_rows.filter(|rows| !rows.is_empty()) {
+        edits.expand(index.source(), data, rows)?;
     }
     if let Some(edit) = dimension_edit(index, &changed_cells)? {
         edits.push(edit)?;
     }
+    edits.finish();
     Ok(edits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edits_are_allocated_at_exactly_their_size() {
+        // New cells between and after existing ones, in an empty row and in new
+        // rows, rewritten cells, and several of them at one position, whatever
+        // their values need: XML and Excel escapes, long numbers, styles and a
+        // prefix.
+        for (namespace, prefix) in [("", ""), (":x", "x:")] {
+            let xml = format!(
+                "<{prefix}worksheet xmlns{namespace}='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><{prefix}sheetData><{prefix}row r='1'><{prefix}c r='A1'/><{prefix}c r='C1'><{prefix}v>1</{prefix}v></{prefix}c></{prefix}row><{prefix}row r='2' s='3' customFormat='1'/><{prefix}row r='4'><{prefix}c r='A4'/></{prefix}row><{prefix}row r='6'/></{prefix}sheetData></{prefix}worksheet>"
+            );
+            let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+            let text = |text: &str| CellValue::Text(text.to_owned());
+            let cells = BTreeMap::from([
+                ("A1".parse().unwrap(), text("rewritten & empty")),
+                ("B1".parse().unwrap(), text("R&D <1>\r_x0041_\u{1}")),
+                ("C1".parse().unwrap(), CellValue::Number(12_345.0 / 7.0)),
+                ("D1".parse().unwrap(), CellValue::Number(1e21)),
+                ("E1".parse().unwrap(), text(&"long ".repeat(40))),
+                ("A2".parse().unwrap(), text("in an empty row")),
+                ("B2".parse().unwrap(), CellValue::Bool(false)),
+                ("A3".parse().unwrap(), CellValue::Bool(true)),
+                ("A5".parse().unwrap(), CellValue::Error("#N/A".to_owned())),
+                (
+                    "XFD4".parse().unwrap(),
+                    CellValue::Error("#DIV/0!".to_owned()),
+                ),
+            ]);
+            let plan = plan_cells(&index, &cells, || None, false).unwrap();
+            let markup: Vec<_> = plan
+                .edits
+                .iter()
+                .filter(|edit| edit.bytes.starts_with('<'))
+                .collect();
+            // A1's payload with B1, which follows it; C1's payload; D1 with
+            // E1; A2 and B2 with row 3; row 5; and XFD4.
+            assert_eq!(markup.len(), 6, "{xml}");
+            // Every edit, including attribute and value replacements.
+            for edit in &plan.edits {
+                assert_eq!(edit.bytes.capacity(), edit.bytes.len(), "{}", edit.bytes);
+            }
+            let patched = String::from_utf8(plan.apply(xml.as_bytes()).unwrap()).unwrap();
+            for expected in [
+                format!(
+                    "<{prefix}c r='A1' t=\"inlineStr\"><{prefix}is><{prefix}t xml:space=\"preserve\">rewritten &amp; empty</{prefix}t></{prefix}is></{prefix}c>"
+                ),
+                format!(
+                    "<{prefix}c r=\"B1\" t=\"inlineStr\"><{prefix}is><{prefix}t xml:space=\"preserve\">R&amp;D &lt;1&gt;&#13;_x005F_x0041__x0001_</{prefix}t></{prefix}is></{prefix}c>"
+                ),
+                format!(
+                    "<{prefix}c r='C1'><{prefix}v>1763.5714285714287</{prefix}v></{prefix}c><{prefix}c r=\"D1\"><{prefix}v>1000000000000000000000</{prefix}v></{prefix}c><{prefix}c r=\"E1\""
+                ),
+                format!("customFormat='1'><{prefix}c r=\"A2\" s=\"3\" t=\"inlineStr\">"),
+                format!(
+                    "<{prefix}v>0</{prefix}v></{prefix}c></{prefix}row><{prefix}row r=\"3\"><{prefix}c r=\"A3\" t=\"b\"><{prefix}v>1</{prefix}v></{prefix}c></{prefix}row><{prefix}row r='4'>"
+                ),
+                format!(
+                    "<{prefix}row r=\"5\"><{prefix}c r=\"A5\" t=\"e\"><{prefix}v>#N/A</{prefix}v></{prefix}c></{prefix}row>"
+                ),
+                format!(
+                    "<{prefix}c r=\"XFD4\" t=\"e\"><{prefix}v>#DIV/0!</{prefix}v></{prefix}c></{prefix}row>"
+                ),
+            ] {
+                assert!(patched.contains(&expected), "{patched}\n{expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn edits_closed_on_every_path_are_allocated_at_exactly_their_size() {
+        // B1's long text grows the reused buffer first, so a smaller edit
+        // that kept it would show a larger capacity than its length.
+        //
+        // - B1 and C1, which grows their buffer past B1's exact reservation,
+        //   stay open while their row's spans edit is added, and are copied
+        //   when A4 needs the buffer.
+        // - A4 and B4 get values in cells without a value element.
+        // - Row 5's three long cells, over `REUSE_LIMIT`, are shrunk rather
+        //   than copied when the next row needs the buffer.
+        // - Row 6's expansion is the last edit, still open while the
+        //   dimension edit is added and shrunk when planning ends.
+        let xml = "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><dimension ref='A1'/><sheetData><row r='1' spans='1:1'><c r='A1'><v>1</v></c></row><row r='4'><c r='A4'></c><c r='B4'><extLst/></c></row><row r='6'/></sheetData></worksheet>";
+        let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+        let long = "x".repeat(30_000);
+        let mut cells = BTreeMap::from([
+            ("B1".parse().unwrap(), CellValue::Text("long ".repeat(80))),
+            ("C1".parse().unwrap(), CellValue::Number(2.5)),
+            ("A4".parse().unwrap(), CellValue::Number(2.0)),
+            ("B4".parse().unwrap(), CellValue::Error("#REF!".to_owned())),
+            ("A6".parse().unwrap(), CellValue::Bool(true)),
+        ]);
+        for column in ["A", "B", "C"] {
+            cells.insert(
+                format!("{column}5").parse().unwrap(),
+                CellValue::Text(long.clone()),
+            );
+        }
+        let plan = plan_cells(&index, &cells, || None, false).unwrap();
+        let markup: Vec<_> = plan
+            .edits
+            .iter()
+            .filter(|edit| edit.bytes.starts_with('<'))
+            .collect();
+        assert_eq!(markup.len(), 5);
+        assert!(markup.iter().any(|edit| edit.bytes.len() > REUSE_LIMIT));
+        for edit in &plan.edits {
+            assert_eq!(
+                edit.bytes.capacity(),
+                edit.bytes.len(),
+                "{}",
+                &edit.bytes[..edit.bytes.len().min(80)]
+            );
+        }
+        let patched = String::from_utf8(plan.apply(xml.as_bytes()).unwrap()).unwrap();
+        for expected in [
+            "<dimension ref='A1:C6'/>",
+            "<row r='1' spans='1:3'><c r='A1'><v>1</v></c><c r=\"B1\" t=\"inlineStr\">",
+            "</c><c r=\"C1\"><v>2.5</v></c></row>",
+            "<c r='A4'><v>2</v></c><c r='B4' t=\"e\"><v>#REF!</v><extLst/></c></row><row r=\"5\">",
+            "</row><row r='6'><c r=\"A6\" t=\"b\"><v>1</v></c></row></sheetData>",
+        ] {
+            assert!(patched.contains(expected), "{expected}");
+        }
+
+        // New rows for an empty `<sheetData/>`, and a dimension edit.
+        let xml = "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><dimension ref='A1'/><sheetData/></worksheet>";
+        let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+        let cells = BTreeMap::from([
+            ("A1".parse().unwrap(), CellValue::Text("new row ".repeat(9))),
+            ("B3".parse().unwrap(), CellValue::Number(3.0)),
+        ]);
+        let plan = plan_cells(&index, &cells, || None, false).unwrap();
+        for edit in &plan.edits {
+            assert_eq!(edit.bytes.capacity(), edit.bytes.len(), "{}", edit.bytes);
+        }
+        let patched = String::from_utf8(plan.apply(xml.as_bytes()).unwrap()).unwrap();
+        assert!(
+            patched.contains("<dimension ref='A1:B3'/><sheetData><row r=\"1\">"),
+            "{patched}"
+        );
+    }
+
+    #[test]
+    fn type_edits_keep_a_plan_in_document_order() {
+        // Rewrites that change a cell's type add a type edit before its value
+        // edit, and an empty cell is expanded; `apply`'s sort then sees one run.
+        let xml = "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData><row r='1'><c r='A1'><v>1</v></c><c r='B1' t='s'><v>0</v></c><c r='C1' t='str'><v>x</v></c><c r='D1'/><c r='E1' t='b'><v>1</v></c></row><row r='2'><c r='A2'><v>2</v></c></row></sheetData></worksheet>";
+        let index = WorksheetIndex::parse(xml.as_bytes()).unwrap();
+        let cells = BTreeMap::from([
+            ("A1".parse().unwrap(), CellValue::Bool(true)),
+            ("B1".parse().unwrap(), CellValue::Number(3.0)),
+            ("C1".parse().unwrap(), CellValue::Blank),
+            ("D1".parse().unwrap(), CellValue::Error("#N/A".to_owned())),
+            ("E1".parse().unwrap(), CellValue::Text("text".to_owned())),
+            ("A2".parse().unwrap(), CellValue::Bool(false)),
+        ]);
+        let plan = plan_cells(&index, &cells, || None, false).unwrap();
+        assert!(
+            plan.edits.is_sorted_by_key(|edit| (edit.start, edit.end)),
+            "{:?}",
+            plan.edits
+                .iter()
+                .map(|edit| (edit.start, edit.end))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_number_fits_the_stack_buffer() {
+        let mut values = vec![
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            5e-324,
+            -5e-324,
+            1.234_567_890_123_456_7e-308,
+            -1e-323,
+        ];
+        // Every subnormal power of two, and its neighbours.
+        let mut tiny = f64::MIN_POSITIVE;
+        while tiny > 0.0 {
+            values.extend([tiny, -tiny, tiny * 1.999_999_999_999_999_8]);
+            tiny /= 2.0;
+        }
+        for value in values {
+            let mut digits = Digits {
+                bytes: [0; 336],
+                len: 0,
+            };
+            assert!(write!(digits, "{value}").is_ok(), "{value:e}");
+            assert_eq!(&digits.bytes[..digits.len], value.to_string().as_bytes());
+        }
+    }
 }

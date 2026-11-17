@@ -9,7 +9,7 @@ use self::error::Failure;
 use self::output::{CellOutput, Escape};
 use self::patch::Patch;
 use self::streams::{Destination, ObsoleteRecords, Source};
-use sheetpatch::{CellEdit, CellRange};
+use sheetpatch::CellRange;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
@@ -131,14 +131,14 @@ fn run_set(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     let sheet = line.text(2)?;
     let cell = line.text(3)?;
     let kind = line.text(4)?;
-    let value = args.get(5).map(|_| line.text(5)).transpose()?;
+    let text = args.get(5).map(|_| line.text(5)).transpose()?;
     let cell = args::parse_cell(cell).map_err(|message| Failure::invalid("set", message))?;
-    let value = args::parse_value(kind, value).map_err(|error| match error {
+    let value = args::parse_value(kind, text).map_err(|error| match error {
         ValueError::Arity(message) => Failure::Usage(message),
         ValueError::Invalid(message) => Failure::invalid("set", message),
     })?;
-    let edit = CellEdit::try_new_at(sheet, cell, value)
-        .map_err(|error| Failure::invalid("set", error.to_string()))?;
+    let edit = args::cell_edit(sheet, cell, value, text)
+        .map_err(|message| Failure::invalid("set", message))?;
     let source = Source::try_new(line.command, &args[0])?;
     let destination = Destination::try_new(line.command, &args[1], terminal)?;
     let mut workbook = source.open()?;
@@ -248,9 +248,8 @@ pub(super) fn main() -> ExitCode {
     use std::io::IsTerminal as _;
 
     let args: Vec<OsString> = env::args_os().collect();
-    let stdout = io::stdout();
-    let terminal = stdout.is_terminal();
-    let mut output = BufWriter::new(stdout.lock());
+    let terminal = io::stdout().is_terminal();
+    let mut output = BufWriter::new(streams::Stdout::default());
     let result =
         run(&args, &mut output, terminal).and_then(|()| output.flush().map_err(Failure::Output));
     // Discard anything still buffered after a failure instead of flushing a

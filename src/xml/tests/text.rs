@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 use std::iter;
 
 #[test]
@@ -281,5 +282,125 @@ fn excel_escape_decoding_is_single_pass_and_utf16_aware() {
             ),
             "{text}"
         );
+    }
+}
+
+#[test]
+fn decoded_excel_text_is_compact_and_appends_within_its_spelling() {
+    let texts = [
+        "plain",
+        "_",
+        "under_score",
+        "_x0041_",
+        "line_x000D_ 0 under_score",
+        "_x005F_x0041_",
+        "雪_x0041__xD83D__xDE00_😀_",
+        "_xD800_",
+        "ok_xDC00_",
+    ];
+    for text in texts {
+        let padded = format!("{text}{}", "y".repeat(200));
+        for text in [text, padded.as_str()] {
+            let decoded = excel_text(text);
+            if let Ok(decoded) = &decoded {
+                assert_eq!(decoded.capacity(), decoded.len(), "{text:?}");
+            }
+            // Appending grows the output by at most the spelling's length.
+            for prefix in ["", "abc", &"z".repeat(300)] {
+                let mut output = prefix.to_owned();
+                output.try_reserve(text.len()).unwrap();
+                let capacity = output.capacity();
+                let appended = append_excel_text(&mut output, text);
+                assert_eq!(appended.is_ok(), decoded.is_ok(), "{text:?}");
+                if let Ok(decoded) = &decoded {
+                    assert_eq!(output, format!("{prefix}{decoded}"), "{text:?}");
+                }
+                assert_eq!(output.capacity(), capacity, "{text:?} after {prefix:?}");
+            }
+        }
+    }
+}
+
+// The per-character escaping that `append_escaped` replaces with copied runs.
+fn escaped_by_character(text: &str, xml: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    for (position, character) in text.char_indices() {
+        if character == '_'
+            && excel_escape_prefix_at(bytes, position)
+            && text[position + 6..]
+                .chars()
+                .next()
+                .is_some_and(|next| next == '_' || !valid_char(next))
+        {
+            output.push_str("_x005F_");
+        } else if valid_char(character) {
+            match (xml, character) {
+                (true, '&') => output.push_str("&amp;"),
+                (true, '<') => output.push_str("&lt;"),
+                (true, '>') => output.push_str("&gt;"),
+                (true, '\r') => output.push_str("&#13;"),
+                _ => output.push(character),
+            }
+        } else {
+            write!(output, "_x{:04X}_", u32::from(character)).unwrap();
+        }
+    }
+    output
+}
+
+#[test]
+fn escaping_in_runs_matches_escaping_each_character() {
+    // Characters around every escapable byte: every ASCII control, others
+    // that share U+FFFE's 0xEF lead byte, and pieces of `_xHHHH_` tokens.
+    let controls: Vec<String> = (0..0x20_u8)
+        .map(|byte| char::from(byte).to_string())
+        .collect();
+    let mut pieces: Vec<&str> = vec![
+        "a",
+        "Z",
+        " ",
+        "&",
+        "<",
+        ">",
+        "\"",
+        "'",
+        "_",
+        "_x",
+        "_x0041",
+        "_x0041_",
+        "_X0041_",
+        "x0041_",
+        "\u{e9}",
+        "\u{20ac}",
+        "\u{feff}",
+        "\u{fffd}",
+        "\u{fffe}",
+        "\u{ffff}",
+        "\u{ef00}",
+        "\u{1f600}",
+        "\u{10ffff}",
+    ];
+    pieces.extend(controls.iter().map(String::as_str));
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        usize::try_from(state % u64::try_from(bound).unwrap()).unwrap()
+    };
+    for _ in 0..20_000 {
+        let mut text = String::new();
+        for _ in 0..next(24) {
+            text.push_str(pieces[next(pieces.len())]);
+        }
+        for xml in [false, true] {
+            for reserve in [0, text.len(), text.len() + 40] {
+                let mut output = String::from("prefix");
+                output.reserve_exact(reserve);
+                append_escaped(&mut output, &text, xml);
+                assert_eq!(output[6..], escaped_by_character(&text, xml), "{text:?}");
+            }
+        }
     }
 }

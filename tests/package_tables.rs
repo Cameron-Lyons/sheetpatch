@@ -325,6 +325,9 @@ fn header_checks_agree_before_and_after_the_tables_are_resolved() {
     let unreadable_header = "invalid workbook: worksheet \"Data\": B1: invalid cell style index";
     for (parts, expected) in [
         (&plain, [Ok(()), Err(refusal.as_str()), Ok(()), Ok(())]),
+        // A change to the table reads its headers, which refuse B1's style
+        // index. A batch that only rewrites the headers' current values
+        // changes nothing and succeeds.
         (
             &unreadable,
             [
@@ -343,6 +346,26 @@ fn header_checks_agree_before_and_after_the_tables_are_resolved() {
         assert_eq!(results, expected);
         assert_eq!(outcomes(parts, /* resolved: */ true), first);
     }
+}
+
+#[test]
+fn a_header_edit_is_refused_exactly_when_it_would_change_the_cell() {
+    // A header that reads as -0, which writing 0 would replace and writing -0
+    // would leave.
+    let mut parts = parts("ref='A1:B3'");
+    let sheet = parts.get_mut("xl/worksheets/sheet1.xml").unwrap();
+    *sheet = sheet.replace(
+        "<c r='B1' t='inlineStr'><is><t>Amount</t></is></c>",
+        "<c r='B1'><v>-0</v></c>",
+    );
+    let mut book = book(&parts);
+    let refusal = format!("protected cell: worksheet \"Data\": B1 {REFUSAL}");
+    for value in [0.0, 1.0] {
+        let error = book.set_cell("Data", "B1", value).unwrap_err();
+        assert_eq!(error.to_string(), refusal, "{value}");
+    }
+    book.set_cell("Data", "B1", -0.0).unwrap();
+    assert!(!book.has_changes());
 }
 
 #[test]

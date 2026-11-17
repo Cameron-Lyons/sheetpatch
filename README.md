@@ -171,11 +171,12 @@ call. Both workbooks and prepared views can be shared across threads.
 
 `cell_contents()` visits existing cells directly through the prepared index,
 including style-only cells. `cell_contents_in(Some(range))` filters addresses
-before decoding, uses the row index to skip unrelated rows and columns,
-and never expands missing cells. Each item returns
-its own read result; starting another iterator replays the view. Use these
-methods for whole-sheet processing with bounded result memory, and
-`get_cells_at` when a specific request order or duplicate addresses are needed.
+before decoding, uses the row index to skip unrelated rows and, where that
+costs less than filtering, unrelated columns, and never expands missing
+cells. Each item returns its own read result; starting another iterator
+replays the view. Use these methods for whole-sheet processing with bounded
+result memory, and `get_cells_at` when a specific request order or duplicate
+addresses are needed.
 
 An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 `Error::ProtectedCell { sheet, cell, reason }`, displayed as
@@ -183,7 +184,8 @@ An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 inside a worksheet name it and, where one applies, the cell. Errors in another
 part, such as the shared-string table or a worksheet's relationships and table
 parts, name that part instead, as in `part "xl/sharedStrings.xml": …`. An
-invalid value in a `set_cells` or `set_cells_at` batch names its cell but not
+`Error::Io`, such as a refused allocation while the table loads, names neither.
+An invalid value in a `set_cells` or `set_cells_at` batch names its cell but not
 its worksheet, as in `invalid cell value: B7: numbers must be finite`.
 Malformed or ambiguous content, such as a numeric cell whose value is not a
 number, a cell reference that is not an address, rows out of order, or a cell
@@ -362,9 +364,10 @@ exact text and escape every control character, including DEL and C1 as `\u00XX`.
 `save`, `save_compact`, and CLI file outputs write a temporary file beside the
 destination and rename it into place after a successful write. The original
 destination is retained if generation or writing fails, and the input path can be
-the destination. The destination must name a file: a path without a file name,
-and an existing directory, FIFO, device, or socket (also behind a symlink),
-return `Error::Io` of kind `InvalidInput` before any output is generated.
+the destination. The destination must name a file: a path without a file name
+or ending in a separator or `.` component, and an existing directory, FIFO,
+device, or socket (also behind a symlink), return `Error::Io` of kind
+`InvalidInput` before any output is generated.
 
 Existing destination permission bits are applied to the temporary file before
 workbook contents are written. On Unix the replacement also keeps the
@@ -397,8 +400,10 @@ Saves replace the destination directory
 entry: an output symlink to a regular file is replaced rather than written
 through, and hard links to the old file keep the old contents. On Unix, like
 `sed -i`, a save replaces a read-only destination as long as its directory is
-writable; Windows refuses to replace a read-only destination. After the rename,
-Unix saves sync the directory (best effort) so a completed save survives a crash.
+writable; Windows refuses to replace a read-only destination, so such a save
+returns an `Error::Io` of kind `PermissionDenied` before generating any
+output. After the rename, Unix saves sync the directory (best effort) so a
+completed save survives a crash.
 
 If the process is killed during a save (Ctrl-C, SIGTERM, SIGKILL, power loss),
 the destination is untouched, but a hidden temporary file can remain beside it.
@@ -412,7 +417,7 @@ incomplete copy and safe to delete.
 | --- | --- |
 | Untouched package parts | Original payload, compressed bytes, local headers, extra fields, and comments are retained byte for byte; directory offsets may change. |
 | Edited worksheet | Original XML outside the necessary edits is retained byte for byte. |
-| Existing cell formatting | Style, other attributes, and unfamiliar sibling content are retained. |
+| Existing cell formatting | Style, other attributes, and unfamiliar sibling content are retained; a change to a cell whose style index is not an unsigned 32-bit integer is refused, as reads refuse that cell. |
 | New cells and rows | Inserted in coordinate order. A new cell takes its row's style when the row has a custom format, otherwise its column's style; existing cells are never restyled. Existing dimension and row-span hints are widened as needed. |
 | Text | Written as inline strings; shared strings stay untouched. Whitespace, XML characters, and literal Excel escape sequences are preserved. Characters XML 1.0 forbids, such as NUL and other control characters, are stored as Excel's `_xHHHH_` escapes and read back exactly. |
 | Unchanged values | Writing the value a cell already stores, including a shared string's own text or an ISO 8601 date cell's serial, leaves the worksheet unchanged; edits may load the shared-string table to compare, and an entry that cannot be decoded counts as changed. Protections still apply. |
@@ -492,7 +497,10 @@ in cached results. The original workbook's calculation settings are retained.
   selects. Mixed strict and transitional SpreadsheetML in
   workbook metadata, worksheets, or shared strings is unsupported, since
   ignoring the other dialect could omit data or bypass edit protections.
-  XML nested deeper than 256 elements is unsupported.
+  XML nested deeper than 256 elements is unsupported, and so is XML with more
+  than 128 namespace declarations on the elements open at once, counting any
+  that a nested declaration of the same prefix overrides but not one of the
+  reserved `xml` prefix.
 - Formula cells and shared, array, or data-table formula ranges are protected
   against overwriting. Existing formulas remain untouched. Formula creation,
   structural edits, style creation, and calculation are outside this version's scope.
@@ -642,8 +650,9 @@ additional dependency.
 Batch edits with `set_cells` or `apply_edits` so each affected worksheet is
 parsed once. For repeated reads, retain a `WorksheetView`; `cell_contents`
 streams existing cells without building an address list or a result vector.
-Range iteration skips unrelated rows and columns, and ordered batch reads reuse
-the index position while preserving duplicate addresses and blank results.
+Range iteration skips unrelated rows and most unrelated columns, and ordered
+batch reads reuse the index position while preserving duplicate addresses and
+blank results.
 
 Read batches bound cell count, not total text bytes: repeated requests each own
 their value and formula. Result slots and text copies use fallible allocations,

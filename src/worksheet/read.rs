@@ -9,6 +9,8 @@ use quick_xml::events::Event;
 use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::result::Result as StdResult;
@@ -158,6 +160,75 @@ pub(super) fn validate_rich_text_structure(
     Ok(())
 }
 
+// Visits the text elements of a rich-text element, such as a shared string's
+// `si` or an inline string's `is`, in document order. Callers validate it with
+// `validate_rich_text_structure` first.
+fn visit_rich_text(
+    source: &str,
+    elements: &[Element],
+    index: usize,
+    namespace: NamespaceId,
+    mut visit: impl FnMut(&Element) -> Result<()>,
+) -> Result<()> {
+    for child in elements[index].children(elements) {
+        let element = &elements[child];
+        if element.is(source, namespace, "t") {
+            visit(element)?;
+        } else if element.is(source, namespace, "r") {
+            for child in element.children(elements) {
+                let element = &elements[child];
+                if element.is(source, namespace, "t") {
+                    visit(element)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// The text of a rich-text element appended to `text`, such as a shared string
+// appended to its table's buffer. On an error, `text` may hold part of it.
+fn append_rich_text(
+    text: &mut String,
+    source: &str,
+    elements: &[Element],
+    index: usize,
+    namespace: NamespaceId,
+) -> Result<()> {
+    // The buffer grows as for pushing each entry decoded and whole. Decoding
+    // never lengthens text, so an entry whose markup fits the buffer's spare
+    // capacity is decoded straight into it, which cannot grow it, and pushing
+    // it whole would not have either. An entry that may not fit is read to a
+    // string of its own first, and the buffer grows for that.
+    let element = &elements[index];
+    if text.capacity() - text.len() < element.end() - element.start() {
+        let entry = rich_text(source, elements, index, namespace)?;
+        return append_text(text, &entry);
+    }
+    validate_rich_text_structure(source, elements, index, namespace)?;
+    let capacity = text.capacity();
+    visit_rich_text(source, elements, index, namespace, |element| {
+        let piece = element_text(source, element)?;
+        // Only an underscore can start an Excel escape.
+        if piece.contains('_') {
+            xml::append_excel_text(text, &piece)
+        } else {
+            text.push_str(&piece);
+            Ok(())
+        }
+    })?;
+    debug_assert_eq!(
+        text.capacity(),
+        capacity,
+        "an entry is decoded within the markup that bounds it"
+    );
+    Ok(())
+}
+
+// The text of a rich-text element as a value of its own, such as an inline
+// string. Its first nonempty piece becomes the value, so a decoded piece is
+// not copied again. Escapes are decoded piece by piece into compact text:
+// decoding them in place would keep their longer spelling's capacity.
 fn rich_text(
     source: &str,
     elements: &[Element],
@@ -166,7 +237,7 @@ fn rich_text(
 ) -> Result<String> {
     validate_rich_text_structure(source, elements, index, namespace)?;
     let mut text = String::new();
-    let mut append = |element: &Element| -> Result<()> {
+    visit_rich_text(source, elements, index, namespace, |element| {
         let piece = element_text(source, element)?;
         // Only an underscore can start an Excel escape.
         let piece = if piece.contains('_') {
@@ -176,24 +247,11 @@ fn rich_text(
         };
         if text.is_empty() {
             text = owned_text(piece)?;
+            Ok(())
         } else {
-            append_text(&mut text, &piece)?;
+            append_text(&mut text, &piece)
         }
-        Ok(())
-    };
-    for child in elements[index].children(elements) {
-        let element = &elements[child];
-        if element.is(source, namespace, "t") {
-            append(element)?;
-        } else if element.is(source, namespace, "r") {
-            for child in element.children(elements) {
-                let element = &elements[child];
-                if element.is(source, namespace, "t") {
-                    append(element)?;
-                }
-            }
-        }
-    }
+    })?;
     Ok(text)
 }
 
@@ -211,11 +269,22 @@ pub(super) struct ArenaPeaks {
     pub(super) values: usize,
 }
 
-// The peaks of the streaming shared-string parse on this thread, for tests.
+// The decoded text of every entry, in order, for tests.
+#[cfg(test)]
+impl SharedStrings {
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+// The peaks of the streaming shared-string parse on this thread, for tests,
+// and the capacity of the table's text after each entry of the last table.
 #[cfg(test)]
 thread_local! {
     pub(super) static SHARED_STRING_PEAKS: Cell<ArenaPeaks> =
         const { Cell::new(ArenaPeaks { elements: 0, values: 0 }) };
+    pub(super) static SHARED_STRING_CAPACITIES: RefCell<Vec<usize>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Decodes each string as its `si` element completes and then releases that
@@ -231,6 +300,8 @@ thread_local! {
 /// too large to index is reported only after the rest of the part is known
 /// to be valid.
 pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
+    #[cfg(test)]
+    SHARED_STRING_CAPACITIES.with_borrow_mut(Vec::clear);
     let mut strings = SharedStrings::default();
     let mut distinct_errors: HashMap<String, u32> = HashMap::new();
     let mut hidden_string = false;
@@ -264,14 +335,16 @@ pub(crate) fn read_shared_strings(xml: &[u8]) -> Result<SharedStrings> {
             && !mixed_namespace
             && table_error.is_none()
             && elements[index].is(source, namespace, "si")
-            && let Err(error) = match rich_text(source, elements, index, namespace) {
-                Ok(text) => strings.push(&text),
-                // Memory exhaustion is not an undecodable string entry.
-                Err(error @ Error::Io(_)) => Err(error),
-                Err(error) => strings.push_undecodable(error, &mut distinct_errors),
-            }
         {
-            table_error = Some(error);
+            if let Err(error) = strings.push_with(&mut distinct_errors, |text| {
+                append_rich_text(text, source, elements, index, namespace)
+            }) {
+                table_error = Some(error);
+            }
+            #[cfg(test)]
+            SHARED_STRING_CAPACITIES.with_borrow_mut(|capacities| {
+                capacities.push(strings.text.capacity());
+            });
         }
         true
     })?;
@@ -314,8 +387,8 @@ pub(crate) struct SharedStrings {
     // Each distinct decoding error once, so that a table of many damaged
     // entries costs little more than their indexes. `Error` is not
     // `RefUnwindSafe` only because an `io::Error` can box any source. A kept
-    // error never changes. Allocation errors contain only an ErrorKind, not
-    // a user-supplied source, so the table and workbook stay unwind-safe.
+    // error never changes and is never an I/O error, which `push_with`
+    // returns instead, so the table and workbook stay unwind-safe.
     errors: Vec<AssertUnwindSafe<Error>>,
 }
 
@@ -347,15 +420,35 @@ impl SharedStrings {
         Some(Ok(&self.text[start..end]))
     }
 
-    fn push(&mut self, text: &str) -> Result<()> {
-        let end = index_limit(self.text.len() + text.len())?;
-        self.text.push_str(text);
+    // Records the next entry, which `decode` appends to the table's text, so
+    // that no entry needs a string of its own. An entry that cannot be
+    // decoded is recorded as undecodable; `distinct` holds the position of
+    // each error already recorded, by its display.
+    fn push_with(
+        &mut self,
+        distinct: &mut HashMap<String, u32>,
+        decode: impl FnOnce(&mut String) -> Result<()>,
+    ) -> Result<()> {
+        let start = self.text.len();
+        match decode(&mut self.text) {
+            Ok(()) => self.end_entry(),
+            // Memory exhaustion is not an undecodable string entry.
+            Err(error @ Error::Io(_)) => Err(error),
+            Err(error) => {
+                self.text.truncate(start);
+                self.push_undecodable(error, distinct)
+            }
+        }
+    }
+
+    // Ends the entry whose text was appended last.
+    fn end_entry(&mut self) -> Result<()> {
+        let end = index_limit(self.text.len())?;
         self.ends.push(end);
         Ok(())
     }
 
-    // Records the next entry as undecodable. `distinct` holds the position
-    // of each error already recorded, by its display.
+    // Records the next entry as undecodable, with no text.
     fn push_undecodable(
         &mut self,
         error: Error,
@@ -363,7 +456,7 @@ impl SharedStrings {
     ) -> Result<()> {
         let index = index_limit(self.ends.len())?;
         let next = index_limit(self.errors.len())?;
-        self.push("")?;
+        self.end_entry()?;
         let errors = &mut self.errors;
         let position = *distinct.entry(error.to_string()).or_insert_with(|| {
             errors.push(AssertUnwindSafe(error));
@@ -395,7 +488,9 @@ impl<'text> FromIterator<&'text str> for SharedStrings {
     fn from_iter<I: IntoIterator<Item = &'text str>>(strings: I) -> Self {
         let mut table = Self::default();
         for text in strings {
-            table.push(text).unwrap();
+            table
+                .push_with(&mut HashMap::new(), |output| append_text(output, text))
+                .unwrap();
         }
         table
     }
@@ -424,7 +519,7 @@ pub(super) enum StoredValue {
 
 // The cell's `v` or `is` payload, if it has one.
 pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
-    let (source, elements, namespace) = (index.source, &index.elements, index.namespace);
+    let (source, elements, namespace) = (index.source(), &index.elements, index.namespace);
     errors::unique(
         cell.children(elements).filter(|&child| {
             elements[child].is(source, namespace, "v")
@@ -450,7 +545,7 @@ pub(super) fn decode_payload(
     date1904: bool,
 ) -> Result<StoredValue> {
     let elements = &index.elements;
-    let source = index.source;
+    let source = index.source();
     let namespace = index.namespace;
     let payload = &elements[payload_index];
     let kind = cell
@@ -522,22 +617,28 @@ struct StoredCell {
     value: StoredValue,
 }
 
-// The cell's style, formula and stored value, read in that order.
-fn stored_cell(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredCell> {
-    let elements = &index.elements;
-    let style_index: Option<u32> = cell
-        .attribute(&index.attributes, "s")
+// The cell's style index, if it has one. Inlined, as it was inside
+// `stored_cell`, which every read of a cell runs.
+#[inline]
+pub(super) fn style_index(index: &WorksheetIndex, cell: &Element) -> Result<Option<u32>> {
+    cell.attribute(&index.attributes, "s")
         .map(|attribute| {
             xml::trim_whitespace(attribute.value)
                 .parse()
                 .map_err(|_| errors::invalid("invalid cell style index"))
         })
-        .transpose()?;
+        .transpose()
+}
+
+// The cell's style, formula and stored value, read in that order.
+fn stored_cell(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredCell> {
+    let elements = &index.elements;
+    let style_index = style_index(index, cell)?;
     let formulas = cell
         .children(elements)
-        .filter(|&child| elements[child].is(index.source, index.namespace, "f"));
+        .filter(|&child| elements[child].is(index.source(), index.namespace, "f"));
     let formula = errors::unique(formulas, || errors::invalid("cell has multiple formulas"))?
-        .map(|formula| element_text(index.source, &elements[formula]).and_then(owned_text))
+        .map(|formula| element_text(index.source(), &elements[formula]).and_then(owned_text))
         .transpose()?;
     Ok(StoredCell {
         style_index,

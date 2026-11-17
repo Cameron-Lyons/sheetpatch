@@ -37,22 +37,39 @@ pub(super) fn escaped_target(target: &str) -> Result<String> {
 }
 
 /// The escaped directory segments of a source part, against which its
-/// relationship targets resolve.
+/// relationship targets resolve: the directory as one string, and where each
+/// of its segments ends, rather than a string per segment.
 pub(super) struct TargetBase {
-    segments: Vec<String>,
+    directory: String,
+    ends: Vec<u32>,
     first_empty: Option<usize>,
 }
 
 impl TargetBase {
     pub(super) fn try_new(source: &str) -> Result<Self> {
-        let source = escape_path(source)?;
-        let segments: Vec<String> = source
-            .rsplit_once('/')
-            .map(|(directory, _)| directory.split('/').map(str::to_owned).collect())
-            .unwrap_or_default();
-        let first_empty = segments.iter().position(String::is_empty);
+        let mut directory = escape_path(source)?;
+        let mut ends = Vec::new();
+        let mut first_empty = None;
+        if let Some(end) = directory.rfind('/') {
+            directory.truncate(end);
+            let mut offset = 0;
+            for (position, segment) in directory.split('/').enumerate() {
+                if segment.is_empty() && first_empty.is_none() {
+                    first_empty = Some(position);
+                }
+                offset += segment.len();
+                // Parts are smaller than 4 GiB, so their names are too.
+                ends.push(u32::try_from(offset).map_err(|_| {
+                    Error::Unsupported("relationship source path is too long".into())
+                })?);
+                offset += 1;
+            }
+        } else {
+            directory.clear();
+        }
         Ok(Self {
-            segments,
+            directory,
+            ends,
             first_empty,
         })
     }
@@ -64,7 +81,7 @@ impl TargetBase {
         let mut kept = if target.starts_with('/') {
             0
         } else {
-            self.segments.len()
+            self.ends.len()
         };
         let mut parts: Vec<&str> = Vec::new();
         // Empty URI segments are significant: removing them changes both direct
@@ -100,11 +117,8 @@ impl TargetBase {
                 value => parts.push(value),
             }
         }
-        if kept == 0 && parts.is_empty() {
-            return Err(Error::InvalidWorkbook(
-                "relationship target names no part".into(),
-            ));
-        }
+        // The last segment always leaves a part, empty after a trailing '/',
+        // '.' or '..', so a target that names no part fails here too.
         if self.first_empty.is_some_and(|index| index < kept) || parts.iter().any(|p| p.is_empty())
         {
             return Err(Error::InvalidWorkbook(
@@ -114,18 +128,13 @@ impl TargetBase {
         Ok((kept, parts.join("/")))
     }
 
+    // `appended` comes from `normalize`, so it is never empty.
     pub(super) fn join(&self, kept: usize, appended: &str) -> String {
-        let mut path = String::new();
-        for segment in &self.segments[..kept] {
-            path.push_str(segment);
-            path.push('/');
-        }
-        if appended.is_empty() {
-            path.pop();
-        } else {
-            path.push_str(appended);
-        }
-        path
+        let directory = kept
+            .checked_sub(1)
+            .map_or("", |last| &self.directory[..self.ends[last] as usize]);
+        let separator = if kept == 0 { "" } else { "/" };
+        [directory, separator, appended].concat()
     }
 }
 

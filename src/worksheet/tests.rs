@@ -101,6 +101,139 @@ fn expands_empty_sheet_row_and_cell() {
 }
 
 #[test]
+fn batched_insertions_keep_document_order_at_every_position() {
+    let input = sheet(
+        r#"<sheetData><row r="2"><c r="B2"><v>1</v></c><c r="E2"><v>2</v></c></row><row r="5"><c r="A5"><v>3</v></c></row></sheetData>"#,
+    );
+    let cells = BTreeMap::from([
+        ("A1", 1.0),
+        ("C1", 2.0),
+        ("C2", 3.0),
+        ("D2", 4.0),
+        ("F2", 5.0),
+        ("G2", 6.0),
+        ("A3", 7.0),
+        ("A4", 8.0),
+        ("A6", 9.0),
+        ("A7", 10.0),
+    ])
+    .into_iter()
+    .map(|(cell, value)| (cell.parse().unwrap(), CellValue::Number(value)))
+    .collect();
+    let batched = patch_cells(input.as_bytes(), &cells, || None, false).unwrap();
+    let expected = sheet(concat!(
+        r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="C1"><v>2</v></c></row>"#,
+        r#"<row r="2"><c r="B2"><v>1</v></c><c r="C2"><v>3</v></c><c r="D2"><v>4</v></c>"#,
+        r#"<c r="E2"><v>2</v></c><c r="F2"><v>5</v></c><c r="G2"><v>6</v></c></row>"#,
+        r#"<row r="3"><c r="A3"><v>7</v></c></row><row r="4"><c r="A4"><v>8</v></c></row>"#,
+        r#"<row r="5"><c r="A5"><v>3</v></c></row><row r="6"><c r="A6"><v>9</v></c></row>"#,
+        r#"<row r="7"><c r="A7"><v>10</v></c></row></sheetData>"#,
+    ));
+    assert_eq!(String::from_utf8(batched.into_owned()).unwrap(), expected);
+    // One edit at a time gives the same document.
+    let mut sequential = input;
+    for (cell, value) in &cells {
+        sequential = edit(&sequential, &cell.to_string(), value.clone()).unwrap();
+    }
+    assert_eq!(sequential, expected);
+}
+
+#[test]
+fn too_many_namespace_declarations_in_scope_are_unsupported() {
+    // `sheet` declares two namespaces; quick-xml allows 128 in scope.
+    let with = |extra: usize| {
+        let declarations: String = (0..extra)
+            .map(|index| format!(" xmlns:p{index}='urn:p{index}'"))
+            .collect();
+        sheet(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#).replacen(
+            "<worksheet ",
+            &format!("<worksheet{declarations} "),
+            1,
+        )
+    };
+    let cell = "A1".parse().unwrap();
+    assert_eq!(
+        read_cell(with(126).as_bytes(), cell, None).unwrap().value,
+        CellValue::Number(1.0)
+    );
+    let error = read_cell(with(127).as_bytes(), cell, None).unwrap_err();
+    assert!(
+        matches!(&error, Error::Unsupported(message) if message == "more than 128 XML namespace declarations on open elements"),
+        "{error:?}"
+    );
+    assert!(matches!(
+        patch_cell(with(127).as_bytes(), cell, &CellValue::Number(2.0)),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn negative_zero_is_written_as_zero() {
+    let input = sheet(r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#);
+    for cell in ["A1", "B1", "A2"] {
+        let changed = edit(&input, cell, CellValue::Number(-0.0)).unwrap();
+        assert!(
+            changed.contains(&format!(r#"<c r="{cell}"><v>0</v></c>"#)),
+            "{changed}"
+        );
+    }
+    // Zero of either sign leaves a stored 0 alone. A stored -0, which reads
+    // keep, is replaced by 0 and left alone by -0, its current value.
+    let zero = sheet(r#"<sheetData><row r="1"><c r="A1"><v>0</v></c></row></sheetData>"#);
+    let negative = sheet(r#"<sheetData><row r="1"><c r="A1"><v>-0</v></c></row></sheetData>"#);
+    for value in [0.0, -0.0] {
+        assert_eq!(edit(&zero, "A1", CellValue::Number(value)).unwrap(), zero);
+    }
+    assert_eq!(edit(&negative, "A1", CellValue::Number(0.0)).unwrap(), zero);
+    assert_eq!(
+        edit(&negative, "A1", CellValue::Number(-0.0)).unwrap(),
+        negative
+    );
+}
+
+#[test]
+fn edits_refuse_cells_whose_style_index_reads_refuse() {
+    for style in ["x", "", "-0", "1e2", "4294967296"] {
+        let input = sheet(&format!(
+            r#"<sheetData><row r="1"><c r="A1" s="{style}"><v>42</v></c><c r="B1" s="3"><v>1</v></c></row></sheetData>"#
+        ));
+        for value in [CellValue::Number(7.0), CellValue::Blank] {
+            assert!(
+                matches!(
+                    edit(&input, "A1", value.clone()),
+                    Err(Error::InvalidWorkbook(message)) if message == "A1: invalid cell style index"
+                ),
+                "{style:?} {value:?}"
+            );
+        }
+        // An edit that changes nothing writes nothing, so it succeeds.
+        assert_eq!(edit(&input, "A1", CellValue::Number(42.0)).unwrap(), input);
+        // A payload that cannot be read either reports the index, as reads do.
+        let broken = input.replace("<v>42</v>", "<v>42</v><v>43</v>");
+        assert!(
+            matches!(
+                edit(&broken, "A1", CellValue::Number(7.0)),
+                Err(Error::InvalidWorkbook(message)) if message == "A1: invalid cell style index"
+            ),
+            "{style:?}"
+        );
+        // Other cells are edited as usual.
+        assert!(
+            edit(&input, "B1", CellValue::Number(2.0))
+                .unwrap()
+                .contains(r#"<c r="B1" s="3"><v>2</v></c>"#)
+        );
+    }
+    // A valid index, with surrounding whitespace as reads allow, is kept.
+    let spaced = sheet(r#"<sheetData><row r="1"><c r="A1" s=" 4 "><v>1</v></c></row></sheetData>"#);
+    assert!(
+        edit(&spaced, "A1", CellValue::Number(2.0))
+            .unwrap()
+            .contains(r#"<c r="A1" s=" 4 "><v>2</v></c>"#)
+    );
+}
+
+#[test]
 fn understands_prefixed_strict_namespace_and_ignores_foreign_tags() {
     let input = format!(
         r#"<s:worksheet xmlns:s="{STRICT}" xmlns:x="urn:x"><x:sheetData/><s:sheetData><s:row r="1"><s:c r="A1" t="s"><x:v>keep</x:v><s:v>0</s:v></s:c></s:row></s:sheetData></s:worksheet>"#
@@ -2240,6 +2373,28 @@ fn xml_variants_follow_the_shared_policy() {
         read_cell(encoded.as_bytes(), "A1".parse().unwrap(), None),
         Err(Error::Unsupported(_))
     ));
+    // A part actually encoded as UTF-16, in either byte order and with or
+    // without a byte order mark, is valid but unsupported too.
+    for big_endian in [false, true] {
+        for bom in ["\u{feff}", ""] {
+            let text = format!("{bom}{encoded}");
+            let utf16: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|unit| {
+                    if big_endian {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                })
+                .collect();
+            let error = read_cell(&utf16, "A1".parse().unwrap(), None).unwrap_err();
+            assert!(
+                matches!(&error, Error::Unsupported(message) if message == "only UTF-8 XML is supported"),
+                "{error:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2591,6 +2746,74 @@ fn prepared_worksheets_read_their_cells_as_they_were_before_a_patch() {
         cells(&PreparedWorksheet::parse(&patched).unwrap()),
         ["new".into(), "Name".into(), 8.0.into()]
     );
+}
+
+#[test]
+fn shared_string_tables_grow_as_for_pushing_whole_entries() {
+    // Entries whose markup outweighs their text in different ways: escapes,
+    // references, several runs, a carriage return, CDATA, and two that cannot
+    // be decoded, one after its first run is appended, among plain ones of
+    // varied lengths. Each with the text it decodes to, if any.
+    let long = "x".repeat(3000);
+    let escaped = "y".repeat(300);
+    let kinds: [(String, Option<String>); 11] = [
+        ("<si><t>plain</t></si>".into(), Some("plain".into())),
+        (
+            "<si><t>line_x000D_ 0 under_score</t></si>".into(),
+            Some("line\r 0 under_score".into()),
+        ),
+        (
+            "<si><r><t>Bold heading</t></r><r><t> 7</t></r></si>".into(),
+            Some("Bold heading 7".into()),
+        ),
+        (
+            "<si><r><t>R&amp;D</t></r><r><t>&#x1F600; x</t></r></si>".into(),
+            Some("R&D\u{1F600} x".into()),
+        ),
+        ("<si><t>a\r\nb</t></si>".into(), Some("a\nb".into())),
+        ("<si><t><![CDATA[x<y]]></t></si>".into(), Some("x<y".into())),
+        ("<si><t>_xD800_</t></si>".into(), None),
+        (
+            "<si><r><t>kept</t></r><r><t>_xD800_</t></r></si>".into(),
+            None,
+        ),
+        ("<si><t/></si>".into(), Some(String::new())),
+        (format!("<si><t>{long}</t></si>"), Some(long.clone())),
+        (
+            format!("<si><t>{escaped}_x0041_</t></si>"),
+            Some(format!("{escaped}A")),
+        ),
+    ];
+    // Each kind starts a table, and meets the buffer's growth at many sizes.
+    for first in 0..kinds.len() {
+        let order = |entry: usize| &kinds[(first + entry * 7) % kinds.len()];
+        let entries: String = (0..200).map(|entry| order(entry).0.as_str()).collect();
+        let input = format!("<sst xmlns='{TRANSITIONAL}'>{entries}</sst>");
+        let strings = read::read_shared_strings(input.as_bytes()).unwrap();
+        let mut pushed = String::new();
+        let mut expected = Vec::new();
+        for entry in 0..200 {
+            let (xml, text) = order(entry);
+            let read = strings.get(entry).unwrap();
+            match text {
+                Some(text) => {
+                    assert_eq!(read.ok(), Some(text.as_str()), "{xml}");
+                    pushed.try_reserve(text.len()).unwrap();
+                    pushed.push_str(text);
+                }
+                None => assert!(read.is_err(), "{xml}"),
+            }
+            expected.push(pushed.capacity());
+        }
+        assert_eq!(
+            read::SHARED_STRING_CAPACITIES.take(),
+            expected,
+            "starting with {}",
+            order(0).0
+        );
+        // An entry that fails leaves none of its text behind.
+        assert_eq!(strings.text(), pushed, "starting with {}", order(0).0);
+    }
 }
 
 #[test]

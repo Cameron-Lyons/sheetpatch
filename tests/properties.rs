@@ -499,7 +499,8 @@ impl SheetModel {
 
     fn accepts(&self, cell: CellRef, value: &CellValue) -> bool {
         !self.protected(cell)
-            && (!self.metadata_cells.contains(&cell) || self.expected(cell).value == *value)
+            && (!self.metadata_cells.contains(&cell)
+                || rewrites_unchanged(&self.expected(cell).value, value))
     }
 
     fn protected_cells(&self) -> Vec<CellRef> {
@@ -1804,6 +1805,20 @@ fn pick_cell(rng: &mut Rng, sheet: &SheetModel) -> CellRef {
 
 fn spelling(rng: &mut Rng) -> Spelling {
     *rng.pick(&[Spelling::Typed, Spelling::Upper, Spelling::Lower])
+}
+
+/// Whether writing `new` over a cell holding `old` changes nothing. A number
+/// is written with -0 as 0, and either the current number or the one written
+/// for it leaves the cell unchanged, so a stored -0 is kept by -0 and replaced
+/// by 0.
+fn rewrites_unchanged(old: &CellValue, new: &CellValue) -> bool {
+    match (old, new) {
+        (CellValue::Number(old), CellValue::Number(new)) => {
+            let written = if *new == 0.0 { 0.0 } else { *new };
+            old.to_bits() == new.to_bits() || old.to_bits() == written.to_bits()
+        }
+        _ => old == new,
+    }
 }
 
 /// An edit the worksheet accepts: an unprotected cell, with metadata cells
