@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 — release candidate
+## 1.2.0 — 2026-11-17
 
 This release adds streaming cell iteration and a per-workbook compression
 thread limit, reduces read and edit overhead, and bounds batch and patch
