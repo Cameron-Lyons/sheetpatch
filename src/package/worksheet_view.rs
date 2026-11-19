@@ -123,6 +123,43 @@ impl<'workbook> WorksheetView<'workbook> {
             .map(|result| result.map_err(|error| self.workbook.read_context(self.sheet, error)))
     }
 
+    /// Read every address in a rectangle, row by row, including missing cells.
+    ///
+    /// A missing cell yields a blank value with no formula or style index.
+    /// Stored cells retain their style and formula, including style-only cells.
+    /// The iterator decodes one cell at a time and can be cloned at its current
+    /// position. Even a whole-grid range can be consumed a few items at a time.
+    /// Use [`Self::cell_contents_in`] to visit only stored cells in the rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Each item can fail like [`Self::get_cell_at`] for its address. Iteration
+    /// can continue after an error. Shared-string loading follows the same
+    /// retry behavior as [`Self::cell_contents`].
+    ///
+    /// ```
+    /// # let bytes = include_bytes!("../../tests/fixtures/libreoffice.xlsx").to_vec();
+    /// let book = sheetpatch::Workbook::from_bytes(bytes)?;
+    /// let sheet = book.prepare_sheet("Data")?;
+    /// for result in sheet.range_contents("A1:C2".parse()?) {
+    ///     let (address, content) = result?;
+    ///     println!("{address}: {}", content.value);
+    /// }
+    /// # Ok::<(), sheetpatch::Error>(())
+    /// ```
+    pub fn range_contents(
+        &self,
+        range: CellRange,
+    ) -> impl Iterator<Item = Result<(CellRef, CellContent)>> + Clone + '_ {
+        self.worksheet
+            .range_contents(
+                range,
+                self.workbook.shared_strings_for_pass(),
+                self.workbook.uses_1904_dates(),
+            )
+            .map(|result| result.map_err(|error| self.workbook.read_context(self.sheet, error)))
+    }
+
     /// The smallest range containing every cell element, or `None` for a
     /// worksheet without cells.
     ///

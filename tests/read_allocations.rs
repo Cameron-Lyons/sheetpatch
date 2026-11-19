@@ -122,6 +122,10 @@ fn fixture(case: &str) -> Vec<u8> {
         "string" => format!("<c r='A1' t='str'><v>{text}</v></c>"),
         "error" => format!("<c r='A1' t='e'><v>{text}</v></c>"),
         "markup" => format!("<c r='A1' t='str'><v><![CDATA[{text}]]></v></c>"),
+        "numeric-spelling" => format!(
+            "<c r='A1' t='n'><v><![CDATA[{}1e0]]></v></c>",
+            " ".repeat(TEXT_BYTES - 3)
+        ),
         "rich" => format!(
             "<c r='A1' t='inlineStr'><is><r><t>x</t></r><r><t>{}</t></r></is></c>",
             &text[1..]
@@ -192,6 +196,40 @@ fn deflated_parts_retry_after_a_refused_output_allocation() {
         "deflated_parts_retry_after_a_refused_output_allocation",
         "inflate",
     );
+}
+
+#[test]
+fn concurrent_readers_inflate_a_worksheet_once() {
+    if env::var(CHILD_CASE).as_deref() != Ok("worksheet-inflate") {
+        run_child(
+            "concurrent_readers_inflate_a_worksheet_once",
+            "worksheet-inflate",
+        );
+        return;
+    }
+    let mut parts = common::payloads(include_bytes!("fixtures/libreoffice.xlsx"));
+    // The output allocation includes a byte for detecting oversized streams.
+    parts
+        .get_mut("xl/worksheets/sheet1.xml")
+        .unwrap()
+        .resize(TEXT_BYTES - 1, b' ');
+    let entries: Vec<_> = parts
+        .iter()
+        .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+        .collect();
+    let bytes = common::write_zip(&entries, &common::ZipLayout::deflated(1));
+    let book = Workbook::from_bytes(bytes).unwrap();
+    let readers = Barrier::new(8);
+    TEXT_ATTEMPTS.store(0, Ordering::SeqCst);
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                readers.wait();
+                assert_eq!(book.get_cell("Data", "B1").unwrap().value, 12.5.into());
+            });
+        }
+    });
+    assert_eq!(TEXT_ATTEMPTS.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -266,6 +304,28 @@ fn read_result_allocations_report_out_of_memory() {
     ] {
         run_child("read_result_allocations_report_out_of_memory", case);
     }
+}
+
+#[test]
+fn refused_value_comparison_preserves_the_cell_spelling() {
+    let case = "numeric-spelling";
+    if env::var(CHILD_CASE).as_deref() != Ok(case) {
+        run_child("refused_value_comparison_preserves_the_cell_spelling", case);
+        return;
+    }
+
+    let mut book = Workbook::from_bytes(fixture(case)).unwrap();
+    book.set_cell("Data", "B1", 7).unwrap();
+    let before = book.to_bytes().unwrap();
+    FAIL_NEXT_TEXT.store(true, Ordering::SeqCst);
+    let result = book.set_cell("Data", "A1", 1);
+    assert!(!FAIL_NEXT_TEXT.swap(false, Ordering::SeqCst));
+    assert!(matches!(result, Err(Error::Io(error)) if error.kind() == ErrorKind::OutOfMemory));
+    assert_eq!(book.to_bytes().unwrap(), before);
+    // With enough memory, comparing the same number preserves its original
+    // CDATA, whitespace, and scientific notation as well as the pending edit.
+    book.set_cell("Data", "A1", 1).unwrap();
+    assert_eq!(book.to_bytes().unwrap(), before);
 }
 
 #[test]

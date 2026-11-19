@@ -438,11 +438,11 @@ fn unchanged_value<'s>(
     payload: usize,
     value: &CellValue,
     current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
-) -> bool {
+) -> Result<bool> {
     // An existing payload, even an empty `<v/>` that reads as blank, is a
     // representation that clearing removes.
     if matches!(value, CellValue::Blank) {
-        return false;
+        return Ok(false);
     }
     // A different scalar type cannot compare equal. In particular, replacing
     // a large stored string with a number must not decode and allocate the old
@@ -458,19 +458,22 @@ fn unchanged_value<'s>(
             | (CellValue::Bool(_), "b")
             | (CellValue::Error(_), "e")
     ) {
-        return false;
+        return Ok(false);
     }
     match read::decode_payload(index, cell, payload, current.date1904) {
-        Ok(StoredValue::Value(old)) => rewrites_unchanged(&old, value),
+        Ok(StoredValue::Value(old)) => Ok(rewrites_unchanged(&old, value)),
         // The table is loaded only to compare text. An entry that cannot be
         // decoded, like a table that cannot be loaded, leaves a change.
         Ok(StoredValue::SharedString(position)) => match value {
-            CellValue::Text(text) => (current.shared_strings)()
+            CellValue::Text(text) => Ok((current.shared_strings)()
                 .and_then(|strings| strings.get(position)?.ok())
-                .is_some_and(|old| old == text.as_str()),
-            _ => false,
+                .is_some_and(|old| old == text.as_str())),
+            _ => Ok(false),
         },
-        Err(_) => false,
+        // A temporary allocation failure says nothing about the stored value.
+        // Treating it as a change could discard formatting on a no-op edit.
+        Err(error @ Error::Io(_)) => Err(error),
+        Err(_) => Ok(false),
     }
 }
 
@@ -512,7 +515,7 @@ fn patched_cell<'s>(
             .map_err(|error| refused(index, cell, address, error))?;
     }
     let unchanged = if let Some(child) = value_child {
-        unchanged_value(index, cell, child, value, current)
+        unchanged_value(index, cell, child, value, current)?
     } else {
         matches!(value, CellValue::Blank) && cell.attribute(attributes, "t").is_none()
     };
@@ -691,10 +694,10 @@ fn patch_existing_row<'s>(
     current: &mut CurrentValues<impl FnMut() -> Option<&'s SharedStrings>>,
 ) -> Result<()> {
     let (source, elements) = (index.source(), &index.elements);
-    let element = &elements[row.element];
+    let element = &elements[row.element()];
     // The prefix of new cells, found once one is needed.
     let mut prefix = None;
-    let existing_cells = &index.cells[row.cells.clone()];
+    let existing_cells = &index.cells[row.cells()];
     let mut cell_position = 0;
     // The new cells of an empty row (`<row/>`). A first cell is written to the
     // reused buffer. A second moves the row to a buffer of exactly the first
@@ -711,7 +714,7 @@ fn patch_existing_row<'s>(
     // move new cells ahead of existing ones.
     let mut trailing = element.children(elements);
     if let Some(last_cell) = existing_cells.last() {
-        trailing.next = elements[last_cell.element].descendants().end;
+        trailing.next = elements[last_cell.element()].descendants().end;
     }
     let fallback = trailing
         .map(|child| &elements[child])
@@ -727,7 +730,7 @@ fn patch_existing_row<'s>(
             .get(cell_position)
             .filter(|existing| existing.address == cell);
         if let Some(existing) = existing {
-            if !patched_cell(index, cell, existing.element, value, edits, current)? {
+            if !patched_cell(index, cell, existing.element(), value, edits, current)? {
                 continue;
             }
         } else if matches!(value, CellValue::Blank) {
@@ -761,7 +764,7 @@ fn patch_existing_row<'s>(
             } else {
                 let insertion = existing_cells
                     .get(cell_position)
-                    .map_or(fallback, |next| elements[next.element].start());
+                    .map_or(fallback, |next| elements[next.element()].start());
                 edits.insert(insertion, |markup| {
                     append_new_cell(markup, prefix, cell, style, value)
                 })?;
@@ -919,7 +922,7 @@ pub(super) fn plan_cells<'xml, 's>(
                 )?;
             } else {
                 let insertion = next_row.map_or(data.close_start(), |row| {
-                    index.elements[row.element].start()
+                    index.elements[row.element()].start()
                 });
                 edits.insert(insertion, |markup| {
                     append_new_row(markup, index, number, &changes, &mut changed_cells)

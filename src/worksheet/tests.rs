@@ -2247,8 +2247,11 @@ fn duplicate_attributes_are_found_in_tags_of_any_length() {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn parse_records_stay_compact() {
+    use super::index::{CellEntry, RowEntry};
     use super::parse::Element;
     use crate::xml::Attribute;
+    assert_eq!(size_of::<RowEntry>(), 16);
+    assert_eq!(size_of::<CellEntry>(), 12);
     assert_eq!(size_of::<Element>(), 48);
     assert_eq!(size_of::<Attribute>(), 24);
 }

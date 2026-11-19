@@ -40,11 +40,8 @@ pub(super) fn parse(bytes: &[u8], keep: &dyn Fn(&str, &str) -> bool) -> Result<V
             if tag.depth > 1 {
                 misplaced = true;
             } else if !misplaced && invalid.is_none() {
-                match relationship(tag, &ids, keep) {
-                    Ok((id, relationship)) => {
-                        kept.extend(relationship);
-                        ids.insert(id);
-                    }
+                match relationship(tag, &mut ids, keep) {
+                    Ok(relationship) => kept.extend(relationship),
                     Err(error) => invalid = Some(error),
                 }
             }
@@ -66,18 +63,29 @@ pub(super) fn parse(bytes: &[u8], keep: &dyn Fn(&str, &str) -> bool) -> Result<V
 }
 
 // Checks a relationship element's attributes against the IDs before it.
-// Returns its ID, and the relationship if `keep` selects it.
+// Records its ID and returns the relationship if `keep` selects it.
 fn relationship<'xml>(
     tag: &Tag<'_, 'xml>,
-    ids: &HashSet<Cow<'xml, str>>,
+    ids: &mut HashSet<Cow<'xml, str>>,
     keep: &dyn Fn(&str, &str) -> bool,
-) -> Result<(Cow<'xml, str>, Option<Relationship>)> {
+) -> Result<Option<Relationship>> {
     let required = |key| {
         tag.attribute(key)
             .ok_or_else(|| Error::InvalidWorkbook(format!("relationship lacks {key}")))
     };
-    let id = required("Id")?;
-    if ids.contains(&*id) {
+    // OPC relationship IDs are xsd:ID. The schema collapses XML whitespace
+    // before checking the NCName and its uniqueness (ECMA-376 Part 2, C.5).
+    let id = match required("Id")? {
+        Cow::Borrowed(raw) => Cow::Borrowed(xml::trim_whitespace(raw)),
+        Cow::Owned(raw) if xml::trim_whitespace(&raw).len() != raw.len() => {
+            Cow::Owned(xml::trim_whitespace(&raw).to_owned())
+        }
+        id => id,
+    };
+    if !xml::valid_ncname(&id) {
+        return Err(Error::InvalidWorkbook("invalid relationship id".into()));
+    }
+    if !ids.insert(id.clone()) {
         return Err(Error::InvalidWorkbook("duplicate relationship id".into()));
     }
     let external = match tag.attribute("TargetMode").as_deref() {
@@ -97,11 +105,10 @@ fn relationship<'xml>(
     // ECMA-376 Part 2, Annex C.5 (Relationships Part).
     let kind = xml::trim_whitespace(&kind);
     let target = required("Target")?;
-    let relationship = keep(&id, kind).then(|| Relationship {
-        id: id.to_string(),
+    Ok(keep(&id, kind).then(|| Relationship {
+        id: id.into_owned(),
         kind: kind.to_owned(),
         target: target.into_owned(),
         external,
-    });
-    Ok((id, relationship))
+    }))
 }

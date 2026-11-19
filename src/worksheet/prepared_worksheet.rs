@@ -34,7 +34,7 @@ impl<'xml> PreparedWorksheet<'xml> {
         // work on wide sheets. Scanning the cells skips empty rows on sparse ones.
         if self.index.rows.len() <= cells.len() / 2 {
             for row in &self.index.rows {
-                let entries = &cells[row.cells.clone()];
+                let entries = &cells[row.cells()];
                 if let Some((left, right)) = entries.first().zip(entries.last()) {
                     first.column = first.column.min(left.address.column);
                     last.column = last.column.max(right.address.column);
@@ -57,7 +57,13 @@ impl<'xml> PreparedWorksheet<'xml> {
         mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>>,
         date1904: bool,
     ) -> StdResult<CellContent, ReadError> {
-        read::cell_content(&self.index, cell, &mut shared_strings, date1904)
+        read::cell_content(
+            &self.index,
+            cell,
+            self.index.cell(cell),
+            &mut shared_strings,
+            date1904,
+        )
     }
 
     /// Decodes existing cells directly from their index entries. Range
@@ -72,11 +78,32 @@ impl<'xml> PreparedWorksheet<'xml> {
             read::indexed_cell_content(
                 &self.index,
                 cell.address,
-                cell.element,
+                cell.element(),
                 &mut shared_strings,
                 date1904,
             )
             .map(|content| (cell.address, content))
+        })
+    }
+
+    /// Advance through the index in request order, seeking only as far as the
+    /// current address even when an entire column in the rectangle is empty.
+    pub(crate) fn range_contents<'view, 'strings>(
+        &'view self,
+        range: CellRange,
+        mut shared_strings: impl FnMut() -> Result<Option<&'strings SharedStrings>> + Clone + 'view,
+        date1904: bool,
+    ) -> impl Iterator<Item = StdResult<(CellRef, CellContent), ReadError>> + Clone + 'view {
+        let mut cursor = self.index.cell_cursor();
+        range.cells().map(move |address| {
+            read::cell_content(
+                &self.index,
+                address,
+                cursor.cell(address),
+                &mut shared_strings,
+                date1904,
+            )
+            .map(|content| (address, content))
         })
     }
 

@@ -12,6 +12,6 @@ pub(crate) use attributes::{
     AttributeChecks, AttributeView, Attributes, arena_push, attribute_spans, attribute_value,
     compact, markup,
 };
-pub(crate) use document::{DocumentRules, is_space, trim_whitespace};
+pub(crate) use document::{DocumentRules, is_space, trim_whitespace, valid_ncname};
 pub(crate) use namespace::{NameKind, NamespaceId, NamespacePool, NamespaceReader};
 pub(crate) use text::{append_cell_text, append_excel_text, copy_text, excel_text, reference};

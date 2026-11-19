@@ -447,6 +447,37 @@ fn worksheet_relationship(id: &str, target: &str, mode: &str) -> String {
 }
 
 #[test]
+fn relationship_ids_follow_xml_schema_id_rules() {
+    let sheets = format!("<sheets>{SHEET}</sheets>");
+    for padded in [" one ", "&#9;o&#110;e&#13;", "\tone\n"] {
+        let relationship = worksheet_relationship(padded, "worksheets/sheet1.xml", "");
+        let original = fixture(&sheets, &relationship, &[]);
+        let mut book = Workbook::from_bytes(original.clone()).unwrap();
+        assert_eq!(book.get_cell("Data", "A1").unwrap().value, 7.into());
+        assert_eq!(book.to_bytes().unwrap(), original);
+        book.set_cell("Data", "A1", 8).unwrap();
+        let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.get_cell("Data", "A1").unwrap().value, 8.into());
+
+        let duplicate = format!("{RELATIONSHIP}{relationship}");
+        assert!(matches!(
+            Workbook::from_bytes(fixture(&sheets, &duplicate, &[])),
+            Err(Error::InvalidWorkbook(message)) if message.contains("duplicate relationship id")
+        ));
+    }
+    for invalid in ["", "   ", "a b", "a&#9;b", "1one", "a:b"] {
+        let extra = worksheet_relationship(invalid, "worksheets/sheet2.xml", "");
+        assert!(matches!(
+            Workbook::from_bytes(fixture(&sheets, &format!("{RELATIONSHIP}{extra}"), &[])),
+            Err(Error::InvalidWorkbook(message)) if message.contains("invalid relationship id")
+        ));
+    }
+    let sheets = sheets.replace("r:id='one'", "r:id='Σ-二'");
+    let relationship = worksheet_relationship(" Σ-二 ", "worksheets/sheet1.xml", "");
+    assert!(Workbook::from_bytes(fixture(&sheets, &relationship, &[])).is_ok());
+}
+
+#[test]
 fn sheets_sharing_one_worksheet_part_are_rejected() {
     // Edits are tracked per worksheet part, so two names for one part would let
     // a later edit through one name silently replace an edit through the other.

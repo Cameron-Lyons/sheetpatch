@@ -158,14 +158,14 @@ impl Archive {
         let preserve_gaps = matches!(policy, RecordPolicy::PreserveGaps);
         let mut output = KeepTail::new(writer, self.local_tail_len());
         let LocalLayout {
-            mut position,
+            position,
             offsets,
             replacements,
         } = self.emit_local_records(plan, &mut output, preserve_gaps)?;
         let local_tail = output.into_tail();
         self.emit_directory(
             writer,
-            &mut position,
+            position,
             &local_tail,
             &offsets,
             &replacements,
@@ -277,14 +277,9 @@ impl Archive {
             }
         }
         writer.write_all(&local)?;
-        self.emit_directory(
-            writer,
-            &mut position,
-            &local,
-            &offsets,
-            &replacements,
-            |probe| Ok(probe.write_all(&local)?),
-        )
+        self.emit_directory(writer, position, &local, &offsets, &replacements, |probe| {
+            Ok(probe.write_all(&local)?)
+        })
     }
 
     /// Remove obsolete local records from earlier append saves. Unknown gaps
@@ -373,27 +368,43 @@ impl Archive {
     pub(super) fn emit_directory<W: Write>(
         &self,
         writer: &mut W,
-        position: &mut usize,
+        position: usize,
         local_tail: &[u8],
         offsets: &[u32],
         replacements: &[Option<Sizes>],
         reemit: impl FnOnce(&mut Probe) -> Result<()>,
     ) -> Result<()> {
-        let central_start = zip32(*position, "ZIP central-directory offset")?;
-        // Central records are copied whole, so the directory keeps its size,
-        // which the input's end record already stored below u32::MAX.
-        let central_size = (self.end - self.central_start) as u32;
-        let mut ending = self.original[self.end..].to_vec();
-        set_u32(&mut ending, 12, central_size);
-        set_u32(&mut ending, 16, central_start);
-        // Only the directory offset (record bytes 16..20) can differ from the
-        // input's end record, which passed `hides_end_record` with the same
-        // comment. So a new signature starts at record offset 13 to 19, and
-        // only an archive comment exposes it to backward-scanning readers.
-        // Refuse that rare layout rather than write an archive that they would
-        // misread, or that Python could open before the save but not after.
-        if hides_end_record(&ending)
-            || (shadows_end_record(&ending) && !shadows_end_record(&self.original[self.end..]))
+        let central_start = zip32(position, "ZIP central-directory offset")?;
+        // Rewriting fields leaves the directory and end-record length fixed.
+        // Check that the full output length fits, including on 32-bit targets.
+        add(position, self.original.len() - self.central_start)?;
+        let local_tail = &local_tail[local_tail.len().saturating_sub(self.local_tail_len())..];
+        // Keep the records intersecting the end-record search window. One
+        // record can straddle its start, but ZIP32 bounds the length of its
+        // name, extra field and comment to u16::MAX bytes each.
+        let window = self.original.len().saturating_sub(END_TAIL_LEN);
+        let first_tail_entry = self
+            .entries
+            .partition_point(|entry| entry.central.end <= window);
+        let tail_start = self
+            .entries
+            .get(first_tail_entry)
+            .map_or(self.end, |entry| entry.central.start);
+        let prefix_len = tail_start - self.central_start;
+        let mut tail = Vec::with_capacity(local_tail.len() + (self.original.len() - tail_start));
+        tail.extend_from_slice(local_tail);
+        for index in first_tail_entry..self.entries.len() {
+            self.append_central_record(&mut tail, index, offsets[index], replacements[index]);
+        }
+        let end = tail.len();
+        tail.extend_from_slice(&self.original[self.end..]);
+        let ending = &mut tail[end..];
+        set_u32(ending, 16, central_start);
+        // Only the directory offset can introduce a signature into the end
+        // record. Refuse output that readers searching back through a ZIP
+        // comment would open differently, including Python's zipfile.
+        if hides_end_record(ending)
+            || (shadows_end_record(ending) && !shadows_end_record(&self.original[self.end..]))
         {
             return Err(unsupported(
                 "saving would make the ZIP end-of-directory record ambiguous: the new \
@@ -401,33 +412,54 @@ impl Archive {
                  back through the archive comment would select",
             ));
         }
-        // Build the directory after the last local bytes, which the check of
-        // the output's end needs, and write it only once that check passes.
-        let mut tail =
-            Vec::with_capacity(local_tail.len() + self.original.len() - self.central_start);
-        tail.extend_from_slice(local_tail);
-        for (index, entry) in self.entries.iter().enumerate() {
-            let record = &self.original[entry.central.clone()];
-            let mut header = [0; CENTRAL_HEADER_LEN];
-            header.copy_from_slice(&record[..CENTRAL_HEADER_LEN]);
-            if let Some(sizes) = replacements[index] {
-                set_u16(&mut header, 8, entry.flags & !FLAG_DESCRIPTOR);
-                sizes.write(&mut header, 16);
+        let base = position - local_tail.len() + prefix_len;
+        check_end_records(&tail, base, local_tail.len(), |probe| {
+            reemit(probe)?;
+            self.write_directory_prefix(probe, first_tail_entry, offsets, replacements)
+        })?;
+
+        // Validation must finish before writing any central records. Those
+        // before the window can now be generated in bounded batches.
+        self.write_directory_prefix(writer, first_tail_entry, offsets, replacements)?;
+        writer.write_all(&tail[local_tail.len()..])?;
+        Ok(())
+    }
+
+    fn write_directory_prefix<W: Write>(
+        &self,
+        writer: &mut W,
+        count: usize,
+        offsets: &[u32],
+        replacements: &[Option<Sizes>],
+    ) -> Result<()> {
+        let mut batch = Vec::new();
+        for index in 0..count {
+            self.append_central_record(&mut batch, index, offsets[index], replacements[index]);
+            if batch.len() >= END_TAIL_LEN {
+                writer.write_all(&batch)?;
+                batch.clear();
             }
-            // The local offset is the only field compaction changes for an
-            // untouched member; comments, extras and all other metadata survive.
-            set_u32(&mut header, 42, offsets[index]);
-            tail.extend_from_slice(&header);
-            tail.extend_from_slice(&record[CENTRAL_HEADER_LEN..]);
         }
-        debug_assert_eq!(
-            tail.len() - local_tail.len(),
-            central_size as usize,
-            "central records are copied whole, so the directory keeps the input's size"
-        );
-        tail.extend_from_slice(&ending);
-        let base = *position - local_tail.len();
-        check_end_records(&tail, base, local_tail.len(), reemit)?;
-        emit(writer, position, &tail[local_tail.len()..])
+        writer.write_all(&batch)?;
+        Ok(())
+    }
+
+    fn append_central_record(
+        &self,
+        buffer: &mut Vec<u8>,
+        index: usize,
+        offset: u32,
+        replacement: Option<Sizes>,
+    ) {
+        let entry = &self.entries[index];
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.original[entry.central.clone()]);
+        let header = &mut buffer[start..start + CENTRAL_HEADER_LEN];
+        if let Some(sizes) = replacement {
+            set_u16(header, 8, entry.flags & !FLAG_DESCRIPTOR);
+            sizes.write(header, 16);
+        }
+        // Compaction changes only the local offset for untouched members.
+        set_u32(header, 42, offset);
     }
 }

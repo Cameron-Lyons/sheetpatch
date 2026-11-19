@@ -97,9 +97,19 @@ fn column_styles(
 pub(super) struct RowEntry {
     pub(super) number: u32,
     /// The row's index in `WorksheetIndex::elements`.
-    pub(super) element: usize,
-    /// The row's cells, as a range of `WorksheetIndex::cells`.
-    pub(super) cells: Range<usize>,
+    element: u32,
+    /// Cell and element positions fit in the parsed XML's 32-bit offset space.
+    cells: Range<u32>,
+}
+
+impl RowEntry {
+    pub(super) fn element(&self) -> usize {
+        self.element as usize
+    }
+
+    pub(super) fn cells(&self) -> Range<usize> {
+        self.cells.start as usize..self.cells.end as usize
+    }
 }
 
 /// One `c` of a `sheetData` row, located in the index arenas.
@@ -107,7 +117,13 @@ pub(super) struct RowEntry {
 pub(super) struct CellEntry {
     pub(super) address: CellRef,
     /// The cell's index in `WorksheetIndex::elements`.
-    pub(super) element: usize,
+    element: u32,
+}
+
+impl CellEntry {
+    pub(super) fn element(&self) -> usize {
+        self.element as usize
+    }
 }
 
 /// The most cells per requested row number that a range read filters by
@@ -189,7 +205,7 @@ impl<'index> Iterator for CellEntries<'index> {
         let future = rows
             .first()
             .zip(rows.last())
-            .map_or(0, |(first, last)| last.cells.end - first.cells.start);
+            .map_or(0, |(first, last)| last.cells().end - first.cells().start);
         (remaining, Some(remaining + future))
     }
 
@@ -207,7 +223,7 @@ impl<'index> Iterator for CellEntries<'index> {
                 return Some(cell);
             }
             let row = self.rows.next()?;
-            let cells = &self.cells[row.cells.clone()];
+            let cells = &self.cells[row.cells()];
             self.remaining = cell_columns(cells, self.first_column, self.last_column).iter();
         }
     }
@@ -229,7 +245,7 @@ impl<'index> Iterator for CellEntries<'index> {
         }
         let mut result = self.remaining.fold(initial, &mut fold);
         for row in self.rows {
-            let cells = &self.cells[row.cells.clone()];
+            let cells = &self.cells[row.cells()];
             result = cell_columns(cells, self.first_column, self.last_column)
                 .iter()
                 .fold(result, &mut fold);
@@ -240,6 +256,7 @@ impl<'index> Iterator for CellEntries<'index> {
 
 /// Lookup state for nondecreasing addresses. Adjacent cells and duplicates
 /// reuse the current position; larger gaps seek within the current row.
+#[derive(Clone)]
 pub(super) struct CellCursor<'index> {
     cells: &'index [CellEntry],
     rows: &'index [RowEntry],
@@ -265,14 +282,14 @@ impl CellCursor<'_> {
         if self.row != Some(address.row) {
             self.remaining = seek(&mut self.rows, |row| row.number < address.row)
                 .filter(|row| row.number == address.row)
-                .map_or(&[], |row| &self.cells[row.cells.clone()]);
+                .map_or(&[], |row| &self.cells[row.cells()]);
             self.row = Some(address.row);
         }
         seek(&mut self.remaining, |cell| {
             cell.address.column < address.column
         })
         .filter(|cell| cell.address.column == address.column)
-        .map(|cell| cell.element)
+        .map(CellEntry::element)
     }
 }
 
@@ -424,7 +441,7 @@ fn index_rows(
             previous_column = address.column;
             cells.push(CellEntry {
                 address,
-                element: cell_index,
+                element: xml::compact(cell_index),
             });
             for formula in cell.children(elements) {
                 let formula = &elements[formula];
@@ -435,8 +452,8 @@ fn index_rows(
         }
         rows.push(RowEntry {
             number,
-            element: row_index,
-            cells: cells_start..cells.len(),
+            element: xml::compact(row_index),
+            cells: xml::compact(cells_start)..xml::compact(cells.len()),
         });
     }
     Ok(RowIndex { rows, cells })
@@ -727,11 +744,11 @@ impl<'xml> WorksheetIndex<'xml> {
                 self.rows.get(address.row.checked_sub(first)? as usize)?
             }
         };
-        let cells = &self.cells[row.cells.clone()];
+        let cells = &self.cells[row.cells()];
         let cell = cells
             .binary_search_by_key(&address.column, |cell| cell.address.column)
             .ok()?;
-        Some(cells[cell].element)
+        Some(cells[cell].element())
     }
 
     pub(super) fn cell_cursor(&self) -> CellCursor<'_> {
@@ -792,8 +809,8 @@ impl<'xml> WorksheetIndex<'xml> {
             // one cell, and otherwise sought in each row, as are the wide rows
             // of a worksheet with no more cells than rows.
             let rows = &self.rows[self.rows_numbered(first_row, last_row)];
-            let start = rows.first().map_or(0, |row| row.cells.start);
-            let end = rows.last().map_or(start, |row| row.cells.end);
+            let start = rows.first().map_or(0, |row| row.cells().start);
+            let end = rows.last().map_or(start, |row| row.cells().end);
             if all_columns {
                 entries.remaining = self.cells[start..end].iter();
             } else if !row_heavy && end - start <= rows.len() {
@@ -801,11 +818,11 @@ impl<'xml> WorksheetIndex<'xml> {
                 // last row's after them, need not be filtered.
                 let (start, end) = match (rows.first(), rows.last()) {
                     (Some(top), Some(bottom)) => (
-                        top.cells.start
-                            + self.cells[top.cells.clone()]
+                        top.cells().start
+                            + self.cells[top.cells()]
                                 .partition_point(|cell| cell.address.column < range.first().column),
-                        bottom.cells.start
-                            + self.cells[bottom.cells.clone()]
+                        bottom.cells().start
+                            + self.cells[bottom.cells()]
                                 .partition_point(|cell| cell.address.column <= range.last().column),
                     ),
                     _ => (start, end),
@@ -1024,7 +1041,7 @@ mod tests {
                     .cells
                     .iter()
                     .find(|cell| cell.address == address)
-                    .map(|cell| cell.element);
+                    .map(CellEntry::element);
                 assert_eq!(index.cell(address), expected, "case {case} {address}");
             }
         }
@@ -1180,7 +1197,7 @@ mod tests {
                             .cells
                             .iter()
                             .find(|cell| cell.address == address)
-                            .map(|cell| cell.element);
+                            .map(CellEntry::element);
                         assert_eq!(index.cell(address), expected, "{numbers:?} {address}");
                     }
                 }
