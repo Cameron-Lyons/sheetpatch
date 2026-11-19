@@ -91,12 +91,35 @@ fn symlinked_device_destinations_are_rejected_without_writing() {
 
 #[cfg(unix)]
 #[test]
+fn dangling_output_symlinks_survive_failed_saves() {
+    use std::os::unix::fs as unix_fs;
+    use std::path::Path;
+
+    let directory = TempDir::new();
+    let destination = directory.join("output.xlsx");
+    let missing = Path::new("missing.xlsx");
+    unix_fs::symlink(missing, &destination).unwrap();
+    let workbook = Workbook::open(FIXTURE).unwrap();
+    assert_invalid_input(
+        workbook.save(&destination),
+        "destination is not a regular file",
+    );
+    assert_invalid_input(
+        workbook.save_compact(&destination),
+        "destination is not a regular file",
+    );
+    assert_eq!(fs::read_link(destination).unwrap(), missing);
+    assert_eq!(directory.entries(), 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn oversized_inputs_are_rejected_before_reading() {
     let directory = TempDir::new();
     let path = directory.join("huge.xlsx");
     // A sparse file one byte larger than any ZIP32 archive can be: rejected
     // from its metadata, without allocating or reading eight gibibytes.
-    let limit = 2 * u64::from(u32::MAX) + 22 + u64::from(u16::MAX);
+    let limit = 2 * u64::from(u32::MAX - 1) + 22 + u64::from(u16::MAX);
     File::create(&path).unwrap().set_len(limit + 1).unwrap();
     match Workbook::open(&path) {
         Err(Error::Unsupported(message)) => assert!(message.contains("ZIP32"), "{message}"),

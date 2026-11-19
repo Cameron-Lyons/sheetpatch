@@ -155,6 +155,48 @@ fn relationship_type_whitespace_cannot_bypass_table_header_protection() {
 }
 
 #[test]
+fn relationship_targets_collapse_xml_whitespace_before_part_resolution() {
+    let mut parts = parts("ref='A1:B3'");
+    let table = parts.remove(TABLE_PATH).unwrap();
+    parts.insert("xl/tables/Order%20Details.xml".into(), table);
+    // Percent escapes belong to the URI. Even consecutive escaped spaces
+    // must survive the XML whitespace normalization.
+    let strings = parts.remove("xl/sharedStrings.xml").unwrap();
+    parts.insert("xl/shared%20%20strings.xml".into(), strings);
+    for (path, from, to) in [
+        (
+            "_rels/.rels",
+            "xl/workbook.xml",
+            " &#x9;xl/workbook.xml&#xA; ",
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            "worksheets/sheet1.xml",
+            " &#xD;/xl/worksheets/sheet1.xml ",
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            "sharedStrings.xml",
+            " shared%20%20strings.xml ",
+        ),
+        (
+            SHEET_RELATIONSHIPS,
+            "../tables/table1.xml",
+            " ../tables/Order&#x9; &#xA;Details.xml ",
+        ),
+    ] {
+        let xml = parts.get_mut(path).unwrap();
+        *xml = xml.replace(from, to);
+    }
+    let mut book = book(&parts);
+    assert_eq!(book.get_cell("Data", "A1").unwrap().value, "Name".into());
+    assert_refused(book.set_cell("Data", "B1", "Changed"), "B1");
+    book.set_cell("Data", "B2", 7).unwrap();
+    let reopened = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.get_cell("Data", "B2").unwrap().value, 7.into());
+}
+
+#[test]
 fn table_relationships_resolve_independently_of_legacy_zip_name_spelling() {
     for (target, sheet_path, relationships_path) in [
         (

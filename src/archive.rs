@@ -63,7 +63,7 @@ pub(crate) const MAX_PART_SIZE: usize = 64 * 1024 * 1024;
 /// The length of the largest possible ZIP32 archive: the central directory's
 /// offset and size are each below `u32::MAX`, and only a 22-byte end record
 /// and a comment of at most 64 KiB follow it.
-const MAX_ARCHIVE_LEN: u64 = 2 * u32::MAX as u64 + END_LEN as u64 + u16::MAX as u64;
+const MAX_ARCHIVE_LEN: u64 = 2 * (u32::MAX as u64 - 1) + END_LEN as u64 + u16::MAX as u64;
 pub(crate) trait PartChanges {
     /// Names are unique; iteration order is also the validation error order.
     fn parts(&self) -> impl Iterator<Item = (&str, &[u8])>;
@@ -93,6 +93,22 @@ pub(crate) struct Entry {
     local_header: Range<usize>,
     data: Range<usize>,
     local_record: Range<usize>,
+}
+
+/// The verified contents of a member. Stored bytes already live in the
+/// archive, so a worksheet can cache their range without copying them.
+pub(crate) enum PartData {
+    Stored(Range<usize>),
+    Inflated(Vec<u8>),
+}
+
+impl PartData {
+    pub(crate) fn bytes<'a>(&'a self, archive: &'a Archive) -> &'a [u8] {
+        match self {
+            Self::Stored(range) => &archive.original[range.clone()],
+            Self::Inflated(bytes) => bytes,
+        }
+    }
 }
 
 pub(crate) struct Archive {
@@ -267,7 +283,20 @@ impl Archive {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>> {
+        self.with_part(name, |bytes| Ok(bytes.to_vec()))
+    }
+
+    pub(crate) fn with_part<T>(
+        &self,
+        name: &str,
+        parse: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        parse(self.read_part(name)?.bytes(self))
+    }
+
+    pub(crate) fn read_part(&self, name: &str) -> Result<PartData> {
         let entry = self
             .index
             .get(name)
@@ -279,13 +308,16 @@ impl Archive {
             return Err(over_read_limit(format_args!("ZIP member {name}")));
         }
         let compressed = &self.original[entry.data.clone()];
-        let output = match codec {
-            Codec::Stored => compressed.to_vec(),
+        let part = match codec {
+            Codec::Stored => PartData::Stored(entry.data.clone()),
             Codec::Deflated => {
-                let mut decoder = Decompress::new(/* zlib_header: */ false);
                 // The declared length also bounds malformed streams that expand
                 // beyond their header, rather than trusting that header.
-                let mut output = Vec::with_capacity(sizes.size as usize + 1);
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(sizes.size as usize + 1)
+                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                let mut decoder = Decompress::new(/* zlib_header: */ false);
                 let status = decoder
                     .decompress_vec(compressed, &mut output, FlushDecompress::Finish)
                     .map_err(|error| {
@@ -297,13 +329,14 @@ impl Archive {
                         "incomplete deflate stream or length mismatch in {name}"
                     )));
                 }
-                output
+                PartData::Inflated(output)
             }
         };
-        if output.len() != sizes.size as usize || crc32(&output) != sizes.crc {
+        let output = part.bytes(self);
+        if output.len() != sizes.size as usize || crc32(output) != sizes.crc {
             return Err(invalid(format!("ZIP size or checksum mismatch in {name}")));
         }
-        Ok(output)
+        Ok(part)
     }
 }
 

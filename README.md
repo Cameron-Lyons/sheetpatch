@@ -126,9 +126,9 @@ chart sheets are retained as opaque parts. `sheet(name)` finds one worksheet,
 whose edits are refused. Worksheet names match exactly, including case. Package
 discovery resolves URI-escaped relationship targets and compares part paths
 without ASCII case, retaining the actual ZIP member names. Ambiguous equivalent
-names for an accessed part are rejected. Relationship types recognize surrounding
-XML whitespace, as their URI schema type requires, including when identifying
-tables and digital signatures.
+names for an accessed part are rejected. Relationship types and targets ignore
+surrounding XML whitespace. Within a target, a run of XML whitespace represents
+one space. Each explicit `%20` in the target represents a separate space.
 
 `get_cell` returns a `CellContent` with a scalar `value`, stored `formula` text,
 and `style_index`. Its fields are public for reading; it is `#[non_exhaustive]`,
@@ -166,8 +166,9 @@ from the data, such as one at XFD1048576, can stretch that range over all
 17,179,869,184 cells of the grid, so check `CellRange::cell_count` before
 reading a range, or read `cells()` as above. The view borrows the workbook;
 drop it before making edits. Dropping the view releases the parsed index.
-Ordinary reads retain cached decompressed XML but release their index after each
-call. Both workbooks and prepared views can be shared across threads.
+Ordinary reads release their index after each call. They cache decompressed
+worksheet XML for Deflate members and read Stored members directly from the
+archive. Both workbooks and prepared views can be shared across threads.
 
 `cell_contents()` visits existing cells directly through the prepared index,
 including style-only cells. `cell_contents_in(Some(range))` filters addresses
@@ -237,7 +238,8 @@ sheetpatch help patch
 `get` accepts one or more addresses or ranges such as `B2:D4` (corners in any
 order) and prints each current scalar value in argument order, with ranges
 expanded row by row, or an empty line for a blank cell. One `get` reads at most
-1,048,576 cells. The worksheet is parsed once; all reads must succeed before any
+1,048,576 cells. It stores one range per argument and generates addresses as
+needed. The worksheet is parsed once and all reads must succeed before any
 values are printed. Text can include embedded newlines or tabs. Use `get --json`
 for unambiguous machine-readable output: a JSON array of objects with `sheet`,
 normalized A1 `cell`, `type`, `value`, `formula`, and `style_index` fields. Types
@@ -291,8 +293,9 @@ sheet name names a different worksheet. Patch files must use UTF-8, optionally
 with a BOM, and LF or CRLF line endings. Any other carriage return is rejected,
 including one before a CRLF ending, rather than merging classic Mac lines into
 one value or leaving a stray carriage return; only a final line without a line
-feed may end with one, which stays in the value. Empty lines
-and tab-free lines beginning with `#` are ignored. Literal multiline values use
+feed may end with one, which stays in the value. Tab-free lines that contain
+only whitespace or begin with `#` are ignored. A line containing a tab is
+validated as a patch row, even if its fields are empty. Literal multiline values use
 the Rust API. Invalid rows and rows naming a missing worksheet report their line
 number; an edit refused for a protected cell names the last line for that cell,
 as in `Patch line 5: protected cell: worksheet "Summary": D2 contains a formula`.
@@ -364,10 +367,10 @@ exact text and escape every control character, including DEL and C1 as `\u00XX`.
 `save`, `save_compact`, and CLI file outputs write a temporary file beside the
 destination and rename it into place after a successful write. The original
 destination is retained if generation or writing fails, and the input path can be
-the destination. The destination must name a file: a path without a file name
-or ending in a separator or `.` component, and an existing directory, FIFO,
-device, or socket (also behind a symlink), return `Error::Io` of kind
-`InvalidInput` before any output is generated.
+the destination. The path must have a file name and cannot end in a separator
+or a `.` component. An existing destination must resolve to a regular file.
+Directories, FIFOs, devices, sockets, and dangling symlinks return `Error::Io`
+of kind `InvalidInput` before any output is generated.
 
 Existing destination permission bits are applied to the temporary file before
 workbook contents are written. On Unix the replacement also keeps the
@@ -555,12 +558,13 @@ in cached results. The original workbook's calculation settings are retained.
 
 ## Dependencies and checks
 
-Three direct dependencies, and a fourth on Linux; XML parsing, compression, and
-`rustix` disable default features:
+The crate has four direct dependencies and a fifth on Linux. XML parsing,
+compression, and `rustix` disable default features.
 
 - [`quick-xml`](https://docs.rs/quick-xml/0.42.0/quick_xml/): namespace-aware parsing.
 - [`flate2`](https://docs.rs/flate2/1.1.10/flate2/): pure Rust Deflate compression.
 - [`crc32fast`](https://docs.rs/crc32fast/1.5.4/crc32fast/): optimized ZIP checksums.
+- [`memchr`](https://docs.rs/memchr/2.8.3/memchr/) searches ZIP records, worksheet text, and patch rows.
 - [`rustix`](https://docs.rs/rustix/1.1.6/rustix/) (Linux only, `fs` and `std`
   features): reads a file's access ACL for saves, so the crate keeps
   `forbid(unsafe_code)`.

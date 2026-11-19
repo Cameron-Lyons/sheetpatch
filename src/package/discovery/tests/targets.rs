@@ -18,6 +18,9 @@ fn resolve_relative_and_absolute_part_uris() {
         ("./sheet:1.xml", "books/sheet:1.xml"),
         ("/tabs/sheet:1.xml", "tabs/sheet:1.xml"),
         ("workshee%74s/sheet1.xml", "books/worksheets/sheet1.xml"),
+        (" \t/a   b.xml\r\n", "a%20b.xml"),
+        ("a\t%20\nb.xml", "books/a%20%20%20b.xml"),
+        ("\u{a0}a.xml\u{a0}", "books/%C2%A0a.xml%C2%A0"),
     ] {
         assert_eq!(resolve_target("books/main.xml", target).unwrap(), resolved);
     }
@@ -29,6 +32,8 @@ fn resolve_relative_and_absolute_part_uris() {
         "a%00b",
         "%2e%2e/escape",
         "//example.com/a",
+        " \t//example.com/a",
+        " \r\n ",
         "sheet:1.xml",
         "a%",
         "a\\b",

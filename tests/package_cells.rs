@@ -66,6 +66,23 @@ fn fixture_cells_are_enumerated_with_their_contents() {
 }
 
 #[test]
+fn used_range_includes_both_column_extremes_of_a_middle_row() {
+    let empty_rows: String = (4..40).map(|row| format!("<row r='{row}'/>")).collect();
+    for trailing in ["", &empty_rows] {
+        let book = book(&format!(
+            "<worksheet xmlns='{MAIN_NAMESPACE}'><sheetData>\
+             <row r='1'><c r='G1'/><c r='H1'/></row>\
+             <row r='2'><c r='A2'/><c r='D2'/><c r='XFD2' s='1'/></row>\
+             <row r='3'><c r='C3'/></row>{trailing}</sheetData></worksheet>"
+        ));
+        let view = book.prepare_sheet("Data").unwrap();
+        let expected = Some("A1:XFD3".parse().unwrap());
+        assert_eq!(view.used_range(), expected);
+        assert_eq!(view.used_range(), expected);
+    }
+}
+
+#[test]
 fn sheets_without_cells_have_no_used_range() {
     for body in [
         "<sheetData/>",

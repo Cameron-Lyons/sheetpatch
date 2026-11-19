@@ -74,10 +74,15 @@ fn element_text<'xml>(source: &'xml str, element: &Element) -> Result<Cow<'xml, 
     }
     let content = &source[element.open_end()..element.close_start()];
     // Text without markup, references or carriage returns is its own value.
-    if !content
-        .bytes()
-        .any(|byte| matches!(byte, b'<' | b'&' | b'\r'))
-    {
+    // Tiny scalars are cheaper to check inline. Search longer text in blocks.
+    let plain = if content.len() < 16 {
+        !content
+            .bytes()
+            .any(|byte| matches!(byte, b'<' | b'&' | b'\r'))
+    } else {
+        memchr::memchr3(b'<', b'&', b'\r', content.as_bytes()).is_none()
+    };
+    if plain {
         return Ok(Cow::Borrowed(content));
     }
     let mut content = content.as_bytes();
@@ -517,23 +522,23 @@ pub(super) enum StoredValue {
     SharedString(usize),
 }
 
-// The cell's `v` or `is` payload, if it has one.
-pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
-    let (source, elements, namespace) = (index.source(), &index.elements, index.namespace);
-    errors::unique(
-        cell.children(elements).filter(|&child| {
-            elements[child].is(source, namespace, "v")
-                || elements[child].is(source, namespace, "is")
-        }),
-        || errors::invalid("cell has multiple value payloads"),
-    )
+fn is_value_payload(index: &WorksheetIndex, element: &Element) -> bool {
+    element.is(index.source(), index.namespace, "v")
+        || element.is(index.source(), index.namespace, "is")
 }
 
-fn stored_value(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredValue> {
-    match value_payload(index, cell)? {
-        None => Ok(StoredValue::Value(CellValue::Blank)),
-        Some(payload_index) => decode_payload(index, cell, payload_index, date1904),
-    }
+fn multiple_value_payloads() -> Error {
+    errors::invalid("cell has multiple value payloads")
+}
+
+// The cell's `v` or `is` payload, if it has one.
+pub(super) fn value_payload(index: &WorksheetIndex, cell: &Element) -> Result<Option<usize>> {
+    let elements = &index.elements;
+    errors::unique(
+        cell.children(elements)
+            .filter(|&child| is_value_payload(index, &elements[child])),
+        multiple_value_payloads,
+    )
 }
 
 // Decodes the cell's payload as reads see it; no-op detection compares an
@@ -634,16 +639,37 @@ pub(super) fn style_index(index: &WorksheetIndex, cell: &Element) -> Result<Opti
 fn stored_cell(index: &WorksheetIndex, cell: &Element, date1904: bool) -> Result<StoredCell> {
     let elements = &index.elements;
     let style_index = style_index(index, cell)?;
-    let formulas = cell
-        .children(elements)
-        .filter(|&child| elements[child].is(index.source(), index.namespace, "f"));
-    let formula = errors::unique(formulas, || errors::invalid("cell has multiple formulas"))?
-        .map(|formula| element_text(index.source(), &elements[formula]).and_then(owned_text))
+    // Locate the formula and payload in one pass. A malformed formula takes
+    // precedence even when repeated payloads appear earlier in the XML.
+    let mut formula = None;
+    let mut payload = None;
+    let mut multiple_values = false;
+    for child in cell.children(elements) {
+        let element = &elements[child];
+        if is_value_payload(index, element) {
+            multiple_values = payload.is_some();
+            payload = Some(child);
+        } else if element.is(index.source(), index.namespace, "f") {
+            if formula.is_some() {
+                return Err(errors::invalid("cell has multiple formulas"));
+            }
+            formula = Some(element);
+        }
+    }
+    let formula = formula
+        .map(|formula| element_text(index.source(), formula).and_then(owned_text))
         .transpose()?;
+    if multiple_values {
+        return Err(multiple_value_payloads());
+    }
+    let value = match payload {
+        Some(payload) => decode_payload(index, cell, payload, date1904)?,
+        None => StoredValue::Value(CellValue::Blank),
+    };
     Ok(StoredCell {
         style_index,
         formula,
-        value: stored_value(index, cell, date1904)?,
+        value,
     })
 }
 

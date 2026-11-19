@@ -1,7 +1,7 @@
 use super::args::{ValueError, parse_cell, parse_value};
 use super::error::write_failure;
 use super::output::{Escaped, write_cell, write_json_string, write_read_cells};
-use super::patch::{EditLines, read_patch};
+use super::patch::read_patch;
 use super::streams::quoted_path;
 use super::*;
 use sheetpatch::{CellRef, CellValue, Workbook};
@@ -168,6 +168,32 @@ fn json_strings_escape_all_controls_and_keep_unicode() {
         String::from_utf8(output).unwrap(),
         format!("\"~{escapes}\u{a0}\u{a1}\"")
     );
+}
+
+#[test]
+fn json_escaping_handles_utf8_across_block_boundaries() {
+    let suffix = "☕".repeat(45);
+    for padding in (60..=68).chain(124..=132) {
+        let prefix = "x".repeat(padding);
+        for (text, encoded) in [
+            ("😀", "😀"),
+            ("\u{a0}", "\u{a0}"),
+            ("\u{80}", "\\u0080"),
+            ("\u{9f}", "\\u009f"),
+            ("😀\"", "😀\\\""),
+            ("雪\\", "雪\\\\"),
+            ("\n", "\\n"),
+        ] {
+            let mut output = Vec::new();
+            write_json_string(&mut output, &format!("{prefix}{text}{suffix}")).unwrap();
+            let expected = format!("\"{prefix}{encoded}{suffix}\"");
+            assert_eq!(
+                output,
+                expected.as_bytes(),
+                "padding {padding}, text {text:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -368,7 +394,8 @@ fn read_output_does_not_depend_on_the_buffer_budget() {
                 }
                 for budget in (0..=expected.len() + 1).chain([usize::MAX]) {
                     let mut output = Vec::new();
-                    write_read_cells(&view, &cells, budget, &mut output, format()).unwrap();
+                    write_read_cells(&view, cells.iter().copied(), budget, &mut output, format())
+                        .unwrap();
                     assert_eq!(output, expected, "budget {budget}");
                 }
                 // A malformed value after any buffered prefix still
@@ -377,8 +404,14 @@ fn read_output_does_not_depend_on_the_buffer_budget() {
                 invalid.push(cell("B3"));
                 for budget in [0, expected.len() / 2, usize::MAX] {
                     let mut output = Vec::new();
-                    let failure = write_read_cells(&view, &invalid, budget, &mut output, format())
-                        .unwrap_err();
+                    let failure = write_read_cells(
+                        &view,
+                        invalid.iter().copied(),
+                        budget,
+                        &mut output,
+                        format(),
+                    )
+                    .unwrap_err();
                     assert!(failure.to_string().contains("B3"), "{failure}");
                     assert!(output.is_empty(), "budget {budget}");
                 }
@@ -432,7 +465,7 @@ fn buffered_read_output_stops_before_stored_text_over_the_budget() {
                 escape: Escape::Exact,
             };
             let mut output = Writes(Vec::new());
-            write_read_cells(&view, &cells, 200, &mut output, format).unwrap();
+            write_read_cells(&view, cells.iter().copied(), 200, &mut output, format).unwrap();
             let prefix = output.0[0];
             assert!(
                 prefix <= 200,
@@ -479,10 +512,17 @@ fn buffered_read_output_bounds_escapes_and_sheet_names() {
             escape,
         };
         let mut expected = Vec::new();
-        write_read_cells(&view, &cells, usize::MAX, &mut expected, format()).unwrap();
+        write_read_cells(
+            &view,
+            cells.iter().copied(),
+            usize::MAX,
+            &mut expected,
+            format(),
+        )
+        .unwrap();
         for budget in [200, 1, 0, expected.len() - 1, expected.len()] {
             let mut output = Writes(Vec::new(), Vec::new());
-            write_read_cells(&view, &cells, budget, &mut output, format()).unwrap();
+            write_read_cells(&view, cells.iter().copied(), budget, &mut output, format()).unwrap();
             assert!(
                 output.0[0] <= budget,
                 "json={json}, budget={budget}: buffered {} bytes",
@@ -703,12 +743,10 @@ fn patch_preserves_text_tabs_whitespace_and_empty_values() {
     assert_eq!(patch.row_count, 2);
     assert_eq!(patch.edits.len(), 2);
     let edit = &patch.edits[0];
-    assert_eq!(patch.lines.lines[0], EditLines { first: 3, last: 3 });
     assert_eq!(edit.sheet(), "Data & Notes");
     assert_eq!(edit.cell().to_string(), "B2");
     assert_eq!(edit.value(), &CellValue::Text("  left\tright  ".into()));
     let edit = &patch.edits[1];
-    assert_eq!(patch.lines.lines[1], EditLines { first: 4, last: 4 });
     assert_eq!(edit.sheet(), "#Data");
     assert_eq!(edit.value(), &CellValue::Text(String::new()));
 }

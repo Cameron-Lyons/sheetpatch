@@ -288,28 +288,39 @@ fn create_temporary(destination: &Path, mode: Option<u32>) -> Result<Temporary> 
 /// it, so it is rejected before any output is generated. So, on Windows, is
 /// a read-only destination, which a rename refuses to replace.
 fn existing_destination(path: &Path) -> io::Result<Option<Metadata>> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            // The rename replaces a symlink itself rather than its target, so
-            // the attribute that decides is the link's own.
-            #[cfg(windows)]
-            if fs::symlink_metadata(path)?.permissions().readonly() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "destination is read-only",
-                ));
-            }
-            Ok(Some(metadata))
+    let entry = match fs::symlink_metadata(path) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // The rename replaces the directory entry, so its own readonly attribute
+    // decides whether Windows permits the rename.
+    #[cfg(windows)]
+    let readonly = entry.permissions().readonly();
+    let metadata = if entry.is_symlink() {
+        match fs::metadata(path) {
+            Ok(target) => target,
+            // A dangling link is an existing, non-regular destination.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => entry,
+            Err(error) => return Err(error),
         }
-        // Like other I/O errors, this one does not repeat the path, which
-        // callers already name.
-        Ok(_) => Err(io::Error::new(
+    } else {
+        entry
+    };
+    if !metadata.is_file() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "destination is not a regular file",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+        ));
     }
+    #[cfg(windows)]
+    if readonly {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination is read-only",
+        ));
+    }
+    Ok(Some(metadata))
 }
 
 /// The permission bits applied to an existing destination's replacement.

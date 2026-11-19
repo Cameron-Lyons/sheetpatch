@@ -141,12 +141,31 @@ def validate_warmup(name, binary, arguments, cells):
         if name.startswith("cells_"):
             expected = hashlib.sha256()
             count = cells if name == "cells_numeric" else min(cells, 20_000)
+            shared = "text" * 128
+            if name == "cells_shared_json":
+                expected.update(b"[")
             for row in range(1, count + 1):
                 if name == "cells_numeric":
                     record = f"A{row}\tnumber\t{row}\n"
+                elif name == "cells_shared_json":
+                    if row > 1:
+                        expected.update(b",")
+                    record = json.dumps(
+                        {
+                            "sheet": "Data",
+                            "cell": f"A{row}",
+                            "type": "text",
+                            "value": shared,
+                            "formula": None,
+                            "style_index": None,
+                        },
+                        separators=(",", ":"),
+                    )
                 else:
-                    record = f"A{row}\ttext\t{'text' * 128}\n"
+                    record = f"A{row}\ttext\t{shared}\n"
                 expected.update(record.encode())
+            if name == "cells_shared_json":
+                expected.update(b"]\n")
             require(
                 digest_file(output) == expected.digest(),
                 f"{name}: {binary} returned incorrect cell output",
@@ -188,6 +207,7 @@ def fixtures(directory, cells):
     return {
         "cells_numeric": ["cells", str(numeric), "Data"],
         "cells_shared": ["cells", str(shared), "Data"],
+        "cells_shared_json": ["cells", "--json", str(shared), "Data"],
         "set_large_sheet": ["set", str(numeric), str(output), "Data", "A1", "text", "updated"],
         "patch_insertion": ["patch", str(empty), str(output), str(patch)],
     }
@@ -243,7 +263,7 @@ def main():
             "peak_rss": "CLI process maximum resident set size, reported in KiB by native time",
             "time_executable": str(timer),
             "time_sha256": hashlib.sha256(timer.read_bytes()).hexdigest(),
-            "correctness": "exact numeric/shared read output; edited cell values; ZIP CRCs and untouched local records",
+            "correctness": "exact numeric and shared-text output, including shared-text JSON; edited cell values; ZIP CRCs and untouched local records",
         },
         "cells": args.cells,
         "binaries": {label: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for label, path in binaries.items()},

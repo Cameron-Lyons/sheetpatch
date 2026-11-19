@@ -310,6 +310,10 @@ fn trailing_cells_follow_existing_cells_around_misplaced_extension_lists() {
             "<extLst/><c r='A1'/><extLst/>",
             "<extLst/><c r='A1'/><c r=\"D1\"><v>2</v></c><extLst/>",
         ),
+        (
+            "<c r='A1'><v>1</v><extLst><ext uri='cell'/></extLst></c><extLst/>",
+            "<c r='A1'><v>1</v><extLst><ext uri='cell'/></extLst></c><c r=\"D1\"><v>2</v></c><extLst/>",
+        ),
     ] {
         let mut book = workbook(&row(cells), None);
         book.set_cell("Data", "D1", 2).unwrap();
@@ -732,6 +736,10 @@ fn iso_8601_date_cells_read_as_excel_serial_numbers() {
         ("1899-12-30T23:59:59", true),
         ("2024-01-15T00:00:00+01:00", true),
         ("2024-01-15-05:00", true),
+        ("12:00+14:00", true),
+        ("2024-01-15T00:00:00-13:59", true),
+        ("12:00-14:01", false),
+        ("2024-01-15+14:59", false),
         ("2023-02-29", false),
         ("2024-04-31", false),
         ("2023-09-31", false),

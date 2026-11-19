@@ -3,29 +3,61 @@ use sheetpatch::{CellContent, CellRef, CellValue, WorksheetView};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 
+// Skip entire blocks of plain text before decoding individual characters.
+// Escaped characters are ASCII or a C1 control encoded as C2 80 through C2 9F.
+// Looking one byte ahead also detects a control split across blocks.
+fn plain_json_prefix(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut prefix = 0;
+    while let Some(window) = bytes[prefix..].first_chunk::<65>() {
+        let needs_escape = (0..64).fold(false, |found, i| {
+            let byte = window[i];
+            found
+                | (byte < 0x20)
+                | (byte == b'"')
+                | (byte == b'\\')
+                | (byte == 0x7f)
+                | ((byte == 0xc2) & (window[i + 1] < 0xa0))
+        });
+        if needs_escape {
+            break;
+        }
+        prefix += 64;
+    }
+    while !value.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    prefix
+}
+
 pub(super) fn write_json_string(output: &mut impl Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")?;
     let mut start = 0;
-    for (index, character) in value.char_indices() {
-        let escape = match character {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            '\u{08}' => "\\b",
-            '\u{0c}' => "\\f",
-            // JSON requires escapes only for C0 controls. Escaping DEL and C1
-            // controls too keeps them out of terminals showing the output.
-            '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => "",
+    let prefix = plain_json_prefix(value);
+    for (offset, character) in value[prefix..].char_indices() {
+        let index = prefix + offset;
+        let control;
+        let escape: &[u8] = match character {
+            '"' => b"\\\"",
+            '\\' => b"\\\\",
+            '\n' => b"\\n",
+            '\r' => b"\\r",
+            '\t' => b"\\t",
+            '\u{08}' => b"\\b",
+            '\u{0c}' => b"\\f",
+            // Escape DEL and C1 as well so these controls stay out of terminals.
+            '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let code = character as usize;
+                control = [b'\\', b'u', b'0', b'0', HEX[code >> 4], HEX[code & 15]];
+                &control
+            }
             _ => continue,
         };
-        output.write_all(&value.as_bytes()[start..index])?;
-        if escape.is_empty() {
-            write!(output, "\\u{:04x}", character as u32)?;
-        } else {
-            output.write_all(escape.as_bytes())?;
+        if start < index {
+            output.write_all(&value.as_bytes()[start..index])?;
         }
+        output.write_all(escape)?;
         start = index + character.len_utf8();
     }
     output.write_all(&value.as_bytes()[start..])?;
@@ -197,6 +229,8 @@ pub(super) fn write_cell(
         }
         *first = false;
         write_json_cell(output, format.sheet, cell, content)
+    } else if !format.records && content.value.is_blank() {
+        output.write_all(b"\n")
     } else {
         let value = Escaped {
             value: &content.value,
@@ -295,15 +329,13 @@ fn buffer_cell(
 /// and formatting or escaping that exceeds it rolls back that cell's output.
 pub(super) fn write_read_cells(
     view: &WorksheetView<'_>,
-    cells: &[CellRef],
+    cells: impl Iterator<Item = CellRef> + Clone,
     budget: usize,
     output: &mut impl Write,
     format: CellOutput<'_>,
 ) -> Result<(), Failure> {
     write_cells(
-        cells
-            .iter()
-            .map(|&cell| view.get_cell_at(cell).map(|content| (cell, content))),
+        cells.map(|cell| view.get_cell_at(cell).map(|content| (cell, content))),
         budget,
         output,
         format,
