@@ -2459,6 +2459,10 @@ fn read_errors_name_the_cell() {
             "<c r='B2'><f>1</f><f>2</f><v>2</v></c>",
             "B2: cell has multiple formulas",
         ),
+        (
+            "<c r='B2'><v>1</v><v>2</v><f>1</f><f>2</f></c>",
+            "B2: cell has multiple formulas",
+        ),
     ] {
         let input = sheet(&format!("<sheetData><row r='2'>{cell}</row></sheetData>"));
         let error = read_cell(input.as_bytes(), "B2".parse().unwrap(), None).unwrap_err();

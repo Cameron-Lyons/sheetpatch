@@ -3,9 +3,7 @@ use super::compression::{
     DEFLATE_LEVEL, MAX_DEFLATE_THREADS, deflate, deflate_segments, inspect_deflate,
 };
 use super::records::{Sizes, check_extra, set_u16, set_u32, u16_at, u32_at};
-use super::validation::{
-    end_of_central_directory, end_record_candidates, hides_end_record, shadows_end_record,
-};
+use super::validation::{end_of_central_directory, hides_end_record, shadows_end_record};
 use super::writer::KeepTail;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
@@ -739,6 +737,36 @@ fn borrowed_changes_keep_validation_order_and_fail_before_output() {
         ));
         assert!(output.is_empty());
     }
+}
+
+#[test]
+fn more_contiguous_untouched_members_do_not_increase_write_calls() {
+    #[derive(Default)]
+    struct CountWrites(usize);
+
+    impl Write for CountWrites {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let changes = BTreeMap::from([("part1".into(), b"replacement".to_vec())]);
+    let write_counts = |members| {
+        let parts = (0..members)
+            .map(|index| named_fixture(format!("part{index}").as_bytes(), 0, Descriptor::Absent));
+        let archive = Archive::try_new(combine_members(parts)).unwrap();
+        let mut normal = CountWrites::default();
+        let mut compact = CountWrites::default();
+        archive.write_to(&changes, &mut normal).unwrap();
+        archive.compact_to(&changes, &mut compact).unwrap();
+        (normal.0, compact.0)
+    };
+    assert_eq!(write_counts(3), write_counts(32));
 }
 
 #[test]
@@ -1849,7 +1877,10 @@ fn saves_refuse_rewritten_fields_that_would_form_another_end_record() {
     assert!(output.is_empty());
     let (result, output) = emit_directory_at(&archive, 45, &[0], &[new_sizes(END + 1)]);
     result.unwrap();
-    assert_eq!(end_record_candidates(&output).count(), 1);
+    assert_eq!(
+        end_of_central_directory(&output).unwrap(),
+        archive.end - archive.central_start
+    );
 
     // Then the field is a new local-record offset, at header offset 42,
     // and name bytes 16..18, "00", count the rest: the archive comment.
@@ -1869,7 +1900,10 @@ fn saves_refuse_rewritten_fields_that_would_form_another_end_record() {
     assert!(output.is_empty());
     let (result, output) = emit_directory_at(&archive, position, &[END + 1], &[None]);
     result.unwrap();
-    assert_eq!(end_record_candidates(&output).count(), 1);
+    assert_eq!(
+        end_of_central_directory(&output).unwrap(),
+        archive.end - archive.central_start
+    );
 }
 
 #[test]
@@ -2244,7 +2278,7 @@ fn stream_reads_stop_one_byte_past_the_limit() {
     assert_eq!(read_at_most(&input[..], Some(10), 10).unwrap(), input);
     assert_eq!(read_at_most(&input[..], Some(4), 10).unwrap(), input);
     assert!(too_long(read_at_most(io::repeat(0), Some(4), 10)));
-    assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX) + 22 + 65535);
+    assert_eq!(MAX_ARCHIVE_LEN, 2 * u64::from(u32::MAX - 1) + 22 + 65535);
 }
 
 #[test]

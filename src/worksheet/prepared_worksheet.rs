@@ -11,14 +11,12 @@ use std::result::Result as StdResult;
 /// view or of one worksheet's edits. All spans borrow the immutable XML
 /// supplied at construction.
 pub(crate) struct PreparedWorksheet<'xml> {
-    xml: &'xml [u8],
     index: WorksheetIndex<'xml>,
 }
 
 impl<'xml> PreparedWorksheet<'xml> {
     pub(crate) fn parse(xml: &'xml [u8]) -> Result<Self> {
         Ok(Self {
-            xml,
             index: WorksheetIndex::parse(xml)?,
         })
     }
@@ -26,6 +24,29 @@ impl<'xml> PreparedWorksheet<'xml> {
     /// The address of every `<c>` element, in row-major order.
     pub(crate) fn cells(&self) -> impl ExactSizeIterator<Item = CellRef> + '_ {
         self.index.cells.iter().map(|cell| cell.address)
+    }
+
+    pub(crate) fn used_range(&self) -> Option<CellRange> {
+        let cells = &self.index.cells;
+        let mut first = cells.first()?.address;
+        let mut last = cells.last()?.address;
+        // Each row is ordered by column. Visiting its two endpoints saves
+        // work on wide sheets. Scanning the cells skips empty rows on sparse ones.
+        if self.index.rows.len() <= cells.len() / 2 {
+            for row in &self.index.rows {
+                let entries = &cells[row.cells.clone()];
+                if let Some((left, right)) = entries.first().zip(entries.last()) {
+                    first.column = first.column.min(left.address.column);
+                    last.column = last.column.max(right.address.column);
+                }
+            }
+        } else {
+            for cell in cells {
+                first.column = first.column.min(cell.address.column);
+                last.column = last.column.max(cell.address.column);
+            }
+        }
+        Some(CellRange::new(first, last))
     }
 
     /// Reads one cell without allocating a batch result. The shared-string
@@ -74,8 +95,8 @@ impl<'xml> PreparedWorksheet<'xml> {
     }
 
     /// Plans writing `cells` into the indexed XML, or returns `None` when
-    /// nothing changes. The plan holds only the new markup; its `apply`
-    /// writes the edited XML. This worksheet is left unchanged, so its reads
+    /// nothing changes. The plan borrows the original XML and owns the new
+    /// markup. This worksheet is left unchanged, so its reads
     /// still return the cells as they were before the edits. Every public
     /// edit path validates its values before reaching the worksheet, so they
     /// are not checked again here.
@@ -90,16 +111,13 @@ impl<'xml> PreparedWorksheet<'xml> {
         cells: &BTreeMap<CellRef, CellValue>,
         shared_strings: impl FnMut() -> Option<&'strings SharedStrings>,
         date1904: bool,
-    ) -> Result<Option<CellPatch<'xml>>> {
+    ) -> Result<Option<EditPlan<'xml>>> {
         debug_assert!(
             cells.values().all(|value| value.validate().is_ok()),
             "every public edit path validates its values before planning them"
         );
         let plan = patch::plan_cells(&self.index, cells, shared_strings, date1904)?;
-        Ok((!plan.is_empty()).then_some(CellPatch {
-            xml: self.xml,
-            plan,
-        }))
+        Ok((!plan.is_empty()).then_some(plan))
     }
 
     /// Returns the indexed XML with `cells` written, or the original XML,
@@ -112,22 +130,9 @@ impl<'xml> PreparedWorksheet<'xml> {
         date1904: bool,
     ) -> Result<Cow<'xml, [u8]>> {
         match self.plan_cells(cells, shared_strings, date1904)? {
-            Some(patch) => patch.apply().map(Cow::Owned),
-            None => Ok(Cow::Borrowed(self.xml)),
+            Some(plan) => plan.into_patch()?.apply().map(Cow::Owned),
+            None => Ok(Cow::Borrowed(self.index.source().as_bytes())),
         }
-    }
-}
-
-/// The planned edits of a batch that changes a worksheet.
-pub(crate) struct CellPatch<'xml> {
-    xml: &'xml [u8],
-    plan: EditPlan,
-}
-
-impl CellPatch<'_> {
-    /// Writes the edited worksheet XML.
-    pub(crate) fn apply(self) -> Result<Vec<u8>> {
-        self.plan.apply(self.xml)
     }
 }
 

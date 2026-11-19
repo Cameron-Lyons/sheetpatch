@@ -31,18 +31,17 @@ pub(in crate::package) struct DiscoveredSheet {
 pub(in crate::package) fn discover(archive: &Archive) -> Result<PackageMetadata> {
     validate_content_types(archive)?;
     let office = office_document(archive)?;
-    let workbook = {
-        let xml = archive.read(&office.path)?;
-        let part = part::part_xml(&xml, workbook_node)?;
+    let workbook = archive.with_part(&office.path, |xml| {
+        let part = part::part_xml(xml, workbook_node)?;
         let root = &part.nodes[0];
         if part.process_content
             && root.local == "workbook"
             && namespaces::main_namespace(&root.namespace)
         {
-            part::reject_promoted_workbook_properties(&xml)?;
+            part::reject_promoted_workbook_properties(xml)?;
         }
-        part.nodes
-    };
+        Ok(part.nodes)
+    })?;
     let (sheets_index, date1904) = workbook_properties(&workbook)?;
     let workbook_relationships_path =
         targets::part_path(archive, &targets::relationships_path(&office.uri))?;
@@ -51,10 +50,11 @@ pub(in crate::package) fn discover(archive: &Archive) -> Result<PackageMetadata>
     let sheet_ids: HashSet<&str> = sheet_nodes(&workbook)
         .flat_map(sheet_relationship_ids)
         .collect();
-    let workbook_relationships =
-        relationships::parse(&archive.read(&workbook_relationships_path)?, &|id, kind| {
+    let workbook_relationships = archive.with_part(&workbook_relationships_path, |xml| {
+        relationships::parse(xml, &|id, kind| {
             namespaces::office_type(kind, "sharedStrings") || sheet_ids.contains(id)
-        })?;
+        })
+    })?;
     let shared_strings_path = shared_strings_path(archive, &office.uri, &workbook_relationships)?;
     let sheets = sheets(
         archive,
@@ -77,7 +77,7 @@ fn validate_content_types(archive: &Archive) -> Result<()> {
     let path = archive
         .part_name("[Content_Types].xml")?
         .ok_or_else(|| Error::InvalidWorkbook("missing [Content_Types].xml".into()))?;
-    let types = part::xml_nodes(&archive.read(path)?, part::root_only)?;
+    let types = archive.with_part(path, |xml| part::xml_nodes(xml, part::root_only))?;
     if types[0].local != "Types" || &*types[0].namespace != CONTENT_TYPES_NAMESPACE {
         return Err(Error::InvalidWorkbook("invalid content-types root".into()));
     }
@@ -95,8 +95,10 @@ struct OfficeDocument {
 fn office_document(archive: &Archive) -> Result<OfficeDocument> {
     let root_relationships_path = archive.part_name("_rels/.rels")?.unwrap_or("_rels/.rels");
     // Only the office document and a signature origin are used.
-    let roots = relationships::parse(&archive.read(root_relationships_path)?, &|_, kind| {
-        namespaces::office_type(kind, "officeDocument") || kind == SIGNATURE_ORIGIN
+    let roots = archive.with_part(root_relationships_path, |xml| {
+        relationships::parse(xml, &|_, kind| {
+            namespaces::office_type(kind, "officeDocument") || kind == SIGNATURE_ORIGIN
+        })
     })?;
     let mut office = roots
         .iter()

@@ -1,6 +1,6 @@
 //! OPC target URI normalization and lookup of retained ZIP member names.
 use crate::archive::Archive;
-use crate::{Error, Result};
+use crate::{Error, Result, xml};
 
 #[cfg(test)]
 #[path = "tests/targets.rs"]
@@ -21,6 +21,9 @@ pub(super) fn resolve_target(source: &str, target: &str) -> Result<String> {
 
 // Validates an internal target's syntax and normalizes its escapes.
 pub(super) fn escaped_target(target: &str) -> Result<String> {
+    // Target is an xsd:anyURI. Strip XML padding before checking whether the
+    // reference is relative or absolute. escape_path handles inner whitespace.
+    let target = xml::trim_whitespace(target);
     if target.is_empty()
         || target.starts_with("//")
         || target.contains(['\\', '#', '?', '\0'])
@@ -39,19 +42,20 @@ pub(super) fn escaped_target(target: &str) -> Result<String> {
 /// The escaped directory segments of a source part, against which its
 /// relationship targets resolve: the directory as one string, and where each
 /// of its segments ends, rather than a string per segment.
-pub(super) struct TargetBase {
-    directory: String,
+pub(super) struct TargetBase<'source> {
+    directory: &'source str,
     ends: Vec<u32>,
     first_empty: Option<usize>,
 }
 
-impl TargetBase {
-    pub(super) fn try_new(source: &str) -> Result<Self> {
-        let mut directory = escape_path(source)?;
+impl<'source> TargetBase<'source> {
+    // The source is a previously resolved part URI (or the package root).
+    pub(super) fn try_new(source: &'source str) -> Result<Self> {
+        let mut directory = "";
         let mut ends = Vec::new();
         let mut first_empty = None;
-        if let Some(end) = directory.rfind('/') {
-            directory.truncate(end);
+        if let Some((parent, _)) = source.rsplit_once('/') {
+            directory = parent;
             let mut offset = 0;
             for (position, segment) in directory.split('/').enumerate() {
                 if segment.is_empty() && first_empty.is_none() {
@@ -64,8 +68,6 @@ impl TargetBase {
                 })?);
                 offset += 1;
             }
-        } else {
-            directory.clear();
         }
         Ok(Self {
             directory,
@@ -143,8 +145,15 @@ impl TargetBase {
 fn escape_path(path: &str) -> Result<String> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut escaped = String::with_capacity(path.len());
-    let mut input = path.as_bytes().iter().copied();
+    let mut input = path.bytes().peekable();
     while let Some(input_byte) = input.next() {
+        // Collapse a run of raw XML whitespace to one space. Percent-encoded
+        // bytes represent the URI itself, so even adjacent %20s stay distinct.
+        if xml::is_space(input_byte) {
+            while input.next_if(|&byte| xml::is_space(byte)).is_some() {}
+            escaped.push_str("%20");
+            continue;
+        }
         let (byte, was_escaped) = if input_byte == b'%' {
             let high = input.next().and_then(|c| (c as char).to_digit(16));
             let low = input.next().and_then(|c| (c as char).to_digit(16));
@@ -199,6 +208,9 @@ pub(super) fn resolve_part_target(archive: &Archive, source: &str, target: &str)
 pub(super) fn part_path(archive: &Archive, path: &str) -> Result<String> {
     if let Some(name) = archive.part_name(path)? {
         return Ok(name.to_owned());
+    }
+    if !path.contains('%') {
+        return Ok(path.to_owned());
     }
     // Earlier versions accepted ZIP names with decoded spaces and Unicode.
     // Keep those packages readable when the canonical encoded part is absent.

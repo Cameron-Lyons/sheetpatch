@@ -92,12 +92,12 @@ fn offset(text: &str) -> Option<&str> {
     let split = text.len().checked_sub(6)?;
     let (value, offset) = (text.get(..split)?, text.get(split..)?);
     let bytes = offset.as_bytes();
-    (matches!(bytes[0], b'+' | b'-')
-        && bytes[3] == b':'
-        && digits(offset, 1..3).is_some_and(|hours| hours <= 14)
-        && digits(offset, 4..6).is_some_and(|minutes| minutes <= 59)
-        && !value.is_empty())
-    .then_some(value)
+    if value.is_empty() || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return None;
+    }
+    let hours = digits(offset, 1..3)?;
+    let minutes = digits(offset, 4..6)?;
+    (minutes < 60 && hours * 60 + minutes <= 14 * 60).then_some(value)
 }
 
 /// Converts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM[:SS[.fraction]]` or a time-only
