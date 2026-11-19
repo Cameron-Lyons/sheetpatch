@@ -1754,10 +1754,9 @@ fn emit_directory_at(
 ) -> (Result<()>, Vec<u8>) {
     let local_tail = vec![0; position.min(archive.local_tail_len())];
     let mut output = Vec::new();
-    let mut output_position = position;
     let result = archive.emit_directory(
         &mut output,
-        &mut output_position,
+        position,
         &local_tail,
         offsets,
         replacements,
@@ -2023,6 +2022,83 @@ fn saves_refuse_end_records_that_forward_scanning_readers_could_select() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn large_directories_stream_in_batches_and_preserve_entry_comments() {
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        largest_write: usize,
+    }
+
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.largest_write = self.largest_write.max(bytes.len());
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let archive = Archive::try_new(combine_members((0..8).map(|i| {
+        with_entry_comment(
+            named_fixture(format!("part{i}").as_bytes(), 0, Descriptor::Signed),
+            &vec![b'a' + i; u16::MAX as usize],
+        )
+    })))
+    .unwrap();
+    let changes = BTreeMap::from([
+        ("part0".into(), b"first".to_vec()),
+        ("part7".into(), b"last".to_vec()),
+    ]);
+    let mut output = Output::default();
+    archive.write_to(&changes, &mut output).unwrap();
+    assert!(output.largest_write <= 2 * END_TAIL_LEN);
+    let reopened = Archive::try_new(output.bytes).unwrap();
+    for (name, data) in &changes {
+        assert_eq!(reopened.read(name).unwrap(), *data);
+    }
+    for (old, new) in archive.entries.iter().zip(&reopened.entries) {
+        assert_eq!(
+            archive.original[old.central.start + CENTRAL_HEADER_LEN..old.central.end],
+            reopened.original[new.central.start + CENTRAL_HEADER_LEN..new.central.end]
+        );
+    }
+}
+
+#[test]
+fn directory_validation_probes_rewritten_records_before_the_retained_tail() {
+    // A four-byte growth puts the first central signature at the directory
+    // offset in the decoy. A full-size intervening comment puts that central
+    // record before the tail the writer retained for validation.
+    let bytes = combine_members([
+        fixture(Descriptor::Absent),
+        with_entry_comment(
+            named_fixture(b"middle", 0, Descriptor::Absent),
+            &vec![b'm'; u16::MAX as usize],
+        ),
+        named_fixture(b"last", 0, Descriptor::Absent),
+    ]);
+    let start = Archive::try_new(bytes.clone()).unwrap().central_start;
+    let archive = Archive::try_new(with_entry_comment(
+        bytes,
+        &decoy(start + 4, CENTRAL_HEADER_LEN),
+    ))
+    .unwrap();
+    for compact in [false, true] {
+        let mut output = Vec::new();
+        let changes = BTreeMap::from([("part.xml".into(), b"<part/>abcd".to_vec())]);
+        let result = if compact {
+            archive.compact_to(&changes, &mut output)
+        } else {
+            archive.write_to(&changes, &mut output)
+        };
+        assert!(refused_as_ambiguous(result));
+        assert_eq!(output.len(), start + 4);
     }
 }
 

@@ -87,7 +87,7 @@ fn run_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     let view = workbook.prepare_sheet(sheet)?;
     output::write_read_cells(
         &view,
-        ranges.iter().copied().flat_map(CellRange::cells),
+        &ranges,
         READ_BUFFER_BYTES,
         output,
         CellOutput {
@@ -111,6 +111,7 @@ fn run_cells(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Res
     // Iterate the existing indexed cells directly. Filtering precedes value
     // decoding, and a large range is never expanded into missing addresses.
     output::write_cells(
+        &view,
         view.cell_contents_in(range),
         READ_BUFFER_BYTES,
         output,

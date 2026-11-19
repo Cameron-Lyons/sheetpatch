@@ -71,6 +71,41 @@ fn ordered_batches_retain_duplicates_and_blanks_across_sparse_rows() {
 }
 
 #[test]
+fn range_contents_includes_blanks_and_continues_after_a_cell_error() {
+    let mut book = book(
+        "<row r='1'><c r='B1' s='4'/><c r='C1'><v>bad</v></c></row>\
+         <row r='3'><c r='A3'><f>1+1</f><v>2</v></c></row>",
+    );
+    book.set_cell("Data", "B3", "pending").unwrap();
+    let view = book.prepare_sheet("Data").unwrap();
+    for rectangle in ["C3:A1", "B1:B4", "B3:D3", "XFC1048575:XFD1048576"] {
+        let range: CellRange = rectangle.parse().unwrap();
+        let mut contents = view.range_contents(range);
+        for (offset, address) in range.cells().enumerate() {
+            let remaining = range.cell_count() as usize - offset;
+            assert_eq!(contents.size_hint(), (remaining, Some(remaining)));
+            let expected = view
+                .get_cell_at(address)
+                .map(|value| (address, value))
+                .map_err(|error| error.to_string());
+            for item in [contents.clone().next(), contents.next()] {
+                assert_eq!(item.unwrap().map_err(|error| error.to_string()), expected);
+            }
+        }
+        assert!(contents.next().is_none());
+    }
+
+    let grid = "A1:XFD1048576".parse().unwrap();
+    let first_two: Vec<_> = view
+        .range_contents(grid)
+        .take(2)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(first_two[0].1.value.is_blank());
+    assert_eq!(first_two[1].1.style_index, Some(4));
+}
+
+#[test]
 fn batches_report_the_first_requested_bad_value_in_every_order() {
     let book = book(
         "<row r='1'><c r='B1'><v>bad number</v></c><c r='D1' s='bad style'/></row>\

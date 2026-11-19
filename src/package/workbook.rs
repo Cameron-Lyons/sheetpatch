@@ -191,6 +191,8 @@ struct SheetXml {
     // The part URI can differ from its ZIP name in legacy decoded archives.
     uri: String,
     original: OnceLock<PartData>,
+    // Serializes first loads of this sheet, including retries after an error.
+    loading: Mutex<()>,
     // Present only when the XML differs from the original, and the only record
     // that the worksheet has a pending change.
     current: Option<Vec<u8>>,
@@ -799,16 +801,19 @@ impl Workbook {
             .ok_or_else(|| Error::SheetNotFound(name.to_owned()))
     }
 
-    // The worksheet caches are loaded outside `get_or_init`, so a failed load
-    // is not cached and fails the call that needed it, which can be retried.
-    // Concurrent first loads can only duplicate the work.
+    // Only first readers contend. Each sheet has its own lock so other
+    // worksheets can inflate independently. A failed load leaves it empty.
     fn original_sheet(&self, index: usize) -> Result<&[u8]> {
-        let cache = &self.sheet_xml[index].original;
-        let part = match cache.get() {
+        let sheet = &self.sheet_xml[index];
+        if let Some(part) = sheet.original.get() {
+            return Ok(part.bytes(&self.archive));
+        }
+        let _guard = sheet.loading.lock().unwrap_or_else(PoisonError::into_inner);
+        let part = match sheet.original.get() {
             Some(part) => part,
             None => {
                 let part = self.archive.read_part(&self.sheets[index].path)?;
-                cache.get_or_init(|| part)
+                sheet.original.get_or_init(|| part)
             }
         };
         Ok(part.bytes(&self.archive))

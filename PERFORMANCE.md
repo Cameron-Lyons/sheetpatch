@@ -18,7 +18,9 @@ per workbook, even when several worksheets relate to it. Inserted cells resolve
 their row's default style once, while column defaults remain specific to each
 column. Row defaults are validated only when needed.
 Indexed ZIP/sheet lookup and cached decompression avoid repeated archive scans,
-and ZIP physical order is cached for repeated saves.
+and ZIP physical order is cached for repeated saves. Concurrent first readers
+of a deflated worksheet share its decompressed bytes. Other worksheets can
+load independently, and a failed load can be retried.
 
 Worksheet parsing reads each element's attributes in a single pass into compact
 records that refer to the original XML by 32-bit offsets, 48 bytes per element
@@ -26,7 +28,9 @@ and 24 per attribute. Names and raw attribute values are read back from those
 spans; only values that XML normalization changes are stored separately, and
 the streaming shared-string parse releases them with each string. Direct
 children use ranges in the parse index, attributes and row cells use shared
-buffers, and normalized namespace URIs use compact identifiers.
+buffers, and normalized namespace URIs use compact identifiers. The coordinate
+index uses 16 bytes per stored row and 12 per stored cell, with 32-bit offsets
+into the element and cell arrays.
 Namespace resolution reuses active prefix bindings across descendants and
 restores cached parent bindings after nested declarations. XML 1.0 character
 checks scan each part's UTF-8 bytes in vectorizable chunks rather than decoding
@@ -73,7 +77,9 @@ controlled by the view's lifetime; single-cell reads avoid allocating a batch
 result. Simple scalar payloads borrow the validated XML
 instead of allocating a temporary string before parsing a number, boolean,
 date, or shared-string index. CLI `cells` traverses indexed records directly,
-without collecting addresses or searching for them again. CLI reads buffer up to 4 MiB of
+without collecting addresses or searching for them again. CLI `get` and
+`WorksheetView::range_contents` reuse their row and column positions as they
+visit each address in a rectangle. CLI reads buffer up to 4 MiB of
 formatted output while validating, including escapes and repeated JSON sheet
 names, with no cell-count cap, so most reads decode each cell once. Buffer
 growth is fallible and bounded by that limit. Cells beyond the buffer are
@@ -81,13 +87,13 @@ validated before printing and then read again individually for output.
 
 Streaming saves borrow ZIP metadata and hold one replacement compressed part at
 a time, in addition to the input archive, cached original XML, and pending
-worksheet XML. Before writing the central directory, a save also holds the
-rewritten directory and end record and up to the last 64 KiB of local-record
-output, so that it can check the archive's end as a reader would. In the rare
-case that an end-record-like structure in that window points before it (in
-ordinary workbooks, only a Stored embedded ZIP's own end record), the local
-records are generated a second time, recompressing replacements, to read those
-bytes back. Changed parts resolve to archive entry indexes once per save, and
+worksheet XML. Before writing any central-directory records, a save validates
+the final ZIP search window of about 64 KiB. It retains whole records where
+the window intersects the directory. Earlier directory records are written in
+bounded batches. If a possible end record points before the window, the save
+replays local records and earlier directory records to check the referenced
+bytes. This rare case can require compressing replacements a second time.
+Changed parts resolve to archive entry indexes once per save, and
 normal and compact saves share one record emitter with their respective
 gap-preservation rules. Compaction searches for obsolete record boundaries only
 in gaps between validated active records, so active payload bytes do not become
@@ -154,8 +160,9 @@ python3 scripts/benchmark.py --candidate target/release/sheetpatch --samples 7 -
 python3 scripts/benchmark.py --candidate target/release/sheetpatch --baseline /path/to/previous/sheetpatch --samples 7 --output target/comparison.json
 ```
 
-The script measures numeric and shared-string whole-sheet reads, including
-shared strings exported as JSON, a large-sheet save, and row insertions.
+The script measures a 16-column `get` range with 15 blank columns, numeric
+and shared-string whole-sheet reads, shared strings exported as JSON, a
+large-sheet save, and row insertions.
 Untimed warmups validate read output, edits, ZIP
 checksums, and untouched records. Each CLI measurement runs in a fresh worker;
 fixture generation and Python startup are excluded, while the native time

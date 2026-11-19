@@ -138,7 +138,12 @@ def validate_warmup(name, binary, arguments, cells):
         )
         require(not process.stderr, f"{name}: {binary} unexpectedly wrote to stderr")
         output.seek(0)
-        if name.startswith("cells_"):
+        if name == "get_range":
+            expected = hashlib.sha256()
+            for row in range(1, min(cells, 65_536) + 1):
+                expected.update(str(row).encode() + b"\n" * 16)
+            require(digest_file(output) == expected.digest(), "get_range: incorrect rectangular output")
+        elif name.startswith("cells_"):
             expected = hashlib.sha256()
             count = cells if name == "cells_numeric" else min(cells, 20_000)
             shared = "text" * 128
@@ -205,6 +210,7 @@ def fixtures(directory, cells):
     patch.write_text("".join(f"Data\tA{r}\ttext\tinserted {r}\n" for r in range(1, 1001)))
     output = directory / "output.xlsx"
     return {
+        "get_range": ["get", str(numeric), "Data", f"A1:P{min(cells, 65_536)}"],
         "cells_numeric": ["cells", str(numeric), "Data"],
         "cells_shared": ["cells", str(shared), "Data"],
         "cells_shared_json": ["cells", "--json", str(shared), "Data"],

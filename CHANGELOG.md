@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Added `WorksheetView::range_contents` to stream a rectangle in row-major
+  order, including missing cells and cells that hold only a style. CLI `get`
+  uses the same iterator and retains its existing output and cell limit.
+- Reduced worksheet index memory on 64-bit systems. Concurrent readers of a
+  worksheet now share its first successful decompression.
+- Streaming saves validate the ZIP end record with bounded directory buffers,
+  reducing peak memory for archives with large central directories.
+- Package discovery accepts surrounding XML whitespace in relationship IDs
+  and rejects invalid IDs and duplicates after normalization.
+- An allocation failure while comparing a stored scalar during an edit now
+  returns an error and preserves earlier pending edits and the cell's XML.
+
 ## 1.2.0 — 2026-11-17
 
 This release adds streaming cell iteration and a per-workbook compression

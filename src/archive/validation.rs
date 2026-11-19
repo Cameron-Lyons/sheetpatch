@@ -116,8 +116,8 @@ fn decoy_directory(tail: &[u8], base: usize, offset: usize) -> Result<Option<usi
 /// Refuse output that readers could interpret differently from its own end
 /// record, the last one in `tail`. `tail` holds the output's last bytes after
 /// `base` earlier ones, as [`locate_end_record`] requires: `local_len` bytes
-/// of local records, then the central directory and end record. `reemit`
-/// writes the local records again, for reading back earlier bytes.
+/// of local records, then the final central records and end record. `reemit`
+/// writes all local records and any central records before `tail` again.
 pub(super) fn check_end_records(
     tail: &[u8],
     base: usize,
@@ -172,8 +172,7 @@ pub(super) fn check_end_records(
         debug_assert_eq!(
             probe.position,
             base + local_len,
-            "emission is deterministic, so writing the local records again must end where \
-             they did"
+            "replayed records must end at the first central record in the retained tail"
         );
         probe.write_all(&tail[local_len..])?;
         if probe.words.iter().any(|word| word.bytes == central) {

@@ -82,6 +82,17 @@ fn check_view(view: &WorksheetView<'_>) {
         .zip(addresses.last())
         .map(|(&first, &last)| CellRange::new(first, last));
     let single = addresses.first().copied().map(CellRange::from);
+    if let Some(range) = range {
+        let mut dense = view.range_contents(range);
+        for address in range.cells().take(64) {
+            compare_read(
+                dense
+                    .next()
+                    .expect("every requested address must be visited"),
+                view.get_cell_at(address).map(|content| (address, content)),
+            );
+        }
+    }
     for range in [None, range, single] {
         let expected: Vec<_> = view
             .cells()

@@ -126,7 +126,9 @@ chart sheets are retained as opaque parts. `sheet(name)` finds one worksheet,
 whose edits are refused. Worksheet names match exactly, including case. Package
 discovery resolves URI-escaped relationship targets and compares part paths
 without ASCII case, retaining the actual ZIP member names. Ambiguous equivalent
-names for an accessed part are rejected. Relationship types and targets ignore
+names for an accessed part are rejected. Relationship IDs must be valid XML
+NCNames and unique within their relationships part after trimming surrounding
+XML whitespace. Relationship types and targets ignore
 surrounding XML whitespace. Within a target, a run of XML whitespace represents
 one space. Each explicit `%20` in the target represents a separate space.
 
@@ -177,7 +179,10 @@ costs less than filtering, unrelated columns, and never expands missing
 cells. Each item returns its own read result; starting another iterator
 replays the view. Use these methods for whole-sheet processing with bounded
 result memory, and `get_cells_at` when a specific request order or duplicate
-addresses are needed.
+addresses are needed. To stream every address in a rectangle, including
+blank positions, use `sheet.range_contents("A1:C20".parse()?)`. It yields
+one `(CellRef, CellContent)` result at a time in row-major order, so consumers
+can stop early without allocating the full rectangle.
 
 An edit of a protected cell (see [Supported scope](#supported-scope)) returns
 `Error::ProtectedCell { sheet, cell, reason }`, displayed as
@@ -509,8 +514,11 @@ in cached results. The original workbook's calculation settings are retained.
   structural edits, style creation, and calculation are outside this version's scope.
 - Excel table header cells are protected: an edit may rewrite a header's current
   value but not change it, since Excel requires header text to match the table's
-  column names. Table bodies stay editable. Edits read the worksheet's table
-  relationships and parts; missing or malformed ones refuse edits to that worksheet.
+  column names. Table bodies stay editable. Sheetpatch finds tables through
+  the worksheet's table relationships. A malformed relationships part, or a
+  table relationship pointing to a missing or malformed table, prevents changes
+  to that worksheet. A sheet with no table relationships has no protected table
+  headers.
 - Written error values must be one of Excel's error codes: `#NULL!`, `#DIV/0!`,
   `#VALUE!`, `#REF!`, `#NAME?`, `#NUM!`, `#N/A`, `#GETTING_DATA`, `#SPILL!`,
   `#CALC!`, `#FIELD!`, `#BLOCKED!`, `#CONNECT!`, `#BUSY!`, `#UNKNOWN!`,

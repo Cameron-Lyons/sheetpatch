@@ -1,5 +1,5 @@
 use super::error::Failure;
-use sheetpatch::{CellContent, CellRef, CellValue, WorksheetView};
+use sheetpatch::{CellContent, CellRange, CellRef, CellValue, WorksheetView};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 
@@ -298,13 +298,13 @@ impl Write for PrefixBuffer<'_> {
 fn buffer_cell(
     buffer: &mut Vec<u8>,
     budget: usize,
-    cell: CellRef,
-    content: &CellContent,
+    item: sheetpatch::Result<(CellRef, CellContent)>,
     format: &CellOutput<'_>,
     first: &mut bool,
-) -> io::Result<bool> {
-    if stored_len(content, format.json) > budget - buffer.len() {
-        return Ok(false);
+) -> Result<Option<CellRef>, Failure> {
+    let (cell, content) = item?;
+    if stored_len(&content, format.json) > budget - buffer.len() {
+        return Ok(Some(cell));
     }
     let start = buffer.len();
     let was_first = *first;
@@ -313,13 +313,14 @@ fn buffer_cell(
         budget,
         full: false,
     };
-    let result = write_cell(&mut writer, cell, content, format, first);
+    let result = write_cell(&mut writer, cell, &content, format, first);
     if writer.full {
         writer.bytes.truncate(start);
         *first = was_first;
-        return Ok(false);
+        return Ok(Some(cell));
     }
-    result.map(|()| true)
+    result?;
+    Ok(None)
 }
 
 /// Validate every requested value before emitting any output. While
@@ -329,24 +330,27 @@ fn buffer_cell(
 /// and formatting or escaping that exceeds it rolls back that cell's output.
 pub(super) fn write_read_cells(
     view: &WorksheetView<'_>,
-    cells: impl Iterator<Item = CellRef> + Clone,
+    ranges: &[CellRange],
     budget: usize,
     output: &mut impl Write,
     format: CellOutput<'_>,
 ) -> Result<(), Failure> {
+    if let [range] = ranges {
+        return write_cells(view, view.range_contents(*range), budget, output, format);
+    }
     write_cells(
-        cells.map(|cell| view.get_cell_at(cell).map(|content| (cell, content))),
+        view,
+        ranges.iter().flat_map(|&range| view.range_contents(range)),
         budget,
         output,
         format,
     )
 }
 
-/// Save the iterator's position immediately after the buffered prefix. The
-/// output pass resumes there, without storing addresses or decoding the
-/// prefix again to skip it. Clones of these iterators copy only their cursor
-/// and references to immutable worksheet data.
+/// Buffer complete cells and validate the rest before writing. On overflow,
+/// retain just the first unbuffered address and the iterator over its suffix.
 pub(super) fn write_cells<I>(
+    view: &WorksheetView<'_>,
     mut cells: I,
     budget: usize,
     output: &mut impl Write,
@@ -365,15 +369,12 @@ where
         .write_all(b"[")?;
     }
     let mut first = true;
-    let mut remaining = cells.clone();
-    let mut buffering = budget > 0;
-    while let Some(cell) = cells.next() {
-        let (cell, content) = cell?;
-        if buffering {
-            buffering = buffer_cell(&mut buffer, budget, cell, &content, &format, &mut first)?;
-            if buffering {
-                remaining = cells.clone();
-            }
+    let overflow = cells
+        .find_map(|item| buffer_cell(&mut buffer, budget, item, &format, &mut first).transpose())
+        .transpose()?;
+    if overflow.is_some() {
+        for result in cells.clone() {
+            result?;
         }
     }
     output.write_all(&buffer)?;
@@ -382,9 +383,12 @@ where
     }
     // Release the buffer before the remaining cells are read again.
     drop(buffer);
-    for cell in remaining {
-        let (cell, content) = cell?;
-        write_cell(output, cell, &content, &format, &mut first)?;
+    if let Some(cell) = overflow {
+        write_cell(output, cell, &view.get_cell_at(cell)?, &format, &mut first)?;
+        for result in cells {
+            let (cell, content) = result?;
+            write_cell(output, cell, &content, &format, &mut first)?;
+        }
     }
     if format.json {
         output.write_all(b"]\n")?;

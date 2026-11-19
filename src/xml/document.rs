@@ -20,7 +20,7 @@ fn name_character(character: char) -> bool {
             '-' | '.' | '0'..='9' | '\u{b7}' | '\u{300}'..='\u{36f}' | '\u{203f}'..='\u{2040}')
 }
 
-fn ncname(name: &str) -> bool {
+pub(crate) fn valid_ncname(name: &str) -> bool {
     let mut characters = name.chars();
     characters.next().is_some_and(name_start) && characters.all(name_character)
 }
@@ -28,8 +28,8 @@ fn ncname(name: &str) -> bool {
 // Element and attribute names follow Namespaces in XML's QName grammar.
 pub(super) fn valid_qname(name: &str) -> bool {
     match name.split_once(':') {
-        Some((prefix, local)) => ncname(prefix) && ncname(local),
-        None => ncname(name),
+        Some((prefix, local)) => valid_ncname(prefix) && valid_ncname(local),
+        None => valid_ncname(name),
     }
 }
 

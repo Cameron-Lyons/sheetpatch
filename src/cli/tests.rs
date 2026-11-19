@@ -373,6 +373,7 @@ fn read_output_does_not_depend_on_the_buffer_budget() {
         .filter(|&address| address != cell("B3"))
         .collect();
     cells.extend(["A3", "C1", "E9", "A2"].map(cell));
+    let ranges: Vec<_> = cells.iter().copied().map(CellRange::from).collect();
     for json in [false, true] {
         for records in [false, true] {
             for escape in [Escape::Exact, Escape::Controls] {
@@ -394,24 +395,17 @@ fn read_output_does_not_depend_on_the_buffer_budget() {
                 }
                 for budget in (0..=expected.len() + 1).chain([usize::MAX]) {
                     let mut output = Vec::new();
-                    write_read_cells(&view, cells.iter().copied(), budget, &mut output, format())
-                        .unwrap();
+                    write_read_cells(&view, &ranges, budget, &mut output, format()).unwrap();
                     assert_eq!(output, expected, "budget {budget}");
                 }
                 // A malformed value after any buffered prefix still
                 // prevents all output.
-                let mut invalid = cells.clone();
-                invalid.push(cell("B3"));
+                let mut invalid = ranges.clone();
+                invalid.push(cell("B3").into());
                 for budget in [0, expected.len() / 2, usize::MAX] {
                     let mut output = Vec::new();
-                    let failure = write_read_cells(
-                        &view,
-                        invalid.iter().copied(),
-                        budget,
-                        &mut output,
-                        format(),
-                    )
-                    .unwrap_err();
+                    let failure = write_read_cells(&view, &invalid, budget, &mut output, format())
+                        .unwrap_err();
                     assert!(failure.to_string().contains("B3"), "{failure}");
                     assert!(output.is_empty(), "budget {budget}");
                 }
@@ -465,7 +459,7 @@ fn buffered_read_output_stops_before_stored_text_over_the_budget() {
                 escape: Escape::Exact,
             };
             let mut output = Writes(Vec::new());
-            write_read_cells(&view, cells.iter().copied(), 200, &mut output, format).unwrap();
+            write_read_cells(&view, &cells.map(CellRange::from), 200, &mut output, format).unwrap();
             let prefix = output.0[0];
             assert!(
                 prefix <= 200,
@@ -512,17 +506,10 @@ fn buffered_read_output_bounds_escapes_and_sheet_names() {
             escape,
         };
         let mut expected = Vec::new();
-        write_read_cells(
-            &view,
-            cells.iter().copied(),
-            usize::MAX,
-            &mut expected,
-            format(),
-        )
-        .unwrap();
+        write_read_cells(&view, &cells, usize::MAX, &mut expected, format()).unwrap();
         for budget in [200, 1, 0, expected.len() - 1, expected.len()] {
             let mut output = Writes(Vec::new(), Vec::new());
-            write_read_cells(&view, cells.iter().copied(), budget, &mut output, format()).unwrap();
+            write_read_cells(&view, &cells, budget, &mut output, format()).unwrap();
             assert!(
                 output.0[0] <= budget,
                 "json={json}, budget={budget}: buffered {} bytes",
@@ -542,6 +529,7 @@ fn indexed_output_replays_only_values_after_its_buffered_prefix() {
     let visits: Vec<_> = view.cells().map(|_| Cell::new(0)).collect();
     let mut output = Vec::new();
     output::write_cells(
+        &view,
         view.cell_contents().enumerate().map(|(index, content)| {
             visits[index].set(visits[index].get() + 1);
             content
@@ -562,8 +550,9 @@ fn indexed_output_replays_only_values_after_its_buffered_prefix() {
     );
     assert_eq!(
         visits.iter().map(Cell::get).collect::<Vec<_>>(),
-        // The first two lines use 19 bytes; the third would exceed 20.
-        [1, 1, 2, 2, 2]
+        // The first two lines use 19 bytes. The third cell is replayed by
+        // its address, and the last two by replaying the iterator's suffix.
+        [1, 1, 1, 2, 2]
     );
 }
 

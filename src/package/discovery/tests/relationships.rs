@@ -31,7 +31,10 @@ fn reference_relationships(bytes: &[u8]) -> Result<Vec<Relationship>> {
                 .map(str::to_owned)
                 .ok_or_else(|| Error::InvalidWorkbook(format!("relationship lacks {key}")))
         };
-        let id = required("Id")?;
+        let id = xml::trim_whitespace(&required("Id")?).to_owned();
+        if !xml::valid_ncname(&id) {
+            return Err(Error::InvalidWorkbook("invalid relationship id".into()));
+        }
         if !ids.insert(id.clone()) {
             return Err(Error::InvalidWorkbook("duplicate relationship id".into()));
         }
@@ -189,6 +192,7 @@ fn streamed_relationships_match_the_retaining_reference() {
         "relationship lacks Type",
         "relationship lacks Target",
         "duplicate relationship id",
+        "invalid relationship id",
         "invalid relationship TargetMode",
         "Xml(",
         "Ok(0)",
