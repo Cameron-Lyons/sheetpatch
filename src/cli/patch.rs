@@ -3,6 +3,7 @@ use super::error::Failure;
 use super::streams;
 use sheetpatch::{CellEdit, CellRef};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -34,7 +35,7 @@ fn read_row(reader: &mut impl BufRead, row: &mut Vec<u8>) -> Result<(), RowError
         }
         let remaining = MAX_ROW_BYTES - row.len();
         let examined = &available[..available.len().min(remaining + 1)];
-        let newline = examined.iter().position(|&byte| byte == b'\n');
+        let newline = memchr::memchr(b'\n', examined);
         let count = newline.map_or(examined.len(), |index| index + 1);
         if count > remaining {
             return Err(RowError::TooLong);
@@ -58,21 +59,19 @@ fn read_row(reader: &mut impl BufRead, row: &mut Vec<u8>) -> Result<(), RowError
     }
 }
 
-/// The first and last patch lines that target one edit's cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct EditLines {
-    pub(super) first: usize,
-    pub(super) last: usize,
+#[derive(Debug)]
+struct SheetLines {
+    first_line: usize,
+    cells: HashMap<CellRef, usize>,
 }
 
 /// The patch lines of each unique edit, kept for diagnostics after the
 /// edits move into the transaction.
 #[derive(Debug, Default)]
 pub(super) struct PatchLines {
-    /// The lines of each edit, by edit index.
-    pub(super) lines: Vec<EditLines>,
-    /// The index of each edit by worksheet name and cell.
-    targets: HashMap<String, HashMap<CellRef, usize>>,
+    sheets: HashMap<String, SheetLines>,
+    // Indexed like Patch::edits, including when a later row replaces an edit.
+    last_lines: Vec<usize>,
 }
 
 impl PatchLines {
@@ -80,15 +79,9 @@ impl PatchLines {
     /// missing worksheet, or the last line supplying a protected cell's value.
     pub(super) fn line_for(&self, error: &sheetpatch::Error) -> Option<usize> {
         match error {
-            // Edits are indexed in first-occurrence order, so a worksheet's
-            // lowest edit index began on the first line naming it.
-            sheetpatch::Error::SheetNotFound(sheet) => {
-                let first_edit = self.targets.get(sheet)?.values().min()?;
-                Some(self.lines[*first_edit].first)
-            }
+            sheetpatch::Error::SheetNotFound(sheet) => Some(self.sheets.get(sheet)?.first_line),
             sheetpatch::Error::ProtectedCell { sheet, cell, .. } => {
-                let index = self.targets.get(sheet)?.get(cell)?;
-                Some(self.lines[*index].last)
+                Some(self.last_lines[*self.sheets.get(sheet)?.cells.get(cell)?])
             }
             _ => None,
         }
@@ -102,6 +95,34 @@ pub(super) struct Patch {
     pub(super) edits: Vec<CellEdit>,
     pub(super) lines: PatchLines,
     pub(super) row_count: usize,
+}
+
+impl Patch {
+    fn push(&mut self, edit: CellEdit, line: usize) {
+        self.row_count += 1;
+        let sheets = &mut self.lines.sheets;
+        let sheet = match sheets.get_mut(edit.sheet()) {
+            Some(sheet) => sheet,
+            None => sheets
+                .entry(edit.sheet().to_owned())
+                .or_insert_with(|| SheetLines {
+                    first_line: line,
+                    cells: HashMap::new(),
+                }),
+        };
+        match sheet.cells.entry(edit.cell()) {
+            Entry::Occupied(entry) => {
+                let index = *entry.get();
+                self.lines.last_lines[index] = line;
+                self.edits[index] = edit;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(self.edits.len());
+                self.lines.last_lines.push(line);
+                self.edits.push(edit);
+            }
+        }
+    }
 }
 
 /// Validate every patch row, retaining only each target's final value.
@@ -156,11 +177,12 @@ pub(super) fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch
                 "carriage return without line feed; use LF or CRLF line endings".into(),
             ));
         }
-        if line.trim().is_empty() || (line.starts_with('#') && !line.contains('\t')) {
-            continue;
-        }
         let mut fields = line.splitn(4, '\t');
         let sheet = fields.next().unwrap_or_default();
+        // A tab starts another field even when all the fields are empty.
+        if sheet.len() == line.len() && (sheet.starts_with('#') || sheet.trim().is_empty()) {
+            continue;
+        }
         let (Some(cell), Some(kind)) = (fields.next(), fields.next()) else {
             return Err(invalid("expected SHEET<TAB>CELL<TAB>TYPE<TAB>VALUE".into()));
         };
@@ -170,27 +192,7 @@ pub(super) fn read_patch(mut reader: impl BufRead, origin: &str) -> Result<Patch
             ValueError::Arity(message) | ValueError::Invalid(message) => invalid(message),
         })?;
         let edit = args::cell_edit(sheet, cell, value, text).map_err(invalid)?;
-        patch.row_count += 1;
-        let lines = &mut patch.lines;
-        if let Some(&index) = lines.targets.get(sheet).and_then(|cells| cells.get(&cell)) {
-            lines.lines[index].last = line_number;
-            patch.edits[index] = edit;
-        } else {
-            // Most rows name a sheet already seen, whose name is not copied.
-            let index = patch.edits.len();
-            if let Some(cells) = lines.targets.get_mut(sheet) {
-                cells.insert(cell, index);
-            } else {
-                lines
-                    .targets
-                    .insert(sheet.to_owned(), HashMap::from([(cell, index)]));
-            }
-            lines.lines.push(EditLines {
-                first: line_number,
-                last: line_number,
-            });
-            patch.edits.push(edit);
-        }
+        patch.push(edit, line_number);
     }
     Ok(patch)
 }

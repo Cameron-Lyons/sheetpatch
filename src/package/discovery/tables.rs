@@ -32,9 +32,8 @@ pub(in crate::package) fn table_headers(
     let mut resolved: HashSet<(usize, String)> = HashSet::new();
     let mut base = None;
     let relationships = archive
-        .read(&relationships_part)
-        .and_then(|xml| {
-            relationships::parse(&xml, &|_, kind| namespaces::office_type(kind, "table"))
+        .with_part(&relationships_part, |xml| {
+            relationships::parse(xml, &|_, kind| namespaces::office_type(kind, "table"))
         })
         .map_err(in_relationships)?;
     for relationship in relationships {
@@ -75,8 +74,7 @@ pub(in crate::package) fn table_headers(
             Some(&header) => header,
             None => {
                 let header = archive
-                    .read(&path)
-                    .and_then(|xml| table_header(&xml))
+                    .with_part(&path, table_header)
                     .map_err(|error| error.in_part(&path))?;
                 parsed.insert(path, header);
                 header

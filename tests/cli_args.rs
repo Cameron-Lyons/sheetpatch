@@ -78,6 +78,11 @@ fn misplaced_options_are_usage_errors_and_never_become_files() {
             Some(("-o", "OUTPUT")),
             None,
         ),
+        (
+            vec!["set", "in.xlsx", "out.xlsx", "Data", "-h", "blank"],
+            None,
+            Some("sheetpatch set -h"),
+        ),
         (vec!["list", "-in.xlsx"], None, None),
         (
             vec!["list", "in.xlsx", "--json"],

@@ -2,7 +2,7 @@ use super::discovery::{self, DiscoveredSheet, PackageMetadata};
 use super::read_batch;
 use super::sheet::Sheet;
 use super::worksheet_view::WorksheetView;
-use crate::archive::{self, Archive, PartChanges};
+use crate::archive::{self, Archive, PartChanges, PartData};
 use crate::atomic::{self, SourcePermissions};
 use crate::worksheet::{self, PreparedWorksheet, ReadError, SharedStrings, protection};
 use crate::{CellContent, CellEdit, CellRange, CellRef, CellValue, Error, Result};
@@ -101,9 +101,9 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 /// as a shared-string table that cannot be loaded, name that part's path in
 /// the archive instead. An [`Error::Io`] names neither.
 ///
-/// Result vectors and copied cell text use fallible allocations, returning
-/// [`Error::Io`] of kind [`std::io::ErrorKind::OutOfMemory`] when refused,
-/// including while the shared-string table loads.
+/// Buffers for decompressed part data, result vectors, and copied cell text use fallible
+/// allocations. A refusal returns [`Error::Io`] of kind
+/// [`std::io::ErrorKind::OutOfMemory`], including while the shared-string table loads.
 /// The batch cell-count limit does not bound the total text returned: repeated
 /// addresses each own their value and formula. For large results, consume
 /// [`WorksheetView::cell_contents`] incrementally or request smaller batches.
@@ -190,7 +190,7 @@ impl Debug for Workbook {
 struct SheetXml {
     // The part URI can differ from its ZIP name in legacy decoded archives.
     uri: String,
-    original: OnceLock<Vec<u8>>,
+    original: OnceLock<PartData>,
     // Present only when the XML differs from the original, and the only record
     // that the worksheet has a pending change.
     current: Option<Vec<u8>>,
@@ -278,7 +278,9 @@ impl Workbook {
     /// ZIP entries, and a sheet name with an unpaired UTF-16 surrogate
     /// escape, which names the sheet's position in the workbook. Returns
     /// [`Error::InvalidWorkbook`] or [`Error::Xml`] for a damaged or ambiguous
-    /// archive or package metadata. Worksheet XML is checked when a worksheet
+    /// archive or package metadata, and [`Error::Io`] of kind
+    /// [`std::io::ErrorKind::OutOfMemory`] if a metadata part's decompression
+    /// buffer cannot be allocated. Worksheet XML is checked when a worksheet
     /// is first read or edited.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let archive = Archive::try_new(bytes)?;
@@ -552,7 +554,7 @@ impl Workbook {
             let original = self.original_sheet(index).map_err(in_sheet)?;
             let current = self.sheet_xml[index].current.as_deref().unwrap_or(original);
             let worksheet = PreparedWorksheet::parse(current).map_err(in_sheet)?;
-            let Some(patch) = worksheet
+            let Some(plan) = worksheet
                 .plan_cells(
                     &cells,
                     || *table.get_or_insert_with(|| strings().ok().flatten()),
@@ -562,13 +564,15 @@ impl Workbook {
             else {
                 continue;
             };
-            // A worksheet's first change resolves its tables, reading its
-            // whole relationships part. That happens before the edited XML is
-            // written, so that the part is never held with both the index and
-            // the output. A patch error still comes first.
+            // A worksheet's first change resolves its tables. A bad patch
+            // size or span takes precedence over a table or header error.
             let headers = self.table_headers(index);
-            let patched = patch.apply().map_err(in_sheet)?;
+            let patch = plan.into_patch().map_err(in_sheet)?;
             self.check_table_headers(index, &worksheet, headers?, &cells, &mut strings)?;
+            // Copying the edited XML needs only the original bytes and patch.
+            drop(worksheet);
+            drop(cells);
+            let patched = patch.apply().map_err(in_sheet)?;
             let changed = (patched != original).then_some(patched);
             staged.push((index, changed));
         }
@@ -800,11 +804,14 @@ impl Workbook {
     // Concurrent first loads can only duplicate the work.
     fn original_sheet(&self, index: usize) -> Result<&[u8]> {
         let cache = &self.sheet_xml[index].original;
-        if let Some(xml) = cache.get() {
-            return Ok(xml);
-        }
-        let xml = self.archive.read(&self.sheets[index].path)?;
-        Ok(cache.get_or_init(|| xml))
+        let part = match cache.get() {
+            Some(part) => part,
+            None => {
+                let part = self.archive.read_part(&self.sheets[index].path)?;
+                cache.get_or_init(|| part)
+            }
+        };
+        Ok(part.bytes(&self.archive))
     }
 
     // Errors name the relationships or table part they concern.
@@ -901,8 +908,7 @@ impl Workbook {
         let path = self.shared_strings_path.as_deref()?;
         let load = || {
             self.archive
-                .read(path)
-                .and_then(|xml| worksheet::read_shared_strings(&xml))
+                .with_part(path, worksheet::read_shared_strings)
                 .map_err(|error| error.in_part(path))
         };
         // The I/O error of a first load that this use ran, which it returns
@@ -1038,9 +1044,9 @@ impl Workbook {
     ///
     /// The destination must name a file, so it cannot end in a path separator
     /// or a `.` component. An existing destination must resolve to a regular
-    /// file: directories, FIFOs, devices, and sockets are rejected before
-    /// output is generated. Both cases return an [`Error::Io`] of kind
-    /// [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
+    /// file. Directories, FIFOs, devices, sockets, and dangling symlinks are
+    /// rejected before output is generated. These checks return [`Error::Io`]
+    /// with kind [`std::io::ErrorKind::InvalidInput`]. A symlink to a regular file is
     /// replaced by the new file rather than written through. On Unix, a
     /// read-only destination is replaced when its directory is writable. On
     /// Windows, whose rename cannot replace a read-only file, an existing
@@ -1261,6 +1267,24 @@ mod tests {
             .map(|(name, xml)| (*name, xml.as_bytes()))
             .collect();
         Workbook::from_bytes(common::stored_archive(&entries)).unwrap()
+    }
+
+    #[test]
+    fn stored_worksheet_reads_reuse_the_archive_bytes_after_an_edit_and_reset() {
+        let original = shared_string_book("<si><t>first</t></si><si><t>second</t></si>")
+            .to_bytes()
+            .unwrap();
+        let archive_bytes = original.as_ptr_range();
+        let mut book = Workbook::from_bytes(original).unwrap();
+        let index = book.sheet_index("Data").unwrap();
+        assert_eq!(book.get_cell("Data", "A1").unwrap().value, "first".into());
+        let stored = book.current_sheet(index).unwrap().as_ptr();
+        assert!(archive_bytes.contains(&stored));
+        book.set_cell("Data", "A1", "edited").unwrap();
+        assert_eq!(book.get_cell("Data", "A1").unwrap().value, "edited".into());
+        book.reset_changes();
+        assert_eq!(book.current_sheet(index).unwrap().as_ptr(), stored);
+        assert_eq!(book.get_cell("Data", "A1").unwrap().value, "first".into());
     }
 
     #[test]

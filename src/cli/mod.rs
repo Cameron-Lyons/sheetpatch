@@ -71,8 +71,7 @@ fn run_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
     let ranges: Vec<CellRange> = (2..args.len())
         .map(|index| args::parse_range("get", line.text(index)?))
         .collect::<Result<_, _>>()?;
-    // Count before expanding, so that a whole-sheet range fails without
-    // allocating an address for every cell.
+    // Check the combined limit before opening the workbook.
     let count = ranges.iter().fold(0u64, |count, range| {
         count.saturating_add(range.cell_count())
     });
@@ -84,13 +83,11 @@ fn run_get(line: &CommandLine, output: &mut impl Write, terminal: bool) -> Resul
             ),
         ));
     }
-    let mut cells = Vec::with_capacity(count as usize);
-    cells.extend(ranges.into_iter().flat_map(CellRange::cells));
     let workbook = Source::try_new(line.command, &args[0])?.open()?;
     let view = workbook.prepare_sheet(sheet)?;
     output::write_read_cells(
         &view,
-        &cells,
+        ranges.iter().copied().flat_map(CellRange::cells),
         READ_BUFFER_BYTES,
         output,
         CellOutput {

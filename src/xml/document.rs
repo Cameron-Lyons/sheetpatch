@@ -46,7 +46,7 @@ const MAX_DEPTH: usize = 256;
 
 // XML whitespace is exactly these four characters, unlike Rust's ASCII and
 // Unicode whitespace sets.
-pub(super) fn is_space(byte: u8) -> bool {
+pub(crate) fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 

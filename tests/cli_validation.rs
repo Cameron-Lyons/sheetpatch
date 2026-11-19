@@ -57,7 +57,7 @@ fn checks_complete_transactions_without_writing_the_workbook_or_other_files() {
 #[test]
 fn stdin_checks_accept_empty_patches_and_report_raw_edit_counts() {
     for (patch, expected) in [
-        ("# comment\r\n\r\n", "Validated 0 patch rows.\n"),
+        ("# comment\r\n  \r\n\r\n", "Validated 0 patch rows.\n"),
         (
             "\u{feff}Notes\tB2\ttext\tCafé ☕\r\n",
             "Validated 1 patch row.\n",
@@ -67,6 +67,32 @@ fn stdin_checks_accept_empty_patches_and_report_raw_edit_counts() {
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, expected.as_bytes());
         assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn empty_tsv_fields_are_rejected_before_saving() {
+    let directory = TempDir::new();
+    let patch = directory.join("edits.tsv");
+    let output = directory.join("output.xlsx");
+    fs::write(&output, b"original destination").unwrap();
+    for row in ["\t", "\t\t\t", "  \t  \t  \t  "] {
+        fs::write(&patch, format!("Notes\tB2\ttext\tUpdated\n{row}\n")).unwrap();
+        let patch = patch.to_str().unwrap();
+        for args in [
+            ["patch", "--check", FIXTURE, patch],
+            ["patch", FIXTURE, output.to_str().unwrap(), patch],
+        ] {
+            let result = cli(&args);
+            assert_eq!(result.status.code(), Some(2), "{row:?}");
+            assert!(
+                String::from_utf8(result.stderr)
+                    .unwrap()
+                    .contains("Patch line 2:")
+            );
+            assert!(result.stdout.is_empty());
+            assert_eq!(fs::read(&output).unwrap(), b"original destination");
+        }
     }
 }
 

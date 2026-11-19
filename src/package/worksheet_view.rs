@@ -4,6 +4,7 @@ use super::workbook::Workbook;
 use crate::worksheet::PreparedWorksheet;
 use crate::{CellContent, CellRange, CellRef, Result};
 use std::fmt::{self, Debug, Formatter};
+use std::sync::OnceLock;
 
 /// A read-only worksheet view that reuses one validated XML index.
 ///
@@ -14,6 +15,7 @@ pub struct WorksheetView<'workbook> {
     sheet: &'workbook Sheet,
     workbook: &'workbook Workbook,
     worksheet: PreparedWorksheet<'workbook>,
+    used_range: OnceLock<Option<CellRange>>,
 }
 
 impl Debug for WorksheetView<'_> {
@@ -35,6 +37,7 @@ impl<'workbook> WorksheetView<'workbook> {
             sheet,
             workbook,
             worksheet,
+            used_range: OnceLock::new(),
         }
     }
 
@@ -124,8 +127,8 @@ impl<'workbook> WorksheetView<'workbook> {
     /// worksheet without cells.
     ///
     /// Like Excel's used range, this includes cells that hold only a style.
-    /// It is computed from the cells themselves rather than the worksheet's
-    /// stored `<dimension>`, which other tools can leave stale.
+    /// The view computes it once from the indexed cells. This also works when
+    /// another tool has left the worksheet's stored `<dimension>` stale.
     ///
     /// A single formatted cell far from the data, such as a style-only cell
     /// at `XFD1048576`, can make the range cover the whole grid of
@@ -147,23 +150,7 @@ impl<'workbook> WorksheetView<'workbook> {
     /// ```
     #[must_use]
     pub fn used_range(&self) -> Option<CellRange> {
-        let mut cells = self.worksheet.cells();
-        let first = cells.next()?;
-        // Rows are in order, but a later row can start further left.
-        let (left, right, last_row) = cells.fold(
-            (first.column, first.column, first.row),
-            |(left, right, _), cell| (left.min(cell.column), right.max(cell.column), cell.row),
-        );
-        Some(CellRange::new(
-            CellRef {
-                row: first.row,
-                column: left,
-            },
-            CellRef {
-                row: last_row,
-                column: right,
-            },
-        ))
+        *self.used_range.get_or_init(|| self.worksheet.used_range())
     }
 
     /// Read a cell without reparsing the worksheet.

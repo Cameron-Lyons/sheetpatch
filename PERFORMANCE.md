@@ -154,8 +154,9 @@ python3 scripts/benchmark.py --candidate target/release/sheetpatch --samples 7 -
 python3 scripts/benchmark.py --candidate target/release/sheetpatch --baseline /path/to/previous/sheetpatch --samples 7 --output target/comparison.json
 ```
 
-The script measures numeric and shared-string whole-sheet reads, a large-sheet
-save, and row insertions. Untimed warmups validate read output, edits, ZIP
+The script measures numeric and shared-string whole-sheet reads, including
+shared strings exported as JSON, a large-sheet save, and row insertions.
+Untimed warmups validate read output, edits, ZIP
 checksums, and untouched records. Each CLI measurement runs in a fresh worker;
 fixture generation and Python startup are excluded, while the native time
 wrapper's startup/exit overhead is included. Native time measures the CLI's

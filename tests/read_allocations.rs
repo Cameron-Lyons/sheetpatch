@@ -1,9 +1,9 @@
-//! Reject a selected text allocation in a child process, so an infallible
+//! Reject a selected allocation in a child process, so an infallible
 //! allocation regression fails this test instead of aborting the whole suite.
 
 mod common;
 
-use sheetpatch::{CellRef, CellValue, Error, Workbook};
+use sheetpatch::{CellEdit, CellRef, CellValue, Error, Workbook};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::ErrorKind;
 use std::process::Command;
@@ -82,6 +82,20 @@ unsafe impl GlobalAlloc for FailOnce {
 #[global_allocator]
 static ALLOCATOR: FailOnce = FailOnce;
 
+fn run_child(test: &str, case: &str) {
+    let output = Command::new(env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD_CASE, case)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{test} ({case}) failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn fixture(case: &str) -> Vec<u8> {
     let text = "x".repeat(TEXT_BYTES);
     let cell = match case {
@@ -148,6 +162,85 @@ fn fixture(case: &str) -> Vec<u8> {
 }
 
 #[test]
+fn deflated_parts_retry_after_a_refused_output_allocation() {
+    if env::var(CHILD_CASE).as_deref() == Ok("inflate") {
+        for path in ["xl/worksheets/sheet1.xml", "xl/sharedStrings.xml"] {
+            let mut parts = common::payloads(include_bytes!("fixtures/libreoffice.xlsx"));
+            // The inflater reserves the declared size plus one to detect an
+            // overlong stream. Trailing XML whitespace reaches that exact size.
+            parts.get_mut(path).unwrap().resize(TEXT_BYTES - 1, b' ');
+            let entries: Vec<_> = parts
+                .iter()
+                .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+                .collect();
+            let bytes = common::write_zip(&entries, &common::ZipLayout::deflated(1));
+            let book = Workbook::from_bytes(bytes).unwrap();
+            FAIL_NEXT_TEXT.store(true, Ordering::SeqCst);
+            let result = book.get_cell("Data", "A1");
+            assert!(
+                matches!(result, Err(Error::Io(error)) if error.kind() == ErrorKind::OutOfMemory),
+                "{path}"
+            );
+            assert_eq!(
+                book.get_cell("Data", "A1").unwrap().value.as_text(),
+                Some("Original text")
+            );
+        }
+        return;
+    }
+    run_child(
+        "deflated_parts_retry_after_a_refused_output_allocation",
+        "inflate",
+    );
+}
+
+#[test]
+fn refused_worksheet_output_rolls_back_a_multi_sheet_edit() {
+    if env::var(CHILD_CASE).as_deref() != Ok("edit-output") {
+        run_child(
+            "refused_worksheet_output_rolls_back_a_multi_sheet_edit",
+            "edit-output",
+        );
+        return;
+    }
+    let mut parts = common::payloads(include_bytes!("fixtures/libreoffice.xlsx"));
+    // Editing 7 to 8 keeps the XML length. Only the final output for the
+    // second worksheet needs this allocation size.
+    let mut sheet =
+        b"<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'>\
+        <sheetData><row r='1'><c r='A1'><v>7</v></c></row></sheetData></worksheet>"
+            .to_vec();
+    sheet.resize(TEXT_BYTES, b' ');
+    parts.insert("xl/worksheets/sheet2.xml".into(), sheet);
+    let entries: Vec<_> = parts
+        .iter()
+        .map(|(name, xml)| (name.as_str(), xml.as_slice()))
+        .collect();
+    let mut book = Workbook::from_bytes(common::stored_archive(&entries)).unwrap();
+    book.set_cell("Data", "B1", 19).unwrap();
+    let before = book.to_bytes().unwrap();
+    let edits = [
+        CellEdit::try_new("Data", "B1", 23).unwrap(),
+        CellEdit::try_new("Notes", "A1", 8).unwrap(),
+    ];
+    let first_attempt = edits.clone();
+    FAIL_NEXT_TEXT.store(true, Ordering::SeqCst);
+    let result = book.apply_edits(first_attempt);
+    assert!(matches!(result, Err(Error::Io(error)) if error.kind() == ErrorKind::OutOfMemory));
+    assert_eq!(book.to_bytes().unwrap(), before);
+    book.apply_edits(edits).unwrap();
+    let saved = Workbook::from_bytes(book.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        saved.get_cell("Data", "B1").unwrap().value.as_number(),
+        Some(23.0)
+    );
+    assert_eq!(
+        saved.get_cell("Notes", "A1").unwrap().value.as_number(),
+        Some(8.0)
+    );
+}
+
+#[test]
 fn read_result_allocations_report_out_of_memory() {
     if let Ok(case) = env::var(CHILD_CASE) {
         let workbook = Workbook::from_bytes(fixture(&case)).unwrap();
@@ -171,21 +264,7 @@ fn read_result_allocations_report_out_of_memory() {
     for case in [
         "shared", "inline", "escaped", "decoded", "formula", "string", "error", "markup", "rich",
     ] {
-        let output = Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "read_result_allocations_report_out_of_memory",
-                "--nocapture",
-            ])
-            .env(CHILD_CASE, case)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{case}: allocation failure killed or failed the child: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        run_child("read_result_allocations_report_out_of_memory", case);
     }
 }
 
@@ -213,21 +292,7 @@ fn changing_scalar_type_does_not_copy_the_old_value() {
     for case in [
         "shared", "inline", "escaped", "decoded", "string", "error", "markup",
     ] {
-        let output = Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "changing_scalar_type_does_not_copy_the_old_value",
-                "--nocapture",
-            ])
-            .env(CHILD_CASE, case)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{case}: type change copied the old text or failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        run_child("changing_scalar_type_does_not_copy_the_old_value", case);
     }
 }
 
@@ -255,21 +320,7 @@ fn a_refused_compaction_reserves_no_output() {
         return;
     }
 
-    let output = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "a_refused_compaction_reserves_no_output",
-            "--nocapture",
-        ])
-        .env(CHILD_CASE, "compact")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "the child failed: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    run_child("a_refused_compaction_reserves_no_output", "compact");
 }
 
 // A refused allocation is transient, unlike a damaged part, so a table whose
@@ -298,20 +349,9 @@ fn a_shared_string_table_that_ran_out_of_memory_loads_again() {
         return;
     }
 
-    let output = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "a_shared_string_table_that_ran_out_of_memory_loads_again",
-            "--nocapture",
-        ])
-        .env(CHILD_CASE, "table")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "allocation failure killed or failed the child: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    run_child(
+        "a_shared_string_table_that_ran_out_of_memory_loads_again",
+        "table",
     );
 }
 
@@ -390,20 +430,9 @@ fn a_shared_string_table_that_cannot_be_loaded_is_tried_once_per_call() {
         return;
     }
 
-    let output = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "a_shared_string_table_that_cannot_be_loaded_is_tried_once_per_call",
-            "--nocapture",
-        ])
-        .env(CHILD_CASE, "per-call")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "the child failed: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    run_child(
+        "a_shared_string_table_that_cannot_be_loaded_is_tried_once_per_call",
+        "per-call",
     );
 }
 
@@ -516,19 +545,8 @@ fn concurrent_uses_of_a_shared_string_table_share_its_loads() {
         return;
     }
 
-    let output = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "concurrent_uses_of_a_shared_string_table_share_its_loads",
-            "--nocapture",
-        ])
-        .env(CHILD_CASE, "concurrent")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "the child failed: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    run_child(
+        "concurrent_uses_of_a_shared_string_table_share_its_loads",
+        "concurrent",
     );
 }

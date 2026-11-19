@@ -193,45 +193,45 @@ impl Archive {
         preserve_gaps: bool,
     ) -> Result<LocalLayout> {
         let mut position = 0;
-        let mut original_position = 0;
+        let mut copy_start = 0;
+        let mut previous_end = 0;
         let mut replacements: Vec<Option<Sizes>> = vec![None; self.entries.len()];
         let mut offsets: Vec<u32> = vec![0; self.entries.len()];
         let mut pending = plan.changes.iter().peekable();
         // Both policies keep the physical local-record order.
         for &index in &self.local_order {
             let entry = &self.entries[index];
-            // Prefixes, gaps and any obsolete records from older versions are
-            // opaque here. Preserve them; only explicit compaction removes
-            // obsolete records after proving their boundaries and checksums.
-            if preserve_gaps {
+            let start = entry.local_record.start;
+            // Copy each contiguous span of unchanged input in one write. A
+            // compact save ends the span at every verified obsolete record gap.
+            if !preserve_gaps && previous_end != start {
                 emit(
                     writer,
                     &mut position,
-                    &self.original[original_position..entry.local_record.start],
+                    &self.original[copy_start..previous_end],
                 )?;
+                copy_start = start;
             }
-            offsets[index] = zip32(position, "ZIP local-record offset")?;
+            offsets[index] = zip32(
+                add(position, start - copy_start)?,
+                "ZIP local-record offset",
+            )?;
             if let Some(&Change { codec, data, .. }) =
                 pending.next_if(|change| change.index == index)
             {
+                emit(writer, &mut position, &self.original[copy_start..start])?;
                 replacements[index] =
                     Some(self.emit_replacement(entry, codec, data, writer, &mut position)?);
-            } else {
-                emit(
-                    writer,
-                    &mut position,
-                    &self.original[entry.local_record.clone()],
-                )?;
+                copy_start = entry.local_record.end;
             }
-            original_position = entry.local_record.end;
+            previous_end = entry.local_record.end;
         }
-        if preserve_gaps {
-            emit(
-                writer,
-                &mut position,
-                &self.original[original_position..self.central_start],
-            )?;
-        }
+        let copy_end = if preserve_gaps {
+            self.central_start
+        } else {
+            previous_end
+        };
+        emit(writer, &mut position, &self.original[copy_start..copy_end])?;
         Ok(LocalLayout {
             position,
             offsets,

@@ -4,7 +4,16 @@ use super::{
     CENTRAL, END, END_LEN, END_TAIL_LEN, ZIP64_LOCATOR, ZIP64_LOCATOR_LEN, invalid, unsupported,
 };
 use crate::Result;
+use memchr::memmem;
 use std::io::{self, Write};
+
+const END_SIGNATURE: [u8; 4] = END.to_le_bytes();
+
+/// Signature offsets with enough remaining bytes for a complete fixed header.
+fn end_signatures(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let searchable = bytes.len().saturating_sub(END_LEN - END_SIGNATURE.len());
+    memmem::find_iter(&bytes[..searchable], &END_SIGNATURE)
+}
 
 /// Whether an end record followed by its comment, `ending`, contains another
 /// end-record signature with room for a complete record before EOF.
@@ -14,8 +23,7 @@ use std::io::{self, Write};
 /// comment makes the archive ambiguous. A signature too close to EOF for a
 /// complete record cannot be read as one; see also [`shadows_end_record`].
 pub(super) fn hides_end_record(ending: &[u8]) -> bool {
-    let last = ending.len().saturating_sub(END_LEN);
-    (1..=last).any(|offset| ending[offset..offset + 4] == END.to_le_bytes())
+    end_signatures(&ending[1..]).next().is_some()
 }
 
 /// Whether Python's `zipfile` would select an end-record signature after the
@@ -24,10 +32,7 @@ pub(super) fn hides_end_record(ending: &[u8]) -> bool {
 /// complete record follows it. Only an archive without a comment is exempt:
 /// Python first looks for a record in exactly the last 22 bytes.
 pub(super) fn shadows_end_record(ending: &[u8]) -> bool {
-    ending.len() > END_LEN
-        && ending[1..]
-            .windows(4)
-            .any(|window| window == END.to_le_bytes())
+    ending.len() > END_LEN && memmem::find(&ending[1..], &END_SIGNATURE).is_some()
 }
 
 /// Locate the end-of-central-directory record. It must be the only record
@@ -45,20 +50,6 @@ pub(super) fn end_of_central_directory(bytes: &[u8]) -> Result<usize> {
     Ok(end)
 }
 
-/// Offsets in `tail`, the end of an archive, of end-record signatures whose
-/// record and comment end exactly at EOF, last first. A comment of at most
-/// 64 KiB puts every such record in the last `END_LEN + u16::MAX` bytes.
-pub(super) fn end_record_candidates(tail: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    let first = tail.len().saturating_sub(END_LEN + u16::MAX as usize);
-    (first..=tail.len().saturating_sub(END_LEN))
-        .rev()
-        .filter(|&offset| {
-            u32_at(tail, offset).ok() == Some(END)
-                && u16_at(tail, offset + 20)
-                    .is_ok_and(|comment| offset + END_LEN + comment as usize == tail.len())
-        })
-}
-
 /// Apply the end-record rules to `tail`, the last bytes of an archive that
 /// has `base` bytes before them. `tail` must hold the whole archive or at
 /// least its last `END_TAIL_LEN` bytes, since every rule is relative to EOF
@@ -70,34 +61,29 @@ pub(super) fn end_record_candidates(tail: &[u8]) -> impl Iterator<Item = usize> 
 /// records that libzip could select instead: the archive is ambiguous if a
 /// central-directory header starts at any of them.
 fn locate_end_record(tail: &[u8], base: usize) -> Result<(usize, Vec<usize>)> {
-    // Multiple records ending at EOF would make the member index ambiguous.
-    let mut candidates = end_record_candidates(tail);
-    let end = match (candidates.next(), candidates.next()) {
-        (Some(end), None) => end,
-        (None, _) => {
-            return Err(invalid(
-                "ZIP end-of-directory record is missing or truncated",
-            ));
-        }
-        (Some(_), Some(_)) => return Err(invalid("ambiguous ZIP end-of-directory records")),
-    };
-    // Fixed fields may legitimately hold the signature's bytes, for example a
-    // central directory at offset 0x06054b50. That matters only when the
-    // comment leaves room for a complete record after the signature.
-    if hides_end_record(&tail[end..]) {
-        return Err(invalid("ambiguous ZIP end-of-directory records"));
-    }
-    // libzip before 1.11 instead scans its tail window forward and keeps the
-    // first record whose directory it can read, unless a later one spans more
-    // local data. Report every earlier record it could select.
     let window = tail.len().saturating_sub(END_TAIL_LEN);
+    let mut signatures = end_signatures(&tail[window..]);
     let mut decoy_directories = Vec::new();
-    for offset in window..end {
+    while let Some(relative) = signatures.next() {
+        let offset = window + relative;
+        let comment = usize::from(u16_at(tail, offset + 20)?);
+        if tail.len() - offset - END_LEN == comment {
+            // A backward-scanning reader could select any later complete
+            // header, even if its comment does not reach EOF.
+            if signatures.next().is_some() {
+                return Err(invalid("ambiguous ZIP end-of-directory records"));
+            }
+            return Ok((offset, decoy_directories));
+        }
+        // libzip before 1.11 scans forward. Keep earlier records whose
+        // directories it could select instead.
         if let Some(directory) = decoy_directory(tail, base, offset)? {
             decoy_directories.push(directory);
         }
     }
-    Ok((end, decoy_directories))
+    Err(invalid(
+        "ZIP end-of-directory record is missing or truncated",
+    ))
 }
 
 /// The directory offset of a record at `offset` in `tail`, the end of an
@@ -110,10 +96,7 @@ fn locate_end_record(tail: &[u8], base: usize) -> Result<(usize, Vec<usize>)> {
 /// A Stored embedded ZIP's own end record normally fails the header test,
 /// because its directory offset is relative to the embedded archive.
 fn decoy_directory(tail: &[u8], base: usize, offset: usize) -> Result<Option<usize>> {
-    let record_end = add(offset, END_LEN)?;
-    if record_end > tail.len() || u32_at(tail, offset)? != END {
-        return Ok(None);
-    }
+    let record_end = offset + END_LEN;
     let entries = u16_at(tail, offset + 10)?;
     let comment_end = add(record_end, u16_at(tail, offset + 20)? as usize)?;
     let central_start = u32_at(tail, offset + 16)? as usize;

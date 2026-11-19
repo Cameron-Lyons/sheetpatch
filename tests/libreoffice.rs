@@ -233,6 +233,11 @@ impl Office {
             "libmergedlo.so",
             "libsofficeapp.dylib",
             "libmergedlo.dylib",
+            // A macOS app puts its launcher in MacOS and the kit in Frameworks.
+            #[cfg(target_os = "macos")]
+            "../Frameworks/libsofficeapp.dylib",
+            #[cfg(target_os = "macos")]
+            "../Frameworks/libmergedlo.dylib",
         ]
         .iter()
         .map(|name| program.join(name))
@@ -241,6 +246,7 @@ impl Office {
         })
         .unwrap_or_else(|| panic!("LibreOfficeKit library not found in {}", program.display()));
         let name = c_string(library.as_os_str().as_bytes());
+        let install = c_string(library.parent().unwrap().as_os_str().as_bytes());
         // SAFETY: the library is LibreOffice's own, which supports being
         // loaded this way. It is never unloaded.
         let library = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
@@ -252,7 +258,6 @@ impl Office {
             unsafe extern "C" fn(*const c_char, *const c_char) -> *mut Handle<OfficeFunctions>;
         // SAFETY: the symbol has this signature in LibreOfficeKitInit.h.
         let hook = unsafe { mem::transmute::<*mut c_void, Hook>(hook) };
-        let install = c_string(program.as_os_str().as_bytes());
         let profile = c_string(file_uri(&directory.join("profile")));
         // SAFETY: both arguments are NUL-terminated; LibreOffice copies them.
         let office = unsafe { hook(install.as_ptr(), profile.as_ptr()) };
